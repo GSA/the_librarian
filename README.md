@@ -1,0 +1,152 @@
+# Qualified Context Kit
+
+Local, data-empty tools for maintaining document metadata, recording attributed
+reviews and retrieving exact, bounded context through a read-only MCP interface.
+No organization corpus, inherited database, example business records or
+conversation history is included. Initialization creates empty stores, not
+demonstration claims.
+
+## Requirements
+
+Linux/POSIX, Python 3.11 or later with SQLite FTS5, and the dependencies declared
+in `tools/context-mcp/pyproject.toml`. Writes use filesystem locking and private
+directories. The application does not call embedding/model services or start a
+network listener. Your MCP client may forward returned text to a model; choose
+an authorized processing path.
+
+## Initialize an empty installation
+
+Run from this directory:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install ./tools/context-mcp
+.venv/bin/python tools/schemas/export_schemas.py --check
+.venv/bin/python tools/initialize.py
+.venv/bin/qualified-context-preflight \
+  --root "$PWD" --reader "$PWD/tools/context-index/context_index.py"
+```
+
+Initialization creates private `.local/catalog`, `.local/review-events` and
+`tools/context-index/.local` storage. It validates existing stores instead of
+reinitializing them. It does not silently rebuild a stale existing index;
+request `--refresh-index` through preflight after deliberate configuration or
+source changes. Initialization and every authoritative write retain verified
+local snapshots. These are not off-host disaster recovery.
+
+If the host lacks `ensurepip` but already supplies system pip, create the
+environment with `python3 -m venv --without-pip .venv`, then install using
+`python3 -m pip --python .venv/bin/python install ./tools/context-mcp`.
+Missing prerequisites must be resolved explicitly; do not reuse another
+project's environment as the distributed installation.
+
+## Configure your own content
+
+`config/policy.json` contains neutral deployment defaults. An optional ignored
+`config/policy.local.json` overrides selected top-level fields. Path roots,
+filename-exclusion regular expressions and transcript section dictionaries
+are configuration, not code. Do not commit a private dictionary or include
+it in a release. Format labels are parser rules, not supplied document content.
+
+Put authorized Markdown beneath a configured `markdown_roots` directory and
+original artifacts beneath `original_roots`. Neither directory is crawled or
+automatically indexed. The default selection is empty.
+Registered renditions remain subject to their original source's current
+root and exclusion policy. Tightening that policy blocks rebuilds and reads
+of a selection containing the excluded source before its text or rendition
+is opened; registration does not exempt extracted text from current policy.
+
+Create an ignored `config/selection.local.json` following the shape of
+`config/selection.json`. Each `documents` entry requires your actual `path`,
+`role` and a `context` array of required companion locators. `context_rules`
+maps a selected `path#anchor` to additional required locators. This supports
+qualifications, corrections and related passages without hardcoded question
+IDs or business dictionaries. Required locators must resolve; they are not
+optional suggestions. Empty `documents` and `renditions` arrays are valid.
+
+Pass `--manifest config/selection.local.json` to both the reader and MCP
+client/preflight when using that selection. Rebuild explicitly:
+
+```sh
+.venv/bin/qualified-context-preflight \
+  --root "$PWD" --reader "$PWD/tools/context-index/context_index.py" \
+  --manifest config/selection.local.json --refresh-index
+```
+
+Policy belongs to this installed toolkit; `--root` selects the data workspace,
+not a second implicit policy file. Separate deployments can have separate
+toolkit configurations. Policy changes invalidate derived retrieval. Changing
+the review audience changes the persisted contract: do not change it on a
+populated store without an explicit migration design.
+
+## Interfaces
+
+Each command supports `--help`. CLI paths are relative to this toolkit.
+
+| Tool | Purpose |
+|---|---|
+| `tools/catalog/catalog_store.py` | Initialize, submit/query metadata, inspect revisions, back up and restore |
+| `tools/catalog/inventory.py` | Explicit-root metadata discovery with configured exclusions; never registration or source interpretation |
+| `tools/review-events/event_store.py` | Schema, attributed native append, correction history, state-pinned writes, backup and restore |
+| `tools/review-events/event_reader.py` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
+| `tools/extraction/extract.py` | Registered Gemini-format UTF-8 transcript/ODT extraction, verification and separate metadata registration |
+| `tools/context-index/context_index.py` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
+| `qualified-context-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |
+
+Catalog submissions are an object with a `records` array. Catalog records use
+`id`, `kind` and `data`; the validator defines exact fields for receipt, source,
+artifact, policy and relationship records. Protocol identifiers use D for
+receipts, S/I/O for source classes, A- for artifacts and R- for relationships;
+these are identifier syntax, not preloaded identities. Native review bundles
+use the JSON schema returned by `event_store.py schema`. Supply actual
+attribution, handling, known/unknown metadata and scope; do not fabricate
+review results to satisfy required fields.
+
+Retrieval returns original text, hashes and exact spans, together with
+configured qualifications. Search snippets are discovery only. Compact and
+batched formats share response-local references without discarding evidence.
+Stale inputs or insufficient budgets produce errors, not truncated
+qualifications. An empty store/query means no supplied records, not proof of
+absence in the world.
+
+MCP invocation:
+
+```sh
+.venv/bin/qualified-context-mcp \
+  --root "$PWD" --reader "$PWD/tools/context-index/context_index.py"
+```
+
+The process waits for a client over stdio. Client configuration must use this
+copy's executable and paths. No client is modified by setup.
+See [agent instructions](agents/coder.md) and [refinement](agents/refiner.md).
+
+## Reproduction and distribution
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python tools/package.py --output .local/qualified-context-kit.zip
+```
+
+Tests use temporary workspaces and this toolkit's own documentation as input.
+They create transient structural records to exercise contracts; they never
+seed the installed stores or pretend to describe an external organization.
+The package uses the explicit `release-files.json` allowlist, not a directory
+copy or a keyword-redaction rule. It excludes local policy, content, databases,
+snapshots, environments, caches and version history. Review changes to every
+allowlisted file before distribution; an allowlist does not certify its text.
+
+This is preparation for reproduction, not publication authorization. No license
+grant is selected. Resolve ownership, licensing and dependency obligations
+before publishing. Do not infer release permission from absence of names.
+
+## Boundaries
+
+This toolkit does not include historical corpus-import mappings, domain-specific
+coverage parsers, live external connectors, semantic search, rendered-document
+verification, cloud hosting, multi-user authorization or enforced agent
+sandboxes. Native event queries replace no missing historical review evidence.
+Source-specific extensions should be separate private adapters/configuration,
+with explicit contracts and tests, not constants embedded in core code.
+Database structure snapshots are not data backups; retain originals and
+verified snapshots. Keep raw sources, narrative authority, metadata, review
+events and the disposable search index distinct.

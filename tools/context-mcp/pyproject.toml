@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qualified-context-mcp"
+version = "0.2.0"
+description = "Local read-only MCP adapter for the qualified context reader"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp==2.2.0",
+    "anyio>=4.5,<5",
+    "jsonschema>=4.19.2,<5",
+]
+
+[project.scripts]
+qualified-context-mcp = "qualified_context_mcp.server:main"
+qualified-context-preflight = "qualified_context_mcp.preflight:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

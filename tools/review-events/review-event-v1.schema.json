@@ -1,0 +1,427 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:qualified-context:review-events:1",
+  "title": "Native review-event submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "audience",
+    "events"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "authority": {
+      "const": "review-events-only"
+    },
+    "audience": {
+      "const": "authorized-local"
+    },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/event"
+      }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "pattern": "\\S"
+    },
+    "nullableText": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/text"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^rev-[a-z0-9-]{1,100}(?![\\s\\S])"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}(?![\\s\\S])"
+    },
+    "count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "pointer"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/text"
+        },
+        "sha256": {
+          "$ref": "#/$defs/hash"
+        },
+        "pointer": {
+          "type": "string",
+          "maxLength": 1000,
+          "pattern": "^/"
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "source",
+        "scope",
+        "outcome",
+        "counts",
+        "reason",
+        "reviewer",
+        "reviewed_on",
+        "recorded_at",
+        "evidence",
+        "uncertainties",
+        "handling",
+        "provenance",
+        "relationships",
+        "supersedes",
+        "correction_reason"
+      ],
+      "properties": {
+        "event_id": {
+          "$ref": "#/$defs/id"
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "receipt_id",
+            "source_id",
+            "locator",
+            "parent_locator",
+            "checksum"
+          ],
+          "properties": {
+            "receipt_id": {
+              "type": "string",
+              "pattern": "^D0*[1-9][0-9]*(?![\\s\\S])"
+            },
+            "source_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^S[1-9][0-9]*(?![\\s\\S])"
+            },
+            "locator": {
+              "$ref": "#/$defs/text"
+            },
+            "parent_locator": {
+              "$ref": "#/$defs/nullableText"
+            },
+            "checksum": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "sha256",
+                "basis"
+              ],
+              "properties": {
+                "sha256": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "basis": {
+                  "enum": [
+                    "unknown",
+                    "reported"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "content",
+            "unit",
+            "extent",
+            "coordinates",
+            "ranges",
+            "description"
+          ],
+          "properties": {
+            "content": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "text",
+                  "tables",
+                  "images",
+                  "attachments",
+                  "illustrative_code",
+                  "unspecified"
+                ]
+              }
+            },
+            "unit": {
+              "enum": [
+                "file",
+                "line",
+                "character",
+                "page",
+                "image",
+                "attachment",
+                "issue"
+              ]
+            },
+            "extent": {
+              "enum": [
+                "defined_scope",
+                "selected_ranges"
+              ]
+            },
+            "coordinates": {
+              "enum": [
+                "not_applicable",
+                "one_based_inclusive",
+                "zero_based_half_open"
+              ]
+            },
+            "ranges": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start",
+                  "end"
+                ],
+                "properties": {
+                  "start": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "end": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "description": {
+              "$ref": "#/$defs/text"
+            }
+          }
+        },
+        "outcome": {
+          "enum": [
+            "reviewed",
+            "partial",
+            "pending",
+            "unreadable",
+            "dispositioned"
+          ]
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "total",
+            "reviewed",
+            "pending",
+            "unreadable",
+            "dispositioned"
+          ],
+          "properties": {
+            "total": {
+              "$ref": "#/$defs/count"
+            },
+            "reviewed": {
+              "$ref": "#/$defs/count"
+            },
+            "pending": {
+              "$ref": "#/$defs/count"
+            },
+            "unreadable": {
+              "$ref": "#/$defs/count"
+            },
+            "dispositioned": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        },
+        "reason": {
+          "$ref": "#/$defs/nullableText"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/nullableText"
+        },
+        "reviewed_on": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date"
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "pointer",
+              "quote"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "agent_statement"
+                ]
+              },
+              "pointer": {
+                "$ref": "#/$defs/nullableText"
+              },
+              "quote": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        },
+        "uncertainties": {
+          "type": "array",
+          "maxItems": 30,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "handling": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "origin",
+            "record",
+            "mapping_version",
+            "unmapped_fields"
+          ],
+          "properties": {
+            "origin": {
+              "enum": [
+                "agent_review"
+              ]
+            },
+            "record": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/reference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mapping_version": {
+              "$ref": "#/$defs/nullableText"
+            },
+            "unmapped_fields": {
+              "type": "array",
+              "maxItems": 100,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "target_event_id",
+              "scope",
+              "basis",
+              "independent_corroboration"
+            ],
+            "properties": {
+              "kind": {
+                "const": "duplicate_content"
+              },
+              "target_event_id": {
+                "$ref": "#/$defs/id"
+              },
+              "scope": {
+                "$ref": "#/$defs/text"
+              },
+              "basis": {
+                "$ref": "#/$defs/text"
+              },
+              "independent_corroboration": {
+                "const": false
+              }
+            }
+          }
+        },
+        "supersedes": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "correction_reason": {
+          "$ref": "#/$defs/nullableText"
+        }
+      }
+    }
+  }
+}

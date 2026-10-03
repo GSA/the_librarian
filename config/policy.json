@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "audience": "authorized-local",
+  "handling": "Use only with authorized local data and model processing; preserve source restrictions. Recorded claims are not independent verification or approval.",
+  "markdown_roots": ["documents"],
+  "original_roots": ["sources"],
+  "excluded_directory_names": [".git", ".local", ".venv", "node_modules", "__pycache__"],
+  "excluded_name_patterns": [],
+  "transcript": {
+    "notes_headings": ["quick notes", "notes", "summary", "details", "suggested next steps"],
+    "transcript_heading": "transcript",
+    "end_pattern": "Transcription ended after \\d{2,}:[0-5]\\d:[0-5]\\d\\s*",
+    "precedence": "Section labels describe format only; they do not establish source precedence or verification."
+  }
+}
