@@ -34,6 +34,15 @@ DISCOVERY = (
     "Discovery only: excerpts are incomplete, not qualified answers or verified "
     "facts. Use get on a locator for exact text and required context."
 )
+ABSENCE = {
+    "absent-corpus": "No query term appears in the searched scope. This reports what has not been "
+                     "collected and indexed; it is not evidence that the subject does not exist.",
+    "absent-partial": "Some query terms do not appear in the searched scope. Coverage is partial; "
+                      "this is not evidence about the missing subject matter.",
+    "present-uncombined": "Every query term appears in the searched scope, but no indexed section "
+                          "contains them together. This is a retrieval or selection limit, not an "
+                          "absence of collected material.",
+}
 ANCHOR = re.compile(r'<a\s+id=["\']([^"\']+)["\']\s*>\s*</a>', re.I)
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)|[ \t]*)$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
@@ -600,13 +609,48 @@ def envelope(**values):
 
 
 
-def literal_query(query):
+def query_terms(query):
     terms = re.findall(r"[^\W_]+", query, re.UNICODE)
     if not terms:
         fail("Search requires at least one word or number, not just punctuation")
     if len(query) > 4096 or len(terms) > 100:
         fail("Search is limited to 4096 characters and 100 literal terms")
-    return " AND ".join('"' + word.replace('"', '""') + '"' for word in terms)
+    return terms
+
+
+def fts_term(term):
+    return '"' + term.replace('"', '""') + '"'
+
+
+def literal_query(query):
+    return " AND ".join(fts_term(term) for term in query_terms(query))
+
+
+def term_presence(connection, terms, path):
+    """Count sections matching each term alone, over the existing index; adds no schema."""
+    restriction = " AND s.path=?" if path is not None else ""
+    counts = {}
+    for term in dict.fromkeys(terms):
+        parameters = [fts_term(term)] + ([path] if path is not None else [])
+        counts[term] = connection.execute(
+            "SELECT count(*) FROM search_fts JOIN sections s ON s.id=search_fts.rowid "
+            "WHERE search_fts MATCH ?" + restriction, parameters,
+        ).fetchone()[0]
+    return counts
+
+
+def classify_absence(connection, query, path):
+    """Explain a zero-result search without quoting the corpus or claiming a fact is absent."""
+    counts = term_presence(connection, query_terms(query), path)
+    absent = [term for term, count in counts.items() if not count]
+    classification = ("absent-corpus" if len(absent) == len(counts)
+                      else "absent-partial" if absent else "present-uncombined")
+    return {
+        "classification": classification, "terms": len(counts), "absent_terms": len(absent),
+        "sections_matching_any": sum(counts.values()),
+        "scope": "selection" if path is None else "path",
+        "caveat": ABSENCE[classification],
+    }
 
 
 def search(connection, query, limit, path):
@@ -638,7 +682,10 @@ def search(connection, query, limit, path):
         if location:
             hit["source_location"] = json.loads(location[0])
             hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
-    return envelope(command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
+    result = envelope(command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
+    if not hits:
+        result["absence"] = classify_absence(connection, query, path)
+    return result
 
 
 def reference_definitions(text):

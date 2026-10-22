@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:qualified-context:review-events:1",
-  "title": "Native review-event submission",
+  "$id": "urn:the-librarian:review-events:1",
+  "title": "The Librarian native review-event submission",
   "type": "object",
   "additionalProperties": false,
   "required": [
