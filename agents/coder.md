@@ -1,4 +1,4 @@
-# Coding-agent context contract
+# Engineer context contract
 
 Use the original task, applicable repository instructions and authorized
 context. Verify your own MCP connection and retrieve exact qualified evidence
@@ -16,6 +16,19 @@ Keep readiness for design, implementation and execution separate. Use reversible
 local choices consistent with existing contracts; record consequential
 assumptions and revisit triggers. Never assume access or deployment authority.
 Implement only when explicitly authorized.
+
+When a ticket/refinement agent supplies Kata specs/tasks, retain the original
+request and its acceptance criteria alongside them. Local task completion is
+not proof of business acceptance, upstream ticket status or release authority.
+Ask the Librarian for missing business context and check code for technical
+facts; do not assume the task author already identified every relevant source.
+
+Return reusable observations, corrections and retrieval failures through the
+[contribution/disposition contract](contributions.md). Task-only implementation
+choices remain in the task. Record bounded requests, qualified answers and
+decisions under the originating task/run references, not unrestricted
+conversation transcripts. A contribution without an authorized maintenance
+handoff remains not submitted.
 
 Pass the original task, source/code revisions, scoped diff, criterion mapping,
 actual commands/results and unresolved limitations to an independent reviewer.

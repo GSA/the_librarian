@@ -16,3 +16,6 @@ data/
 dist/
 *.egg-info/
 build/
+.kata.local.toml
+# roborev snapshots
+/.roborev/

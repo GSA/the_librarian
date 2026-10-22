@@ -1,4 +1,4 @@
-# Qualified Context Kit
+# The Librarian
 
 Local, data-empty tools for maintaining document metadata, recording attributed
 reviews and retrieving exact, bounded context through a read-only MCP interface.
@@ -6,13 +6,44 @@ No organization corpus, inherited database, example business records or
 conversation history is included. Initialization creates empty stores, not
 demonstration claims.
 
+The Librarian is the project name. As of October 21, 2026 the identity is
+unified: the checkout directory is `the_librarian`, the adapter package is
+`the-librarian-mcp` (module `the_librarian_mcp`), the commands are
+`librarian-mcp` and `librarian-preflight`, and the MCP protocol identity is
+`the-librarian`. The earlier `qualified-context-*` names are removed, not
+aliased; existing MCP client configurations and the originating installation's
+documentation must be updated explicitly. Persisted store contracts, schema
+versions and record identifier syntax are unchanged, so existing catalog,
+review-event and index databases remain readable without migration.
+Each program supplies its own authorized content, policy, selection and
+stores; the reusable distribution contains none of them.
+
+**Start here:** [agent operating rules](AGENTS.md),
+[Librarian contract](agents/librarian.md),
+[Jira-to-Kata refinement](agents/refiner.md),
+[Engineer contract](agents/coder.md), and
+[contribution/disposition handoffs](agents/contributions.md).
+The [development and ingestion roadmap](ROADMAP.md) is the canonical
+maintainer/operator plan for missing capabilities and future automation,
+not a claim that those capabilities are implemented.
+[Recorded design decisions](docs/decisions/README.md) cover identity,
+updateable distribution, store compatibility, instance topology and source
+onboarding; each states whether it is implemented or only agreed.
+
 ## Requirements
 
 Linux/POSIX, Python 3.11 or later with SQLite FTS5, and the dependencies declared
-in `tools/context-mcp/pyproject.toml`. Writes use filesystem locking and private
+in `tools/context-mcp/pyproject.toml`. `librarian-preflight` probes the actual
+interpreter, SQLite build, FTS5 availability and adapter dependency versions and
+refuses to proceed on a mismatch; run it before serving. Writes use filesystem
+locking and private
 directories. The application does not call embedding/model services or start a
 network listener. Your MCP client may forward returned text to a model; choose
 an authorized processing path.
+
+One installation serves one project's data root, policy and stores. Policy is
+loaded from this directory, so a second project needs its own installation; see
+[decision 0004](docs/decisions/0004-instance-topology.md).
 
 ## Initialize an empty installation
 
@@ -23,7 +54,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install ./tools/context-mcp
 .venv/bin/python tools/schemas/export_schemas.py --check
 .venv/bin/python tools/initialize.py
-.venv/bin/qualified-context-preflight \
+.venv/bin/librarian-preflight \
   --root "$PWD" --reader "$PWD/tools/context-index/context_index.py"
 ```
 
@@ -68,7 +99,7 @@ Pass `--manifest config/selection.local.json` to both the reader and MCP
 client/preflight when using that selection. Rebuild explicitly:
 
 ```sh
-.venv/bin/qualified-context-preflight \
+.venv/bin/librarian-preflight \
   --root "$PWD" --reader "$PWD/tools/context-index/context_index.py" \
   --manifest config/selection.local.json --refresh-index
 ```
@@ -91,7 +122,8 @@ Each command supports `--help`. CLI paths are relative to this toolkit.
 | `tools/review-events/event_reader.py` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
 | `tools/extraction/extract.py` | Registered Gemini-format UTF-8 transcript/ODT extraction, verification and separate metadata registration |
 | `tools/context-index/context_index.py` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
-| `qualified-context-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |
+| `tools/diagnostics/retrieval_log.py` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
+| `librarian-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |
 
 Catalog submissions are an object with a `records` array. Catalog records use
 `id`, `kind` and `data`; the validator defines exact fields for receipt, source,
@@ -107,24 +139,41 @@ configured qualifications. Search snippets are discovery only. Compact and
 batched formats share response-local references without discarding evidence.
 Stale inputs or insufficient budgets produce errors, not truncated
 qualifications. An empty store/query means no supplied records, not proof of
-absence in the world.
+absence in the world. A search with no hits reports why: whether no query term
+is indexed at all, some are missing, or all are indexed but never appear in
+one section. That classification describes this corpus's coverage and
+findability, never the world.
+
+Retrieval diagnostics are off unless an operator passes `--diagnostics-log` to
+the adapter. They record search outcomes, absence classifications, and a bare
+count of reads; query text, locators, excerpts, prompts and model output are
+not representable. Because no locator is recorded, the log cannot report which
+documents were read and is not a basis for pruning selection. Diagnostics are
+never returned by a read tool, never count as a review, and never change
+selection, ranking or qualification. See
+[the adapter README](tools/context-mcp/README.md) and
+[decision 0007](docs/decisions/0007-execution-traces.md).
 
 MCP invocation:
 
 ```sh
-.venv/bin/qualified-context-mcp \
+.venv/bin/librarian-mcp \
   --root "$PWD" --reader "$PWD/tools/context-index/context_index.py"
 ```
 
 The process waits for a client over stdio. Client configuration must use this
 copy's executable and paths. No client is modified by setup.
-See [agent instructions](agents/coder.md) and [refinement](agents/refiner.md).
+The intended workflow is Jira input -> ticket/refinement agent -> local Kata
+specs/tasks -> Engineer, with qualified Librarian consultation and returned
+context discoveries throughout. The role documents are operator-loaded
+contracts, not an installed Jira/Kata connector, agent runner or watcher.
+An independent review checks the original request and implementation evidence.
 
 ## Reproduction and distribution
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python tools/package.py --output .local/qualified-context-kit.zip
+.venv/bin/python tools/package.py --output .local/the-librarian.zip
 ```
 
 Tests use temporary workspaces and this toolkit's own documentation as input.

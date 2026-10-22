@@ -23,7 +23,7 @@ class MCP(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(setup.returncode, 0, setup.stderr)
             parameters = StdioServerParameters(
                 command=sys.executable,
-                args=["-m", "qualified_context_mcp.server", "--root", str(root),
+                args=["-m", "the_librarian_mcp.server", "--root", str(root),
                       "--reader", str(root / "tools/context-index/context_index.py")],
             )
             async with stdio_client(parameters) as (read, write):
@@ -47,6 +47,110 @@ class MCP(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(payload["count"], 0)
                     response = await session.call_tool("get", {"locator": "documents/missing.md"})
                     self.assertTrue(response.is_error)
+
+    async def test_opt_in_diagnostics_record_absence_without_the_query(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "kit"
+            clone(root)
+            setup = subprocess.run([sys.executable, str(root / "tools/initialize.py")],
+                                   capture_output=True, text=True)
+            self.assertEqual(setup.returncode, 0, setup.stderr)
+            log = root / ".local/diagnostics/retrieval.jsonl"
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "the_librarian_mcp.server", "--root", str(root),
+                      "--reader", str(root / "tools/context-index/context_index.py"),
+                      "--diagnostics-log", ".local/diagnostics/retrieval.jsonl"],
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    response = await session.call_tool("search", {"query": "zzsecretsubject"})
+                    self.assertFalse(response.is_error, response)
+                    payload = json.loads(response.content[0].text)
+                    self.assertEqual(payload["hits"], [])
+                    self.assertEqual(payload["absence"]["classification"], "absent-corpus")
+                    failure = await session.call_tool("search", {"query": "???"})
+                    self.assertTrue(failure.is_error)
+                    missing = await session.call_tool("get", {"locator": "documents/missing.md"})
+                    self.assertTrue(missing.is_error)
+                    await session.call_tool("status", {})
+                    await session.call_tool("catalog", {})
+            raw = log.read_text()
+            self.assertNotIn("zzsecretsubject", raw)
+            self.assertNotIn("documents/missing.md", raw)
+            records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            self.assertEqual(len(records), 3, "only search and reads are observed")
+            self.assertEqual(records[0]["outcome"], "empty")
+            self.assertEqual(records[0]["classification"], "absent-corpus")
+            self.assertEqual((records[1]["operation"], records[1]["outcome"]), ("search", "error"))
+            self.assertEqual((records[2]["operation"], records[2]["outcome"]), ("read", "error"))
+            for record in records[1:]:
+                self.assertTrue(record["error_type"].isidentifier())
+
+    async def test_diagnostics_count_reads_without_recording_what_was_read(self):
+        """A successful get is counted as a bare event, with no locator in the log."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "kit"
+            clone(root)
+            (root / "documents").mkdir(parents=True, exist_ok=True)
+            (root / "documents/guide.md").write_text(
+                "# Guide\n\n## Overview\n\nzzuniquesubject material for retrieval.\n")
+            (root / "config/selection.json").write_text(json.dumps({
+                "schema_version": 1, "audience": "authorized-local",
+                "documents": [{"path": "documents/guide.md",
+                               "role": "toolkit-documentation", "context": []}],
+                "context_rules": {}, "renditions": []}))
+            subprocess.run([sys.executable, str(root / "tools/initialize.py")],
+                           capture_output=True, text=True, check=True)
+            log = root / ".local/diagnostics/retrieval.jsonl"
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "the_librarian_mcp.server", "--root", str(root),
+                      "--reader", str(root / "tools/context-index/context_index.py"),
+                      "--diagnostics-log", ".local/diagnostics/retrieval.jsonl"],
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    found = await session.call_tool("search", {"query": "zzuniquesubject"})
+                    self.assertFalse(found.is_error, found)
+                    hits = json.loads(found.content[0].text)["hits"]
+                    self.assertTrue(hits)
+                    fetched = await session.call_tool("get", {"locator": hits[0]["locator"]})
+                    self.assertFalse(fetched.is_error, fetched)
+                    self.assertIn("zzuniquesubject", fetched.content[0].text)
+            raw = log.read_text()
+            for leaked in ("zzuniquesubject", "documents/guide.md", "guide", "Overview"):
+                self.assertNotIn(leaked, raw)
+            records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            self.assertEqual([(r["operation"], r["outcome"]) for r in records],
+                             [("search", "hit"), ("read", "hit")])
+            self.assertNotIn("hits", records[1])
+            summary = subprocess.run(
+                [sys.executable, str(root / "tools/diagnostics/retrieval_log.py"),
+                 "--root", str(root), "report"],
+                capture_output=True, text=True, check=True)
+            report = json.loads(summary.stdout)
+            self.assertEqual((report["searches"], report["reads"]), (1, 1))
+            self.assertNotIn("read_per_answered_search", report)
+
+    async def test_diagnostics_stay_off_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "kit"
+            clone(root)
+            subprocess.run([sys.executable, str(root / "tools/initialize.py")],
+                           capture_output=True, text=True, check=True)
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "the_librarian_mcp.server", "--root", str(root),
+                      "--reader", str(root / "tools/context-index/context_index.py")],
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    await session.call_tool("search", {"query": "documentation"})
+            self.assertFalse((root / ".local/diagnostics").exists())
 
 
 if __name__ == "__main__":

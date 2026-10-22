@@ -17,6 +17,7 @@ class Config:
     max_results: int = 25
     timeout_seconds: float = 30
     event_reader: Path | None = None
+    diagnostics_log: Path | None = None
 
     @property
     def event_reader_path(self) -> Path:
@@ -36,6 +37,13 @@ class Config:
             path = value if value.is_absolute() else self.root / value
             if ".." in path.parts or not path.is_relative_to(self.root):
                 raise ValueError(f"--{name} must stay within --root")
+        if self.diagnostics_log is not None:
+            path = (self.diagnostics_log if self.diagnostics_log.is_absolute()
+                    else self.root / self.diagnostics_log)
+            if ".." in path.parts or not path.is_relative_to(self.root):
+                raise ValueError("--diagnostics-log must stay within --root")
+            if path.suffix != ".jsonl":
+                raise ValueError("--diagnostics-log must be a .jsonl file")
         for name in ("max_source_chars", "max_output_chars", "max_results"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -57,4 +65,6 @@ def parser(description: str) -> argparse.ArgumentParser:
     result.add_argument("--max-output-chars", type=int, default=60000)
     result.add_argument("--max-results", type=int, default=25)
     result.add_argument("--timeout-seconds", type=float, default=30)
+    result.add_argument("--diagnostics-log", type=Path, default=None,
+                        help="Opt in to body-free retrieval diagnostics at this .jsonl path")
     return result
