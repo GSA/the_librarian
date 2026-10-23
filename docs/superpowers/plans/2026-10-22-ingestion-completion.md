@@ -125,6 +125,18 @@ Source: the `SWHL/RapidOCR` published ONNX conversions (Apache-2.0), revision `1
 
 **Completion:** the five-fixture matrix passes twice with no network access using hash-verified reachable assets; `profile()` version 2 names the models; every error and budget path is still non-successful.
 
+**Status, October 23, 2026 — partially executed, not complete.** The re-pin, the
+profile version bump and the three new tests are done, and the assets were
+provisioned and hash-verified in place. Conversion now succeeds on all five
+fixtures with byte-identical renditions across two isolated runs, and every
+content assertion passes except the two-column reading-order check, which fails
+on all five. Docling merges the top two rows of both columns into a single text
+block. `native.pdf` reports `ocr_score: {"state": "unknown"}` — OCR never ran —
+and fails identically, so the cause is layout clustering, not the new OCR
+models. No assertion was weakened and no fixture was substituted; the measured
+evidence is in `.superpowers/sdd/2026-10-20-docling-ingestion/progress.md`.
+Resolving the expectation is the remaining work before this task can close.
+
 ### Task 2: Lifecycle, Bridge and CLI
 
 **Goal:** explicit, reproducible, recoverable OCR ingestion through this repository's own catalog.
