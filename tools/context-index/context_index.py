@@ -23,7 +23,8 @@ import policy
 
 
 SCHEMA = 1
-APPLICATION_ID = 0x46435458
+APPLICATION_ID = 0x4C435458
+SUPERSEDED_APPLICATION_ID = 0x46435458
 AUDIENCE = policy.SETTINGS["audience"]
 NOTICE = (
     "Local retrieval for already-authorized local users only. This label is "
@@ -388,7 +389,10 @@ def readonly(path):
     connection = sqlite3.connect(f"file:{quote(str(path), safe='/')}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
-        if connection.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
+        application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+        if application_id == SUPERSEDED_APPLICATION_ID:
+            fail("Superseded FCTX index identity; explicit migration or re-initialization is required")
+        if application_id != APPLICATION_ID:
             fail(f"Refusing non-index database: {path}")
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
             fail(f"Unsupported index database schema: {path}")

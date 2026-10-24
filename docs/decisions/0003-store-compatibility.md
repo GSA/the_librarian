@@ -13,11 +13,11 @@ whole basis of the upgrade story.
 
 **Authority stores** hold what cannot be recomputed:
 
-- Catalog: immutable hash-chained revisions, `application_id` `0x46434154`,
+- Catalog: immutable hash-chained revisions, `application_id` `0x4C434154`,
   `user_version` 1, `catalog-metadata-only` authority, ABORT triggers on
   update and delete, verified pre-write and post-write backups.
 - Review events: append-only hash chain with corrections,
-  `application_id` `0x46524556`, `review-events-only` authority, a
+  `application_id` `0x4C524556`, `review-events-only` authority, a
   `contract_hash` derived from the published event schema and checked against
   stored metadata, and append-only triggers verified by exact SQL text.
 
@@ -54,10 +54,11 @@ growth is an operational fact that per-project instances multiply.
 ### The upgrade contract
 
 1. Upgrading code **never** migrates an authority store implicitly. A version
-   whose persisted structure differs from a store's recorded contract refuses
-   to operate and reports that an explicit migration is required. The review
-   event store already does this through `contract_hash`; the catalog does it
-   through `user_version` and `contract_version`.
+   whose persisted structure or application identity differs from a store's
+   recorded contract refuses to operate and reports that explicit migration or
+   re-initialization is required. The superseded `FCAT`, `FREV` and `FCTX`
+   identities receive this specific refusal. The review event store also binds
+   `contract_hash`; the catalog binds `user_version` and `contract_version`.
 2. Upgrading code **always** assumes the derived index must be rebuilt. A
    rebuild is a normal, expected, side-effect-free step of an upgrade, and the
    stale-read refusal is the mechanism that keeps a half-upgraded installation

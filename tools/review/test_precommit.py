@@ -296,6 +296,7 @@ else:
             "docs/decisions/0008-proof-of-concept-closure.md", "docs/decisions/README.md",
             "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
             "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+            "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
         }
         excluded = {"docs/decisions/private.md", "tools/schemas/private.sql",
                     "tools/catalog/private.py", "tests/private.py"}
@@ -372,6 +373,83 @@ else:
                 self.assert_blocked(result, "exit 1")
                 self.assertIn("no verified completed failed review", result.stderr)
                 self.assertNotIn("UNVERIFIED FINDING", result.stderr)
+
+    def test_repeated_snapshot_failures_report_each_verified_job(self):
+        self.stage()
+        self.fake(exit_code=1, verdict=0, output="Medium: fixture defect")
+        self.launcher.write_text(self.launcher.read_text().replace(
+            "print(json.dumps([job] if True else []))",
+            "assert sys.argv[sys.argv.index('--repo') + 1] == str(root)\n"
+            "    assert '--all-branches' in sys.argv\n"
+            "    print(json.dumps([job, {**job, 'id': 40}]))",
+        ).replace("'job_id': 42", "'job_id': int(sys.argv[3])").replace(
+            "'job': job, 'prompt': prompt",
+            "'job': {**job, 'id': int(sys.argv[3])}, 'prompt': prompt",
+        ))
+        result = self.run_gate()
+        self.assert_blocked(result, "exit 1")
+        for job_id in (42, 40):
+            self.assertIn(f"completed failed Pi dirty-review job {job_id}", result.stderr)
+        self.assertIn("not proof of which job caused this command exit", result.stderr)
+        run = Path(self.observed()["repo"]).parent
+        record = json.loads((run / "result.json").read_text())
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["diagnostic_job_ids"], [42, 40])
+        self.assertNotIn("job_id", record)
+        self.assertIn("job 40", (run / "review.log").read_text())
+
+    def test_one_unavailable_result_does_not_hide_other_failed_jobs(self):
+        spec = importlib.util.spec_from_file_location("gate_under_test", GATE)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        job = {"id": 42, "status": "done", "repo_path": str(self.root),
+               "git_ref": "dirty", "agent": "pi"}
+        older = {**job, "id": 40}
+        review = {"job_id": 40, "agent": "pi", "job": older,
+                  "verdict_bool": 0, "output": "VERIFIED OLDER FINDING"}
+        with mock.patch.object(gate, "launcher_call", side_effect=[
+                json.dumps([job, older]), gate.GateError("unavailable"), json.dumps(review)]):
+            ids = []
+            diagnostic = gate.failed_review_diagnostic(str(self.launcher), self.root, ids)
+        self.assertIn("diagnostic lookup failed for job 42", diagnostic)
+        self.assertIn("VERIFIED OLDER FINDING", diagnostic)
+        self.assertEqual(ids, [40])
+
+    def test_many_large_results_have_bounded_combined_findings_and_queries(self):
+        spec = importlib.util.spec_from_file_location("gate_under_test", GATE)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        jobs = [{"id": n, "status": "done", "repo_path": str(self.root),
+                 "git_ref": "dirty", "agent": "pi"} for n in range(1, 21)]
+        def call(launcher, repo, args):
+            if args[0] == "list":
+                return json.dumps(jobs)
+            job = jobs[int(args[2]) - 1]
+            return json.dumps({"job_id": job["id"], "agent": "pi", "job": job,
+                               "verdict_bool": 0, "output": "X" * 20000})
+        with mock.patch.object(gate, "launcher_call", side_effect=call) as calls:
+            ids = []
+            diagnostic = gate.failed_review_diagnostic(str(self.launcher), self.root, ids)
+        self.assertEqual(ids, list(range(1, 11)))
+        self.assertEqual(calls.call_count, 11)
+        self.assertLess(len(diagnostic), 19000)
+        self.assertIn("diagnostic truncated", diagnostic)
+
+    def test_multiple_jobs_still_cannot_authorize_commit(self):
+        self.stage()
+        self.fake()
+        self.launcher.write_text(self.launcher.read_text().replace(
+            "print(json.dumps([job] if True else []))",
+            "print(json.dumps([job, {**job, 'id': 40}]))",
+        ))
+        self.assert_blocked(self.run_gate(), "no unique completed review job")
+
+    def test_infrastructure_failure_is_identified_without_findings(self):
+        self.stage()
+        self.fake(exit_code=1, status="failed", output="UNVERIFIED FINDING")
+        result = self.run_gate()
+        self.assert_blocked(result, "infrastructure failure: Pi dirty-review job 42")
+        self.assertNotIn("UNVERIFIED FINDING", result.stderr)
 
     def test_failed_review_diagnostic_is_bounded(self):
         self.stage()

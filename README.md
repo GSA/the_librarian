@@ -11,10 +11,10 @@ unified: the checkout directory is `the_librarian`, the adapter package is
 `the-librarian-mcp` (module `the_librarian_mcp`), the commands are
 `librarian-mcp` and `librarian-preflight`, and the MCP protocol identity is
 `the-librarian`. The earlier `qualified-context-*` names are removed, not
-aliased; existing MCP client configurations and the originating installation's
-documentation must be updated explicitly. Persisted store contracts, schema
-versions and record identifier syntax are unchanged, so existing catalog,
-review-event and index databases remain readable without migration.
+aliased; existing MCP client configurations must be updated explicitly. Store authority strings, schema
+versions and record identifier syntax are unchanged. The empty local stores now
+use `LCAT`, `LREV` and `LCTX`; superseded identities require explicit migration
+or re-initialization and are never converted automatically.
 Each program supplies its own authorized content, policy, selection and
 stores; the reusable distribution contains none of them.
 
@@ -121,6 +121,7 @@ Each command supports `--help`. CLI paths are relative to this toolkit.
 | `tools/review-events/event_store.py` | Schema, attributed native append, correction history, state-pinned writes, backup and restore |
 | `tools/review-events/event_reader.py` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
 | `tools/extraction/extract.py` | Registered Gemini-format UTF-8 transcript/ODT extraction, verification and separate metadata registration |
+| `tools/extraction/docling_extract.py` | Optional offline PDF/image Docling prepare, repeat verification and separate deferred-rendition registration |
 | `tools/context-index/context_index.py` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
 | `tools/diagnostics/retrieval_log.py` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
 | `librarian-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |

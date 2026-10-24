@@ -14,7 +14,42 @@
 
 **Supersedes:** [October 20 implementation plan](2026-10-20-docling-ingestion.md), Tasks 1-4. That plan's Task 0 (Kata tracking and the roborev pre-commit gate) is complete and is not repeated here. Its Task 3 (porting into a second installation) is withdrawn.
 
-**Status:** Spec approved October 22, 2026 with the amendment **no second-installation obligation.** This plan is awaiting owner approval. Execution mode carries forward from October 20: subagent-driven, tracked in Kata, worked in place on the current branch, with the roborev pre-commit gate active.
+**Status:** Spec approved October 22, 2026 with the amendment **no second-installation obligation.** Implementation is present in the working tree; this is no longer an unstarted plan. Task 1 has recorded real acceptance. Tasks 2-4 have passing automated implementation checks, but their remaining delivery/acceptance steps are not all evidenced (see the reconciliation below). Historical execution checkboxes are not retroactively checked without evidence. Execution mode carries forward from October 20: subagent-driven, Kata-tracked, in-place work with the roborev pre-commit gate.
+
+## Completion reconciliation - October 23, 2026
+
+| Work | Verified state | Remaining before full closure |
+|---|---|---|
+| Task 1: assets and worker | Recorded five-fixture real acceptance, two networkless runs per fixture; profile version 2 and pinned assets present | No current asset blocker; task-scoped commit and live Kata status not verified in this reconciliation |
+| Task 2: lifecycle, bridge and CLI | Implementation and lifecycle/recovery regressions present; saved final Task 2 review reports no issues | No inspected evidence of the required real CLI `prepare`/`verify`/`register`/retry cycle or task-scoped commit |
+| Task 3: clean-copy boundary | Both clean-copy boundary regressions pass in the full suite; schema snapshots current | Stored staged-review verdict and task-scoped commit not verified |
+| Task 4: identity, closure and guide | New store identities, superseded-identity refusal tests, schema snapshots, guide and closure record present; suite green | Fresh whole-change review and task-scoped commit not verified; local-store re-initialization evidence not inspected |
+
+The reconciliation ran the installed-environment suite: 72 tests passed. The
+lightweight worker suite passed 25 tests with 7 opt-in skips; it did **not**
+re-run real inference. Schema `--check` passed and the legacy extractor hash
+still matches the recorded baseline. Passing clean-copy/package tests do not
+establish publication approval or real-document accuracy.
+
+**Reviewed Kata reconciliation - October 24:** the supported launcher now
+accepts explicit project `librarian` with `--as pi`. Independent completion
+audit `283e782c-4fbb-423b-a415-056e2eced147` approved partial cleanup:
+`3axg` (worker review), `wxj5` (original worker criteria) and `1s34`
+(original hook work under amended scope) closed done; `gb16` retired
+`wontfix` as withdrawn, not successfully integrated. Parent `k6pr`, lifecycle
+`ekbs` and final handoff `9jj9` remain open. Historical task criteria were
+preserved, obsolete attention removed and final handoff now depends on the
+unfinished lifecycle, not the withdrawn port. Unrelated tasks were untouched.
+
+The audit found outstanding corrections: check catalog state before rendition
+publication; collect diagnostics with a bounded collector rather than slicing
+after unbounded collection; align guide installation/provisioning with pinned
+requirements; include final-task paths in the mandatory staged-review scope;
+and exercise the cloned CLI rather than only its adapter API. The real CLI
+cycle, local-store evidence and delivery/final-review gaps remain visible.
+The reviewer inspected code and saved evidence but did not execute tests or
+fresh inference. No application fixes were made by this reconciliation.
+This section is a bounded verification snapshot; Kata owns live task state.
 
 ## Global Constraints
 
@@ -125,17 +160,17 @@ Source: the `SWHL/RapidOCR` published ONNX conversions (Apache-2.0), revision `1
 
 **Completion:** the five-fixture matrix passes twice with no network access using hash-verified reachable assets; `profile()` version 2 names the models; every error and budget path is still non-successful.
 
-**Status, October 23, 2026 — partially executed, not complete.** The re-pin, the
-profile version bump and the three new tests are done, and the assets were
-provisioned and hash-verified in place. Conversion now succeeds on all five
-fixtures with byte-identical renditions across two isolated runs, and every
-content assertion passes except the two-column reading-order check, which fails
-on all five. Docling merges the top two rows of both columns into a single text
-block. `native.pdf` reports `ocr_score: {"state": "unknown"}` — OCR never ran —
-and fails identically, so the cause is layout clustering, not the new OCR
-models. No assertion was weakened and no fixture was substituted; the measured
-evidence is in `.superpowers/sdd/2026-10-20-docling-ingestion/progress.md`.
-Resolving the expectation is the remaining work before this task can close.
+**Status, October 23, 2026 — complete.** The re-pin, profile version bump and
+three model-identity tests are done; the assets were provisioned and
+hash-verified in place. The original three-line, approximately 30pt-gutter
+fixture was found to resemble a row grid: Docling consistently clustered its
+top rows across columns even for native text. The replacement fixture has five
+lines per column and a visible 120pt+ gutter, and strengthens the assertion to
+check all five labels in each column. The complete matrix now passes twice in
+isolated networkless children with byte-identical canonical renditions and all
+content, table, page, blank-page and provenance assertions intact. No worker
+setting or acceptance property was weakened. Exact hashes and evidence are in
+`.superpowers/sdd/2026-10-20-docling-ingestion/progress.md`.
 
 ### Task 2: Lifecycle, Bridge and CLI
 

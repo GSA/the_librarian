@@ -23,7 +23,8 @@ AUTHORITY = "catalog-metadata-only"
 HOME = ".local/catalog"
 DB_NAME = "catalog.sqlite3"
 VERSION = 1
-APPLICATION_ID = 0x46434154
+APPLICATION_ID = 0x4C434154
+SUPERSEDED_APPLICATION_ID = 0x46434154
 VALIDATOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 KINDS = {"receipt", "source", "artifact", "policy", "relationship"}
 ROLES = {
@@ -400,8 +401,10 @@ def make_state(metadata, revision, head, count):
 
 def inspect(connection):
     """Verify physical integrity, every historical payload/graph, chain, and current projection."""
-    require(connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID,
-            "Not a catalog store")
+    application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+    require(application_id != SUPERSEDED_APPLICATION_ID,
+            "Superseded FCAT catalog identity; explicit migration or re-initialization is required")
+    require(application_id == APPLICATION_ID, "Not a catalog store")
     require(connection.execute("PRAGMA user_version").fetchone()[0] == VERSION, "Unsupported catalog version")
     require([row[0] for row in connection.execute("PRAGMA integrity_check")] == ["ok"],
             "SQLite integrity check failed")
@@ -612,7 +615,13 @@ def status(root, *, audit=False):
         return validated_state(connection, home, audit=audit)
 
 
-def submit(root, records, *, actor, request_id, expected_state, reason):
+def submit(root, records, *, actor, request_id, expected_state, reason,
+           precommit_check=None):
+    """Submit metadata; an optional local guard runs inside the final transaction.
+
+    Guards must raise CatalogError on failure and must not write this catalog.
+    They are invocation-only checks, never part of a persisted request recipe.
+    """
     text(actor, "Actor", 200)
     text(request_id, "Request ID", 200)
     text(reason, "Revision reason")
@@ -633,6 +642,8 @@ def submit(root, records, *, actor, request_id, expected_state, reason):
                 recovery = _snapshot(connection, backups, "retry")
             except (OSError, sqlite3.Error, CatalogError) as error:
                 raise CatalogError("Request already committed; retry the same request: backup failed") from error
+            if precommit_check is not None:
+                precommit_check()
             return {"command": "submit", "idempotent": True, **state, "state": state,
                     "request_id": request_id, "committed_revision": prior["revision"],
                     "committed_at": prior["committed_at"], "committed_state": committed_states[prior["revision"]],
@@ -659,6 +670,8 @@ def submit(root, records, *, actor, request_id, expected_state, reason):
                 connection.execute(
                     "INSERT INTO current_records VALUES (?,?,?) ON CONFLICT(record_id) DO UPDATE "
                     "SET revision=excluded.revision, ordinal=excluded.ordinal", (record["id"], revision, ordinal))
+            if precommit_check is not None:
+                precommit_check()
             connection.execute("COMMIT")
             committed = True
             seal(db)
