@@ -108,10 +108,16 @@ Snapshots and their results are retained on success or failure for inspection,
 not silently expired. A failed review command's error is recorded there.
 A quiet review may exit 1 with no output because its completed verdict is fail,
 not because enqueue failed. On a nonzero review exit the gate queries the exact
-snapshot with `--all-branches`, verifies one completed failed Pi dirty-review
-job and its stored identity/verdict, and reports its job ID and findings (up to
-16,384 characters). This diagnostic is also retained in `review.log`. Missing,
-ambiguous, mismatched or unavailable evidence is reported without claiming a
+snapshot with `--all-branches --limit 10`, verifies each completed failed Pi
+dirty-review job against its stored identity/verdict, and reports job IDs and
+findings (a combined 16,384-character findings budget divided across returned
+jobs). Stored failed execution statuses are identified separately as
+infrastructure failures. Repeated snapshot reviews are reported as history,
+not proof of which job caused the command exit; the gate never chooses a
+historical pass. A failed result query does not hide other verified findings.
+This diagnostic is retained in `review.log`, and `result.json` preserves verified
+failing IDs in `diagnostic_job_ids`, separately from the approval `job_id`.
+Missing, mismatched or unavailable evidence is reported without claiming a
 verified review; the original nonzero exit still blocks. Diagnostics never
 replace the unchanged passing-verdict, exact-diff and source/index checks.
 After a review is finished and its evidence is no longer needed, an operator

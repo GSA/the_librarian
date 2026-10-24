@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -40,6 +41,158 @@ def clone(destination):
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+
+
+class StoreIdentity(unittest.TestCase):
+    def test_new_application_ids_and_superseded_refusal(self):
+        self.assertEqual(catalog.APPLICATION_ID, 0x4C434154)
+        self.assertEqual(events.APPLICATION_ID, 0x4C524556)
+        self.assertEqual(index.APPLICATION_ID, 0x4C435458)
+        for module, old, message in (
+                (catalog, 0x46434154, "Superseded FCAT"),
+                (events, 0x46524556, "Superseded FREV")):
+            with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = module.initialize(root)
+                database = module.locations(root)[1]
+                with sqlite3.connect(database) as connection:
+                    connection.execute(f"PRAGMA application_id={old}")
+                with self.assertRaisesRegex(Exception, message + ".*migration or re-initialization"):
+                    module.status(root)
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "index.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute("PRAGMA application_id=0x46435458")
+            with self.assertRaisesRegex(Exception, "Superseded FCTX.*migration or re-initialization"):
+                index.readonly(database)
+
+
+class DoclingCleanCopy(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.kit = self.root / "kit"
+        self.kit.mkdir()
+        clone(self.kit)
+
+    def test_clean_copy_contains_installable_review_gate(self):
+        required = {".githooks/pre-commit", "tools/review/roborev_precommit.py",
+                    "tools/review/install_hooks.py", "tools/review/README.md",
+                    "tools/review/test_precommit.py"}
+        self.assertTrue(required <= {name for name, _ in package.release_paths(ROOT)})
+        for name in required:
+            self.assertEqual((self.kit / name).read_bytes(), (ROOT / name).read_bytes())
+        # Source archives do not promise executable-bit preservation; the
+        # documented activation prerequisite must be applied to a copied hook.
+        (self.kit / ".githooks/pre-commit").chmod(0o755)
+        launcher = self.root / "scoped-wrapper"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", str(self.kit)], env=env, check=True)
+        result = subprocess.run([sys.executable, "tools/review/install_hooks.py",
+                                 "--launcher", str(launcher)], cwd=self.kit, env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        configured = subprocess.check_output(["git", "-C", str(self.kit), "config",
+                                               "--local", "--get", "core.hooksPath"], env=env)
+        self.assertEqual(configured.strip(), b".githooks")
+
+    def test_bridge_is_the_only_installation_specific_file(self):
+        bridge = self.kit / "tools/extraction/docling_bridge.py"
+        bridge.unlink()
+        process = subprocess.run(
+            [sys.executable, "tools/extraction/docling_extract.py", "--help"],
+            cwd=self.kit, capture_output=True, text=True)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("docling_bridge", process.stderr)
+        excluded = {"tools/extraction/docling_bridge.py"}
+        for name, source in package.release_paths(ROOT):
+            if name not in excluded:
+                self.assertEqual((self.kit / name).read_bytes(), source.read_bytes(), name)
+
+    def test_clean_copy_runs_docling_lifecycle_under_its_own_policy(self):
+        local = self.kit / "config/policy.local.json"
+        local.write_text(json.dumps({"original_roots": ["clone-sources"]}))
+        script = r'''
+import hashlib,json,sys,subprocess
+from pathlib import Path
+from unittest.mock import patch
+sys.path[:0]=['tools/extraction','tools/catalog','tools']
+import catalog_store as c
+import docling_adapter as a
+import docling_bridge as b
+root=Path.cwd()
+raw=b'%PDF-1.7\nclean-copy structural fixture'
+(root/'sources').mkdir(); (root/'sources/refused.pdf').write_bytes(raw)
+(root/'clone-sources').mkdir(); (root/'clone-sources/accepted.pdf').write_bytes(raw)
+def records(receipt,artifact,path):
+ return [
+  {'id':'S'+receipt[1:],'kind':'source','data':{'category':'artifact','provenance':[]}},
+  {'id':receipt,'kind':'receipt','data':{'source_ids':['S'+receipt[1:]],'artifact_id':artifact,'provenance':[]}},
+  {'id':artifact,'kind':'artifact','data':{'path':path,'parent_id':None,'receipt_id':receipt,
+   'role':'original','audience':'source','coverage':'pending-extraction','reason':'Clean-copy structural fixture.',
+   'presence':'present','sha256':hashlib.sha256(raw).hexdigest(),'hash_basis':'observed','bytes':len(raw),
+   'extraction':'pending','handling_refs':[],'provenance':[]}}]
+s=c.initialize(root)['state']
+out=c.submit(root,records('D1','A-refused','sources/refused.pdf')+records('D2','A-accepted','clone-sources/accepted.pdf'),
+ actor='clean-copy',request_id='inputs',expected_state=s['state_token'],reason='Clean-copy structural acceptance')
+try:
+ b.source(root,'D1','pdf')
+ raise AssertionError('checkout source root was accepted by clone policy')
+except b.BridgeError:
+ pass
+report={'conversion':{'schema':'docling-rendition-v1','format':'pdf','document':{'texts':[],'tables':[]},
+ 'pages':[],'confidence':{},'warnings':[],'omissions':[]},'runtime':{'docling':'stub'},
+ 'profile':{'version':2,'limits':{}},'assets':{'schema':'docling-assets-v1','files':[],'sha256':'a'*64}}
+worker=hashlib.sha256(a.WORKER.read_bytes()).hexdigest()
+def invoke(command,receipt='D2',extra=()):
+ args=['--root',str(root),command,receipt,'--format','pdf',
+       '--artifacts-path','models','--python','python',*extra]
+ # Execute the cloned entry point as __main__ in a fresh subprocess.
+ # Only inference is substituted; parser, exit codes, serialization, policy,
+ # publication and catalog writes are the real packaged implementation.
+ seam="""import sys,json,runpy,hashlib
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0,'tools/extraction')
+import docling_adapter as a
+report=json.loads(sys.argv.pop(1))
+sys.argv[0]='tools/extraction/docling_extract.py'
+def convert(*args):
+ with Path('inference-calls').open('a') as log: log.write('convert\\n')
+ return report,hashlib.sha256(a.WORKER.read_bytes()).hexdigest()
+with patch.object(a,'_convert_with_identity',side_effect=convert):
+ runpy.run_path(sys.argv[0],run_name='__main__')
+"""
+ result=subprocess.run([sys.executable,'-c',seam,json.dumps(report),*args],
+                       cwd=root,capture_output=True,text=True)
+ return result.returncode,result.stdout,result.stderr
+code,output,error=invoke('prepare','D1')
+assert code==1 and 'outside configured' in error and not output
+assert not (root/'inference-calls').exists()
+code,output,error=invoke('prepare'); assert code==0,error
+prepared=json.loads(output)
+code,output,error=invoke('verify'); assert code==0,error
+verified=json.loads(output); assert verified['run_id']==prepared['run_id']
+state=c.status(root)['state_token']
+extra=['--actor','clean-copy','--expected-state',state]
+code,output,error=invoke('register',extra=extra); assert code==0,error
+registered=json.loads(output)
+code,output,error=invoke('register',extra=extra); assert code==0,error
+retry=json.loads(output); assert retry['catalog']['idempotent']
+assert (root/'inference-calls').read_text().splitlines()==['convert']*4
+print(json.dumps({'prepared':prepared['created'],'registered':registered['registered'],
+ 'verified':verified['command']=='verify','retry':retry['catalog']['idempotent'],
+ 'records':[r['id'] for r in c.read_records(root,receipt='D2',limit=20)['records']]}))
+'''
+        process = subprocess.run([sys.executable, "-c", script], cwd=self.kit,
+                                 capture_output=True, text=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        result = json.loads(process.stdout)
+        self.assertTrue(all(result[key] for key in ("prepared", "registered", "verified", "retry")))
+        self.assertTrue(any(value.startswith("A-docling-") for value in result["records"]))
 
 
 class Workspace(unittest.TestCase):

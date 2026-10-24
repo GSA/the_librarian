@@ -1,6 +1,6 @@
 -- Generated from tools/catalog/catalog_store.py (SQL); do not edit.
 -- Schema version 1; structure only, not a data backup or restore procedure.
-PRAGMA application_id=1178812756;
+PRAGMA application_id=1279476052;
 PRAGMA user_version=1;
 
 CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);

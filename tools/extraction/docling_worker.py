@@ -98,7 +98,7 @@ def profile() -> dict:
         "local_file_fetching": False, "enrichments": False, "retain_images": False,
         "deterministic_algorithms": True, "seed": 0,
         "required_assets": list(REQUIRED_ASSETS), "limits": dict(LIMITS),
-        "asset_lock": {"revisions": dict(ASSET_REVISIONS),
+        "asset_lock": {"revisions": {key: list(value) for key, value in ASSET_REVISIONS.items()},
                        "files": [{"path": path, "size": size, "sha256": sha}
                                  for path, (size, sha) in zip(REQUIRED_ASSETS, ASSET_PINS)]},
     }

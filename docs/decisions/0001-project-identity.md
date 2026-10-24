@@ -19,8 +19,9 @@ that existing client registrations break until they are corrected explicitly.
 
 ## Decision
 
-Rename the externally visible software identity and leave persisted data
-identity untouched.
+Rename the externally visible software identity. Persisted store identity was
+initially left untouched and was subsequently freed after direct verification
+that this repository's stores were empty.
 
 Renamed:
 
@@ -42,23 +43,11 @@ to open - `Stored contract differs from installed contract; explicit migration
 required` - and was re-initialized rather than migrated, which is the right
 handling for an empty store and not a precedent for a populated one.
 
-Deliberately unchanged, because they are persisted identity shared with a
-populated installation:
-
-- The store authority strings `catalog-metadata-only` and
-  `review-events-only`, the SQLite `application_id` values and
-  `user_version`/`schema_version` numbers. The `application_id` values decode
-  as ASCII `FCAT`, `FREV` and `FCTX` - the `F` is a fossil of the originating
-  program name. Renaming them is cosmetic and would cost a migration against
-  80,309 catalog versions and 1,670 review events in the originating
-  installation, so the fossil stays.
-- Record locator syntax, receipt identifiers and selection-manifest fields.
-
-The originating installation is unaffected by the `$id` rename: it already
-uses a different schema identity (`urn:falcon:review-event-trial:1`, authority
-`trial-non-authoritative`, audience `authorized-local-post-eod`) and therefore
-a different `contract_hash`. The two review contracts had already diverged
-before this rename.
+The store authority strings `catalog-metadata-only` and `review-events-only`,
+record locator syntax, receipt identifiers, selection-manifest fields and
+schema-version numbers remain unchanged. The SQLite application identities are
+now `LCAT`, `LREV` and `LCTX`. The superseded identities are refused with an
+explicit migration-or-re-initialization message; no automatic migration exists.
 
 No alias, shim, deprecation period or forwarding entry point is provided.
 
@@ -71,15 +60,10 @@ No alias, shim, deprecation period or forwarding entry point is provided.
   and must be re-initialized. That is only acceptable because every store here
   was empty; it would otherwise require the explicit migration demanded by
   [0003](0003-store-compatibility.md).
-- The originating corpus installation still runs the old names. It is a
-  separate installation with its own upgrade path; see
-  [0004](0004-instance-topology.md). Neither installation imports code from
-  the other's checkout, so the two can differ until it is upgraded.
-- Existing catalog, review-event and index databases are readable by the
-  renamed adapter without migration, because only software identity changed.
-- A future rename of persisted identity, if ever justified, requires the
-  explicit migration and recovery design demanded by the roadmap's refresh
-  procedure. Schema snapshots are not backups.
+- Existing stores with superseded application identities are not read
+  implicitly. Populated stores require an explicit migration; empty stores may
+  be re-initialized deliberately.
+- Schema snapshots are not backups.
 
 ## Verification performed
 

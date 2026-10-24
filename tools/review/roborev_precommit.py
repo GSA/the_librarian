@@ -26,6 +26,7 @@ ALLOWLIST = frozenset({
     "tools/extraction/test_docling_worker.py",
     "tools/extraction/test_docling.py",
     "tests/test_docling.py",
+    "tests/test_worker_contracts.py",
     "tests/test_kit.py",
     "release-files.json",
     "tools/extraction/README.md",
@@ -43,6 +44,7 @@ ALLOWLIST = frozenset({
     "docs/decisions/README.md",
     "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
     "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+    "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
 })
 LAUNCHER_KEY = "roborev.precommitLauncher"
 MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -281,47 +283,74 @@ def launcher_call(launcher, repo, args):
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
         if args[0] == "review":
-            diagnostic = failed_review_diagnostic(launcher, repo)
+            job_ids = []
+            diagnostic = failed_review_diagnostic(launcher, repo, job_ids)
             detail = "\n".join(part for part in (detail, diagnostic) if part)
             (repo.parent / "review.log").write_text(detail + "\n")
-        raise GateError(f"roborev {args[0]} exit {result.returncode}: {detail}")
+        error = GateError(f"roborev {args[0]} exit {result.returncode}: {detail}")
+        if args[0] == "review":
+            error.diagnostic_job_ids = job_ids
+        raise error
     return result.stdout
 
 
-def failed_review_diagnostic(launcher, repo):
-    """Explain a quiet failure without treating diagnostic evidence as approval."""
+def failed_review_diagnostic(launcher, repo, job_ids=None):
+    """Report snapshot evidence, not approval or attribution of a quiet exit."""
     try:
         jobs = json.loads(launcher_call(
             launcher, repo, ["list", "--repo", str(repo), "--all-branches",
-                             "--limit", "2", "--json"],
+                             "--limit", "10", "--json"],
         ))
-        if not isinstance(jobs, list) or len(jobs) != 1:
-            return "no verified completed failed review for snapshot"
-        job = jobs[0]
-        if (not isinstance(job, dict) or job.get("repo_path") != str(repo)
-                or job.get("status") != "done" or job.get("git_ref") != "dirty"
-                or job.get("agent") != "pi" or type(job.get("id")) is not int):
-            return "no verified completed failed review for snapshot"
-        review = json.loads(launcher_call(
-            launcher, repo, ["show", "--job", str(job["id"]), "--json"],
-        ))
-        if not isinstance(review, dict):
-            return "no verified completed failed review for snapshot"
-        embedded = review.get("job")
-        if (review.get("job_id") != job["id"] or review.get("agent") != "pi"
-                or type(review.get("verdict_bool")) is not int
-                or review["verdict_bool"] != 0 or not isinstance(embedded, dict)
-                or any(embedded.get(key) != job.get(key) for key in
-                       ("id", "repo_path", "status", "git_ref", "agent"))):
-            return "no verified completed failed review for snapshot"
-        output = review.get("output")
-        text = output.strip() if isinstance(output, str) and output.strip() else "No review text available; inspect the stored job."
-        limit = 16384
-        if len(text) > limit:
-            text = text[:limit] + "\n[diagnostic truncated; inspect stored job for full findings]"
-        return f"completed failed Pi dirty-review job {job['id']}; commit remains blocked\n{text}"
     except (GateError, OSError, ValueError, subprocess.SubprocessError) as error:
         return f"diagnostic lookup failed: {error}"
+    if not isinstance(jobs, list) or not jobs:
+        return "no verified completed failed review for snapshot; command cause unconfirmed"
+    messages = []
+    if len(jobs) > 1:
+        messages.append("Snapshot job history (up to 10 jobs); not proof of which job caused this command exit.")
+    seen = set()
+    # Bound both the number of queries and combined findings, including when a
+    # wrapper returns more rows than requested. Never choose a historical pass.
+    limit = 16384 // min(len(jobs), 10)
+    for job in jobs[:10]:
+        if (not isinstance(job, dict) or job.get("repo_path") != str(repo)
+                or job.get("git_ref") != "dirty" or job.get("agent") != "pi"
+                or type(job.get("id")) is not int or job["id"] <= 0
+                or job["id"] in seen):
+            messages.append("no verified completed failed review for snapshot: invalid job identity")
+            continue
+        seen.add(job["id"])
+        if job.get("status") == "failed":
+            messages.append(f"stored infrastructure failure: Pi dirty-review job {job['id']}; commit remains blocked")
+            continue
+        if job.get("status") != "done":
+            messages.append(f"no verified completed failed review for snapshot: job {job['id']} is not done")
+            continue
+        try:
+            review = json.loads(launcher_call(
+                launcher, repo, ["show", "--job", str(job["id"]), "--json"],
+            ))
+        except (GateError, OSError, ValueError, subprocess.SubprocessError) as error:
+            messages.append(f"diagnostic lookup failed for job {job['id']}: {error}")
+            continue
+        embedded = review.get("job") if isinstance(review, dict) else None
+        if (not isinstance(review, dict) or type(review.get("job_id")) is not int
+                or review["job_id"] != job["id"] or review.get("agent") != "pi"
+                or type(review.get("verdict_bool")) is not int
+                or review["verdict_bool"] != 0 or not isinstance(embedded, dict)
+                or type(embedded.get("id")) is not int
+                or any(embedded.get(key) != job.get(key) for key in
+                       ("id", "repo_path", "status", "git_ref", "agent"))):
+            messages.append(f"no verified completed failed review for snapshot: job {job['id']} identity/verdict not verified")
+            continue
+        if job_ids is not None:
+            job_ids.append(job["id"])
+        output = review.get("output")
+        text = output.strip() if isinstance(output, str) and output.strip() else "No review text available; inspect the stored job."
+        if len(text) > limit:
+            text = text[:limit] + "\n[diagnostic truncated; inspect stored job for full findings]"
+        messages.append(f"completed failed Pi dirty-review job {job['id']}; commit remains blocked\n{text}")
+    return "\n".join(messages)
 
 
 def completed_verdict(launcher, repo, diff):
@@ -406,6 +435,8 @@ def review_index(root):
         record.update(status="passed-selected-scope-only", verdict=1, source_blobs_verified=True)
     except (GateError, OSError, ValueError, subprocess.SubprocessError) as error:
         record["error"] = str(error)
+        if hasattr(error, "diagnostic_job_ids"):
+            record["diagnostic_job_ids"] = error.diagnostic_job_ids
         raise
     finally:
         path = run / "result.json"

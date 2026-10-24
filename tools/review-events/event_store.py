@@ -17,7 +17,8 @@ import review_events as contract
 
 
 VERSION = 1
-APPLICATION_ID = 0x46524556
+APPLICATION_ID = 0x4C524556
+SUPERSEDED_APPLICATION_ID = 0x46524556
 AUTHORITY = "review-events-only"
 HOME = ".local/review-events"
 DB_NAME = "events.sqlite3"
@@ -168,8 +169,10 @@ def seal(path):
 
 
 def inspect(connection):
-    require(connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID,
-            "Not a review-event store")
+    application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+    require(application_id != SUPERSEDED_APPLICATION_ID,
+            "Superseded FREV review-event identity; explicit migration or re-initialization is required")
+    require(application_id == APPLICATION_ID, "Not a review-event store")
     require(connection.execute("PRAGMA user_version").fetchone()[0] == VERSION, "Unsupported store version")
     require([r[0] for r in connection.execute("PRAGMA integrity_check")] == ["ok"],
             "SQLite integrity check failed")

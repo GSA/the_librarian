@@ -51,5 +51,17 @@
   "tools/review/roborev_precommit.py",
   "tools/review/install_hooks.py",
   "tools/review/README.md",
-  "tools/review/test_precommit.py"
+  "tools/review/test_precommit.py",
+  "tools/extraction/docling_adapter.py",
+  "tools/extraction/docling_bridge.py",
+  "tools/extraction/docling_extract.py",
+  "tools/extraction/docling_worker.py",
+  "tools/extraction/requirements-docling.txt",
+  "tools/extraction/test_docling_worker.py",
+  "tests/test_worker_contracts.py",
+  "tests/test_docling.py",
+  "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+  "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
+  "tools/extraction/README.md",
+  "docs/decisions/0008-proof-of-concept-closure.md"
 ]

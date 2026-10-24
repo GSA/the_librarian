@@ -31,8 +31,12 @@ These are instructions, not an agent runner, task importer or automatic inbox.
 
 The October 21 update unifies software identity: the checkout, package,
 module, commands and MCP protocol name are all renamed to The Librarian, with
-no compatibility aliases. Persisted store contracts and record syntax are
-unchanged. See [decision 0001](docs/decisions/0001-project-identity.md).
+no compatibility aliases. Record syntax remains unchanged. The later ingestion
+completion supersedes the unchanged-application-ID decision: catalog `LCAT`,
+review `LREV`, and derived index `LCTX` explicitly refuse `FCAT`, `FREV`, and
+`FCTX`. Authority stores need explicit migration or deliberate empty-store
+re-initialization; the derived index can be rebuilt from authority data.
+See [decision 0001](docs/decisions/0001-project-identity.md).
 
 ### Recorded design decisions - October 21
 
@@ -57,8 +61,9 @@ adoptable as written. Graph work remains "later, only if justified".
 The same update renames the review-event schema `$id` to
 `urn:the-librarian:review-events:1`. This changed the store contract hash and
 required re-initializing the local review store, which was only acceptable
-because it was empty. Store `application_id` values and authority strings are
-unchanged; see [decision 0001](docs/decisions/0001-project-identity.md).
+because it was empty. Authority strings remain unchanged; application IDs
+were subsequently renamed with explicit superseded-ID refusal, as recorded in
+[decision 0008](docs/decisions/0008-proof-of-concept-closure.md).
 
 It also adds an observation capability that is unlike the ingestion
 sources: **body-free retrieval diagnostics** covering coverage gaps, plus bare
@@ -81,10 +86,14 @@ historical extractor wrappers, with independent repeat verification and
 explicit catalog registration. It does not add automatic review or retrieval
 selection. The [implementation plan](docs/superpowers/plans/2026-10-20-docling-ingestion.md)
 is approved for subagent-driven, Kata-tracked, in-place implementation with
-roborev pre-commit review. Initial worker/runtime development exists, but real
-OCR acceptance is blocked on valid local model assets; the catalog lifecycle,
-second-installation integration and release packaging remain incomplete.
-This is not a shipped or verified OCR ingestion capability.
+roborev pre-commit review. The [October 22 completion plan](docs/superpowers/plans/2026-10-22-ingestion-completion.md)
+supersedes Tasks 1-4 and withdraws the second-installation obligation. The OCR
+asset blocker is resolved, with recorded repeatable real synthetic-fixture
+acceptance. The optional lifecycle, policy bridge, CLI, clean-copy regressions,
+store-identity changes and operating guide are present in the working tree.
+Automated tests pass, but the real CLI registration cycle and fresh whole-change
+review are not evidenced in the latest reconciliation; full delivery closure
+is not claimed. Real-document OCR accuracy remains unmeasured.
 
 ## Reuse gaps identified on October 19
 

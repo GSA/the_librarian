@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add explicit, reproducible, local Docling OCR/layout extraction and catalog registration to the reusable toolkit and the originating corpus without replacing existing ingestion machinery.
+**Goal:** Add explicit, reproducible, local Docling OCR/layout extraction and catalog registration. Tasks 1-4 are superseded by the October 22 completion plan; no other installation is in scope.
 
-**Architecture:** Share a conversion worker, lifecycle module and CLI as identical versioned files in both installations. A small local bridge adapts policy, catalog metadata and output locations. Run inference in a separate optional environment and network-isolated child process; preserve existing extractor wrapper bytes.
+**Architecture (superseded):** The original design shared a conversion worker, lifecycle module and CLI across installations. The October 22 completion plan replaces that obligation with this repository's own clean-copy acceptance. The historical task details below are retained, not current execution instructions.
 
 **Tech Stack:** Python 3.11+, Linux/POSIX namespaces, Docling 2.140.0, RapidOCR 3.10.0 with CPU ONNX Runtime 1.31.0, standard-library unittest and existing catalog APIs.
 
 **Spec:** [Approved Docling ingestion design](../specs/2026-10-20-docling-ingestion-design.md).
 
-**Status:** execution approved October 20, 16:19 EDT: subagent-driven, tracked in Kata, working in place, with roborev pre-commit review. The hook-composition decision was answered October 22 and both gates are active. Partial implementation remains blocked on valid OCR assets; real ingestion acceptance is incomplete.
+**Status:** Task 0 completed; Tasks 1-4 superseded by the [October 22 completion plan](2026-10-22-ingestion-completion.md). The former OCR-asset blocker is resolved and the worker's real fixture acceptance is recorded there. Task 3's second-installation port is withdrawn, not pending. Historical constraints, checklists and gate reports below describe the original execution only; consult the replacement plan for current scope and remaining acceptance.
 
 ## Global Constraints
 
@@ -159,7 +159,7 @@ approved channel, then complete real acceptance and independent review.
 
 **Interfaces:** consume Task 1 worker and Task 2 common runner unchanged. The corpus bridge implements the same three functions and supplies existing corpus policy/handling/output locations and retained-member selection.
 
-- [ ] Write failing corpus tests for originals in ordinary intake stages, exact receipt/member ownership, excluded ancestors, deleted package wrapper versus excluded ancestor, current filename/subtree restrictions, source-hash mismatch, symlinks and policy changes before source reads.
+- [ ] Superseded: source-policy acceptance is defined by the October 22 clean-copy plan and this repository's own temporary catalogs.
 - [ ] Add corpus lifecycle tests for exact byte verification, independent registration, stale state, source mutation and committed retry. Reuse structural fixture patterns from `test_extract.py`, not real intake.
 - [ ] Run `tools/extraction/.venv/bin/python -m unittest discover -s tools/extraction -p 'test_docling.py' -v` and observe failures before implementing the bridge.
 - [ ] Copy identical reviewed common files and implement only the corpus bridge. Use the existing retained-artifact snapshot API; preserve audience/handling and member ancestry. Do not modify `extract.py`, compact/streaming adapters or cohort routing.
@@ -178,7 +178,7 @@ approved channel, then complete real acceptance and independent review.
 - [ ] Document separate environment/model provisioning, exact commands, resource limits, inherited restrictions, output scope, inspection, repeated verification, registration retries and actionable failures. State explicitly that Docling renditions are not yet qualified-reader selections.
 - [ ] Update toolkit roadmap capability state without pretending other missing adapters/cohort automation were ported. Include every required new source/guide/test in `release-files.json`, never environments, model locks/weights, operational records or private fixtures.
 - [ ] Run toolkit tests and clean-copy initialization/package checks; confirm optional Docling is not required for ordinary initialization/extraction. Run both installations' targeted suites and explicit real conversion acceptance matrix. Record actual commands/results and remaining fidelity/resource uncertainty in the scoped ledger.
-- [ ] Record the corpus's exact owner prompts and approved scope as direction, not program evidence. Log direction, decision, saved integration and observed verification without changing ORR status or intake stages.
+- [ ] Superseded: record only generic reusable decisions and observed verification; do not alter source disposition, review or retrieval state.
 - [ ] Inspect persisted changes, links, source preservation and scoped diffs. Run explicit context preflight refresh if selected context/index rules were affected; do not rebuild authoritative stores.
 - [ ] Request one fresh whole-change code review with the original request, approved spec/plan, exact task-owned diff, fixture outcomes and limitations. Resolve high-confidence correctness findings through failing regressions before final verification.
 - [ ] Final handoff distinguishes shipped behavior, unsupported formats, any blocked runtime prerequisites and unmeasured private-document accuracy. Do not claim completion if real OCR/repeatability/registration acceptance remains blocked.

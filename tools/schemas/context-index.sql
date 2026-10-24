@@ -1,6 +1,6 @@
 -- Generated from tools/context-index/context_index.py (DDL); do not edit.
 -- Schema version 1; structure only, not a data backup or restore procedure.
-PRAGMA application_id=1178817624;
+PRAGMA application_id=1279480920;
 PRAGMA user_version=1;
 
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
