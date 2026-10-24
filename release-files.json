@@ -46,5 +46,10 @@
   "tools/schemas/export_schemas.py",
   "tools/schemas/catalog.sql",
   "tools/schemas/context-index.sql",
-  "tools/schemas/review-events.sql"
+  "tools/schemas/review-events.sql",
+  ".githooks/pre-commit",
+  "tools/review/roborev_precommit.py",
+  "tools/review/install_hooks.py",
+  "tools/review/README.md",
+  "tools/review/test_precommit.py"
 ]
