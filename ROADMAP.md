@@ -1,7 +1,7 @@
 # The Librarian development and ingestion roadmap
 
 **Audience:** maintainers, operators and their agents.
-**Updated:** October 21, 2026.
+**Updated:** October 26, 2026.
 **Status:** capability inventory and proposed work, not an implementation,
 permission grant, delivery commitment or program-readiness register.
 
@@ -90,10 +90,16 @@ roborev pre-commit review. The [October 22 completion plan](docs/superpowers/pla
 supersedes Tasks 1-4 and withdraws the second-installation obligation. The OCR
 asset blocker is resolved, with recorded repeatable real synthetic-fixture
 acceptance. The optional lifecycle, policy bridge, CLI, clean-copy regressions,
-store-identity changes and operating guide are present in the working tree.
-Automated tests pass, but the real CLI registration cycle and fresh whole-change
-review are not evidenced in the latest reconciliation; full delivery closure
-is not claimed. Real-document OCR accuracy remains unmeasured.
+store-identity changes and operating guide are committed and reviewed.
+October 26 closure verified the real CLI lifecycle:
+prepare twice, verify, register and idempotent retry, with independent offline
+conversions and identical complete rendition bytes in a temporary catalog.
+The installed suite, cloned CLI/policy boundary, packaging and schema checks pass;
+whole-change review binds the exact delivered diff and passes.
+Approved toolkit-only ingestion work is complete. Renditions remain deferred:
+no automatic review, intake advancement, retrieval selection or indexing, and
+no member selection or additional formats are added. Real-document OCR accuracy
+remains unmeasured; package checks do not grant publication approval.
 
 ## Reuse gaps identified on October 19
 
