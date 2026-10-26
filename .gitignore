@@ -17,6 +17,9 @@ dist/
 *.egg-info/
 build/
 .kata.local.toml
+/.pi/mcp.json
+/.github/mcp.json
+/.roborev.toml
 # roborev snapshots
 /.roborev/
 # Machine-generated roborev hooks; initialized locally by roborev.
