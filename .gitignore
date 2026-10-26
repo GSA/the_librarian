@@ -19,3 +19,8 @@ build/
 .kata.local.toml
 # roborev snapshots
 /.roborev/
+# Machine-generated roborev hooks; initialized locally by roborev.
+# Keep the portable, repository-owned .githooks/pre-commit tracked.
+/.githooks/post-commit
+/.githooks/post-rewrite
+/.githooks/pre-push
