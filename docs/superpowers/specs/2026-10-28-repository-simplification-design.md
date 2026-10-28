@@ -1,7 +1,7 @@
 # Repository simplification design
 
-**Date:** October 28, 2026  
-**Status:** Approved in conversation; implementation planning pending  
+**Date:** October 28, 2026
+**Status:** Approved in conversation; implementation planning pending
 **Audience:** Maintainers and implementation reviewers
 
 ## Intent
