@@ -15,6 +15,9 @@ import sys
 import unicodedata
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import ontology
+
 class CatalogError(ValueError):
     """A catalog contract or integrity violation."""
 
@@ -26,6 +29,23 @@ VERSION = 1
 APPLICATION_ID = 0x4C434154
 SUPERSEDED_APPLICATION_ID = 0x46434154
 VALIDATOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+# Binds the vocabulary loader's bytes as well as the loaded vocabulary, so a
+# change to validation code is as disqualifying as a change to the terms.
+ONTOLOGY_FINGERPRINT = ontology.fingerprint()
+
+
+def require_loaded_vocabulary():
+    """Refuse to read or write under a vocabulary that changed since import.
+
+    inspect() and submit() hold the import-time terms; a configuration edit
+    under a live process would otherwise validate writes against a vocabulary
+    the store no longer declares.
+    """
+    require(ontology.fingerprint() == ONTOLOGY_FINGERPRINT,
+            "Declared vocabulary changed after import; restart the process")
+# Vocabulary the hardcoded validator enforced before config/ontology.json existed.
+# Stores written then carry no vocabulary_hash and are readable only under it.
+BASELINE_VOCABULARY = "385ad4570790f20e415c7ee5015ebb37d8af0cc424a0ace36d7372ec7d157d2d"
 KINDS = {"receipt", "source", "artifact", "policy", "relationship"}
 ROLES = {
     "maintained-context", "historical-context", "instructions", "navigation",
@@ -156,15 +176,24 @@ def validate_record(record):
         category = {"S": "artifact", "I": "live-note", "O": "owner-direction"}[record["id"][0]]
         require(data["category"] == category, "Source category must agree with ID prefix")
     elif kind == "relationship":
+        endpoint_kinds = {}
         for endpoint in ("from_id", "to_id"):
             value = data[endpoint]
             require(isinstance(value, str), "Relationship endpoint must be an artifact or source ID")
-            identifier(value, "artifact" if value.startswith("A-") else "source")
-        require(data["from_id"] != data["to_id"], "Relationship cannot link an endpoint to itself")
-        choice(data["relation"], {"version-of", "duplicate-of", "rendition-of", "same-event"},
-               "relationship relation")
+            endpoint_kinds[endpoint] = "artifact" if value.startswith("A-") else "source"
+            identifier(value, endpoint_kinds[endpoint])
+        relation = data["relation"]
+        require(isinstance(relation, str) and relation in ontology.RELATIONS,
+                "Invalid relationship relation")
+        declared = ontology.RELATIONS[relation]
+        for endpoint, side in (("from_id", "from_kinds"), ("to_id", "to_kinds")):
+            require(endpoint_kinds[endpoint] in declared[side],
+                    f"Relation {relation} does not accept a {endpoint_kinds[endpoint]} {endpoint}")
+        if declared["irreflexive"]:
+            require(data["from_id"] != data["to_id"], "Relationship cannot link an endpoint to itself")
         text(data["scope"], "Relationship scope")
-        require(data["basis"] == "reported", "Relationship basis must be reported")
+        require(data["basis"] in ontology.BASES,
+                "Relationship basis is not a declared basis; entailed edges are never authority records")
     elif kind == "policy":
         require(data["default_audience"] == "agent", "Default audience must be agent")
         require(isinstance(data["human_documents"], list), "human_documents must be a list")
@@ -208,7 +237,7 @@ def validate_records(records):
 
 
 def validate_graph(records):
-    paths, parents = {}, {}
+    paths, parents, asserted = {}, {}, {}
 
     def target(record_id, kind):
         require(record_id in records and records[record_id]["kind"] == kind,
@@ -227,6 +256,16 @@ def validate_graph(records):
                 endpoint_id = data[endpoint]
                 require(endpoint_id in records and records[endpoint_id]["kind"] in {"artifact", "source"},
                         f"Missing artifact/source relationship endpoint: {endpoint_id}")
+            relation = data["relation"]
+            keys = [(data["from_id"], data["to_id"])]
+            if ontology.RELATIONS[relation]["symmetric"]:
+                keys.append((data["to_id"], data["from_id"]))
+            for key in keys:
+                for other in asserted.get(key, ()):
+                    require(not ontology.conflicts(relation, other),
+                            f"Disjoint relations asserted for the same endpoints: {relation} and {other}")
+            for key in keys:
+                asserted.setdefault(key, set()).add(relation)
         elif record["kind"] == "artifact":
             path = data["path"]
             if path is not None:
@@ -401,6 +440,7 @@ def make_state(metadata, revision, head, count):
 
 def inspect(connection):
     """Verify physical integrity, every historical payload/graph, chain, and current projection."""
+    require_loaded_vocabulary()
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     require(application_id != SUPERSEDED_APPLICATION_ID,
             "Superseded FCAT catalog identity; explicit migration or re-initialization is required")
@@ -410,9 +450,19 @@ def inspect(connection):
             "SQLite integrity check failed")
     require(not list(connection.execute("PRAGMA foreign_key_check")), "Foreign-key integrity check failed")
     metadata = dict(connection.execute("SELECT key,value FROM metadata"))
-    exact(metadata, {"store_id", "created_at", "authority", "contract_version"}, "store metadata")
+    base_keys = {"store_id", "created_at", "authority", "contract_version"}
+    require(set(metadata) in (base_keys, base_keys | {"vocabulary_hash"}),
+            "Invalid store metadata fields")
     require(metadata["authority"] == AUTHORITY and metadata["contract_version"] == str(VERSION),
             "Catalog contract mismatch")
+    recorded = metadata.get("vocabulary_hash")
+    if recorded is None:
+        require(ontology.HASH == BASELINE_VOCABULARY,
+                "Store predates vocabulary binding; it is readable only under the shipped default "
+                "vocabulary, and a changed vocabulary requires explicit migration")
+    else:
+        require(recorded == ontology.HASH,
+                "Catalog vocabulary mismatch; explicit migration or re-initialization is required")
     try:
         require(str(uuid.UUID(metadata["store_id"])) == metadata["store_id"], "Invalid store identity")
     except ValueError as error:
@@ -534,7 +584,8 @@ def initialize(root):
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.executescript(schema_sql())
                 metadata = {"store_id": str(uuid.uuid4()), "created_at": now(),
-                            "authority": AUTHORITY, "contract_version": str(VERSION)}
+                            "authority": AUTHORITY, "contract_version": str(VERSION),
+                            "vocabulary_hash": ontology.HASH}
                 connection.executemany("INSERT INTO metadata VALUES (?,?)", metadata.items())
                 state = inspect(connection)[0]
                 initial = _snapshot(connection, backups, "init")
@@ -559,12 +610,14 @@ def validated_state(connection, home, *, audit=False):
     require(hasattr(connection, "serialize"), "Validated reads require SQLite serialize support")
     require(hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == VALIDATOR_SHA256,
             "Catalog validator changed after import; restart the reader")
+    require_loaded_vocabulary()
     # Acquire the read snapshot before hashing; a concurrent commit cannot change it.
     connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
     binding = {
-        "version": 1,
+        "version": 2,
         "snapshot_sha256": hashlib.sha256(connection.serialize()).hexdigest(),
         "validator_sha256": VALIDATOR_SHA256,
+        "vocabulary_sha256": ONTOLOGY_FINGERPRINT,
         "runtime": [sys.version, sqlite3.sqlite_version, unicodedata.unidata_version],
     }
     cache_home = safe_path(home / ".local")
@@ -625,6 +678,8 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
     text(actor, "Actor", 200)
     text(request_id, "Request ID", 200)
     text(reason, "Revision reason")
+    # Refuse before validating with the import-time terms, not merely before writing.
+    require_loaded_vocabulary()
     # Validate and detach caller-owned dictionaries before hashing or persistence.
     validate_records(records)
     incoming = decode(canonical(records))

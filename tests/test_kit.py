@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 for directory in ("tools", "tools/catalog", "tools/context-index", "tools/review-events", "tools/extraction", "tools/diagnostics"):
     sys.path.insert(0, str(ROOT / directory))
 import policy
+import ontology
 import catalog_store as catalog
 import context_index as index
 import compact_records
@@ -499,6 +500,100 @@ class Workspace(unittest.TestCase):
         with ZipFile(output) as archive:
             self.assertEqual(set(archive.namelist()), set(json.loads((kit / "release-files.json").read_text())))
             self.assertNotIn("config/policy.local.json", archive.namelist())
+
+
+class DeclaredVocabulary(Workspace):
+    """The relation model is configuration the validator reads, not embedded constants."""
+
+    def relate(self, relation="version-of", basis="reported", extra=()):
+        home = self.root / catalog.HOME
+        if home.exists():
+            shutil.rmtree(home)
+        records = [
+            {"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}},
+            {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}},
+            {"id": "R-link", "kind": "relationship", "data": {
+                "from_id": "S1", "to_id": "S2", "relation": relation,
+                "scope": "Structural contract test; no reported content claim.",
+                "basis": basis, "provenance": []}},
+            *extra,
+        ]
+        state = catalog.initialize(self.root)["state"]
+        return catalog.submit(self.root, records, actor="test-runner", request_id="relate",
+                              expected_state=state["state_token"], reason="Vocabulary contract test")
+
+    def test_relation_terms_come_from_the_declared_vocabulary(self):
+        with self.assertRaises(catalog.CatalogError):
+            self.relate(relation="supersedes")
+        declared = dict(ontology.RELATIONS["version-of"], description="Declared only for this test.")
+        with patch.dict(ontology.RELATIONS, {"supersedes": declared}):
+            self.assertEqual(self.relate(relation="supersedes")["records"], 3)
+
+    def test_entailed_edges_are_never_authority_records(self):
+        with self.assertRaises(catalog.CatalogError):
+            self.relate(basis="entailed")
+
+    def test_local_configuration_cannot_admit_an_entailed_basis(self):
+        override = self.root / "ontology.local.json"
+        override.write_text(json.dumps({"bases": list(ontology.RESERVED_BASES)}))
+        with patch.object(ontology, "LOCAL", override):
+            with self.assertRaises(ontology.OntologyError):
+                ontology.load()
+        self.assertEqual(ontology.BASES, ontology.AUTHORITY_BASES)
+        self.assertFalse(ontology.AUTHORITY_BASES & ontology.RESERVED_BASES)
+
+    def test_a_vocabulary_edited_after_import_refuses_reads_and_writes(self):
+        self.assertEqual(self.relate()["records"], 3)
+        state = catalog.status(self.root)["state_token"]
+        records = [{"id": "S3", "kind": "source",
+                    "data": {"category": "artifact", "provenance": []}}]
+        with patch.object(catalog.ontology, "fingerprint", lambda: "edited-after-import"):
+            with self.assertRaises(catalog.CatalogError) as refusal:
+                catalog.submit(self.root, records, actor="test-runner", request_id="stale",
+                               expected_state=state, reason="Write under a changed vocabulary")
+            self.assertIn("restart", str(refusal.exception))
+        # The refused write left no trace; the store is readable and unchanged.
+        self.assertEqual(catalog.status(self.root)["state_token"], state)
+        self.assertEqual(catalog.status(self.root)["records"], 3)
+
+    def test_endpoint_kinds_are_enforced_per_relation(self):
+        artifact_only = dict(ontology.RELATIONS["version-of"], from_kinds=["artifact"])
+        with patch.dict(ontology.RELATIONS, {"version-of": artifact_only}):
+            with self.assertRaises(catalog.CatalogError):
+                self.relate(relation="version-of")
+
+    def test_declared_disjointness_refuses_contradictory_edges(self):
+        second = {"id": "R-other", "kind": "relationship", "data": {
+            "from_id": "S1", "to_id": "S2", "relation": "duplicate-of",
+            "scope": "Structural contract test; no reported content claim.",
+            "basis": "reported", "provenance": []}}
+        self.assertEqual(self.relate(extra=[second])["records"], 4)
+        with patch.object(ontology, "DISJOINT",
+                          frozenset([frozenset({"version-of", "duplicate-of"})])):
+            with self.assertRaises(catalog.CatalogError):
+                self.relate(extra=[second])
+
+    def test_store_refuses_a_changed_vocabulary(self):
+        catalog.initialize(self.root)
+        self.assertEqual(catalog.status(self.root, audit=True)["records"], 0)
+        with patch.object(ontology, "HASH", "0" * 64):
+            with self.assertRaises(catalog.CatalogError):
+                catalog.status(self.root, audit=True)
+
+    def test_store_predating_the_binding_requires_the_shipped_vocabulary(self):
+        with closing(sqlite3.connect(":memory:")) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.executescript(catalog.schema_sql())
+            connection.executemany("INSERT INTO metadata VALUES (?,?)", {
+                "store_id": str(uuid.uuid4()),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "authority": catalog.AUTHORITY,
+                "contract_version": str(catalog.VERSION),
+            }.items())
+            self.assertEqual(catalog.inspect(connection)[0]["records"], 0)
+            with patch.object(ontology, "HASH", "0" * 64):
+                with self.assertRaises(catalog.CatalogError):
+                    catalog.inspect(connection)
 
 
 class AbsenceClassification(Workspace):
