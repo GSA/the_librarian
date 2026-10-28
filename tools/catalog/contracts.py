@@ -108,6 +108,10 @@ def refs(value):
                 "Reference line bounds must both be null or positive ordered integers")
 
 
+def resolve_endpoint(value):
+    return "artifact" if value.startswith("A-") else "source"
+
+
 def validate_record(record):
     exact(record, {"id", "kind", "data"}, "record")
     kind, data = record["kind"], record["data"]
@@ -129,7 +133,7 @@ def validate_record(record):
         for endpoint in ("from_id", "to_id"):
             value = data[endpoint]
             require(isinstance(value, str), "Relationship endpoint must be an artifact or source ID")
-            endpoint_kinds[endpoint] = "artifact" if value.startswith("A-") else "source"
+            endpoint_kinds[endpoint] = resolve_endpoint(value)
             identifier(value, endpoint_kinds[endpoint])
         relation = data["relation"]
         require(isinstance(relation, str) and relation in ontology.RELATIONS,
@@ -239,4 +243,3 @@ def validate_graph(records):
             active.add(cursor)
             cursor = parents[cursor]
         visited.update(active)
-

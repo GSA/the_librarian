@@ -1216,6 +1216,16 @@ class DeclaredVocabulary(WorkspaceCase):
         self.assertEqual(catalog.status(self.root)["state_token"], state)
         self.assertEqual(catalog.status(self.root)["records"], 3)
 
+    def test_a_relation_over_an_unresolvable_entity_kind_is_refused(self):
+        """Declaring a business entity kind is a code change, not a config edit."""
+        widened = dict(ontology.SETTINGS,
+                       endpoint_kinds=[*ontology.SETTINGS["endpoint_kinds"], "rule"])
+        with patch.object(catalog.ontology, "SETTINGS", widened):
+            with self.assertRaises(catalog.CatalogError) as refusal:
+                self.relate()
+        self.assertIn("cannot resolve", str(refusal.exception))
+        self.assertIn("rule", str(refusal.exception))
+
     def test_endpoint_kinds_are_enforced_per_relation(self):
         artifact_only = dict(ontology.RELATIONS["version-of"], from_kinds=["artifact"])
         with patch.dict(ontology.RELATIONS, {"version-of": artifact_only}):
