@@ -33,6 +33,17 @@ VALIDATOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 # change to validation code is as disqualifying as a change to the terms.
 ONTOLOGY_FINGERPRINT = ontology.fingerprint()
 
+# Endpoint kinds this validator can actually resolve. resolve_endpoint() derives
+# a kind from the ID prefix, so a vocabulary may only name kinds reachable that
+# way; otherwise a deployment could declare a relation over a kind no record can
+# ever have, and every such edge would be refused for an unrelated-looking
+# reason. Widening the model's entity kinds is a code and decision change.
+RESOLVABLE_KINDS = frozenset({"artifact", "source"})
+
+
+def resolve_endpoint(value):
+    return "artifact" if value.startswith("A-") else "source"
+
 
 def require_loaded_vocabulary():
     """Refuse to read or write under a vocabulary that changed since import.
@@ -43,6 +54,9 @@ def require_loaded_vocabulary():
     """
     require(ontology.fingerprint() == ONTOLOGY_FINGERPRINT,
             "Declared vocabulary changed after import; restart the process")
+    unreachable = sorted(set(ontology.SETTINGS["endpoint_kinds"]) - RESOLVABLE_KINDS)
+    require(not unreachable,
+            f"Vocabulary declares endpoint kinds this validator cannot resolve: {', '.join(unreachable)}")
 # Vocabulary the hardcoded validator enforced before config/ontology.json existed.
 # Stores written then carry no vocabulary_hash and are readable only under it.
 BASELINE_VOCABULARY = "385ad4570790f20e415c7ee5015ebb37d8af0cc424a0ace36d7372ec7d157d2d"
@@ -180,7 +194,7 @@ def validate_record(record):
         for endpoint in ("from_id", "to_id"):
             value = data[endpoint]
             require(isinstance(value, str), "Relationship endpoint must be an artifact or source ID")
-            endpoint_kinds[endpoint] = "artifact" if value.startswith("A-") else "source"
+            endpoint_kinds[endpoint] = resolve_endpoint(value)
             identifier(value, endpoint_kinds[endpoint])
         relation = data["relation"]
         require(isinstance(relation, str) and relation in ontology.RELATIONS,
