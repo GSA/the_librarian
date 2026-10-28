@@ -62,6 +62,13 @@ class MCPConfig(unittest.TestCase):
             lambda paths: [name for name in paths if name != "tools/policy.py"],
             lambda paths: [name for name in paths
                            if name != "tools/diagnostics/retrieval_log.py"],
+            lambda paths: [name for name in paths
+                           if name != "tools/context_index/renditions.py"],
+            lambda paths: [name for name in paths
+                           if name != "tools/review_events/review-event-v1.schema.json"],
+            lambda paths: [name for name in paths if name != "config/selection.json"],
+            lambda paths: [name for name in paths
+                           if name != "tools/schemas/export_schemas.py"],
         ):
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve() / "kit"

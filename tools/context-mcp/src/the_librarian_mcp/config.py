@@ -36,11 +36,21 @@ class Config:
         if not self.root.is_absolute() or not self.root.is_dir():
             raise ValueError("--root must be an absolute, existing instance directory")
         mandatory = {
-            "release-files.json", "config/policy.json", "tools/__init__.py",
+            "release-files.json", "config/policy.json", "config/selection.json",
+            "tools/__init__.py",
+            "tools/policy.py",
             "tools/context_index/__init__.py", "tools/context_index/context_index.py",
-            "tools/context_index/cli.py", "tools/review_events/event_reader.py",
-            "tools/catalog/catalog_store.py", "tools/catalog/contracts.py",
-            "tools/policy.py", "tools/diagnostics/retrieval_log.py",
+            "tools/context_index/cli.py", "tools/context_index/compact_records.py",
+            "tools/context_index/renditions.py",
+            "tools/review_events/__init__.py", "tools/review_events/event_reader.py",
+            "tools/review_events/event_store.py", "tools/review_events/review_events.py",
+            "tools/review_events/review-event-v1.schema.json",
+            "tools/catalog/__init__.py", "tools/catalog/catalog_store.py",
+            "tools/catalog/contracts.py",
+            "tools/diagnostics/__init__.py", "tools/diagnostics/retrieval_log.py",
+            "tools/schemas/__init__.py", "tools/schemas/export_schemas.py",
+            "tools/schemas/catalog.sql", "tools/schemas/context-index.sql",
+            "tools/schemas/review-events.sql",
         }
         try:
             manifest = json.loads((self.toolkit_root / "release-files.json").read_text())
