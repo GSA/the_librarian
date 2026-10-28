@@ -16,9 +16,9 @@ preserved. Selective breaking changes are therefore acceptable when they make
 the architecture materially clearer and all repository callers, tests and
 documentation are updated together.
 
-Acquire is the anticipated first validation target. It does not authorize
-Acquire-specific facts, identities, paths, policy, source material or defaults
-in this reusable, data-empty repository.
+The first authorized corpus will validate the cleaned-up toolkit. Its
+instance-specific facts, identities, paths, policy, source material and defaults
+must remain outside this reusable, data-empty repository.
 
 ## Current observations
 
@@ -153,8 +153,8 @@ of scope. Create or refine prioritized Katas for generic future work, including:
 
 Search and relate existing Katas before creating new ones. Dependencies and
 priorities should favor the minimum path to a first evidence-backed corpus.
-Private task context may name Acquire as the intended validation target, but
-versioned source and generic defaults must not contain deployment facts.
+Private task context may name a specific validation target, but versioned
+source and generic defaults must not contain deployment facts.
 
 ## Incremental delivery and review
 
