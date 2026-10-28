@@ -288,7 +288,9 @@ else:
     def test_final_task_exact_paths_are_reviewed_without_private_neighbors(self):
         selected = {
             "tests/test_kit.py", "release-files.json", "tools/extraction/README.md",
+            "tools/extraction/extract.py",
             "tools/catalog/catalog_store.py", "tools/context-index/context_index.py",
+            "tools/context-index/renditions.py", "tools/context-index/qualification.py",
             "tools/review-events/event_store.py", "tools/schemas/catalog.sql",
             "tools/schemas/context-index.sql", "tools/schemas/review-events.sql",
             "README.md", "ROADMAP.md", "docs/decisions/0001-project-identity.md",
