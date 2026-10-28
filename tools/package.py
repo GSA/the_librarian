@@ -11,17 +11,26 @@ from zipfile import ZIP_DEFLATED, ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def release_paths(root=ROOT):
+def load_release_manifest(root: Path = ROOT) -> list[str]:
     value = json.loads((root / "release-files.json").read_text())
-    if not isinstance(value, list) or not value or len(set(value)) != len(value):
-        raise ValueError("Release file list must be nonempty and unique")
-    result = []
-    for name in value:
+    if not isinstance(value, list) or not value:
+        raise ValueError("Release file list must be nonempty")
+    for position, name in enumerate(value, 1):
+        if not isinstance(name, str):
+            raise TypeError(f"Release manifest entry {position} must be a string")
         path = PurePosixPath(name)
         if (path.is_absolute() or "\\" in name or any(p in ("", ".", "..") for p in name.split("/"))
                 or any(p in {".local", ".venv", ".git", "__pycache__", "node_modules", "data", "sources", "documents"} for p in path.parts)
                 or ".local." in path.name or path.suffix in {".sqlite3", ".db", ".zip", ".pyc"}):
-            raise ValueError("Operational or unsafe release path")
+            raise ValueError(f"Operational or unsafe release path at entry {position}")
+    if len(set(value)) != len(value):
+        raise ValueError("Release file list must be unique")
+    return value
+
+
+def release_paths(root: Path = ROOT) -> list[tuple[str, Path]]:
+    result = []
+    for name in load_release_manifest(root):
         absolute = root / name
         if not absolute.is_file() or any(p.is_symlink() for p in (absolute, *absolute.parents)):
             raise ValueError(f"Missing or symlinked release file: {name}")
@@ -29,15 +38,24 @@ def release_paths(root=ROOT):
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path)
-    args = parser.parse_args()
+def validate_output_path(output: Path) -> Path:
+    output = output.absolute()
+    if any(path.is_symlink() for path in (output, *output.parents)):
+        raise ValueError("Output cannot use symlinks")
+    return output
+
+
+def parser():
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    value.add_argument("--output", required=True, type=Path)
+    return value
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
     try:
         paths = release_paths()
-        output = args.output.absolute()
-        if any(p.is_symlink() for p in (output, *output.parents)):
-            raise ValueError("Output cannot use symlinks")
+        output = validate_output_path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("xb") as stream, ZipFile(stream, "w", compression=ZIP_DEFLATED) as archive:
             for name, path in paths:

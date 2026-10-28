@@ -288,17 +288,15 @@ else:
     def test_final_task_exact_paths_are_reviewed_without_private_neighbors(self):
         selected = {
             "tests/test_kit.py", "release-files.json", "tools/extraction/README.md",
-            "tools/extraction/extract.py",
-            "tools/catalog/catalog_store.py", "tools/context-index/context_index.py",
-            "tools/context-index/renditions.py", "tools/context-index/qualification.py",
-            "tools/review-events/event_store.py", "tools/schemas/catalog.sql",
+            "tools/extraction/extract.py", "tools/catalog/catalog_store.py",
+            "tools/catalog/contracts.py", "tools/context_index/context_index.py",
+            "tools/context_index/cli.py", "tools/context_index/renditions.py",
+            "tools/context_index/qualification.py", "tools/review_events/event_store.py",
+            "tools/schemas/catalog.sql",
             "tools/schemas/context-index.sql", "tools/schemas/review-events.sql",
             "README.md", "ROADMAP.md", "docs/decisions/0001-project-identity.md",
             "docs/decisions/0003-store-compatibility.md",
             "docs/decisions/0008-proof-of-concept-closure.md", "docs/decisions/README.md",
-            "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
-            "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
-            "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
         }
         excluded = {"docs/decisions/private.md", "tools/schemas/private.sql",
                     "tools/catalog/private.py", "tests/private.py"}
@@ -635,6 +633,10 @@ else:
         for _ in range(2):
             result = self.installer()
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                {"installed": True, "hooks_path": ".githooks"},
+            )
         self.assertEqual(global_config.read_bytes(), before)
         self.assertEqual(self.git("config", "--local", "--get", "core.hooksPath").stdout.strip(),
                          b".githooks")
@@ -649,7 +651,9 @@ else:
                 path.write_text("#!/bin/sh\nexit 17\n")
                 path.chmod(0o700)
                 before = (self.root / ".git/config").read_bytes()
-                self.assert_blocked(self.installer(), "existing hook")
+                result = self.installer()
+                self.assert_blocked(result, "existing hook")
+                self.assertTrue(result.stderr.startswith("install-hooks: "), result.stderr)
                 self.assertEqual(path.read_text(), "#!/bin/sh\nexit 17\n")
                 self.assertEqual((self.root / ".git/config").read_bytes(), before)
                 path.unlink()

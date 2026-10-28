@@ -79,20 +79,15 @@ the log into a usage profile. The coverage-gap half of the kept proposal is
 implemented: an empty search returns an absence classification, and an opt-in
 body-free log records that classification without the query.
 
-### Docling integration design - October 20
+### Docling integration
 
-The owner requested Docling ingestion in both this toolkit and the originating
-corpus installation. The [approved design](docs/superpowers/specs/2026-10-20-docling-ingestion-design.md)
-specifies a shared optional local-only PDF/PNG/JPEG adapter, separate from
-historical extractor wrappers, with independent repeat verification and
-explicit catalog registration. It does not add automatic review or retrieval
-selection. The [implementation plan](docs/superpowers/plans/2026-10-20-docling-ingestion.md)
-is approved for subagent-driven, Kata-tracked, in-place implementation with
-roborev pre-commit review. The [October 22 completion plan](docs/superpowers/plans/2026-10-22-ingestion-completion.md)
-supersedes Tasks 1-4 and withdraws the second-installation obligation. The OCR
-asset blocker is resolved, with recorded repeatable real synthetic-fixture
-acceptance. The optional lifecycle, policy bridge, CLI, clean-copy regressions,
-store-identity changes and operating guide are committed and reviewed.
+The optional local-only PDF/PNG/JPEG lifecycle, policy bridge, CLI,
+clean-copy regressions, and store-identity changes are complete. It preserves
+independent repeat verification and explicit catalog registration without
+adding automatic review or retrieval selection. The maintained operating
+contract is in the [extraction guide](tools/extraction/README.md), and the
+proof-of-concept closure and remaining limits are recorded in
+[decision 0008](docs/decisions/0008-proof-of-concept-closure.md).
 October 26 closure verified the real CLI lifecycle:
 prepare twice, verify, register and idempotent retry, with independent offline
 conversions and identical complete rendition bytes in a temporary catalog.

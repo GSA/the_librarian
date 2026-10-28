@@ -41,8 +41,8 @@ directories. The application does not call embedding/model services or start a
 network listener. Your MCP client may forward returned text to a model; choose
 an authorized processing path.
 
-One installation serves one project's data root, policy and stores. Policy is
-loaded from this directory, so a second project needs its own installation; see
+One full-clone installation serves one project's data, policy and stores.
+Policy is loaded from the clone, so a second project needs its own installation; see
 [decision 0004](docs/decisions/0004-instance-topology.md).
 
 ## Initialize an empty installation
@@ -52,14 +52,14 @@ Run from this directory:
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install ./tools/context-mcp
-.venv/bin/python tools/schemas/export_schemas.py --check
+.venv/bin/python -m tools.schemas.export_schemas --check
 .venv/bin/python tools/initialize.py
 .venv/bin/librarian-preflight \
-  --root "$PWD" --reader "$PWD/tools/context-index/context_index.py"
+  --root "$PWD"
 ```
 
 Initialization creates private `.local/catalog`, `.local/review-events` and
-`tools/context-index/.local` storage. It validates existing stores instead of
+`tools/context_index/.local` storage. It validates existing stores instead of
 reinitializing them. It does not silently rebuild a stale existing index;
 request `--refresh-index` through preflight after deliberate configuration or
 source changes. Initialization and every authoritative write retain verified
@@ -118,30 +118,59 @@ client/preflight when using that selection. Rebuild explicitly:
 
 ```sh
 .venv/bin/librarian-preflight \
-  --root "$PWD" --reader "$PWD/tools/context-index/context_index.py" \
+  --root "$PWD" \
   --manifest config/selection.local.json --refresh-index
 ```
 
-Policy belongs to this installed toolkit; `--root` selects the data workspace,
-not a second implicit policy file. Separate deployments can have separate
+Policy belongs to this installed toolkit; `--root` selects the complete clone,
+not an arbitrary data workspace or second implicit policy file. Separate
+deployments can have separate
 toolkit configurations. Policy changes invalidate derived retrieval. Changing
 the review audience changes the persisted contract: do not change it on a
 populated store without an explicit migration design.
 
+## Components
+
+- `tools/catalog/` owns append-only metadata storage; `contracts.py` contains
+  record validation independently of SQLite mechanics.
+- `tools/review_events/` owns attributed append-only review history.
+- `tools/context_index/` owns the disposable freshness-bound retrieval index;
+  `cli.py` is its command adapter and `context_index.py` is its engine.
+- `tools/extraction/` contains explicit extraction lifecycles. Docling remains
+  deliberately isolated behind a separate pinned worker process and model
+  namespace; it is not imported by ordinary toolkit commands.
+- `tools/context-mcp/` is a read-only stdio adapter. It accepts a validated
+  full-clone `--root` and runs fixed package modules; arbitrary reader/store
+  script overrides are intentionally unsupported.
+- `tools/schemas/`, `tools/review/`, and `tests/` contain schema snapshots,
+  the local review gate, and temporary-workspace contract tests.
+
+The underscore package paths replace the former `context-index` and
+`review-events` source directories. Run package commands with `python -m` from
+an installation root; direct source-file execution is not a general interface.
+
+Maintainer verification:
+
+```sh
+python -m unittest discover -s tests -v
+python -m tools.schemas.export_schemas --check
+python -m tools.review.test_precommit
+```
+
 ## Interfaces
 
-Each command supports `--help`. CLI paths are relative to this toolkit.
+Run toolkit commands from the clone root with `python -m`; each supports `--help`.
 
 | Tool | Purpose |
 |---|---|
-| `tools/catalog/catalog_store.py` | Initialize, submit/query metadata, inspect revisions, back up and restore |
-| `tools/catalog/inventory.py` | Explicit-root metadata discovery with configured exclusions; never registration or source interpretation |
-| `tools/review-events/event_store.py` | Schema, attributed native append, correction history, state-pinned writes, backup and restore |
-| `tools/review-events/event_reader.py` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
-| `tools/extraction/extract.py` | Registered strict UTF-8 plain text, Gemini-format transcript and ODT extraction, verification and separate metadata registration |
-| `tools/extraction/docling_extract.py` | Optional offline PDF/image Docling prepare, repeat verification and separate deferred-rendition registration |
-| `tools/context-index/context_index.py` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
-| `tools/diagnostics/retrieval_log.py` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
+| `python -m tools.catalog.catalog_store` | Initialize, submit/query metadata, inspect revisions, back up and restore |
+| `python -m tools.catalog.inventory` | Explicit-root metadata discovery with configured exclusions; never registration or source interpretation |
+| `python -m tools.review_events.event_store` | Schema, attributed native append, correction history, state-pinned writes, backup and restore |
+| `python -m tools.review_events.event_reader` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
+| `python -m tools.extraction.extract` | Registered strict UTF-8 plain text, Gemini-format transcript and ODT extraction, verification and separate metadata registration |
+| `python -m tools.extraction.docling_extract` | Optional offline PDF/image Docling prepare, repeat verification and separate deferred-rendition registration |
+| `python -m tools.context_index.cli` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
+| `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
 | `librarian-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |
 
 Catalog submissions are an object with a `records` array. Catalog records use
@@ -177,7 +206,7 @@ MCP invocation:
 
 ```sh
 .venv/bin/librarian-mcp \
-  --root "$PWD" --reader "$PWD/tools/context-index/context_index.py"
+  --root "$PWD"
 ```
 
 The process waits for a client over stdio. Client configuration must use this

@@ -7,10 +7,11 @@ import re
 from bisect import bisect_right
 from pathlib import PurePosixPath
 
-import qualification
+from tools.context_index import qualification
 
 
 DOCLING_MAX_PAGES = 100
+DOCLING_MAX_RECORDS = 10000
 DOCLING_RENDER_SCALE = 3.0
 DOCLING_MAX_PAGE_PIXELS = 32_000_000
 
@@ -262,6 +263,50 @@ def validate_docling_conversion(value, engine):
     return conversion
 
 
+def docling_record_ranges(raw, name, expected, engine):
+    """Locate canonical array objects in one forward scan of retained bytes."""
+    marker = ('"' + name + '":[').encode()
+    if raw.count(marker) != 1:
+        engine.fail("Docling record collection is missing or ambiguous")
+    position = raw.find(marker) + len(marker)
+    ranges = []
+    for item in expected:
+        if position >= len(raw) or raw[position] != ord("{"):
+            engine.fail("Docling record/range mismatch")
+        start = position
+        depth = 0
+        quoted = escaped = False
+        while position < len(raw):
+            byte = raw[position]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif byte == ord("\\"):
+                    escaped = True
+                elif byte == ord('"'):
+                    quoted = False
+            elif byte == ord('"'):
+                quoted = True
+            elif byte == ord("{"):
+                depth += 1
+            elif byte == ord("}"):
+                depth -= 1
+                if depth == 0:
+                    position += 1
+                    break
+            position += 1
+        exact = json.dumps(item, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+        if quoted or depth != 0 or raw[start:position] != exact:
+            engine.fail("Docling record/range mismatch")
+        ranges.append((start, position))
+        if position < len(raw) and raw[position] == ord(","):
+            position += 1
+    if position >= len(raw) or raw[position] != ord("]"):
+        engine.fail("Docling record collection/range mismatch")
+    return ranges
+
+
 def docling_records(raw, value, engine):
     conversion = validate_docling_conversion(value, engine)
     document = conversion["document"]
@@ -288,10 +333,16 @@ def docling_records(raw, value, engine):
     if page_numbers != set(range(1, len(pages) + 1)):
         engine.fail("Noncanonical Docling page inventory")
     page_inventory = {page["page_no"]: page for page in pages}
+    collections = (document["texts"], document["tables"])
+    if (any(not isinstance(items, list) for items in collections)
+            or sum(len(items) for items in collections) > DOCLING_MAX_RECORDS):
+        engine.fail("Invalid or excessive Docling record count")
+    ranges = {
+        "text": docling_record_ranges(raw, "texts", document["texts"], engine),
+        "table": docling_record_ranges(raw, "tables", document["tables"], engine),
+    }
     ordinal = 0
     for kind, items in (("text", document["texts"]), ("table", document["tables"])):
-        if not isinstance(items, list):
-            engine.fail("Invalid Docling document records")
         for index, item in enumerate(items):
             expected_ref = f"#/{kind}s/{index}"
             if (not isinstance(item, dict) or item.get("self_ref") != expected_ref
@@ -336,12 +387,7 @@ def docling_records(raw, value, engine):
                        for cell in cells):
                     engine.fail("Invalid Docling table cells")
                 search_text = " ".join(cell["text"] for cell in cells)
-            exact_raw = json.dumps(
-                item, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            byte_start = raw.find(exact_raw)
-            if byte_start < 0 or raw.find(exact_raw, byte_start + 1) >= 0:
-                engine.fail("Docling record does not have a unique exact retained byte range")
-            byte_end = byte_start + len(exact_raw)
+            byte_start, byte_end = ranges[kind][index]
             exact = raw[byte_start:byte_end].decode("utf-8")
             ordinal += 1
             yield {"anchor": kind + "-" + str(index + 1),
