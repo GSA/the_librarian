@@ -18,8 +18,12 @@ LF and CR terminators, blank lines, final-line state and original byte offsets.
 Malformed UTF-8, UTF-16/32 BOMs, NUL, excessive line records and oversized
 renditions fail visibly; no replacement decoding or charset guessing occurs.
 Preparation and registration create a deferred rendition only. They do not
-review, qualify, select, index or publish its text. Selected retrieval of this
-format is not yet implemented.
+review, qualify, select, index or publish its text. After a separate supported
+catalog update marks the generated child `indexed`, an operator may explicitly
+select it in `config/selection.local.json` with `format: "text"`, its exact
+rendition hash, receipt ID and maintained Markdown context. Retrieval then uses
+stable `#line-N` locators and reports original byte ranges and terminator kinds.
+Empty and BOM-only renditions have no records and are refused for selection.
 
 ## Optional Docling ingestion
 

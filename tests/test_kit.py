@@ -391,6 +391,130 @@ class Workspace(unittest.TestCase):
         with self.assertRaises(contract.ReviewError):
             events.prepare_submission(events.bundle([event]), self.root)
 
+    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast"):
+        self.registration("sources/notes.txt", raw)
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "verify", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-text-rendition",
+                       expected_state=catalog.status(self.root)["state_token"],
+                       reason="Explicit synthetic text selection")
+        self.docs()
+        self.config["renditions"] = [{"path": prepared["rendition"],
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "context": ["documents/AGENTS.md"]}]
+        self.build()
+        return prepared
+
+    def test_selected_text_round_trips_exact_lines_and_byte_locations(self):
+        prepared = self.selected_text()
+        with closing(index.readonly(self.db)) as db:
+            rows = db.execute("SELECT locator, payload FROM rendition_locations "
+                              "ORDER BY locator").fetchall()
+            self.assertEqual([row[0].rsplit("#", 1)[1] for row in rows],
+                             ["line-1", "line-2", "line-3"])
+            self.assertEqual(json.loads(rows[0][1]), {
+                "json_pointer": "/payload/lines/0", "original_line": 1,
+                "byte_start": 0, "byte_end": 7, "terminator": "crlf",
+            })
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            piece = next(piece for piece in packet["pieces"] if piece["locator"].endswith("#line-2"))
+            self.assertIn('"text": "β\\n"', piece["text"])
+            metadata = packet["renditions"][prepared["rendition"]]
+            self.assertEqual(metadata["format"], "text")
+            self.assertEqual(metadata["bom_bytes"], 0)
+            found = index.search(db, "β", 10, None)
+            self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
+
+    def test_selected_text_unicode_separators_keep_physical_json_line_citations(self):
+        content = "a\u0085b\u2028c\u2029d"
+        prepared = self.selected_text(content.encode("utf-8"))
+        locator = prepared["rendition"] + "#line-1"
+        with closing(index.readonly(self.db)) as db:
+            packet = index.packet(db, self.config, locator, 60000)
+        piece = next(piece for piece in packet["pieces"] if piece["locator"] == locator)
+        physical = (self.root / prepared["rendition"]).read_text().splitlines(keepends=True)
+        # splitlines() is intentionally unsuitable here; derive physical JSON
+        # lines solely from the encoder's LF bytes.
+        raw_text = (self.root / prepared["rendition"]).read_text()
+        physical = [part + "\n" for part in raw_text.split("\n")[:-1]]
+        self.assertEqual(piece["text"], "".join(physical[piece["line_start"] - 1:piece["line_end"]]))
+        self.assertIn(content, piece["text"])
+        self.assertEqual(piece["line_end"] - piece["line_start"], 6)
+
+    def test_text_rendition_refuses_inconsistent_byte_mapping(self):
+        api = index.rendition_api()
+        payload = extract.text(b"one\r\ntwo")
+        payload["lines"][1]["byte_start"] = 4
+        with self.assertRaisesRegex(index.IndexError_, "line mapping"):
+            index.renditions.validate_text_mapping(payload, b"one\r\ntwo", api)
+
+        for label, mutate in (
+            ("truncated", lambda payload: payload["lines"].pop()),
+            ("final-state", lambda payload: payload.update(ends_with_terminator=True)),
+        ):
+            payload = extract.text(b"one\ntwo")
+            mutate(payload)
+            with self.subTest(label=label), self.assertRaisesRegex(index.IndexError_, "mapping"):
+                index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+        payload = extract.text(b"one\ntwo")
+        payload.update(bom_bytes=3)
+        for record in payload["lines"]:
+            record["byte_start"] += 3
+            record["byte_end"] += 3
+        with self.assertRaisesRegex(index.IndexError_, "BOM declaration"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+        for label, lines in (
+            ("merged-lines", [{"line": 1, "text": "a\nb\n", "terminator": "lf",
+                               "byte_start": 0, "byte_end": 4}]),
+            ("split-crlf", [{"line": 1, "text": "a\r", "terminator": "cr",
+                             "byte_start": 0, "byte_end": 2},
+                            {"line": 2, "text": "\n", "terminator": "lf",
+                             "byte_start": 2, "byte_end": 3}]),
+        ):
+            payload = extract.text(b"a\nb\n" if label == "merged-lines" else b"a\r\n")
+            payload["lines"] = lines
+            with self.subTest(label=label), self.assertRaisesRegex(index.IndexError_, "physical line mapping"):
+                index.renditions.validate_text_mapping(
+                    payload, b"a\nb\n" if label == "merged-lines" else b"a\r\n", api)
+
+        payload = extract.text(b"one\ntwo")
+        payload["lines"][0]["text"] = "six\n"
+        with self.assertRaisesRegex(index.IndexError_, "mapping"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+        payload["lines"][0]["text"] = None
+        with self.assertRaisesRegex(index.IndexError_, "field types"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+    def test_selected_empty_text_is_refused_without_replacing_index(self):
+        self.docs()
+        preserved = self.db.read_bytes()
+        self.config["renditions"] = []
+        # Build the empty rendition lifecycle in a fresh workspace state would
+        # duplicate the same receipt IDs, so use the current empty selection as
+        # the prior index and then register the zero-record source.
+        self.registration("sources/empty.txt", b"\xef\xbb\xbf")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-empty-text",
+                       expected_state=catalog.status(self.root)["state_token"], reason="Synthetic empty selection")
+        self.config["renditions"] = [{"path": prepared["rendition"],
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "context": ["documents/AGENTS.md"]}]
+        with self.assertRaisesRegex(index.IndexError_, "no retrievable records"):
+            self.build()
+        self.assertEqual(self.db.read_bytes(), preserved)
+
     def selected_odt(self):
         text = (ROOT / "AGENTS.md").read_text()
         content = ('<office:document-content xmlns:office="' + extract.NS["office"] +

@@ -33,6 +33,7 @@ ALLOWLIST = frozenset({
     "tools/extraction/README.md",
     "tools/catalog/catalog_store.py",
     "tools/context-index/context_index.py",
+    "tools/context-index/renditions.py",
     "tools/review-events/event_store.py",
     "tools/schemas/catalog.sql",
     "tools/schemas/context-index.sql",

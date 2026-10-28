@@ -22,7 +22,7 @@ def validate(config, engine):
         engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"), "Rendition selection")
         if (not eligible(item["path"]) or item["path"] in seen
                 or PurePosixPath(item["path"]).parts[3] != item["receipt_id"]
-                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "odt"}
+                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "odt"}
                 or not isinstance(item["sha256"], str)
                 or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
             engine.fail("Invalid or duplicate rendition selection")
@@ -62,6 +62,8 @@ def inputs(root, config, engine):
         payload = value["payload"]
         required = (("format", "scope", "warnings", "lines", "precedence")
                     if item["format"] == "gemini-txt" else
+                    ("format", "scope", "warnings", "lines", "bom_bytes", "ends_with_terminator")
+                    if item["format"] == "text" else
                     ("format", "scope", "warnings", "nodes", "xml_sha256", "members", "unrendered_features"))
         engine.fields(payload, required, "Extraction payload")
         if (type(value["schema_version"]) is not int
@@ -105,10 +107,13 @@ def inputs(root, config, engine):
         if not original_path.is_file() or original_path.stat().st_size != source["bytes"]:
             engine.fail("Original source missing or changed: " + source["path"])
         with original_path.open("rb") as stream:
-            original_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+            original_raw = stream.read()
+            original_hash = hashlib.sha256(original_raw).hexdigest()
         if original_hash != source["sha256"]:
             engine.fail("Original source missing or changed: " + source["path"])
         payload = value["payload"]
+        if payload["format"] == "text":
+            validate_text_mapping(payload, original_raw, engine)
         metadata = {
             "source": source, "rendition_path": item["path"], "rendition_sha256": item["sha256"],
             "extractor": value["extractor"], "run_id": run,
@@ -117,12 +122,14 @@ def inputs(root, config, engine):
             "warnings": payload["warnings"],
             "selection": ("Transcript-classified records only; generated notes and footer not indexed."
                           if item["format"] == "gemini-txt" else
+                          "All byte-mapped physical text lines explicitly selected; decoding is not review."
+                          if item["format"] == "text" else
                           "Located XML records only; text rendition, not a rendered or approved view."),
             "citation_contract": "Packet line ranges cite extraction JSON, not original lines or pages. "
-                                 "Resolve source_location for the original line or XML member/element. "
+                                 "Resolve source_location for the original line, byte range or XML member/element. "
                                  "Extraction and retrieval are not new review, corroboration or acceptance.",
         }
-        for key in ("precedence", "xml_sha256", "unrendered_features"):
+        for key in ("precedence", "xml_sha256", "unrendered_features", "bom_bytes", "ends_with_terminator"):
             if key in payload:
                 metadata[key] = payload[key]
         result.append((item, raw, value, metadata))
@@ -131,16 +138,68 @@ def inputs(root, config, engine):
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
 
 
+def validate_text_mapping(payload, source_raw, engine):
+    if type(payload["bom_bytes"]) is not int or payload["bom_bytes"] not in {0, 3}:
+        engine.fail("Invalid text BOM declaration")
+    if (payload["bom_bytes"] == 3) != source_raw.startswith(b"\xef\xbb\xbf"):
+        engine.fail("Text BOM declaration does not match original bytes")
+    for record in payload["lines"]:
+        if (not isinstance(record, dict) or not isinstance(record.get("text"), str)
+                or type(record.get("line")) is not int or type(record.get("terminator")) is not str
+                or type(record.get("byte_start")) is not int or type(record.get("byte_end")) is not int):
+            engine.fail("Invalid text line field types")
+    offset = payload["bom_bytes"]
+    canonical = []
+    for number, match in enumerate(re.finditer(b".*?(?:\\r\\n|\\r|\\n|\\Z)", source_raw[offset:]), 1):
+        raw_line = match.group()
+        if not raw_line:
+            continue
+        text = raw_line.decode("utf-8")
+        terminator = ("crlf" if text.endswith("\r\n") else "lf" if text.endswith("\n")
+                      else "cr" if text.endswith("\r") else "none")
+        canonical.append({"line": number, "text": text, "terminator": terminator,
+                          "byte_start": offset, "byte_end": offset + len(raw_line)})
+        offset += len(raw_line)
+    if payload["lines"] != canonical:
+        engine.fail("Invalid text physical line mapping")
+    offset = payload["bom_bytes"]
+    for index, record in enumerate(payload["lines"]):
+        engine.fields(record, ("line", "text", "terminator", "byte_start", "byte_end"),
+                      "Text line")
+        expected_terminator = ("crlf" if record["text"].endswith("\r\n") else
+                               "lf" if record["text"].endswith("\n") else
+                               "cr" if record["text"].endswith("\r") else "none")
+        encoded_size = len(record["text"].encode("utf-8"))
+        if (record["line"] != index + 1 or record["terminator"] != expected_terminator
+                or record["byte_start"] != offset
+                or record["byte_end"] != record["byte_start"] + encoded_size):
+            engine.fail("Invalid text line numbering or byte mapping")
+        if source_raw[record["byte_start"]:record["byte_end"]] != record["text"].encode("utf-8"):
+            engine.fail("Text record does not match original byte slice")
+        offset = record["byte_end"]
+    expected_end = bool(payload["lines"] and payload["lines"][-1]["terminator"] != "none")
+    if offset != len(source_raw) or type(payload["ends_with_terminator"]) is not bool \
+            or payload["ends_with_terminator"] != expected_end:
+        engine.fail("Invalid text byte mapping or final terminator state")
+
+
 def records(raw, value, engine):
     """Return exact on-disk JSON line spans alongside decoded search-only text."""
     text = raw.decode("utf-8")
-    lines = text.splitlines(keepends=True)
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
     line_starts, position = [], 0
     for line in lines:
         line_starts.append(position)
         position += len(line)
     payload = value["payload"]
-    key = "lines" if payload["format"] == "gemini-txt" else "nodes"
+    # Full text/source-byte comparison was performed by inputs() before this
+    # record generator receives a selected rendition.
+    key = "lines" if payload["format"] in {"gemini-txt", "text"} else "nodes"
+    if not payload[key]:
+        return
     match = re.search(r'^\s*"' + key + r'": \[\s*$', text, re.M)
     if match is None:
         engine.fail("Unsupported extraction serialization: missing record array")
@@ -149,14 +208,14 @@ def records(raw, value, engine):
     timestamp = None
     parents = {}
     for index, record in enumerate(payload[key]):
-        if key == "lines":
+        if payload["format"] == "gemini-txt":
             engine.fields(record, ("line", "text", "section"), "Transcript line",
                           optional=("speaker_label_as_written", "timestamp_label"))
             if (type(record["line"]) is not int or record["line"] != index + 1
                     or record["section"] not in {
                         "unclassified", "generated-notes", "transcript", "transcript-footer"}):
                 engine.fail("Invalid transcript line numbering/classification")
-        else:
+        elif payload["format"] != "text":
             engine.fields(record, ("member", "locator", "tag", "attributes", "text", "tail"),
                           "ODT node", optional=("paragraph_text",))
         while offset < len(text) and text[offset] in " \t\r\n,":
@@ -168,7 +227,7 @@ def records(raw, value, engine):
         end_line = bisect_right(line_starts, end - 1)
         offset = end
         parent = None
-        if key == "lines":
+        if payload["format"] == "gemini-txt":
             if record["section"] != "transcript":
                 continue
             anchor = "line-" + str(record["line"])
@@ -179,6 +238,13 @@ def records(raw, value, engine):
             elif timestamp:
                 parent = timestamp
             title = record.get("speaker_label_as_written", record.get("timestamp_label", "Transcript"))
+            search_text = record["text"]
+        elif payload["format"] == "text":
+            anchor = "line-" + str(record["line"])
+            location = {"json_pointer": f"/payload/lines/{index}",
+                        "original_line": record["line"], "byte_start": record["byte_start"],
+                        "byte_end": record["byte_end"], "terminator": record["terminator"]}
+            title = "Line " + str(record["line"])
             search_text = record["text"]
         else:
             anchor = "node-" + str(index + 1)
