@@ -45,8 +45,12 @@ class Config:
             self.toolkit_root / "tools/catalog/catalog_store.py",
             self.toolkit_root / "tools/catalog/contracts.py",
         )
-        if not all(path.is_file() for path in required):
-            raise ValueError("--root must identify a complete trusted toolkit clone")
+        for path in required:
+            relative = path.relative_to(self.toolkit_root)
+            components = [self.toolkit_root.joinpath(*relative.parts[:end])
+                          for end in range(1, len(relative.parts) + 1)]
+            if not path.is_file() or any(component.is_symlink() for component in components):
+                raise ValueError("--root must identify a complete trusted toolkit clone")
         for name in ("manifest", "db"):
             value = getattr(self, name)
             path = value if value.is_absolute() else self.root / value

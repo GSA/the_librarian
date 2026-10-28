@@ -35,6 +35,25 @@ class MCPConfig(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
                     Config(root=root)
 
+    def test_required_toolkit_paths_cannot_use_symlinks(self):
+        for linked in ("tools/__init__.py", "tools/context_index/context_index.py",
+                       "tools/context_index"):
+            with self.subTest(linked=linked), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory).resolve()
+                root = home / "kit"
+                clone_release(root)
+                target = root / linked
+                outside = home / ("outside.py" if target.is_file() else "outside")
+                if target.is_dir():
+                    target.rename(outside)
+                    target.symlink_to(outside, target_is_directory=True)
+                else:
+                    outside.write_bytes(target.read_bytes())
+                    target.unlink()
+                    target.symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
+                    Config(root=root)
+
     def test_other_root_cannot_shadow_trusted_modules(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
