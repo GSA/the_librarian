@@ -37,7 +37,8 @@ class MCPConfig(unittest.TestCase):
 
     def test_required_toolkit_paths_cannot_use_symlinks(self):
         for linked in ("tools/__init__.py", "tools/context_index/context_index.py",
-                       "tools/context_index"):
+                       "tools/context_index", "tools/policy.py",
+                       "tools/diagnostics/retrieval_log.py"):
             with self.subTest(linked=linked), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory).resolve()
                 root = home / "kit"
@@ -51,6 +52,22 @@ class MCPConfig(unittest.TestCase):
                     outside.write_bytes(target.read_bytes())
                     target.unlink()
                     target.symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
+                    Config(root=root)
+
+    def test_malformed_release_manifest_is_rejected(self):
+        for mutate in (
+            lambda paths: {name: True for name in paths},
+            lambda paths: [*paths, paths[0]],
+            lambda paths: [name for name in paths if name != "tools/policy.py"],
+            lambda paths: [name for name in paths
+                           if name != "tools/diagnostics/retrieval_log.py"],
+        ):
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "kit"
+                clone_release(root)
+                manifest = root / "release-files.json"
+                manifest.write_text(json.dumps(mutate(json.loads(manifest.read_text()))))
                 with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
                     Config(root=root)
 

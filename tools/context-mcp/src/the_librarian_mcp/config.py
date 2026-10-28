@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import dataclass
+import json
 import math
 from pathlib import Path
 from typing import ClassVar
@@ -34,18 +35,29 @@ class Config:
     def __post_init__(self):
         if not self.root.is_absolute() or not self.root.is_dir():
             raise ValueError("--root must be an absolute, existing instance directory")
-        required = (
-            self.toolkit_root / "release-files.json",
-            self.toolkit_root / "config/policy.json",
-            self.toolkit_root / "tools/__init__.py",
-            self.toolkit_root / "tools/context_index/__init__.py",
-            self.toolkit_root / "tools/context_index/context_index.py",
-            self.toolkit_root / "tools/context_index/cli.py",
-            self.toolkit_root / "tools/review_events/event_reader.py",
-            self.toolkit_root / "tools/catalog/catalog_store.py",
-            self.toolkit_root / "tools/catalog/contracts.py",
-        )
-        for path in required:
+        mandatory = {
+            "release-files.json", "config/policy.json", "tools/__init__.py",
+            "tools/context_index/__init__.py", "tools/context_index/context_index.py",
+            "tools/context_index/cli.py", "tools/review_events/event_reader.py",
+            "tools/catalog/catalog_store.py", "tools/catalog/contracts.py",
+            "tools/policy.py", "tools/diagnostics/retrieval_log.py",
+        }
+        try:
+            manifest = json.loads((self.toolkit_root / "release-files.json").read_text())
+        except (OSError, TypeError, ValueError):
+            manifest = None
+        if (not isinstance(manifest, list) or not manifest
+                or any(not isinstance(name, str) for name in manifest)
+                or len(manifest) != len(set(manifest))):
+            raise ValueError("--root must identify a complete trusted toolkit clone")
+        names = set(manifest)
+        if not mandatory <= names:
+            raise ValueError("--root must identify a complete trusted toolkit clone")
+        for name in names:
+            if (not isinstance(name, str) or not name or "\\" in name
+                    or Path(name).is_absolute() or any(part in ("", ".", "..") for part in name.split("/"))):
+                raise ValueError("--root must identify a complete trusted toolkit clone")
+            path = self.toolkit_root / name
             relative = path.relative_to(self.toolkit_root)
             components = [self.toolkit_root.joinpath(*relative.parts[:end])
                           for end in range(1, len(relative.parts) + 1)]
