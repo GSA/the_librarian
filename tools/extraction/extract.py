@@ -17,11 +17,8 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "catalog"))
-import catalog_store as catalog
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+from tools import policy
+from tools.catalog import catalog_store as catalog
 
 
 HOME = Path("data/extractions/.local")

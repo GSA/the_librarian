@@ -1,4 +1,4 @@
--- Generated from tools/context-index/context_index.py (DDL); do not edit.
+-- Generated from tools/context_index/context_index.py (DDL); do not edit.
 -- Schema version 1; structure only, not a data backup or restore procedure.
 PRAGMA application_id=1279480920;
 PRAGMA user_version=1;

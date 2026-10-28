@@ -13,7 +13,7 @@ import sqlite3
 import sys
 import uuid
 
-import review_events as contract
+from tools.review_events import review_events as contract
 
 
 VERSION = 1

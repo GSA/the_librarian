@@ -289,7 +289,8 @@ else:
         selected = {
             "tests/test_kit.py", "release-files.json", "tools/extraction/README.md",
             "tools/catalog/catalog_store.py", "tools/context-index/context_index.py",
-            "tools/review-events/event_store.py", "tools/schemas/catalog.sql",
+            "tools/context_index/context_index.py", "tools/review-events/event_store.py",
+            "tools/review_events/event_store.py", "tools/schemas/catalog.sql",
             "tools/schemas/context-index.sql", "tools/schemas/review-events.sql",
             "README.md", "ROADMAP.md", "docs/decisions/0001-project-identity.md",
             "docs/decisions/0003-store-compatibility.md",

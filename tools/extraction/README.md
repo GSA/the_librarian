@@ -116,13 +116,13 @@ PY=.venv/bin/python
 DOCLING_PY=$PWD/tools/extraction/.local/venv-docling/bin/python
 MODELS=$PWD/tools/extraction/.local/models
 
-$PY tools/extraction/docling_extract.py inspect \
+$PY -m tools.extraction.docling_extract inspect \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY tools/extraction/docling_extract.py prepare D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract prepare D-receipt --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY tools/extraction/docling_extract.py verify D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract verify D-receipt --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY tools/extraction/docling_extract.py register D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract register D-receipt --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY" \
   --actor operator --expected-state CATALOG_STATE_TOKEN
 ```

@@ -3,7 +3,6 @@
 
 import argparse
 import ast
-import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -13,8 +12,8 @@ HOME = Path(__file__).resolve().parent
 ROOT = HOME.parents[1]
 SOURCES = {
     "catalog.sql": ("tools/catalog/catalog_store.py", "SQL", "VERSION"),
-    "review-events.sql": ("tools/review-events/event_store.py", "SQL", "VERSION"),
-    "context-index.sql": ("tools/context-index/context_index.py", "DDL", "SCHEMA"),
+    "review-events.sql": ("tools/review_events/event_store.py", "SQL", "VERSION"),
+    "context-index.sql": ("tools/context_index/context_index.py", "DDL", "SCHEMA"),
 }
 
 
@@ -29,14 +28,11 @@ def snapshot(source: Path, symbol: str, version_symbol: str) -> str:
     if not isinstance(ddl, str) or type(version) is not int:
         raise ValueError("Expected literal DDL and integer schema version")
     if symbol == "SQL":
-        sys.path.insert(0, str(source.parent))
-        try:
-            spec = importlib.util.spec_from_file_location(source.stem, source)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            ddl = module.schema_sql()
-        finally:
-            sys.path.pop(0)
+        if source.name == "catalog_store.py":
+            from tools.catalog import catalog_store as module
+        else:
+            from tools.review_events import event_store as module
+        ddl = module.schema_sql()
     else:
         application_id = values["APPLICATION_ID"]
         if type(application_id) is not int:

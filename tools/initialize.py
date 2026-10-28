@@ -9,26 +9,32 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def command(script, action):
+def command(module, action):
     result = subprocess.run(
-        [sys.executable, str(ROOT / script), "--root", str(ROOT), action],
+        [sys.executable, "-m", module, "--root", str(ROOT), action], cwd=ROOT,
         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
     )
     if result.returncode or result.stderr:
-        raise RuntimeError(f"{script} {action}: {result.stderr.strip() or 'command failed'}")
+        raise RuntimeError(f"{module} {action}: {result.stderr.strip() or 'command failed'}")
     return json.loads(result.stdout)
 
 
 def main():
     try:
+        legacy = ROOT / "tools/context-index/.local/index.sqlite3"
+        if legacy.exists() or legacy.is_symlink():
+            raise RuntimeError(
+                "Legacy derived index remains at tools/context-index/.local/index.sqlite3; "
+                "remove it deliberately, then rebuild the disposable index"
+            )
         reports = []
-        for script, path in (
-            ("tools/catalog/catalog_store.py", ".local/catalog/catalog.sqlite3"),
-            ("tools/review-events/event_store.py", ".local/review-events/events.sqlite3"),
+        for module, path in (
+            ("tools.catalog.catalog_store", ".local/catalog/catalog.sqlite3"),
+            ("tools.review_events.event_store", ".local/review-events/events.sqlite3"),
         ):
-            reports.append(command(script, "status" if (ROOT / path).exists() else "init"))
-        path = ROOT / "tools/context-index/.local/index.sqlite3"
-        reports.append(command("tools/context-index/context_index.py", "status" if path.exists() else "build"))
+            reports.append(command(module, "status" if (ROOT / path).exists() else "init"))
+        path = ROOT / "tools/context_index/.local/index.sqlite3"
+        reports.append(command("tools.context_index.context_index", "status" if path.exists() else "build"))
         print(json.dumps({"initialized": True, "seeded_records": 0, "results": reports}))
         return 0
     except (OSError, RuntimeError, ValueError) as error:

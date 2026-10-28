@@ -16,10 +16,9 @@ import types
 import unicodedata
 from urllib.parse import quote, unquote, urlsplit
 import uuid
-import renditions
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+from tools import policy
+from tools.context_index import renditions
 
 
 SCHEMA = 1
@@ -139,26 +138,18 @@ def fields(value, expected, description, optional=()):
 
 
 def load_event_reader():
-    directory = no_symlinks(Path(__file__).resolve().parents[1] / "review-events")
-    sys.path.insert(0, str(directory))
     try:
-        import event_reader
+        from tools.review_events import event_reader
     except ImportError as error:
-        fail(f"Event reader unavailable; install tools/review-events/requirements.txt: {error}")
-    finally:
-        sys.path.pop(0)
+        fail(f"Event reader unavailable; install tools/review_events/requirements.txt: {error}")
     return event_reader
 
 
 def load_catalog():
-    directory = no_symlinks(Path(__file__).resolve().parents[1] / "catalog")
-    sys.path.insert(0, str(directory))
     try:
-        import catalog_store
+        from tools.catalog import catalog_store
     except ImportError as error:
         fail(f"Catalog reader unavailable: {error}")
-    finally:
-        sys.path.pop(0)
     return catalog_store
 
 
@@ -492,7 +483,7 @@ def build(root, manifest, db, config, manifest_hash):
     db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     no_symlinks(db.parent)
     # Only dedicated generated directories receive a permission change.
-    local = root / "tools/context-index/.local"
+    local = root / "tools/context_index/.local"
     if local.exists():
         no_symlinks(local)
         local.chmod(0o700)
@@ -1038,7 +1029,7 @@ def main(argv=None):
         if not manifest.is_absolute():
             manifest = root / manifest
         config, manifest_hash = load_manifest(manifest)
-        db = validate_db_path(root, args.db or root / "tools/context-index/.local/index.sqlite3")
+        db = validate_db_path(root, args.db or root / "tools/context_index/.local/index.sqlite3")
         if db == no_symlinks(manifest):
             fail("Database output cannot overwrite the manifest")
         if args.command == "build":

@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import io
+import importlib
 import json
 import os
 from pathlib import Path
@@ -22,18 +23,43 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-for directory in ("tools", "tools/catalog", "tools/context-index", "tools/review-events", "tools/extraction", "tools/diagnostics"):
-    sys.path.insert(0, str(ROOT / directory))
-import policy
-import catalog_store as catalog
-import context_index as index
-import compact_records
-import event_reader
-import event_store as events
-import review_events as contract
-import extract
-import package
-import retrieval_log as diagnostics
+from tools import package, policy
+from tools.catalog import catalog_store as catalog
+from tools.context_index import compact_records
+from tools.context_index import context_index as index
+from tools.diagnostics import retrieval_log as diagnostics
+from tools.extraction import extract
+from tools.review_events import event_reader
+from tools.review_events import event_store as events
+from tools.review_events import review_events as contract
+
+
+class PackageLayoutTests(unittest.TestCase):
+    MODULES = (
+        "tools.catalog.inventory",
+        "tools.context_index.context_index",
+        "tools.review_events.event_store",
+        "tools.extraction.extract",
+        "tools.diagnostics.retrieval_log",
+    )
+
+    def test_modules_import_without_path_mutation(self):
+        before = list(sys.path)
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(name)
+                self.assertTrue(Path(module.__file__).resolve().is_relative_to(ROOT / "tools"))
+        self.assertEqual(sys.path, before)
+
+    def test_operator_modules_expose_help(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                result = subprocess.run(
+                    [sys.executable, "-m", name, "--help"], cwd=ROOT,
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage:", result.stdout.lower())
 
 
 def clone(destination):
@@ -103,7 +129,7 @@ class DoclingCleanCopy(unittest.TestCase):
         bridge = self.kit / "tools/extraction/docling_bridge.py"
         bridge.unlink()
         process = subprocess.run(
-            [sys.executable, "tools/extraction/docling_extract.py", "--help"],
+            [sys.executable, "-m", "tools.extraction.docling_extract", "--help"],
             cwd=self.kit, capture_output=True, text=True)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("docling_bridge", process.stderr)
@@ -119,10 +145,9 @@ class DoclingCleanCopy(unittest.TestCase):
 import hashlib,json,sys,subprocess
 from pathlib import Path
 from unittest.mock import patch
-sys.path[:0]=['tools/extraction','tools/catalog','tools']
-import catalog_store as c
-import docling_adapter as a
-import docling_bridge as b
+from tools.catalog import catalog_store as c
+from tools.extraction import docling_adapter as a
+from tools.extraction import docling_bridge as b
 root=Path.cwd()
 raw=b'%PDF-1.7\nclean-copy structural fixture'
 (root/'sources').mkdir(); (root/'sources/refused.pdf').write_bytes(raw)
@@ -156,15 +181,14 @@ def invoke(command,receipt='D2',extra=()):
  seam="""import sys,json,runpy,hashlib
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,'tools/extraction')
-import docling_adapter as a
+from tools.extraction import docling_adapter as a
 report=json.loads(sys.argv.pop(1))
-sys.argv[0]='tools/extraction/docling_extract.py'
+sys.argv[0]='tools.extraction.docling_extract'
 def convert(*args):
  with Path('inference-calls').open('a') as log: log.write('convert\\n')
  return report,hashlib.sha256(a.WORKER.read_bytes()).hexdigest()
 with patch.object(a,'_convert_with_identity',side_effect=convert):
- runpy.run_path(sys.argv[0],run_name='__main__')
+ runpy.run_module(sys.argv[0],run_name='__main__')
 """
  result=subprocess.run([sys.executable,'-c',seam,json.dumps(report),*args],
                        cwd=root,capture_output=True,text=True)
@@ -204,7 +228,7 @@ class Workspace(unittest.TestCase):
         self.manifest.parent.mkdir()
         self.config = {"schema_version": 1, "audience": policy.SETTINGS["audience"],
                        "documents": [], "context_rules": {}, "renditions": []}
-        self.db = self.root / "tools/context-index/.local/index.sqlite3"
+        self.db = self.root / "tools/context_index/.local/index.sqlite3"
         self.save_config()
 
     def save_config(self):
@@ -479,6 +503,22 @@ class Workspace(unittest.TestCase):
         with self.assertRaises(extract.ExtractionError):
             extract.xml(b'<!DOCTYPE x><x/>', "content.xml")
 
+    def test_initialize_refuses_an_unmigrated_legacy_index(self):
+        clone(self.root / "kit")
+        kit = self.root / "kit"
+        legacy = kit / "tools/context-index/.local/index.sqlite3"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy derived index")
+        result = subprocess.run(
+            [sys.executable, "tools/initialize.py"], cwd=kit,
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("legacy derived index", result.stderr.lower())
+        self.assertFalse((kit / "tools/context_index/.local/index.sqlite3").exists())
+        self.assertFalse((kit / ".local/catalog").exists())
+        self.assertFalse((kit / ".local/review-events").exists())
+
     def test_clean_copy_and_policy_freshness(self):
         clone(self.root / "kit")
         kit = self.root / "kit"
@@ -489,11 +529,11 @@ class Workspace(unittest.TestCase):
         report = run("tools/initialize.py")
         self.assertEqual(report["seeded_records"], 0)
         (kit / "config/policy.local.json").write_text(json.dumps({"excluded_name_patterns": ["private"]}))
-        result = subprocess.run([sys.executable, "tools/context-index/context_index.py", "status"],
+        result = subprocess.run([sys.executable, "-m", "tools.context_index.context_index", "status"],
                                 cwd=kit, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stale", result.stderr.lower())
-        self.assertEqual(run("tools/context-index/context_index.py", "build")["documents"], 0)
+        self.assertEqual(run("-m", "tools.context_index.context_index", "build")["documents"], 0)
         output = kit / "bundle.zip"
         run("tools/package.py", "--output", str(output))
         with ZipFile(output) as archive:

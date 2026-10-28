@@ -13,12 +13,10 @@ import io
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for directory in ("tools", "tools/catalog", "tools/extraction"):
-    sys.path.insert(0, str(ROOT / directory))
-import catalog_store as catalog
-import docling_adapter as adapter
-import docling_bridge as bridge
-import docling_extract
+from tools.catalog import catalog_store as catalog
+from tools.extraction import docling_adapter as adapter
+from tools.extraction import docling_bridge as bridge
+from tools.extraction import docling_extract
 
 
 class DoclingLifecycle(unittest.TestCase):

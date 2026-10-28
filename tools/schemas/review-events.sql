@@ -1,4 +1,4 @@
--- Generated from tools/review-events/event_store.py (SQL); do not edit.
+-- Generated from tools/review_events/event_store.py (SQL); do not edit.
 -- Schema version 1; structure only, not a data backup or restore procedure.
 PRAGMA application_id=1280460118;
 PRAGMA user_version=1;
