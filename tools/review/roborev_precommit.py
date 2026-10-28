@@ -45,6 +45,7 @@ ALLOWLIST = frozenset({
     "tools/extraction/__init__.py",
     "tools/extraction/extract.py",
     "tools/initialize.py",
+    "tools/package.py",
     "tools/review-events/event_reader.py",
     "tools/review-events/requirements.txt",
     "tools/review-events/review-event-v1.schema.json",
@@ -77,6 +78,7 @@ ALLOWLIST = frozenset({
     "docs/decisions/README.md",
     "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
     "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+    "docs/superpowers/specs/2026-10-20-docling-ingestion-design.md",
     "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
 })
 LAUNCHER_KEY = "roborev.precommitLauncher"

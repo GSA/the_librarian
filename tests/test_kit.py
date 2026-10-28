@@ -796,6 +796,47 @@ class RetrievalDiagnostics(unittest.TestCase):
                 diagnostics.log_path(self.root, value)
 
 
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "file.txt").write_text("release")
+
+    def manifest(self, value):
+        (self.root / "release-files.json").write_text(json.dumps(value))
+
+    def test_manifest_rejects_invalid_entries_before_filesystem_access(self):
+        for value, message in (
+            (["file.txt", "file.txt"], "unique"),
+            (["file.txt", 7], "entry 2"),
+            (["../file.txt"], "unsafe"),
+            (["store.sqlite3"], "unsafe"),
+        ):
+            with self.subTest(value=value):
+                self.manifest(value)
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    package.load_release_manifest(self.root)
+
+    def test_release_paths_rejects_missing_and_symlinked_files(self):
+        self.manifest(["missing.txt"])
+        with self.assertRaisesRegex(ValueError, "Missing"):
+            package.release_paths(self.root)
+        (self.root / "target.txt").write_text("target")
+        (self.root / "link.txt").symlink_to("target.txt")
+        self.manifest(["link.txt"])
+        with self.assertRaisesRegex(ValueError, "symlinked"):
+            package.release_paths(self.root)
+
+    def test_package_rejects_symlinked_output_parent(self):
+        real = self.root / "real"
+        real.mkdir()
+        linked = self.root / "linked"
+        linked.symlink_to(real, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            package.validate_output_path(linked / "release.zip")
+
+
 class Documentation(unittest.TestCase):
     def test_librarian_identity_and_role_documents_are_packaged(self):
         paths = dict(package.release_paths(ROOT))
@@ -804,6 +845,16 @@ class Documentation(unittest.TestCase):
             "ROADMAP.md", "agents/librarian.md", "agents/contributions.md",
             "agents/refiner.md", "agents/coder.md",
         }.issubset(paths))
+
+    def test_retired_execution_documents_are_not_packaged(self):
+        paths = dict(package.release_paths(ROOT))
+        for name in (
+            "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
+            "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+            "docs/superpowers/specs/2026-10-20-docling-ingestion-design.md",
+            "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
+        ):
+            self.assertNotIn(name, paths)
 
     def test_relative_document_links_are_packaged(self):
         paths = dict(package.release_paths(ROOT))

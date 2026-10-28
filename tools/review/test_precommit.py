@@ -296,9 +296,6 @@ else:
             "README.md", "ROADMAP.md", "docs/decisions/0001-project-identity.md",
             "docs/decisions/0003-store-compatibility.md",
             "docs/decisions/0008-proof-of-concept-closure.md", "docs/decisions/README.md",
-            "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
-            "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
-            "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
         }
         excluded = {"docs/decisions/private.md", "tools/schemas/private.sql",
                     "tools/catalog/private.py", "tests/private.py"}
