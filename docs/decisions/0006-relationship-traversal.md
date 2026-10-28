@@ -125,8 +125,12 @@ Before any graph work starts, these must be true:
    selection could not answer, and it was recorded.
 2. The canonical evidence route for answering it is identified, so the graph
    is a navigation aid rather than an answer source.
-3. The preserved qualifiers survive the port: no inferred facts, no implied
-   support, no absence claims, stale-read refusal intact.
+3. The preserved qualifiers survive the port: no synthesized facts, no stored
+   entailments, no implied support, no absence claims, stale-read refusal
+   intact. Narrowed by [0009](0009-declared-ontology-and-entailment.md):
+   computed, premise-carrying, explicitly labelled entailment is admissible
+   inside the projection; a synthesized fact and an entailment written into an
+   authority store are not.
 4. The projection is rebuildable from the authority stores alone.
 
 ### Precondition 1 remains unsatisfied — October 21
