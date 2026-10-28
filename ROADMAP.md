@@ -1,7 +1,7 @@
 # The Librarian development and ingestion roadmap
 
 **Audience:** maintainers, operators and their agents.
-**Updated:** October 26, 2026.
+**Updated:** October 28, 2026.
 **Status:** capability inventory and proposed work, not an implementation,
 permission grant, delivery commitment or program-readiness register.
 
@@ -17,11 +17,13 @@ and engineering; and return supported discoveries to that knowledge base.
 The operator should not need to identify relevant documents before asking
 a question or refining a ticket.
 
-The October 3 data-empty extraction includes native catalog/review stores,
-verified local backups, configurable source restrictions, metadata inventory,
-Gemini TXT/ODT extraction, explicit retrieval selection, exact/compact/batched
-reads and read-only MCP. Empty initialization and source-only packaging remain
-requirements, not temporary demo limitations.
+The current data-empty toolkit includes native catalog/review stores, verified
+local backups, configurable source restrictions, metadata inventory, strict
+ordinary UTF-8 text, Gemini TXT and ODT extraction, explicitly selected strictly
+reviewed Docling text/table retrieval, exact/compact/batched reads and read-only
+MCP. The October 3 extraction established the initial data-empty baseline;
+later dated sections record subsequent increments. Empty initialization and
+source-only packaging remain requirements, not temporary demo limitations.
 
 The October 19 update names the project **The Librarian** and adds the
 [Librarian](agents/librarian.md), [ticket/refinement](agents/refiner.md),
@@ -91,10 +93,13 @@ prepare twice, verify, register and idempotent retry, with independent offline
 conversions and identical complete rendition bytes in a temporary catalog.
 The installed suite, cloned CLI/policy boundary, packaging and schema checks pass;
 whole-change review binds the exact delivered diff and passes.
-Approved toolkit-only ingestion work is complete. Renditions remain deferred:
-no automatic review, intake advancement, retrieval selection or indexing, and
-no member selection or additional formats are added. Real-document OCR accuracy
-remains unmeasured; package checks do not grant publication approval.
+Approved toolkit-only ingestion work is complete. A later approved increment
+adds explicit selection of exact-rendition, substantively reviewed Docling
+text/table records, with retained-byte/JSON-pointer/page provenance. It does
+not add automatic review, qualification, intake advancement, selection or
+indexing; unsupported content collections fail closed. No member selection or
+additional formats are added. Real-document OCR accuracy remains unmeasured;
+package checks do not grant publication approval.
 
 ## Reuse gaps identified on October 19
 
@@ -108,7 +113,7 @@ to exist in this distribution.
 | Capability | State in this repository | Required action |
 |---|---|---|
 | Three-agent collaboration and returned findings | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
-| Broader extraction | Gemini TXT and ODT only | Port ordinary TXT, DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
+| Broader extraction | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT and ODT; optional offline Docling PDF/image conversion | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
 | Archive-member and large-workbook handling | No explicit retained-member extraction selector or row-chunk engine | Port member-policy/ancestor checks and versioned XLSX chunking without automatic recursive expansion or legacy-run rewriting |
 | Bounded ingestion cohorts | No cohort driver or operation-local catalog snapshot API | Adapt `cohort.py` and `ReceiptMetadataSnapshot`; retain source/state checks, serialized writes, saved requests, explicit partial failures and backups |
 | Read-only remote discovery | No remote connector; local explicit-root inventory exists | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |

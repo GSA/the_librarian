@@ -34,6 +34,7 @@
   "tools/context_index/cli.py",
   "tools/context_index/compact_records.py",
   "tools/context_index/renditions.py",
+  "tools/context_index/qualification.py",
   "tools/context-mcp/README.md",
   "tools/context-mcp/pyproject.toml",
   "tools/context-mcp/src/the_librarian_mcp/__init__.py",

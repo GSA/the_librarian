@@ -27,8 +27,9 @@ from tools import package, policy
 from tools.catalog import catalog_store as catalog
 from tools.context_index import compact_records
 from tools.context_index import context_index as index
+from tools.context_index import qualification
 from tools.diagnostics import retrieval_log as diagnostics
-from tools.extraction import extract
+from tools.extraction import docling_bridge, extract
 from tools.review_events import event_reader
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
@@ -470,6 +471,489 @@ class WorkspaceTests(WorkspaceCase):
         with self.assertRaises(contract.ReviewError):
             events.prepare_submission(events.bundle([event]), self.root)
 
+    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast"):
+        self.registration("sources/notes.txt", raw)
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "verify", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-text-rendition",
+                       expected_state=catalog.status(self.root)["state_token"],
+                       reason="Explicit synthetic text selection")
+        self.docs()
+        self.config["renditions"] = [{"path": prepared["rendition"],
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "context": ["documents/AGENTS.md"]}]
+        self.build()
+        return prepared
+
+    def test_selected_text_round_trips_exact_lines_and_byte_locations(self):
+        prepared = self.selected_text()
+        with closing(index.readonly(self.db)) as db:
+            rows = db.execute("SELECT locator, payload FROM rendition_locations "
+                              "ORDER BY locator").fetchall()
+            self.assertEqual([row[0].rsplit("#", 1)[1] for row in rows],
+                             ["line-1", "line-2", "line-3"])
+            self.assertEqual(json.loads(rows[0][1]), {
+                "json_pointer": "/payload/lines/0", "original_line": 1,
+                "byte_start": 0, "byte_end": 7, "terminator": "crlf",
+            })
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            piece = next(piece for piece in packet["pieces"] if piece["locator"].endswith("#line-2"))
+            self.assertIn('"text": "β\\n"', piece["text"])
+            metadata = packet["renditions"][prepared["rendition"]]
+            self.assertEqual(metadata["format"], "text")
+            self.assertEqual(metadata["bom_bytes"], 0)
+            found = index.search(db, "β", 10, None)
+            self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
+            self.assertIsInstance(found["hits"][0]["line_start"], int)
+            self.assertGreaterEqual(found["hits"][0]["line_end"], found["hits"][0]["line_start"])
+            self.assertEqual(found["hits"][0]["line_basis"],
+                             "extraction-json; source_location identifies original line or XML element")
+
+    def test_selected_text_unicode_separators_keep_physical_json_line_citations(self):
+        content = "a\u0085b\u2028c\u2029d"
+        prepared = self.selected_text(content.encode("utf-8"))
+        locator = prepared["rendition"] + "#line-1"
+        with closing(index.readonly(self.db)) as db:
+            packet = index.packet(db, self.config, locator, 60000)
+        piece = next(piece for piece in packet["pieces"] if piece["locator"] == locator)
+        physical = (self.root / prepared["rendition"]).read_text().splitlines(keepends=True)
+        # splitlines() is intentionally unsuitable here; derive physical JSON
+        # lines solely from the encoder's LF bytes.
+        raw_text = (self.root / prepared["rendition"]).read_text()
+        physical = [part + "\n" for part in raw_text.split("\n")[:-1]]
+        self.assertEqual(piece["text"], "".join(physical[piece["line_start"] - 1:piece["line_end"]]))
+        self.assertIn(content, piece["text"])
+        self.assertEqual(piece["line_end"] - piece["line_start"], 6)
+
+    def test_text_rendition_refuses_inconsistent_byte_mapping(self):
+        api = index.rendition_api()
+        payload = extract.text(b"one\r\ntwo")
+        payload["lines"][1]["byte_start"] = 4
+        with self.assertRaisesRegex(index.IndexError_, "line mapping"):
+            index.renditions.validate_text_mapping(payload, b"one\r\ntwo", api)
+
+        for label, mutate in (
+            ("truncated", lambda payload: payload["lines"].pop()),
+            ("final-state", lambda payload: payload.update(ends_with_terminator=True)),
+        ):
+            payload = extract.text(b"one\ntwo")
+            mutate(payload)
+            with self.subTest(label=label), self.assertRaisesRegex(index.IndexError_, "mapping"):
+                index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+        payload = extract.text(b"one\ntwo")
+        payload.update(bom_bytes=3)
+        for record in payload["lines"]:
+            record["byte_start"] += 3
+            record["byte_end"] += 3
+        with self.assertRaisesRegex(index.IndexError_, "BOM declaration"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+        for label, lines in (
+            ("merged-lines", [{"line": 1, "text": "a\nb\n", "terminator": "lf",
+                               "byte_start": 0, "byte_end": 4}]),
+            ("split-crlf", [{"line": 1, "text": "a\r", "terminator": "cr",
+                             "byte_start": 0, "byte_end": 2},
+                            {"line": 2, "text": "\n", "terminator": "lf",
+                             "byte_start": 2, "byte_end": 3}]),
+        ):
+            payload = extract.text(b"a\nb\n" if label == "merged-lines" else b"a\r\n")
+            payload["lines"] = lines
+            with self.subTest(label=label), self.assertRaisesRegex(index.IndexError_, "physical line mapping"):
+                index.renditions.validate_text_mapping(
+                    payload, b"a\nb\n" if label == "merged-lines" else b"a\r\n", api)
+
+        payload = extract.text(b"one\ntwo")
+        payload["lines"][0]["text"] = "six\n"
+        with self.assertRaisesRegex(index.IndexError_, "mapping"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+        payload["lines"][0]["text"] = None
+        with self.assertRaisesRegex(index.IndexError_, "field types"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+    def docling_qualification_fixture(self, *, tables=False):
+        path = "data/extractions/.local/D1/" + "a" * 64 + "/extraction.json"
+        sha = "b" * 64
+        selection = {"path": path, "sha256": sha, "receipt_id": "D1", "format": "docling",
+                     "context": ["documents/README.md"], "review_event_ids": ["rev-exact"]}
+        value = {"schema": "docling-rendition-v1", "source": {
+            "receipt_id": "D1", "source_ids": ["S1"], "path": "sources/input.pdf",
+            "sha256": "c" * 64}, "conversion": {
+                "schema": "docling-rendition-v1", "format": "pdf",
+                "document": {"texts": [], "tables": [{}] if tables else []}, "pages": []}}
+        event = self.pending(path)
+        event.update(event_id="rev-exact", outcome="reviewed", reviewer="test-reviewer",
+                     reviewed_on="2026-10-28")
+        event["source"].update(parent_locator="sources/input.pdf",
+                               checksum={"sha256": sha, "basis": "reported"})
+        event["scope"].update(content=["text", "tables"] if tables else ["text"],
+                              description="Complete exact Docling rendition review.")
+        event["evidence"] = [{"kind": "agent_statement", "pointer": None,
+                              "quote": "Reviewed the complete exact retained rendition."}]
+        event["uncertainties"] = []
+        event["counts"].update(reviewed=1, pending=0)
+        return selection, value, event
+
+    def test_strict_docling_qualification_accepts_only_active_exact_file_review(self):
+        api = index.rendition_api()
+        selection, value, event = self.docling_qualification_fixture(tables=True)
+        snapshot = event_reader.Snapshot({"state_token": "d" * 64}, [event], {})
+        result = qualification.docling(selection, value, {}, snapshot, api)
+        self.assertEqual(result["policy_version"], qualification.POLICY_VERSION)
+        self.assertEqual(result["review_event_ids"], ["rev-exact"])
+        self.assertEqual(result["review_state"], "d" * 64)
+        self.assertEqual(result["reviewed_content"], ["tables", "text"])
+        text_event = deepcopy(event)
+        text_event["scope"]["content"] = ["text"]
+        table_event = deepcopy(event)
+        table_event["event_id"] = "rev-table"
+        table_event["scope"]["content"] = ["tables"]
+        split_selection = deepcopy(selection)
+        split_selection["review_event_ids"] = ["rev-exact", "rev-table"]
+        split = qualification.docling(split_selection, value, {}, event_reader.Snapshot(
+            {"state_token": "d" * 64}, [text_event, table_event], {}), api)
+        self.assertEqual(split["reviewed_content"], ["tables", "text"])
+
+        def assert_refused(label, mutate=None, *, events_=None, successors=None):
+            selected, envelope, candidate = self.docling_qualification_fixture(tables=True)
+            if mutate:
+                mutate(selected, envelope, candidate)
+            history = [candidate] if events_ is None else events_
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                qualification.docling(selected, envelope, {}, event_reader.Snapshot(
+                    {"state_token": "e" * 64}, history, successors or {}), api)
+
+        assert_refused("original-only", lambda s, v, e: e["source"].update(
+            locator=v["source"]["path"], parent_locator=None,
+            checksum={"sha256": v["source"]["sha256"], "basis": "reported"}))
+        assert_refused("wrong-receipt", lambda s, v, e: e["source"].update(receipt_id="D2"))
+        assert_refused("wrong-source", lambda s, v, e: e["source"].update(source_id="S2"))
+        assert_refused("wrong-path", lambda s, v, e: e["source"].update(locator="other.json"))
+        assert_refused("wrong-hash", lambda s, v, e: e["source"].update(
+            checksum={"sha256": "f" * 64, "basis": "reported"}))
+        assert_refused("partial", lambda s, v, e: e.update(outcome="partial"))
+        assert_refused("uncertain", lambda s, v, e: e.update(
+            uncertainties=["Table review completeness is unresolved."]))
+        assert_refused("ranged", lambda s, v, e: e["scope"].update(
+            extent="selected_ranges", unit="page", coordinates="one_based_inclusive",
+            ranges=[{"start": 1, "end": 1}]))
+        assert_refused("narrow-defined-scope", lambda s, v, e: e["scope"].update(
+            description="Only selected paragraphs of the exact retained rendition."))
+        assert_refused("missing-table-scope", lambda s, v, e: e["scope"].update(content=["text"]))
+        assert_refused("missing", events_=[])
+        _, _, superseded = self.docling_qualification_fixture(tables=True)
+        assert_refused("superseded", events_=[superseded], successors={"rev-exact": "rev-new"})
+
+    def selected_docling(self, *, missing_page=False):
+        raw_source = b"%PDF-synthetic-structural-test"
+        records, _ = self.registration("sources/input.pdf", raw_source)
+        run = "a" * 64
+        path = f"data/extractions/.local/D1/{run}/extraction.json"
+        source = {"receipt_id": "D1", "artifact_id": "A-input", "source_ids": ["S1"],
+                  "path": "sources/input.pdf", "sha256": hashlib.sha256(raw_source).hexdigest(),
+                  "bytes": len(raw_source), "audience": "source", "handling_refs": []}
+        bbox = {"l": 1, "t": 2, "r": 80, "b": 40, "coord_origin": "TOPLEFT"}
+        text_item = {"self_ref": "#/texts/0", "label": "text", "text": "Reviewed phrase",
+                     "prov": [{"page_no": 2 if missing_page else 1, "bbox": bbox}]}
+        table = {"self_ref": "#/tables/0", "label": "table",
+                 "prov": [{"page_no": 1, "bbox": bbox}], "data": {
+                     "table_cells": [{"text": "Cell", "start_row_offset_idx": 0,
+                                      "start_col_offset_idx": 0, "end_row_offset_idx": 1,
+                                      "end_col_offset_idx": 1}], "num_rows": 1, "num_cols": 1}}
+        value = {"schema": "docling-rendition-v1", "run_id": run,
+                 "extractor": {"schema_version": 1, "label": "synthetic-docling"},
+                 "source": source, "boundary": "Machine rendition; exact review still required.",
+                 "conversion": {"schema": "docling-conversion-v1", "format": "pdf",
+                                "document": {"texts": [text_item], "tables": [table]},
+                                "pages": [{"page_no": 1, "width": 100, "height": 100,
+                                           "textless": False}],
+                                "warnings": [{"code": "low_confidence", "message": "Synthetic warning"}],
+                                "confidence": {"layout": 0.75},
+                                "omissions": ["generated_page_images"]}}
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        rendition = self.root / path
+        rendition.parent.mkdir(parents=True)
+        rendition.write_bytes(raw)
+        registered_value = deepcopy(value)
+        registered_value["canonical_bytes"] = raw
+        catalog.submit(self.root, docling_bridge.registration_records(
+            self.root, records[2], rendition, registered_value), actor="test-runner",
+            request_id="register-docling", expected_state=catalog.status(self.root)["state_token"],
+            reason="Synthetic Docling registration")
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["id"] == "A-docling-" + run)
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-docling",
+                       expected_state=catalog.status(self.root)["state_token"],
+                       reason="Explicit synthetic Docling selection")
+        event = self.pending(path)
+        event.update(event_id="rev-exact", outcome="reviewed", reviewer="test-reviewer",
+                     reviewed_on=datetime.now(timezone.utc).date().isoformat())
+        event["source"].update(parent_locator=source["path"],
+                               checksum={"sha256": hashlib.sha256(raw).hexdigest(),
+                                         "basis": "reported"})
+        event["scope"].update(content=["text", "tables"],
+                              description="Complete exact Docling rendition review.")
+        event["evidence"] = [{"kind": "agent_statement", "pointer": None,
+                              "quote": "Reviewed the complete exact retained rendition."}]
+        event["uncertainties"] = []
+        event["counts"].update(reviewed=1, pending=0)
+        events.initialize(self.root)
+        events.append(self.root, events.bundle([event]), "test-reviewer", "req-review-docling", 0,
+                      events.status(self.root)["state_token"])
+        self.docs()
+        self.config["renditions"] = [{"path": path, "sha256": hashlib.sha256(raw).hexdigest(),
+                                     "receipt_id": "D1", "format": "docling",
+                                     "context": ["documents/AGENTS.md"],
+                                     "review_event_ids": ["rev-exact"]}]
+        return path, value
+
+    def test_selected_docling_builds_exact_text_and_table_records(self):
+        path, value = self.selected_docling()
+        self.build()
+        with closing(index.readonly(self.db)) as db:
+            rows = db.execute("SELECT locator,payload FROM rendition_locations ORDER BY locator").fetchall()
+            self.assertEqual([row[0] for row in rows], [path + "#table-1", path + "#text-1"])
+            text_packet = index.packet(db, self.config, path + "#text-1", 60000)
+            text_piece = next(piece for piece in text_packet["pieces"]
+                              if piece["locator"] == path + "#text-1")
+            self.assertEqual(json.loads(text_piece["text"]), value["conversion"]["document"]["texts"][0])
+            self.assertIsNone(text_piece["line_start"])
+            self.assertIsNone(text_piece["line_end"])
+            rendition_raw = (self.root / path).read_bytes()
+            text_location = text_piece["source_location"]
+            self.assertEqual(text_piece["text"].encode(),
+                             rendition_raw[text_location["byte_start"]:text_location["byte_end"]])
+            table_packet = index.packet(db, self.config, path + "#table-1", 60000)
+            table_piece = next(piece for piece in table_packet["pieces"]
+                               if piece["locator"] == path + "#table-1")
+            self.assertEqual(json.loads(table_piece["text"]), value["conversion"]["document"]["tables"][0])
+            location = json.loads(dict(rows)[path + "#table-1"])
+            self.assertEqual(table_piece["text"].encode(),
+                             rendition_raw[location["byte_start"]:location["byte_end"]])
+            self.assertIsNone(table_piece["line_start"])
+            self.assertIsNone(table_piece["line_end"])
+            self.assertEqual(location["page_no"], 1)
+            self.assertEqual(location["json_pointer"], "/conversion/document/tables/0")
+            hit = index.search(db, "Reviewed phrase", 10, None)["hits"][0]
+            self.assertEqual(hit["locator"], path + "#text-1")
+            self.assertIsNone(hit["line_start"])
+            self.assertIsNone(hit["line_end"])
+            self.assertEqual(hit["source_location"], text_location)
+            self.assertEqual(hit["line_basis"], "retained-extraction-byte-range-and-json-pointer")
+            self.assertEqual(text_packet["renditions"][path]["qualification"]["review_event_ids"],
+                             ["rev-exact"])
+            self.assertEqual(text_packet["renditions"][path]["warnings"],
+                             value["conversion"]["warnings"])
+            self.assertEqual(text_packet["renditions"][path]["confidence"],
+                             value["conversion"]["confidence"])
+            self.assertEqual(text_packet["renditions"][path]["omissions"],
+                             value["conversion"]["omissions"])
+            # A broad context rule attached to the table must not leak into a
+            # packet for the distinct non-line-based text record.
+            self.config["context_rules"] = {path + "#table-1": ["documents/README.md"]}
+            isolated = index.packet(db, self.config, path + "#text-1", 60000)
+            self.assertNotIn("documents/README.md", {piece["path"] for piece in isolated["pieces"]})
+            self.assertIn("null", text_packet["renditions"][path]["citation_contract"])
+            self.assertIn("byte", text_packet["renditions"][path]["citation_contract"])
+
+    def test_malformed_docling_page_and_bbox_geometry_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        base = json.loads(rendition.read_text())
+        before = self.db.read_bytes()
+        bbox = lambda value: value["conversion"]["document"]["texts"][0]["prov"][0]["bbox"]
+        for label, mutate in (
+            ("negative", lambda value: bbox(value).update(l=-1)),
+            ("inverted", lambda value: bbox(value).update(l=60, r=40)),
+            ("outside", lambda value: bbox(value).update(r=101)),
+            ("nonfinite", lambda value: bbox(value).update(l=float("nan"))),
+            ("oversized-coordinate", lambda value: bbox(value).update(r=10 ** 1000)),
+            ("non-object", lambda value: value["conversion"]["document"]["texts"][0]
+             ["prov"][0].update(bbox=[])),
+            ("bad-page-width", lambda value: value["conversion"]["pages"][0].update(width=-1)),
+            ("oversized-page-width", lambda value: value["conversion"]["pages"][0]
+             .update(width=10 ** 1000)),
+            ("finite-excessive-page-width", lambda value: value["conversion"]["pages"][0]
+             .update(width=1e308)),
+            ("excessive-page-count", lambda value: value["conversion"].update(
+                pages=[{"page_no": number, "width": 1, "height": 1, "textless": True}
+                       for number in range(1, 102)])),
+            ("noncanonical-pages", lambda value: value["conversion"]["pages"][0].update(page_no=2)),
+        ):
+            value = deepcopy(base)
+            mutate(value)
+            raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                   + "\n").encode()
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_excessive_docling_record_count_is_refused(self):
+        _, value, _ = self.docling_qualification_fixture()
+        value["conversion"].update(
+            schema="docling-conversion-v1", format="pdf",
+            pages=[{"page_no": 1, "width": 1, "height": 1}],
+            warnings=[], confidence={}, omissions=[])
+        value["conversion"]["document"]["texts"] = [None] * (
+            index.renditions.DOCLING_MAX_RECORDS + 1)
+        with self.assertRaisesRegex(index.IndexError_, "record count"):
+            list(index.renditions.records(b"{}", value, index.rendition_api()))
+
+    def test_malformed_docling_table_geometry_and_label_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        base = json.loads(rendition.read_text())
+        before = self.db.read_bytes()
+        for label, mutate in (
+            ("geometry", lambda value: value["conversion"]["document"]["tables"][0]
+             ["data"]["table_cells"][0].update(start_row_offset_idx=5, end_row_offset_idx=6)),
+            ("label", lambda value: value["conversion"]["document"]["texts"][0].update(label={})),
+        ):
+            value = deepcopy(base)
+            mutate(value)
+            raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                   + "\n").encode()
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_unsupported_docling_content_collection_preserves_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        value = json.loads(rendition.read_text())
+        value["conversion"]["document"]["key_value_items"] = [{"self_ref": "#/key_value_items/0"}]
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "unsupported content"):
+            list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_malformed_docling_warnings_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        value = json.loads(rendition.read_text())
+        value["conversion"]["warnings"] = "not-a-list"
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "warnings"):
+            list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_unknown_docling_conversion_schema_preserves_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        value = json.loads(rendition.read_text())
+        value["conversion"]["schema"] = "docling-conversion-v2"
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        # Exercise the parser atomically without weakening catalog/hash checks.
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "conversion schema"):
+            list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_docling_missing_page_preserves_prior_index(self):
+        self.selected_docling(missing_page=True)
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "page provenance"):
+            self.build()
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_docling_mid_build_review_change_preserves_prior_index(self):
+        # Build-start qualification sees the active event; the publication
+        # recheck must observe the newer successor map and refuse replacement.
+        self.selected_docling()
+        before = self.db.read_bytes()
+        active = event_reader.read_snapshot(self.root)
+        changed = event_reader.Snapshot({**active.state, "state_token": "f" * 64},
+                                        active.events, {"rev-exact": "rev-correction"})
+        with patch.object(event_reader, "read_snapshot", side_effect=[active, changed]):
+            with self.assertRaisesRegex(index.IndexError_, "missing or superseded"):
+                self.build()
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_qualification_code_is_bound_into_engine_fingerprint(self):
+        qualification_path = ROOT / "tools/context_index/qualification.py"
+        before = index.engine_fingerprint()
+        paths = [Path(index.__file__), ROOT / "tools/context_index/compact_records.py",
+                 ROOT / "tools/context_index/renditions.py", qualification_path,
+                 Path(policy.__file__)]
+        contents = {path: path.read_bytes() for path in paths}
+        with patch.object(Path, "read_bytes", autospec=True,
+                          side_effect=lambda path: contents[path]
+                          + (b"# changed" if path == qualification_path else b"")):
+            self.assertNotEqual(index.engine_fingerprint(), before)
+
+    def test_docling_review_state_binds_freshness_and_failed_rebuild_preserves_index(self):
+        selection, value, event = self.docling_qualification_fixture()
+        api = index.rendition_api()
+        first = qualification.docling(selection, value, {}, event_reader.Snapshot(
+            {"state_token": "1" * 64}, [event], {}), api)
+        second = qualification.docling(selection, value, {}, event_reader.Snapshot(
+            {"state_token": "2" * 64}, [event], {}), api)
+        self.assertNotEqual(
+            index.metadata_expected(self.root, "manifest", rendition_identity=api.digest(
+                json.dumps(first, sort_keys=True).encode())),
+            index.metadata_expected(self.root, "manifest", rendition_identity=api.digest(
+                json.dumps(second, sort_keys=True).encode())))
+
+        self.docs()
+        before = self.db.read_bytes()
+        config, manifest_hash = index.load_manifest(self.manifest)
+        with patch.object(index.renditions, "inputs", side_effect=index.IndexError_(
+                "Configured Docling review event is missing or superseded")):
+            with self.assertRaisesRegex(index.IndexError_, "missing or superseded"):
+                index.build(self.root, self.manifest, self.db, config, manifest_hash)
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_docling_selection_requires_explicit_unique_review_events(self):
+        api = index.rendition_api()
+        base = {"path": "data/extractions/.local/D1/" + "a" * 64 + "/extraction.json",
+                "sha256": "b" * 64, "receipt_id": "D1", "format": "docling",
+                "context": ["documents/README.md"], "review_event_ids": ["rev-exact"]}
+        index.renditions.validate({"renditions": [base]}, api)
+        for review_ids in ([], ["rev-exact", "rev-exact"], [1], [{}]):
+            invalid = deepcopy(base)
+            invalid["review_event_ids"] = review_ids
+            with self.subTest(review_ids=review_ids), self.assertRaises(index.IndexError_):
+                index.renditions.validate({"renditions": [invalid]}, api)
+        invalid = deepcopy(base)
+        invalid["format"] = "text"
+        with self.assertRaises(index.IndexError_):
+            index.renditions.validate({"renditions": [invalid]}, api)
+
+    def test_selected_empty_text_is_refused_without_replacing_index(self):
+        self.docs()
+        preserved = self.db.read_bytes()
+        self.config["renditions"] = []
+        # Build the empty rendition lifecycle in a fresh workspace state would
+        # duplicate the same receipt IDs, so use the current empty selection as
+        # the prior index and then register the zero-record source.
+        self.registration("sources/empty.txt", b"\xef\xbb\xbf")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-empty-text",
+                       expected_state=catalog.status(self.root)["state_token"], reason="Synthetic empty selection")
+        self.config["renditions"] = [{"path": prepared["rendition"],
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "context": ["documents/AGENTS.md"]}]
+        with self.assertRaisesRegex(index.IndexError_, "no retrievable records"):
+            self.build()
+        self.assertEqual(self.db.read_bytes(), preserved)
+
     def selected_odt(self):
         text = (ROOT / "AGENTS.md").read_text()
         content = ('<office:document-content xmlns:office="' + extract.NS["office"] +
@@ -545,6 +1029,88 @@ class WorkspaceTests(WorkspaceCase):
         self.build()
         with closing(index.readonly(self.db)) as db:
             self.assertTrue(index.packet(db, self.config, locator, 60000)["pieces"])
+
+    def test_text_extraction_contract(self):
+        raw = b"\xef\xbb\xbfalpha\r\n\r\n\xce\xb2\nlast\r"
+        self.assertEqual(extract.text(raw), {
+            "format": "text",
+            "scope": "all supplied UTF-8 text, byte-mapped without line-ending normalization",
+            "bom_bytes": 3,
+            "ends_with_terminator": True,
+            "lines": [
+                {"line": 1, "text": "alpha\r\n", "terminator": "crlf",
+                 "byte_start": 3, "byte_end": 10},
+                {"line": 2, "text": "\r\n", "terminator": "crlf",
+                 "byte_start": 10, "byte_end": 12},
+                {"line": 3, "text": "β\n", "terminator": "lf",
+                 "byte_start": 12, "byte_end": 15},
+                {"line": 4, "text": "last\r", "terminator": "cr",
+                 "byte_start": 15, "byte_end": 20},
+            ],
+            "warnings": ["Strict UTF-8 text decoding only; successful decoding is not review or qualification."],
+        })
+        self.assertEqual(extract.text(b"one\ntwo")["lines"][-1],
+                         {"line": 2, "text": "two", "terminator": "none",
+                          "byte_start": 4, "byte_end": 7})
+        self.assertFalse(extract.text(b"one\ntwo")["ends_with_terminator"])
+        unicode_separators = "a\u0085b\u2028c\u2029d".encode("utf-8")
+        self.assertEqual(extract.text(unicode_separators)["lines"], [
+            {"line": 1, "text": "a\u0085b\u2028c\u2029d", "terminator": "none",
+             "byte_start": 0, "byte_end": len(unicode_separators)},
+        ])
+        self.assertEqual(extract.text(b"")["lines"], [])
+        self.assertEqual(extract.text(b"\xef\xbb\xbf")["lines"], [])
+        for raw in (b"\xff", b"\xc3(", b"\xff\xfeA\x00", b"\xfe\xff\x00A",
+                    b"\xff\xfe\x00\x00A\x00\x00\x00", b"\x00\x00\xfe\xff\x00\x00\x00A",
+                    b"valid\x00text"):
+            with self.subTest(raw=raw), self.assertRaises(extract.ExtractionError):
+                extract.text(raw)
+        with self.assertRaisesRegex(extract.ExtractionError, "line record limit"):
+            extract.text(b"x\n" * (extract.MAX_ELEMENTS + 1))
+        with patch.object(extract, "MAX_EXPANDED", 100):
+            with self.assertRaisesRegex(extract.ExtractionError, "rendition exceeds output limit"):
+                extract.text(b"one\ntwo\n")
+
+    def test_text_extraction_lifecycle_is_deferred_and_idempotent(self):
+        raw = b"first\r\n\xce\xb2\nlast"
+        self.registration("sources/notes.txt", raw)
+        source_before = (self.root / "sources/notes.txt").read_bytes()
+        events.initialize(self.root)
+        review_before = events.status(self.root)["state_token"]
+        manifest_before = self.manifest.read_bytes()
+
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        repeated = extract.run(self.root, "prepare", "D1", "text")
+        self.assertTrue(prepared["created"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(extract.run(self.root, "verify", "D1", "text")["run_id"],
+                         prepared["run_id"])
+        state = catalog.status(self.root)["state_token"]
+        registered = extract.run(self.root, "register", "D1", "text", "test-runner", state)
+        retry = extract.run(self.root, "register", "D1", "text", "test-runner", state)
+        self.assertTrue(registered["registered"])
+        self.assertTrue(retry["idempotent"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        self.assertEqual(child["data"]["coverage"], "deferred")
+        self.assertEqual(child["data"]["sha256"], prepared["rendition_sha256"])
+        self.assertEqual((self.root / "sources/notes.txt").read_bytes(), source_before)
+        self.assertEqual(events.status(self.root)["state_token"], review_before)
+        self.assertEqual(self.manifest.read_bytes(), manifest_before)
+
+    def test_text_lifecycle_refuses_changed_source_and_conflicting_publication(self):
+        self.registration("sources/notes.txt", b"stable\n")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        source = self.root / "sources/notes.txt"
+        source.write_bytes(b"changed\n")
+        with self.assertRaisesRegex(extract.ExtractionError, "catalog hash"):
+            extract.run(self.root, "verify", "D1", "text")
+        source.write_bytes(b"stable\n")
+        rendition = self.root / prepared["rendition"]
+        rendition.write_bytes(b"conflicting bytes")
+        with self.assertRaisesRegex(extract.ExtractionError, "differs from repeat extraction"):
+            extract.run(self.root, "verify", "D1", "text")
+        self.assertEqual(rendition.read_bytes(), b"conflicting bytes")
 
     def test_transcript_dictionary_and_xml_rejection(self):
         text = (ROOT / "AGENTS.md").read_text().splitlines()[0]
