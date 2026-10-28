@@ -2,6 +2,7 @@
 
 **Audience:** maintainers and operators.
 **Date:** October 21, 2026. Embedded-candidate facts checked October 22, 2026.
+Upstream edge extraction separated October 23, 2026.
 **Status:** Open. No graph capability exists in this repository. This document
 records the evaluation and what would have to be true before adding one.
 
@@ -128,6 +129,9 @@ Before any graph work starts, these must be true:
 3. The preserved qualifiers survive the port: no inferred facts, no implied
    support, no absence claims, stale-read refusal intact.
 4. The projection is rebuildable from the authority stores alone.
+5. Every edge the projection would carry has an identified origin: extracted
+   from an authority store this instance owns, or attributed to a named
+   ingested artifact. An edge with neither is not projected.
 
 ### Precondition 1 remains unsatisfied — October 21
 
@@ -155,6 +159,78 @@ A graph engine is reconsidered only if a recorded use case needs multi-hop
 path queries that a bounded recursive CTE cannot express, at a scale where
 SQLite measurably fails — and then with an explicit answer for backup,
 recovery, authorization, concurrency and per-instance operational cost.
+
+## Upstream edge extraction is a separate question — October 23
+
+The evaluation above concerns **where traversable relationships are stored and
+queried**. It does not concern **where candidate edges come from**, and
+conflating the two produces bad decisions in both directions. This section
+separates them.
+
+A derived projection over authority stores can only project relationships those
+stores already record: containment, cross-reference, review linkage. It cannot
+produce intra-artifact structure — the symbols inside a source file, the calls
+and imports between them, or module groupings — because no authority store in
+this design holds that information. An unfamiliar code corpus is exactly the
+case where that structure is the useful part and where exact reads and lexical
+search are weakest.
+
+That gap is an **ingestion** question, governed by
+[0005](0005-source-onboarding.md), not a storage-engine question governed here.
+A third-party static-analysis or code-graph extractor is a candidate producer of
+such edges. Adopting one changes what relationships exist to be read; it does
+not change how traversal should be stored or queried, and it relieves no
+precondition above.
+
+### Rules for ingested extractor output
+
+An external extractor's output is **an ingested artifact with its own receipt
+and attribution**, never a relationship layer this software vouches for. The
+constraints are the ordinary source-handling ones, stated here because the
+temptation to treat graph-shaped input as infrastructure is specific and strong:
+
+- **Register it, do not install it.** Extractor output enters through the inbox
+  and the supported catalog writer like any other document. It does not become
+  catalog, review or selection state because it happens to describe structure.
+- **Attribute every edge to the tool and its run.** An extracted edge is a
+  third party's assertion about an artifact, carrying its generator identity,
+  version and run time. It is not this instance's finding.
+- **Keep extracted and inferred nodes distinguishable.** Extractors that pair
+  symbol extraction with model-synthesized abstractions — concept, rationale,
+  theme and similar classes — mix two evidentiary grades in one file. The
+  synthesized classes are inference: barred from the projection by precondition
+  3, and barred from presentation as recorded structure.
+- **Treat a cited-but-absent companion artifact as an unresolved source flag.**
+  Node indexes, edge files and summary reports are often delivered separately,
+  and a delivery missing the edge file yields analysis prose whose structural
+  claims cite something no reader can open. Record the gap against the receipt;
+  do not resolve it by inference, and do not restate the prose's claims as
+  established.
+- **Absent edges are not absent relationships.** This is the existing
+  no-absence-claims qualifier applied to partial extractor coverage: an
+  extractor's silence about a connection is silence, including when its own
+  input was incomplete.
+- **Running an extractor locally is a dependency decision.** License, release
+  cadence, platform and pinnability must satisfy
+  [0002](0002-updateable-distribution.md) before this software invokes any
+  extractor, independently of whether its output is acceptable as a source.
+  Ingesting output someone else produced carries no such obligation, because
+  nothing is installed.
+
+### What this does and does not settle
+
+Ingesting extractor output is permitted under 0005 today and needs no decision
+here. It does **not** satisfy precondition 1: a missing or unavailable upstream
+artifact is a source-delivery gap, not a recorded question that reads, search
+and selection failed to answer. Richer available edges may eventually produce a
+real traversal question, which would then be recorded on its own terms.
+
+The October 21 finding still governs the storage side: interface expressiveness,
+not storage engine, was the limiting factor where a projection actually exists.
+A larger candidate edge set changes neither that conclusion nor the scale
+argument — an order of magnitude more nodes than the prototype characterized
+above remains small for an indexed SQLite edge table under bounded recursive
+traversal.
 
 ## Consequences of leaving this open
 
