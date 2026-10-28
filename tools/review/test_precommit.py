@@ -162,6 +162,21 @@ else:
         self.assertEqual(index, (self.root / ".git/index").read_bytes())
         self.assertIn("selected staged technical scope ONLY", result.stdout)
 
+    def test_replacement_refs_cannot_substitute_reviewed_bytes(self):
+        self.stage(text="REAL = 'reviewed'\n")
+        real = self.git("rev-parse", ":" + SOURCE).stdout.decode().strip()
+        decoy = self.root / ".local/decoy"
+        decoy.parent.mkdir(parents=True, exist_ok=True)
+        decoy.write_text("DECOY = 'substituted'\n")
+        substitute = self.git("hash-object", "-w", "--", str(decoy)).stdout.decode().strip()
+        self.assertNotEqual(real, substitute)
+        self.git("replace", "--force", real, substitute)
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = self.observed()
+        self.assertEqual(data["files"][SOURCE], "REAL = 'reviewed'\n")
+        self.assertNotIn("DECOY", data["diff"])
+
     def fixture_attributes(self, value):
         path = self.home / ".config/git/attributes"
         path.parent.mkdir(parents=True, exist_ok=True)

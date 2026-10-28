@@ -61,6 +61,10 @@ def environment(source=False):
         "HOME": os.path.expanduser("~"),
         "PATH": os.defpath,
         "LANG": "C.UTF-8",
+        # Replacement refs rewrite object reads without changing the index or
+        # HEAD, so a staged blob could be reviewed as substituted bytes while
+        # the real bytes commit. Bind every read to true object content.
+        "GIT_NO_REPLACE_OBJECTS": "1",
     }
     if source:
         # Git supplies a temporary index for partial commits. Read it, do not
