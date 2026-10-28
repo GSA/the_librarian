@@ -51,6 +51,41 @@ class PackageLayoutTests(unittest.TestCase):
                 self.assertTrue(Path(module.__file__).resolve().is_relative_to(ROOT / "tools"))
         self.assertEqual(sys.path, before)
 
+    def test_contracts_and_index_engine_avoid_adapter_dependencies(self):
+        code = (
+            "import sys; "
+            "import tools.catalog.contracts; "
+            "assert 'sqlite3' not in sys.modules; "
+            "import tools.context_index.context_index; "
+            "assert 'argparse' not in sys.modules"
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", code], cwd=ROOT,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_context_cli_and_transitional_module_expose_same_commands(self):
+        outputs = []
+        for name in ("tools.context_index.cli", "tools.context_index.context_index"):
+            result = subprocess.run(
+                [sys.executable, "-m", name, "--help"], cwd=ROOT,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(result.stdout)
+        for command in ("build", "status", "search", "get", "get-many", "catalog"):
+            self.assertTrue(all(command in output for output in outputs), command)
+
+    def test_context_cli_formats_engine_failures_without_traceback(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "tools.context_index.cli", "--root", "/missing", "status"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("context-index:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_operator_modules_expose_help(self):
         for name in self.MODULES:
             with self.subTest(module=name):

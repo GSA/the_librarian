@@ -40,8 +40,10 @@ class Config:
             self.toolkit_root / "tools/__init__.py",
             self.toolkit_root / "tools/context_index/__init__.py",
             self.toolkit_root / "tools/context_index/context_index.py",
+            self.toolkit_root / "tools/context_index/cli.py",
             self.toolkit_root / "tools/review_events/event_reader.py",
             self.toolkit_root / "tools/catalog/catalog_store.py",
+            self.toolkit_root / "tools/catalog/contracts.py",
         )
         if not all(path.is_file() for path in required):
             raise ValueError("--root must identify a complete trusted toolkit clone")

@@ -122,7 +122,7 @@ Run toolkit commands from the clone root with `python -m`; each supports `--help
 | `python -m tools.review_events.event_reader` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
 | `python -m tools.extraction.extract` | Registered Gemini-format UTF-8 transcript/ODT extraction, verification and separate metadata registration |
 | `python -m tools.extraction.docling_extract` | Optional offline PDF/image Docling prepare, repeat verification and separate deferred-rendition registration |
-| `python -m tools.context_index.context_index` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
+| `python -m tools.context_index.cli` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
 | `librarian-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |
 

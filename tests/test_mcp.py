@@ -26,6 +26,15 @@ class MCPConfig(unittest.TestCase):
         self.assertEqual(config.event_module, "tools.review_events.event_reader")
         self.assertEqual(config.diagnostics_path, ROOT / "tools/diagnostics/retrieval_log.py")
 
+    def test_incomplete_clone_missing_new_dependencies_is_rejected(self):
+        for missing in ("tools/context_index/cli.py", "tools/catalog/contracts.py"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "kit"
+                clone(root)
+                (root / missing).unlink()
+                with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
+                    Config(root=root)
+
     def test_other_root_cannot_shadow_trusted_modules(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
