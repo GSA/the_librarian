@@ -2,6 +2,7 @@
 """Activate this installation's pre-commit gate using local Git config only."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
@@ -55,7 +56,7 @@ def install(root, launcher):
     for key in (LAUNCHER_KEY, "core.hooksPath"):
         if key in pending:
             git(root, "config", "--local", "--add", key, pending[key])
-    print("Installed repository-local pre-commit gate; existing hooks/config were not replaced.")
+    return {"installed": True, "hooks_path": ".githooks"}
 
 
 def parser():
@@ -68,10 +69,10 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        install(repository_root(args.root), args.launcher)
+        print(json.dumps(install(repository_root(args.root), args.launcher), sort_keys=True))
         return 0
     except (GateError, OSError, ValueError) as error:
-        print(f"INSTALL REFUSED: {error}", file=sys.stderr)
+        print(f"install-hooks: {error}", file=sys.stderr)
         return 1
 
 

@@ -866,8 +866,9 @@ class Documentation(unittest.TestCase):
                     prefix = path.rstrip("/") + "/"
                     self.assertTrue(path in manifest or any(item.startswith(prefix) for item in manifest), path)
         modules = set(re.findall(
-            r"(?m)^\s*(?:\.venv/bin/)?python\d* -m ([a-zA-Z0-9_.]+)", readme
+            r"(?:\.venv/bin/)?python\d* -m ([a-zA-Z0-9_.]+)", readme
         ))
+        self.assertIn("tools.catalog.catalog_store", modules)
         for module in modules - {"pip", "venv"}:
             with self.subTest(module=module):
                 result = subprocess.run(

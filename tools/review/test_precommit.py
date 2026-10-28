@@ -632,6 +632,10 @@ else:
         for _ in range(2):
             result = self.installer()
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                {"installed": True, "hooks_path": ".githooks"},
+            )
         self.assertEqual(global_config.read_bytes(), before)
         self.assertEqual(self.git("config", "--local", "--get", "core.hooksPath").stdout.strip(),
                          b".githooks")
@@ -646,7 +650,9 @@ else:
                 path.write_text("#!/bin/sh\nexit 17\n")
                 path.chmod(0o700)
                 before = (self.root / ".git/config").read_bytes()
-                self.assert_blocked(self.installer(), "existing hook")
+                result = self.installer()
+                self.assert_blocked(result, "existing hook")
+                self.assertTrue(result.stderr.startswith("install-hooks: "), result.stderr)
                 self.assertEqual(path.read_text(), "#!/bin/sh\nexit 17\n")
                 self.assertEqual((self.root / ".git/config").read_bytes(), before)
                 path.unlink()
