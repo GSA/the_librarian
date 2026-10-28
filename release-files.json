@@ -21,6 +21,7 @@
   "docs/superpowers/specs/2026-10-20-docling-ingestion-design.md",
   "release-files.json",
   "tests/test_kit.py",
+  "tests/support.py",
   "tests/test_mcp.py",
   "tools/__init__.py",
   "tools/policy.py",

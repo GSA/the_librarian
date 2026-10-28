@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "tools/context-mcp/src"))
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from tests.test_kit import clone
+from tests.support import clone_release
 from the_librarian_mcp.config import Config, parser
 
 
@@ -30,7 +30,7 @@ class MCPConfig(unittest.TestCase):
         for missing in ("tools/context_index/cli.py", "tools/catalog/contracts.py"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve() / "kit"
-                clone(root)
+                clone_release(root)
                 (root / missing).unlink()
                 with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
                     Config(root=root)
@@ -54,7 +54,7 @@ class MCP(unittest.IsolatedAsyncioTestCase):
     async def test_empty_service(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "kit"
-            clone(root)
+            clone_release(root)
             setup = subprocess.run([sys.executable, str(root / "tools/initialize.py")],
                                    capture_output=True, text=True)
             self.assertEqual(setup.returncode, 0, setup.stderr)
@@ -88,7 +88,7 @@ class MCP(unittest.IsolatedAsyncioTestCase):
     async def test_opt_in_diagnostics_record_absence_without_the_query(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "kit"
-            clone(root)
+            clone_release(root)
             setup = subprocess.run([sys.executable, str(root / "tools/initialize.py")],
                                    capture_output=True, text=True)
             self.assertEqual(setup.returncode, 0, setup.stderr)
@@ -129,7 +129,7 @@ class MCP(unittest.IsolatedAsyncioTestCase):
         """A successful get is counted as a bare event, with no locator in the log."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "kit"
-            clone(root)
+            clone_release(root)
             (root / "documents").mkdir(parents=True, exist_ok=True)
             (root / "documents/guide.md").write_text(
                 "# Guide\n\n## Overview\n\nzzuniquesubject material for retrieval.\n")
@@ -175,7 +175,7 @@ class MCP(unittest.IsolatedAsyncioTestCase):
     async def test_diagnostics_stay_off_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "kit"
-            clone(root)
+            clone_release(root)
             subprocess.run([sys.executable, str(root / "tools/initialize.py")],
                            capture_output=True, text=True, check=True)
             parameters = StdioServerParameters(

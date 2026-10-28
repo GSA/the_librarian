@@ -32,6 +32,7 @@ from tools.extraction import extract
 from tools.review_events import event_reader
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
+from tests.support import clone_release
 
 
 class PackageLayoutTests(unittest.TestCase):
@@ -97,11 +98,27 @@ class PackageLayoutTests(unittest.TestCase):
                 self.assertIn("usage:", result.stdout.lower())
 
 
-def clone(destination):
-    for name, source in package.release_paths(ROOT):
-        target = destination / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_workspace_scenarios_are_not_inherited_by_absence_tests(self):
+        def flatten(suite):
+            for test in suite:
+                if isinstance(test, unittest.TestSuite):
+                    yield from flatten(test)
+                else:
+                    yield test.id()
+
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
+        ids = list(flatten(suite))
+        workspace = {name.rsplit(".", 1)[-1] for name in ids if ".WorkspaceTests." in name}
+        absence = {name.rsplit(".", 1)[-1] for name in ids if ".AbsenceClassificationTests." in name}
+        self.assertFalse(workspace & absence)
+        worker_modules = {
+            name.rsplit(".", 2)[0] for name in ids
+            if "docling_worker_contract_tests." in name
+        }
+        self.assertEqual(worker_modules, {"docling_worker_contract_tests"})
 
 
 class StoreIdentity(unittest.TestCase):
@@ -135,7 +152,7 @@ class DoclingCleanCopy(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.kit = self.root / "kit"
         self.kit.mkdir()
-        clone(self.kit)
+        clone_release(self.kit)
 
     def test_clean_copy_contains_installable_review_gate(self):
         required = {".githooks/pre-commit", "tools/review/roborev_precommit.py",
@@ -254,7 +271,7 @@ print(json.dumps({'prepared':prepared['created'],'registered':registered['regist
         self.assertTrue(any(value.startswith("A-docling-") for value in result["records"]))
 
 
-class Workspace(unittest.TestCase):
+class WorkspaceCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -335,6 +352,9 @@ class Workspace(unittest.TestCase):
             "relationships": [], "supersedes": [], "correction_reason": None,
         }
 
+
+
+class WorkspaceTests(WorkspaceCase):
     def test_empty_initialization(self):
         self.assertEqual(catalog.initialize(self.root)["records"], 0)
         self.assertEqual(events.initialize(self.root)["events"], 0)
@@ -539,7 +559,7 @@ class Workspace(unittest.TestCase):
             extract.xml(b'<!DOCTYPE x><x/>', "content.xml")
 
     def test_initialize_refuses_an_unmigrated_legacy_index(self):
-        clone(self.root / "kit")
+        clone_release(self.root / "kit")
         kit = self.root / "kit"
         legacy = kit / "tools/context-index/.local/index.sqlite3"
         legacy.parent.mkdir(parents=True)
@@ -555,7 +575,7 @@ class Workspace(unittest.TestCase):
         self.assertFalse((kit / ".local/review-events").exists())
 
     def test_clean_copy_and_policy_freshness(self):
-        clone(self.root / "kit")
+        clone_release(self.root / "kit")
         kit = self.root / "kit"
         def run(*args):
             result = subprocess.run([sys.executable, *args], cwd=kit, capture_output=True, text=True)
@@ -576,7 +596,7 @@ class Workspace(unittest.TestCase):
             self.assertNotIn("config/policy.local.json", archive.namelist())
 
 
-class AbsenceClassification(Workspace):
+class AbsenceClassificationTests(WorkspaceCase):
     """A zero-result search must explain itself without quoting the corpus."""
 
     def corpus(self, documents):

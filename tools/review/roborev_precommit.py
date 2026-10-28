@@ -28,6 +28,7 @@ ALLOWLIST = frozenset({
     "tests/test_docling.py",
     "tests/test_worker_contracts.py",
     "tests/test_kit.py",
+    "tests/support.py",
     "tests/test_mcp.py",
     "tools/__init__.py",
     "tools/catalog/__init__.py",
