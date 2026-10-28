@@ -1,5 +1,6 @@
 """Initialize missing empty stores; validate existing stores without replacing them."""
 
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -19,7 +20,12 @@ def command(module, action):
     return json.loads(result.stdout)
 
 
-def main():
+def parser():
+    return argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+
+
+def main(argv=None):
+    parser().parse_args(argv)
     try:
         legacy = ROOT / "tools/context-index/.local/index.sqlite3"
         if legacy.exists() or legacy.is_symlink():

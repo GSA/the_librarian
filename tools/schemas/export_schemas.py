@@ -45,10 +45,14 @@ def snapshot(source: Path, symbol: str, version_symbol: str) -> str:
     )
 
 
+def parser():
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    value.add_argument("--check", action="store_true", help="Fail if any tracked snapshot is missing or stale")
+    return value
+
+
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Fail if any tracked snapshot is missing or stale")
-    args = parser.parse_args(argv)
+    args = parser().parse_args(argv)
     try:
         expected = {
             name: snapshot(ROOT / path, symbol, version)
@@ -68,7 +72,7 @@ def main(argv=None) -> int:
             print("Schema snapshots missing or stale: " + ", ".join(changed), file=sys.stderr)
         return 0 if ok else 1
     except (OSError, UnicodeError, SyntaxError, ValueError, KeyError, ImportError) as error:
-        print(f"Schema snapshot failure: {error}", file=sys.stderr)
+        print(f"schema-snapshots: {error}", file=sys.stderr)
         return 1
 
 

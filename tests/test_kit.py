@@ -796,6 +796,25 @@ class RetrievalDiagnostics(unittest.TestCase):
                 diagnostics.log_path(self.root, value)
 
 
+class ScriptConventionTests(unittest.TestCase):
+    MODULES = (
+        "tools.initialize", "tools.package", "tools.schemas.export_schemas",
+        "tools.catalog.inventory", "tools.extraction.docling_extract",
+        "tools.review.install_hooks",
+    )
+
+    def test_commands_expose_strict_parser_and_injectable_main(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(name)
+                self.assertTrue(callable(module.parser))
+                with self.assertRaises(SystemExit):
+                    module.parser().parse_args(["--roo", "/tmp"])
+                with self.assertRaises(SystemExit) as stopped:
+                    module.main(["--help"])
+                self.assertEqual(stopped.exception.code, 0)
+
+
 class PackageTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

@@ -45,10 +45,14 @@ def validate_output_path(output: Path) -> Path:
     return output
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path)
-    args = parser.parse_args()
+def parser():
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    value.add_argument("--output", required=True, type=Path)
+    return value
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
     try:
         paths = release_paths()
         output = validate_output_path(args.output)
