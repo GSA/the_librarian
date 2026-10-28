@@ -3,7 +3,6 @@
 **Audience:** maintainers, operators and implementation/review agents.
 **Date:** October 28, 2026.
 **Status:** Owner-approved October 28, 2026.
-**Katas:** `8a5h`, `zqdh`.
 **Planning home:** [development and ingestion roadmap](../../../ROADMAP.md).
 
 ## Intent and boundaries
@@ -66,4 +65,4 @@ Unselected or unreviewed renditions are never retrievable. Malformed locators, e
 
 Reusable implementation, tests, docs and any new qualification module are explicit release files. Operational data, source documents, model assets and private configuration remain excluded.
 
-Verification maps directly to both Kata criteria: line/BOM/encoding/lifecycle failures for `8a5h`; selection/review/source/rendition/freshness/locator and text/table round trips for `zqdh`; regression tests preserve GeminiTXT/ODT behavior. Final work receives Roborev feedback review and a pull request only after verified completion.
+Verification covers line/BOM/encoding/lifecycle failures; selection/review/source/rendition/freshness/locator and text/table round trips; and regressions preserving GeminiTXT/ODT behavior. Final work receives review and a pull request only after verified completion.

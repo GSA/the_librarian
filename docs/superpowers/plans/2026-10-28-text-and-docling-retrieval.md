@@ -128,8 +128,8 @@
 
 - [ ] Update capability/boundary documentation and explicit release allowlist; regenerate schema snapshot only if DDL changed.
 - [ ] Run extraction/context-index/review targeted tests, schema checks, clean-copy/package tests and `python3 -m unittest discover -s tests -v` in the installed environment; record any environment blocker exactly.
-- [ ] Add Kata comments mapping each acceptance criterion to tests and commits; close only after verified completion.
+- [ ] Record acceptance-criterion-to-test/commit evidence in the authorized task tracker; close only after verified completion.
 - [ ] Inspect related Roborev feedback for every branch commit; reproduce relevant correctness findings with failing tests, fix in new commits and rerun verification.
 - [ ] Request a fresh whole-branch code review and resolve Important/Critical findings under TDD.
 - [ ] Commit `docs: document qualified rendition workflows` and any separately justified review-fix commits.
-- [ ] Create the pull request with Kata links, strict qualification rule, evidence and limitations; register PR and Kata workspace targets when Forge target tools are available.
+- [ ] Create the pull request with strict qualification rule, evidence and limitations; register delivery targets in the authorized workspace when available.
