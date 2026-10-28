@@ -17,12 +17,13 @@ and engineering; and return supported discoveries to that knowledge base.
 The operator should not need to identify relevant documents before asking
 a question or refining a ticket.
 
-The October 3 data-empty extraction includes native catalog/review stores,
-verified local backups, configurable source restrictions, metadata inventory,
-strict ordinary UTF-8 text, Gemini TXT and ODT extraction, explicitly selected
-strictly reviewed Docling text/table retrieval, exact/compact/batched reads and
-read-only MCP. Empty initialization and source-only packaging remain
-requirements, not temporary demo limitations.
+The current data-empty toolkit includes native catalog/review stores, verified
+local backups, configurable source restrictions, metadata inventory, strict
+ordinary UTF-8 text, Gemini TXT and ODT extraction, explicitly selected strictly
+reviewed Docling text/table retrieval, exact/compact/batched reads and read-only
+MCP. The October 3 extraction established the initial data-empty baseline;
+later dated sections record subsequent increments. Empty initialization and
+source-only packaging remain requirements, not temporary demo limitations.
 
 The October 19 update names the project **The Librarian** and adds the
 [Librarian](agents/librarian.md), [ticket/refinement](agents/refiner.md),
