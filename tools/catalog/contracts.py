@@ -218,4 +218,3 @@ def validate_graph(records):
             active.add(cursor)
             cursor = parents[cursor]
         visited.update(active)
-
