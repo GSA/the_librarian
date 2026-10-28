@@ -194,7 +194,7 @@ authorize release or deployment.
 
 ## Out of scope
 
-- Acquire corpus content, business ontology or deployment configuration;
+- corpus content, business ontology or deployment-specific configuration;
 - processing or indexing real source material;
 - implementing new source connectors or agent automation;
 - migrating populated stores or relaxing compatibility checks;
