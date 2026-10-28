@@ -68,6 +68,7 @@ def engine_fingerprint():
     return digest(b"\0".join(path.read_bytes() for path in (
         Path(__file__), no_symlinks(Path(__file__).with_name("compact_records.py")),
         no_symlinks(Path(__file__).with_name("renditions.py")),
+        no_symlinks(Path(__file__).with_name("qualification.py")),
         no_symlinks(Path(policy.__file__)),
     )))
 
@@ -181,7 +182,7 @@ def rendition_api():
     return types.SimpleNamespace(**{
         name: globals()[name] for name in (
             "fail", "fields", "validate_context", "no_symlinks", "relative_name", "digest",
-            "load_catalog", "strict_object", "eligible", "canonical_locator", "original_allowed",
+            "load_catalog", "load_event_reader", "strict_object", "eligible", "canonical_locator", "original_allowed",
         )
     })
 
@@ -403,9 +404,10 @@ def readonly(path):
     return connection
 
 
-def metadata_expected(root, manifest_hash, config=None, rendition_identity=None):
+def metadata_expected(root, manifest_hash, config=None, rendition_identity=None, review_snapshot=None):
     if rendition_identity is None:
-        _, rendition_identity = renditions.inputs(root, config or {}, rendition_api())
+        _, rendition_identity = renditions.inputs(
+            root, config or {}, rendition_api(), review_snapshot=review_snapshot)
     return {
         "schema_version": str(SCHEMA), "engine_fingerprint": engine_fingerprint(),
         "manifest_hash": manifest_hash, "corpus_root": str(root),
@@ -484,8 +486,12 @@ def publication_lock(db):
 
 
 def build(root, manifest, db, config, manifest_hash):
-    selected, rendition_identity = renditions.inputs(root, config, rendition_api())
-    expected = metadata_expected(root, manifest_hash, config, rendition_identity)
+    review_snapshot = (load_event_reader().read_snapshot(root)
+                       if any(item["format"] == "docling" for item in config.get("renditions", []))
+                       else None)
+    selected, rendition_identity = renditions.inputs(
+        root, config, rendition_api(), review_snapshot=review_snapshot)
+    expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
         existing = readonly(db)
         existing.close()
@@ -581,7 +587,10 @@ def count_index(connection):
 def freshness(connection, root, manifest, db, config, manifest_hash):
     no_symlinks(db)
     actual = dict(connection.execute("SELECT key,value FROM metadata"))
-    expected = metadata_expected(root, manifest_hash, config)
+    review_snapshot = (load_event_reader().read_snapshot(root)
+                       if any(item["format"] == "docling" for item in config.get("renditions", []))
+                       else None)
+    expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)
     reasons = [f"metadata changed: {key}" for key in expected if actual.get(key) != expected[key]]
     if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rendition_documents'").fetchone():
@@ -675,6 +684,8 @@ def search(connection, query, limit, path):
         "JOIN documents d ON d.path=s.path WHERE search_fts MATCH ?" + restriction
         + " ORDER BY bm25(search_fts),s.path,s.line_start LIMIT ?", parameters,
     ).fetchall()
+    rendition_formats = {path: json.loads(payload)["format"] for path, payload in
+                         connection.execute("SELECT path,payload FROM rendition_documents")}
     hits = [{
         "locator": row["locator"], "path": row["path"], "title": row["title"],
         "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
@@ -685,7 +696,12 @@ def search(connection, query, limit, path):
                                       (hit["locator"],)).fetchone()
         if location:
             hit["source_location"] = json.loads(location[0])
-            hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
+            if rendition_formats.get(hit["path"]) == "docling":
+                hit["line_start"] = None
+                hit["line_end"] = None
+                hit["line_basis"] = "retained-extraction-byte-range-and-json-pointer"
+            else:
+                hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
     result = envelope(command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
     if not hits:
         result["absence"] = classify_absence(connection, query, path)
@@ -779,6 +795,9 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
             location = connection.execute("SELECT payload FROM rendition_locations WHERE locator=?",
                                           (row["locator"],)).fetchone()
             value["source_location"] = json.loads(location[0])
+            if json.loads(rendition_metadata[row["path"]])["format"] == "docling":
+                value["line_start"] = None
+                value["line_end"] = None
         piece_keys[key] = value
         pieces.append(value)
 

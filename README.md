@@ -95,6 +95,24 @@ qualifications, corrections and related passages without hardcoded question
 IDs or business dictionaries. Required locators must resolve; they are not
 optional suggestions. Empty `documents` and `renditions` arrays are valid.
 
+A registered Docling rendition is selectable only by an explicit rendition
+entry with `format: "docling"`, its exact retained `extraction.json` path and
+SHA-256, receipt, maintained context, and a nonempty `review_event_ids` list:
+
+```json
+{"path":"data/extractions/.local/D1/<run-id>/extraction.json",
+ "sha256":"<64-lowercase-hex>","receipt_id":"D1","format":"docling",
+ "context":["documents/guide.md"],"review_event_ids":["rev-exact-review"]}
+```
+
+Every configured event must be active and bind that exact rendition hash,
+path, receipt/source and original parent path under complete file scope. The
+configured events must collectively and without unresolved uncertainty review
+text and, when present, tables. Review of only the original, conversion, or
+registration does not qualify retrieval. Docling exact reads return complete
+canonical item/table JSON; line fields are null and `source_location` supplies
+the exact retained-byte range, JSON pointer, page and bounding box.
+
 Pass `--manifest config/selection.local.json` to both the reader and MCP
 client/preflight when using that selection. Rebuild explicitly:
 
@@ -120,7 +138,7 @@ Each command supports `--help`. CLI paths are relative to this toolkit.
 | `tools/catalog/inventory.py` | Explicit-root metadata discovery with configured exclusions; never registration or source interpretation |
 | `tools/review-events/event_store.py` | Schema, attributed native append, correction history, state-pinned writes, backup and restore |
 | `tools/review-events/event_reader.py` | Exact filtered event queries and one-off Markdown export with state-pinned pagination |
-| `tools/extraction/extract.py` | Registered Gemini-format UTF-8 transcript/ODT extraction, verification and separate metadata registration |
+| `tools/extraction/extract.py` | Registered strict UTF-8 plain text, Gemini-format transcript and ODT extraction, verification and separate metadata registration |
 | `tools/extraction/docling_extract.py` | Optional offline PDF/image Docling prepare, repeat verification and separate deferred-rendition registration |
 | `tools/context-index/context_index.py` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
 | `tools/diagnostics/retrieval_log.py` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
