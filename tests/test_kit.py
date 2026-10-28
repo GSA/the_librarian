@@ -683,6 +683,33 @@ class Workspace(unittest.TestCase):
             self.assertIn("null", text_packet["renditions"][path]["citation_contract"])
             self.assertIn("byte", text_packet["renditions"][path]["citation_contract"])
 
+    def test_malformed_docling_page_and_bbox_geometry_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        base = json.loads(rendition.read_text())
+        before = self.db.read_bytes()
+        bbox = lambda value: value["conversion"]["document"]["texts"][0]["prov"][0]["bbox"]
+        for label, mutate in (
+            ("negative", lambda value: bbox(value).update(l=-1)),
+            ("inverted", lambda value: bbox(value).update(l=60, r=40)),
+            ("outside", lambda value: bbox(value).update(r=101)),
+            ("nonfinite", lambda value: bbox(value).update(l=float("nan"))),
+            ("oversized-coordinate", lambda value: bbox(value).update(r=10 ** 1000)),
+            ("non-object", lambda value: value["conversion"]["document"]["texts"][0]
+             ["prov"][0].update(bbox=[])),
+            ("bad-page-width", lambda value: value["conversion"]["pages"][0].update(width=-1)),
+            ("oversized-page-width", lambda value: value["conversion"]["pages"][0]
+             .update(width=10 ** 1000)),
+            ("noncanonical-pages", lambda value: value["conversion"]["pages"][0].update(page_no=2)),
+        ):
+            value = deepcopy(base)
+            mutate(value)
+            raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                   + "\n").encode()
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
     def test_malformed_docling_table_geometry_and_label_preserve_prior_index(self):
         self.selected_docling()
         rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))

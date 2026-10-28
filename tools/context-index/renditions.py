@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 from bisect import bisect_right
 from pathlib import PurePosixPath
@@ -230,6 +231,15 @@ def validate_text_mapping(payload, source_raw, engine):
         engine.fail("Invalid text byte mapping or final terminator state")
 
 
+def finite_number(value):
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def validate_docling_conversion(value, engine):
     conversion = value.get("conversion")
     engine.fields(conversion, ("schema", "format", "document", "pages", "warnings",
@@ -259,11 +269,14 @@ def docling_records(raw, value, engine):
     pages = conversion["pages"]
     if (not isinstance(pages, list) or not pages
             or any(not isinstance(page, dict) or type(page.get("page_no")) is not int
+                   or any(not finite_number(page.get(key)) or page[key] <= 0
+                          for key in ("width", "height"))
                    for page in pages)):
         engine.fail("Invalid Docling page inventory")
     page_numbers = {page["page_no"] for page in pages}
-    if len(page_numbers) != len(pages):
-        engine.fail("Duplicate Docling page inventory")
+    if page_numbers != set(range(1, len(pages) + 1)):
+        engine.fail("Noncanonical Docling page inventory")
+    page_inventory = {page["page_no"]: page for page in pages}
     ordinal = 0
     for kind, items in (("text", document["texts"]), ("table", document["tables"])):
         if not isinstance(items, list):
@@ -277,12 +290,16 @@ def docling_records(raw, value, engine):
             locations = []
             for provenance in item["prov"]:
                 bbox = provenance.get("bbox", {}) if isinstance(provenance, dict) else {}
-                if (type(provenance.get("page_no")) is not int
-                        or provenance["page_no"] not in page_numbers
+                page_no = provenance.get("page_no") if isinstance(provenance, dict) else None
+                page = page_inventory.get(page_no) if type(page_no) is int else None
+                coordinates = (tuple(bbox.get(key) for key in ("l", "t", "r", "b"))
+                               if isinstance(bbox, dict) else ())
+                if (page is None or not isinstance(bbox, dict)
                         or set(bbox) != {"l", "t", "r", "b", "coord_origin"}
                         or bbox["coord_origin"] not in {"TOPLEFT", "BOTTOMLEFT"}
-                        or any(type(bbox[key]) not in {int, float}
-                               for key in ("l", "t", "r", "b"))):
+                        or any(not finite_number(number) for number in coordinates)
+                        or not 0 <= bbox["l"] <= bbox["r"] <= page["width"]
+                        or not 0 <= min(bbox["t"], bbox["b"]) <= max(bbox["t"], bbox["b"]) <= page["height"]):
                     engine.fail("Invalid Docling page provenance")
                 locations.append({"page_no": provenance["page_no"], "bbox": bbox})
             if kind == "text":
