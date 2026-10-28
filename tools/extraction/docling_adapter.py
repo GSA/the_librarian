@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-import docling_bridge as bridge
+from tools.extraction import docling_bridge as bridge
 
 
 LOADED_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()

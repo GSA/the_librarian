@@ -3,9 +3,8 @@ from datetime import date, datetime
 import json
 from pathlib import Path, PurePosixPath
 import re
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+
+from tools import policy
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA = Path(__file__).with_name("review-event-v1.schema.json")
 LIMIT = 8 * 1024 * 1024
@@ -70,7 +69,7 @@ def schema_validate(bundle, schema=None):
         from referencing import Registry
         from referencing.exceptions import NoSuchResource
     except ImportError as error:
-        raise ReviewError("Install tools/review-events/requirements.txt in a local environment") from error
+        raise ReviewError("Install tools/review_events/requirements.txt in a local environment") from error
     if schema is None:
         schema, _ = read_json(SCHEMA)
         schema["properties"]["audience"] = {"const": policy.SETTINGS["audience"]}

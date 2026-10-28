@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import io
+import importlib
 import json
 import os
 from pathlib import Path
@@ -22,25 +23,103 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-for directory in ("tools", "tools/catalog", "tools/context-index", "tools/review-events", "tools/extraction", "tools/diagnostics"):
-    sys.path.insert(0, str(ROOT / directory))
-import policy
-import catalog_store as catalog
-import context_index as index
-import compact_records
-import event_reader
-import event_store as events
-import review_events as contract
-import extract
-import package
-import retrieval_log as diagnostics
+from tools import package, policy
+from tools.catalog import catalog_store as catalog
+from tools.context_index import compact_records
+from tools.context_index import context_index as index
+from tools.context_index import qualification
+from tools.diagnostics import retrieval_log as diagnostics
+from tools.extraction import docling_bridge, extract
+from tools.review_events import event_reader
+from tools.review_events import event_store as events
+from tools.review_events import review_events as contract
+from tests.support import clone_release
 
 
-def clone(destination):
-    for name, source in package.release_paths(ROOT):
-        target = destination / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+class PackageLayoutTests(unittest.TestCase):
+    MODULES = (
+        "tools.catalog.inventory",
+        "tools.context_index.context_index",
+        "tools.review_events.event_store",
+        "tools.extraction.extract",
+        "tools.diagnostics.retrieval_log",
+    )
+
+    def test_modules_import_without_path_mutation(self):
+        before = list(sys.path)
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(name)
+                self.assertTrue(Path(module.__file__).resolve().is_relative_to(ROOT / "tools"))
+        self.assertEqual(sys.path, before)
+
+    def test_contracts_and_index_engine_avoid_adapter_dependencies(self):
+        code = (
+            "import sys; "
+            "import tools.catalog.contracts; "
+            "assert 'sqlite3' not in sys.modules; "
+            "import tools.context_index.context_index; "
+            "assert 'argparse' not in sys.modules"
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", code], cwd=ROOT,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_context_cli_and_transitional_module_expose_same_commands(self):
+        outputs = []
+        for name in ("tools.context_index.cli", "tools.context_index.context_index"):
+            result = subprocess.run(
+                [sys.executable, "-m", name, "--help"], cwd=ROOT,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(result.stdout)
+        for command in ("build", "status", "search", "get", "get-many", "catalog"):
+            self.assertTrue(all(command in output for output in outputs), command)
+
+    def test_context_cli_formats_engine_failures_without_traceback(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "tools.context_index.cli", "--root", "/missing", "status"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("context-index:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_operator_modules_expose_help(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                result = subprocess.run(
+                    [sys.executable, "-m", name, "--help"], cwd=ROOT,
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage:", result.stdout.lower())
+
+
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_workspace_scenarios_are_not_inherited_by_absence_tests(self):
+        def flatten(suite):
+            for test in suite:
+                if isinstance(test, unittest.TestSuite):
+                    yield from flatten(test)
+                else:
+                    yield test.id()
+
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
+        ids = list(flatten(suite))
+        workspace = {name.rsplit(".", 1)[-1] for name in ids if ".WorkspaceTests." in name}
+        absence = {name.rsplit(".", 1)[-1] for name in ids if ".AbsenceClassificationTests." in name}
+        self.assertFalse(workspace & absence)
+        worker_modules = {
+            name.rsplit(".", 2)[0] for name in ids
+            if "docling_worker_contract_tests." in name
+        }
+        self.assertEqual(worker_modules, {"docling_worker_contract_tests"})
 
 
 class StoreIdentity(unittest.TestCase):
@@ -74,7 +153,7 @@ class DoclingCleanCopy(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.kit = self.root / "kit"
         self.kit.mkdir()
-        clone(self.kit)
+        clone_release(self.kit)
 
     def test_clean_copy_contains_installable_review_gate(self):
         required = {".githooks/pre-commit", "tools/review/roborev_precommit.py",
@@ -103,7 +182,7 @@ class DoclingCleanCopy(unittest.TestCase):
         bridge = self.kit / "tools/extraction/docling_bridge.py"
         bridge.unlink()
         process = subprocess.run(
-            [sys.executable, "tools/extraction/docling_extract.py", "--help"],
+            [sys.executable, "-m", "tools.extraction.docling_extract", "--help"],
             cwd=self.kit, capture_output=True, text=True)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("docling_bridge", process.stderr)
@@ -119,10 +198,9 @@ class DoclingCleanCopy(unittest.TestCase):
 import hashlib,json,sys,subprocess
 from pathlib import Path
 from unittest.mock import patch
-sys.path[:0]=['tools/extraction','tools/catalog','tools']
-import catalog_store as c
-import docling_adapter as a
-import docling_bridge as b
+from tools.catalog import catalog_store as c
+from tools.extraction import docling_adapter as a
+from tools.extraction import docling_bridge as b
 root=Path.cwd()
 raw=b'%PDF-1.7\nclean-copy structural fixture'
 (root/'sources').mkdir(); (root/'sources/refused.pdf').write_bytes(raw)
@@ -156,15 +234,14 @@ def invoke(command,receipt='D2',extra=()):
  seam="""import sys,json,runpy,hashlib
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,'tools/extraction')
-import docling_adapter as a
+from tools.extraction import docling_adapter as a
 report=json.loads(sys.argv.pop(1))
-sys.argv[0]='tools/extraction/docling_extract.py'
+sys.argv[0]='tools.extraction.docling_extract'
 def convert(*args):
  with Path('inference-calls').open('a') as log: log.write('convert\\n')
  return report,hashlib.sha256(a.WORKER.read_bytes()).hexdigest()
 with patch.object(a,'_convert_with_identity',side_effect=convert):
- runpy.run_path(sys.argv[0],run_name='__main__')
+ runpy.run_module(sys.argv[0],run_name='__main__')
 """
  result=subprocess.run([sys.executable,'-c',seam,json.dumps(report),*args],
                        cwd=root,capture_output=True,text=True)
@@ -195,7 +272,7 @@ print(json.dumps({'prepared':prepared['created'],'registered':registered['regist
         self.assertTrue(any(value.startswith("A-docling-") for value in result["records"]))
 
 
-class Workspace(unittest.TestCase):
+class WorkspaceCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -204,7 +281,7 @@ class Workspace(unittest.TestCase):
         self.manifest.parent.mkdir()
         self.config = {"schema_version": 1, "audience": policy.SETTINGS["audience"],
                        "documents": [], "context_rules": {}, "renditions": []}
-        self.db = self.root / "tools/context-index/.local/index.sqlite3"
+        self.db = self.root / "tools/context_index/.local/index.sqlite3"
         self.save_config()
 
     def save_config(self):
@@ -276,6 +353,9 @@ class Workspace(unittest.TestCase):
             "relationships": [], "supersedes": [], "correction_reason": None,
         }
 
+
+
+class WorkspaceTests(WorkspaceCase):
     def test_empty_initialization(self):
         self.assertEqual(catalog.initialize(self.root)["records"], 0)
         self.assertEqual(events.initialize(self.root)["events"], 0)
@@ -520,7 +600,6 @@ class Workspace(unittest.TestCase):
         return selection, value, event
 
     def test_strict_docling_qualification_accepts_only_active_exact_file_review(self):
-        import qualification
         api = index.rendition_api()
         selection, value, event = self.docling_qualification_fixture(tables=True)
         snapshot = event_reader.Snapshot({"state_token": "d" * 64}, [event], {})
@@ -563,6 +642,8 @@ class Workspace(unittest.TestCase):
         assert_refused("ranged", lambda s, v, e: e["scope"].update(
             extent="selected_ranges", unit="page", coordinates="one_based_inclusive",
             ranges=[{"start": 1, "end": 1}]))
+        assert_refused("narrow-defined-scope", lambda s, v, e: e["scope"].update(
+            description="Only selected paragraphs of the exact retained rendition."))
         assert_refused("missing-table-scope", lambda s, v, e: e["scope"].update(content=["text"]))
         assert_refused("missing", events_=[])
         _, _, superseded = self.docling_qualification_fixture(tables=True)
@@ -599,7 +680,6 @@ class Workspace(unittest.TestCase):
         rendition = self.root / path
         rendition.parent.mkdir(parents=True)
         rendition.write_bytes(raw)
-        import docling_bridge
         registered_value = deepcopy(value)
         registered_value["canonical_bytes"] = raw
         catalog.submit(self.root, docling_bridge.registration_records(
@@ -715,6 +795,17 @@ class Workspace(unittest.TestCase):
                 list(index.renditions.records(raw, value, index.rendition_api()))
         self.assertEqual(self.db.read_bytes(), before)
 
+    def test_excessive_docling_record_count_is_refused(self):
+        _, value, _ = self.docling_qualification_fixture()
+        value["conversion"].update(
+            schema="docling-conversion-v1", format="pdf",
+            pages=[{"page_no": 1, "width": 1, "height": 1}],
+            warnings=[], confidence={}, omissions=[])
+        value["conversion"]["document"]["texts"] = [None] * (
+            index.renditions.DOCLING_MAX_RECORDS + 1)
+        with self.assertRaisesRegex(index.IndexError_, "record count"):
+            list(index.renditions.records(b"{}", value, index.rendition_api()))
+
     def test_malformed_docling_table_geometry_and_label_preserve_prior_index(self):
         self.selected_docling()
         rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
@@ -791,10 +882,10 @@ class Workspace(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(), before)
 
     def test_qualification_code_is_bound_into_engine_fingerprint(self):
-        qualification_path = ROOT / "tools/context-index/qualification.py"
+        qualification_path = ROOT / "tools/context_index/qualification.py"
         before = index.engine_fingerprint()
-        paths = [Path(index.__file__), ROOT / "tools/context-index/compact_records.py",
-                 ROOT / "tools/context-index/renditions.py", qualification_path,
+        paths = [Path(index.__file__), ROOT / "tools/context_index/compact_records.py",
+                 ROOT / "tools/context_index/renditions.py", qualification_path,
                  Path(policy.__file__)]
         contents = {path: path.read_bytes() for path in paths}
         with patch.object(Path, "read_bytes", autospec=True,
@@ -803,7 +894,6 @@ class Workspace(unittest.TestCase):
             self.assertNotEqual(index.engine_fingerprint(), before)
 
     def test_docling_review_state_binds_freshness_and_failed_rebuild_preserves_index(self):
-        import qualification
         selection, value, event = self.docling_qualification_fixture()
         api = index.rendition_api()
         first = qualification.docling(selection, value, {}, event_reader.Snapshot(
@@ -1034,8 +1124,24 @@ class Workspace(unittest.TestCase):
         with self.assertRaises(extract.ExtractionError):
             extract.xml(b'<!DOCTYPE x><x/>', "content.xml")
 
+    def test_initialize_refuses_an_unmigrated_legacy_index(self):
+        clone_release(self.root / "kit")
+        kit = self.root / "kit"
+        legacy = kit / "tools/context-index/.local/index.sqlite3"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy derived index")
+        result = subprocess.run(
+            [sys.executable, "tools/initialize.py"], cwd=kit,
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("legacy derived index", result.stderr.lower())
+        self.assertFalse((kit / "tools/context_index/.local/index.sqlite3").exists())
+        self.assertFalse((kit / ".local/catalog").exists())
+        self.assertFalse((kit / ".local/review-events").exists())
+
     def test_clean_copy_and_policy_freshness(self):
-        clone(self.root / "kit")
+        clone_release(self.root / "kit")
         kit = self.root / "kit"
         def run(*args):
             result = subprocess.run([sys.executable, *args], cwd=kit, capture_output=True, text=True)
@@ -1044,11 +1150,11 @@ class Workspace(unittest.TestCase):
         report = run("tools/initialize.py")
         self.assertEqual(report["seeded_records"], 0)
         (kit / "config/policy.local.json").write_text(json.dumps({"excluded_name_patterns": ["private"]}))
-        result = subprocess.run([sys.executable, "tools/context-index/context_index.py", "status"],
+        result = subprocess.run([sys.executable, "-m", "tools.context_index.context_index", "status"],
                                 cwd=kit, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stale", result.stderr.lower())
-        self.assertEqual(run("tools/context-index/context_index.py", "build")["documents"], 0)
+        self.assertEqual(run("-m", "tools.context_index.context_index", "build")["documents"], 0)
         output = kit / "bundle.zip"
         run("tools/package.py", "--output", str(output))
         with ZipFile(output) as archive:
@@ -1056,7 +1162,7 @@ class Workspace(unittest.TestCase):
             self.assertNotIn("config/policy.local.json", archive.namelist())
 
 
-class AbsenceClassification(Workspace):
+class AbsenceClassificationTests(WorkspaceCase):
     """A zero-result search must explain itself without quoting the corpus."""
 
     def corpus(self, documents):
@@ -1256,7 +1362,87 @@ class RetrievalDiagnostics(unittest.TestCase):
                 diagnostics.log_path(self.root, value)
 
 
+class ScriptConventionTests(unittest.TestCase):
+    MODULES = (
+        "tools.initialize", "tools.package", "tools.schemas.export_schemas",
+        "tools.catalog.inventory", "tools.extraction.docling_extract",
+        "tools.review.install_hooks",
+    )
+
+    def test_commands_expose_strict_parser_and_injectable_main(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(name)
+                self.assertTrue(callable(module.parser))
+                with self.assertRaises(SystemExit):
+                    module.parser().parse_args(["--roo", "/tmp"])
+                with self.assertRaises(SystemExit) as stopped:
+                    module.main(["--help"])
+                self.assertEqual(stopped.exception.code, 0)
+
+
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "file.txt").write_text("release")
+
+    def manifest(self, value):
+        (self.root / "release-files.json").write_text(json.dumps(value))
+
+    def test_manifest_rejects_invalid_entries_before_filesystem_access(self):
+        for value, message in (
+            (["file.txt", "file.txt"], "unique"),
+            (["file.txt", 7], "entry 2"),
+            (["../file.txt"], "unsafe"),
+            (["store.sqlite3"], "unsafe"),
+        ):
+            with self.subTest(value=value):
+                self.manifest(value)
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    package.load_release_manifest(self.root)
+
+    def test_release_paths_rejects_missing_and_symlinked_files(self):
+        self.manifest(["missing.txt"])
+        with self.assertRaisesRegex(ValueError, "Missing"):
+            package.release_paths(self.root)
+        (self.root / "target.txt").write_text("target")
+        (self.root / "link.txt").symlink_to("target.txt")
+        self.manifest(["link.txt"])
+        with self.assertRaisesRegex(ValueError, "symlinked"):
+            package.release_paths(self.root)
+
+    def test_package_rejects_symlinked_output_parent(self):
+        real = self.root / "real"
+        real.mkdir()
+        linked = self.root / "linked"
+        linked.symlink_to(real, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            package.validate_output_path(linked / "release.zip")
+
+
 class Documentation(unittest.TestCase):
+    def test_component_map_paths_and_documented_module_commands_are_current(self):
+        readme = (ROOT / "README.md").read_text()
+        manifest = dict(package.release_paths(ROOT))
+        for path in re.findall(r"`((?:tools|tests|docs)/[^` ]+/?)`", readme):
+            if ".local" not in path:
+                with self.subTest(path=path):
+                    prefix = path.rstrip("/") + "/"
+                    self.assertTrue(path in manifest or any(item.startswith(prefix) for item in manifest), path)
+        modules = set(re.findall(
+            r"(?:\.venv/bin/)?python\d* -m ([a-zA-Z0-9_.]+)", readme
+        ))
+        self.assertIn("tools.catalog.catalog_store", modules)
+        for module in modules - {"pip", "venv"}:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-m", module, "--help"], cwd=ROOT,
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_librarian_identity_and_role_documents_are_packaged(self):
         paths = dict(package.release_paths(ROOT))
         self.assertEqual((ROOT / "README.md").read_text().splitlines()[0], "# The Librarian")
@@ -1264,6 +1450,16 @@ class Documentation(unittest.TestCase):
             "ROADMAP.md", "agents/librarian.md", "agents/contributions.md",
             "agents/refiner.md", "agents/coder.md",
         }.issubset(paths))
+
+    def test_retired_execution_documents_are_not_packaged(self):
+        paths = dict(package.release_paths(ROOT))
+        for name in (
+            "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
+            "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+            "docs/superpowers/specs/2026-10-20-docling-ingestion-design.md",
+            "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
+        ):
+            self.assertNotIn(name, paths)
 
     def test_relative_document_links_are_packaged(self):
         paths = dict(package.release_paths(ROOT))

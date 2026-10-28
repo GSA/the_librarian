@@ -42,7 +42,7 @@ def load_diagnostics(config: Config):
     """Load the body-free diagnostics writer only when an operator configured a log."""
     if config.diagnostics_log is None:
         return None
-    path = config.reader.parent.parent / "diagnostics/retrieval_log.py"
+    path = config.diagnostics_path
     specification = importlib.util.spec_from_file_location("librarian_retrieval_log", path)
     if specification is None or specification.loader is None:
         raise ValueError(f"Diagnostics requested but the writer is unavailable: {path}")
@@ -99,12 +99,12 @@ class Reader:
     async def execute(self, command: str, arguments: list[str], output_budget: int) -> TextContent:
         if command == "review-events":
             argv = [
-                sys.executable, "-B", str(self.config.event_reader_path),
+                sys.executable, "-B", "-m", self.config.event_module,
                 "--root", str(self.config.root), "query", *arguments,
             ]
         elif command in {"status", "search", "get", "get-many", "catalog"}:
             argv = [
-                sys.executable, "-B", str(self.config.reader),
+                sys.executable, "-B", "-m", self.config.context_module,
                 "--root", str(self.config.root),
                 "--manifest", str(self.config.manifest),
                 "--db", str(self.config.db), command, *arguments,

@@ -6,9 +6,10 @@ import json
 from pathlib import Path
 import sys
 
+from tools.extraction import docling_adapter as adapter
+
+
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-import docling_adapter as adapter
 
 
 def parser():

@@ -3,7 +3,6 @@
 
 import argparse
 import ast
-import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -13,8 +12,8 @@ HOME = Path(__file__).resolve().parent
 ROOT = HOME.parents[1]
 SOURCES = {
     "catalog.sql": ("tools/catalog/catalog_store.py", "SQL", "VERSION"),
-    "review-events.sql": ("tools/review-events/event_store.py", "SQL", "VERSION"),
-    "context-index.sql": ("tools/context-index/context_index.py", "DDL", "SCHEMA"),
+    "review-events.sql": ("tools/review_events/event_store.py", "SQL", "VERSION"),
+    "context-index.sql": ("tools/context_index/context_index.py", "DDL", "SCHEMA"),
 }
 
 
@@ -29,14 +28,11 @@ def snapshot(source: Path, symbol: str, version_symbol: str) -> str:
     if not isinstance(ddl, str) or type(version) is not int:
         raise ValueError("Expected literal DDL and integer schema version")
     if symbol == "SQL":
-        sys.path.insert(0, str(source.parent))
-        try:
-            spec = importlib.util.spec_from_file_location(source.stem, source)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            ddl = module.schema_sql()
-        finally:
-            sys.path.pop(0)
+        if source.name == "catalog_store.py":
+            from tools.catalog import catalog_store as module
+        else:
+            from tools.review_events import event_store as module
+        ddl = module.schema_sql()
     else:
         application_id = values["APPLICATION_ID"]
         if type(application_id) is not int:
@@ -49,10 +45,14 @@ def snapshot(source: Path, symbol: str, version_symbol: str) -> str:
     )
 
 
+def parser():
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    value.add_argument("--check", action="store_true", help="Fail if any tracked snapshot is missing or stale")
+    return value
+
+
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Fail if any tracked snapshot is missing or stale")
-    args = parser.parse_args(argv)
+    args = parser().parse_args(argv)
     try:
         expected = {
             name: snapshot(ROOT / path, symbol, version)
@@ -72,7 +72,7 @@ def main(argv=None) -> int:
             print("Schema snapshots missing or stale: " + ", ".join(changed), file=sys.stderr)
         return 0 if ok else 1
     except (OSError, UnicodeError, SyntaxError, ValueError, KeyError, ImportError) as error:
-        print(f"Schema snapshot failure: {error}", file=sys.stderr)
+        print(f"schema-snapshots: {error}", file=sys.stderr)
         return 1
 
 

@@ -1,6 +1,7 @@
 """Versioned, fail-closed admission policies for selected renditions."""
 
 POLICY_VERSION = "docling-exact-rendition-review-v1"
+COMPLETE_SCOPE = "Complete exact Docling rendition review."
 
 
 def docling(selection, value, identity, snapshot, engine):
@@ -35,6 +36,7 @@ def docling(selection, value, identity, snapshot, engine):
                 or event.get("outcome") != "reviewed"
                 or scope.get("unit") != "file" or scope.get("extent") != "defined_scope"
                 or scope.get("coordinates") != "not_applicable" or scope.get("ranges") != []
+                or scope.get("description") != COMPLETE_SCOPE
                 or not isinstance(content, list) or not content
                 or not event.get("reviewer") or not event.get("reviewed_on")
                 or not isinstance(event.get("evidence"), list) or not event["evidence"]

@@ -11,8 +11,8 @@ import re
 import sqlite3
 import sys
 
-import event_store as store
-import review_events as contract
+from tools.review_events import event_store as store
+from tools.review_events import review_events as contract
 
 
 NOTICE = (store.NOTICE + " Source statements are not verification or operational acceptance. "

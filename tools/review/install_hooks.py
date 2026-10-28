@@ -2,11 +2,19 @@
 """Activate this installation's pre-commit gate using local Git config only."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
 
-from roborev_precommit import GateError, LAUNCHER_KEY, config_values, git, reject_links, repository_root
+try:
+    from tools.review.roborev_precommit import (
+        GateError, LAUNCHER_KEY, config_values, git, reject_links, repository_root,
+    )
+except ModuleNotFoundError:  # Direct bootstrap execution from tools/review.
+    from roborev_precommit import (  # type: ignore[no-redef]
+        GateError, LAUNCHER_KEY, config_values, git, reject_links, repository_root,
+    )
 
 
 HOOK = b"#!/bin/sh\nexec python3 tools/review/roborev_precommit.py\n"
@@ -48,19 +56,23 @@ def install(root, launcher):
     for key in (LAUNCHER_KEY, "core.hooksPath"):
         if key in pending:
             git(root, "config", "--local", "--add", key, pending[key])
-    print("Installed repository-local pre-commit gate; existing hooks/config were not replaced.")
+    return {"installed": True, "hooks_path": ".githooks"}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=os.getcwd())
-    parser.add_argument("--launcher", required=True, help="existing scoped roborev executable wrapper")
-    args = parser.parse_args()
+def parser():
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    value.add_argument("--root", default=os.getcwd())
+    value.add_argument("--launcher", required=True, help="existing scoped roborev executable wrapper")
+    return value
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
     try:
-        install(repository_root(args.root), args.launcher)
+        print(json.dumps(install(repository_root(args.root), args.launcher), sort_keys=True))
         return 0
     except (GateError, OSError, ValueError) as error:
-        print(f"INSTALL REFUSED: {error}", file=sys.stderr)
+        print(f"install-hooks: {error}", file=sys.stderr)
         return 1
 
 

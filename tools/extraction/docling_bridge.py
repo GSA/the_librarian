@@ -9,10 +9,8 @@ import re
 import stat
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "catalog"))
-import catalog_store as catalog
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+from tools import policy
+from tools.catalog import catalog_store as catalog
 
 
 MAX_SOURCE = 64 * 1024 * 1024
@@ -60,7 +58,7 @@ def binding():
     _, result = _policy_binding()
     here = Path(__file__)
     adapter = here.with_name("docling_adapter.py")
-    coordinator = sys.modules.get("docling_adapter")
+    coordinator = sys.modules.get(f"{__package__}.docling_adapter")
     require(coordinator is not None, "Adapter must be loaded before installation binding")
     require(digest(here.read_bytes()) == LOADED_CODE_SHA256,
             "Loaded bridge code changed; start a fresh process")
