@@ -54,6 +54,8 @@ ALLOWLIST = frozenset({
     "tools/schemas/__init__.py",
     "tools/schemas/export_schemas.py",
     "release-files.json",
+    "config/ontology.json",
+    "tools/ontology.py",
     "tools/extraction/README.md",
     "tools/catalog/catalog_store.py",
     "tools/catalog/contracts.py",
@@ -69,6 +71,7 @@ ALLOWLIST = frozenset({
     "docs/decisions/0001-project-identity.md",
     "docs/decisions/0003-store-compatibility.md",
     "docs/decisions/0008-proof-of-concept-closure.md",
+    "docs/decisions/0009-declared-ontology-and-entailment.md",
     "docs/decisions/README.md",
 })
 LAUNCHER_KEY = "roborev.precommitLauncher"

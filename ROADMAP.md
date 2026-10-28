@@ -60,6 +60,21 @@ answer - is **not yet satisfied**, and with October 22 license, release and
 packaging facts for the two obvious embedded Cypher candidates. Neither is
 adoptable as written. Graph work remains "later, only if justified".
 
+An October 23 addition separates the two questions that "should we add a graph"
+keeps merging: where traversable relationships are **stored and queried**,
+versus where candidate edges **come from**. A derived projection can only
+project what the authority stores record, so intra-artifact structure - symbols,
+calls, imports, module groupings - is unavailable to it by construction. Closing
+that gap means ingesting a third-party extractor's output, which is an ingestion
+question under decision 0005 and needs no graph decision. Such output is a
+receipted, attributed source, never a relationship layer this software vouches
+for; model-synthesized node classes stay inference, a cited-but-absent companion
+artifact is an unresolved source flag, and invoking an extractor locally is a
+decision-0002 dependency decision. Precondition 1 is unaffected: a missing
+upstream artifact is a delivery gap, not a failed question. A new fifth
+precondition requires every projected edge to have an identified origin - an
+owned authority store or a named ingested artifact.
+
 The same update renames the review-event schema `$id` to
 `urn:the-librarian:review-events:1`. This changed the store contract hash and
 required re-initializing the local review store, which was only acceptable
@@ -121,7 +136,8 @@ to exist in this distribution.
 | MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); no general operation audit, no cohort metrics | Adapt the remaining opt-in audit/`metrics.py` and cohort metrics; private modes, explicit logging failures and no telemetry-as-job-authority. Dead weight is withdrawn, not pending, per [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
 | Retrieval refinements | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
 | Reader diagnostics and regressions | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
-| Explicit relationship traversal | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in [decision 0006](docs/decisions/0006-relationship-traversal.md), whose precondition 1 is reported unsatisfied as of October 21 |
+| Explicit relationship traversal | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in [decision 0006](docs/decisions/0006-relationship-traversal.md), whose precondition 1 is reported unsatisfied as of October 21. Upstream edge extraction is separated as an ingestion question on October 23; ingested extractor output is a receipted, attributed source, not a relationship layer |
+| Declared relation vocabulary | `config/ontology.json` declares the relation terms, per-relation endpoint kinds and disjoint pairs the catalog validator enforces; the vocabulary is bound to the store contract and a changed vocabulary is refused pending explicit migration | Implemented October 28 under [decision 0009](docs/decisions/0009-declared-ontology-and-entailment.md). Declared `symmetric`/`transitive` properties are recorded and never applied: no entailment is computed anywhere, and `basis` keeps entailed edges out of every authority store. Computing labelled, premise-carrying entailment remains gated on decision 0006's preconditions and the projection that does not exist |
 | Agent execution traces | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free retrieval diagnostics only - coverage gaps (implemented); dead weight withdrawn; no retrieval-quality figure is derived, because the available counts cannot support one. Traces as durable agent memory are declined in [decision 0007](docs/decisions/0007-execution-traces.md); agent findings route through the contribution contract instead |
 | Discovery-card experiments | Not shipped | Retain the lesson: skims can miss relevant material; evaluate candidate recall with deferred controls, never use cards as proof of absence |
 | Operating guidance | Generic role/feedback contracts now included; private corpus procedures intentionally omitted | Keep task-triggered loading and source fidelity/authority boundaries; add generic format/recovery guides alongside each future port |
