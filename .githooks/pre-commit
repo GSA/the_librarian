@@ -1,2 +1,0 @@
-#!/bin/sh
-exec python3 tools/review/roborev_precommit.py

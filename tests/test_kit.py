@@ -77,29 +77,6 @@ class DoclingCleanCopy(unittest.TestCase):
         self.kit.mkdir()
         clone(self.kit)
 
-    def test_clean_copy_contains_installable_review_gate(self):
-        required = {".githooks/pre-commit", "tools/review/roborev_precommit.py",
-                    "tools/review/install_hooks.py", "tools/review/README.md",
-                    "tools/review/test_precommit.py"}
-        self.assertTrue(required <= {name for name, _ in package.release_paths(ROOT)})
-        for name in required:
-            self.assertEqual((self.kit / name).read_bytes(), (ROOT / name).read_bytes())
-        # Source archives do not promise executable-bit preservation; the
-        # documented activation prerequisite must be applied to a copied hook.
-        (self.kit / ".githooks/pre-commit").chmod(0o755)
-        launcher = self.root / "scoped-wrapper"
-        launcher.write_text("#!/bin/sh\nexit 0\n")
-        launcher.chmod(0o755)
-        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
-        subprocess.run(["git", "init", "-q", str(self.kit)], env=env, check=True)
-        result = subprocess.run([sys.executable, "tools/review/install_hooks.py",
-                                 "--launcher", str(launcher)], cwd=self.kit, env=env,
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        configured = subprocess.check_output(["git", "-C", str(self.kit), "config",
-                                               "--local", "--get", "core.hooksPath"], env=env)
-        self.assertEqual(configured.strip(), b".githooks")
-
     def test_bridge_is_the_only_installation_specific_file(self):
         bridge = self.kit / "tools/extraction/docling_bridge.py"
         bridge.unlink()

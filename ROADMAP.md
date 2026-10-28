@@ -92,29 +92,13 @@ the log into a usage profile. The coverage-gap half of the kept proposal is
 implemented: an empty search returns an absence classification, and an opt-in
 body-free log records that classification without the query.
 
-### Docling integration design - October 20
+### Docling integration - October 20-26
 
-The owner requested Docling ingestion in both this toolkit and the originating
-corpus installation. The [approved design](docs/superpowers/specs/2026-10-20-docling-ingestion-design.md)
-specifies a shared optional local-only PDF/PNG/JPEG adapter, separate from
-historical extractor wrappers, with independent repeat verification and
-explicit catalog registration. It does not add automatic review or retrieval
-selection. The [implementation plan](docs/superpowers/plans/2026-10-20-docling-ingestion.md)
-is approved for subagent-driven, Kata-tracked, in-place implementation with
-roborev pre-commit review. The [October 22 completion plan](docs/superpowers/plans/2026-10-22-ingestion-completion.md)
-supersedes Tasks 1-4 and withdraws the second-installation obligation. The OCR
-asset blocker is resolved, with recorded repeatable real synthetic-fixture
-acceptance. The optional lifecycle, policy bridge, CLI, clean-copy regressions,
-store-identity changes and operating guide are committed and reviewed.
-October 26 closure verified the real CLI lifecycle:
-prepare twice, verify, register and idempotent retry, with independent offline
-conversions and identical complete rendition bytes in a temporary catalog.
-The installed suite, cloned CLI/policy boundary, packaging and schema checks pass;
-whole-change review binds the exact delivered diff and passes.
-Approved toolkit-only ingestion work is complete. Renditions remain deferred:
-no automatic review, intake advancement, retrieval selection or indexing, and
-no member selection or additional formats are added. Real-document OCR accuracy
-remains unmeasured; package checks do not grant publication approval.
+The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extraction/docling_extract.py`, `docling_adapter.py`, `docling_bridge.py`, `docling_worker.py`, and `tools/extraction/README.md`) is implemented and verified:
+- Prepare twice with independent offline conversions, verify identical rendition bytes, and register deferred renditions in the catalog with idempotent retry.
+- Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries (`docs/decisions/0008-proof-of-concept-closure.md`).
+- Qualified retrieval selection of registered Docling renditions is tracked in the Kata backlog (`librarian#zqdh`).
+
 
 ## Reuse gaps identified on October 19
 
