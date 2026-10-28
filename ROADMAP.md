@@ -19,7 +19,7 @@ a question or refining a ticket.
 
 The October 3 data-empty extraction includes native catalog/review stores,
 verified local backups, configurable source restrictions, metadata inventory,
-Gemini TXT/ODT extraction, explicit retrieval selection, exact/compact/batched
+strict ordinary UTF-8 text, Gemini TXT and ODT extraction, explicit retrieval selection, exact/compact/batched
 reads and read-only MCP. Empty initialization and source-only packaging remain
 requirements, not temporary demo limitations.
 
@@ -113,7 +113,7 @@ to exist in this distribution.
 | Capability | State in this repository | Required action |
 |---|---|---|
 | Three-agent collaboration and returned findings | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
-| Broader extraction | Gemini TXT and ODT only | Port ordinary TXT, DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
+| Broader extraction | Strict ordinary UTF-8 text, Gemini TXT and ODT; optional offline Docling PDF/image conversion | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions. Ordinary text retrieval remains separate work until explicit rendition selection is implemented |
 | Archive-member and large-workbook handling | No explicit retained-member extraction selector or row-chunk engine | Port member-policy/ancestor checks and versioned XLSX chunking without automatic recursive expansion or legacy-run rewriting |
 | Bounded ingestion cohorts | No cohort driver or operation-local catalog snapshot API | Adapt `cohort.py` and `ReceiptMetadataSnapshot`; retain source/state checks, serialized writes, saved requests, explicit partial failures and backups |
 | Read-only remote discovery | No remote connector; local explicit-root inventory exists | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |

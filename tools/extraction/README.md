@@ -1,4 +1,27 @@
-# Optional Docling ingestion
+# Extraction workflows
+
+## Ordinary strict UTF-8 text
+
+A registered `.txt` original can use the stdlib extraction lifecycle without
+Docling or model assets:
+
+```sh
+PY=.venv/bin/python
+$PY tools/extraction/extract.py prepare D-receipt --format text
+$PY tools/extraction/extract.py verify D-receipt --format text
+$PY tools/extraction/extract.py register D-receipt --format text \
+  --actor operator --expected-state CATALOG_STATE_TOKEN
+```
+
+The format accepts strict UTF-8 with an optional UTF-8 BOM. It preserves CRLF,
+LF and CR terminators, blank lines, final-line state and original byte offsets.
+Malformed UTF-8, UTF-16/32 BOMs, NUL, excessive line records and oversized
+renditions fail visibly; no replacement decoding or charset guessing occurs.
+Preparation and registration create a deferred rendition only. They do not
+review, qualify, select, index or publish its text. Selected retrieval of this
+format is not yet implemented.
+
+## Optional Docling ingestion
 
 Docling ingestion is an explicit local `prepare` / `verify` / `register`
 lifecycle. It produces a deferred machine OCR/layout rendition. It does not

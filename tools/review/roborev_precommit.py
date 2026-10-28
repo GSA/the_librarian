@@ -22,6 +22,7 @@ ALLOWLIST = frozenset({
     "tools/extraction/docling_adapter.py",
     "tools/extraction/docling_bridge.py",
     "tools/extraction/docling_extract.py",
+    "tools/extraction/extract.py",
     "tools/extraction/requirements-docling.txt",
     "tools/extraction/test_docling_worker.py",
     "tools/extraction/test_docling.py",

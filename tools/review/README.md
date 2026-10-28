@@ -7,7 +7,7 @@ are printed as `NOT reviewed`. Mixed selected/excluded staged changes block
 before any review launch; commit those scopes separately rather than exporting
 restricted paths. An excluded-only commit receives no review,
 not a passing review. The allowlist has exact paths, not directory globs:
-Docling modules/tests/requirements/guide, these hook sources/guide,
+the ordinary extractor, Docling modules/tests/requirements/guide, these hook sources/guide,
 `tests/test_kit.py`, `release-files.json`, the three store modules and their
 schema snapshots, and the exact generic identity/closure/roadmap/ingestion-plan
 documents named there. Root `README.md` and `ROADMAP.md` are selected; neighboring

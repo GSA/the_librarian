@@ -467,6 +467,88 @@ class Workspace(unittest.TestCase):
         with closing(index.readonly(self.db)) as db:
             self.assertTrue(index.packet(db, self.config, locator, 60000)["pieces"])
 
+    def test_text_extraction_contract(self):
+        raw = b"\xef\xbb\xbfalpha\r\n\r\n\xce\xb2\nlast\r"
+        self.assertEqual(extract.text(raw), {
+            "format": "text",
+            "scope": "all supplied UTF-8 text, byte-mapped without line-ending normalization",
+            "bom_bytes": 3,
+            "ends_with_terminator": True,
+            "lines": [
+                {"line": 1, "text": "alpha\r\n", "terminator": "crlf",
+                 "byte_start": 3, "byte_end": 10},
+                {"line": 2, "text": "\r\n", "terminator": "crlf",
+                 "byte_start": 10, "byte_end": 12},
+                {"line": 3, "text": "β\n", "terminator": "lf",
+                 "byte_start": 12, "byte_end": 15},
+                {"line": 4, "text": "last\r", "terminator": "cr",
+                 "byte_start": 15, "byte_end": 20},
+            ],
+            "warnings": ["Strict UTF-8 text decoding only; successful decoding is not review or qualification."],
+        })
+        self.assertEqual(extract.text(b"one\ntwo")["lines"][-1],
+                         {"line": 2, "text": "two", "terminator": "none",
+                          "byte_start": 4, "byte_end": 7})
+        self.assertFalse(extract.text(b"one\ntwo")["ends_with_terminator"])
+        unicode_separators = "a\u0085b\u2028c\u2029d".encode("utf-8")
+        self.assertEqual(extract.text(unicode_separators)["lines"], [
+            {"line": 1, "text": "a\u0085b\u2028c\u2029d", "terminator": "none",
+             "byte_start": 0, "byte_end": len(unicode_separators)},
+        ])
+        self.assertEqual(extract.text(b"")["lines"], [])
+        self.assertEqual(extract.text(b"\xef\xbb\xbf")["lines"], [])
+        for raw in (b"\xff", b"\xc3(", b"\xff\xfeA\x00", b"\xfe\xff\x00A",
+                    b"\xff\xfe\x00\x00A\x00\x00\x00", b"\x00\x00\xfe\xff\x00\x00\x00A",
+                    b"valid\x00text"):
+            with self.subTest(raw=raw), self.assertRaises(extract.ExtractionError):
+                extract.text(raw)
+        with self.assertRaisesRegex(extract.ExtractionError, "line record limit"):
+            extract.text(b"x\n" * (extract.MAX_ELEMENTS + 1))
+        with patch.object(extract, "MAX_EXPANDED", 100):
+            with self.assertRaisesRegex(extract.ExtractionError, "rendition exceeds output limit"):
+                extract.text(b"one\ntwo\n")
+
+    def test_text_extraction_lifecycle_is_deferred_and_idempotent(self):
+        raw = b"first\r\n\xce\xb2\nlast"
+        self.registration("sources/notes.txt", raw)
+        source_before = (self.root / "sources/notes.txt").read_bytes()
+        events.initialize(self.root)
+        review_before = events.status(self.root)["state_token"]
+        manifest_before = self.manifest.read_bytes()
+
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        repeated = extract.run(self.root, "prepare", "D1", "text")
+        self.assertTrue(prepared["created"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(extract.run(self.root, "verify", "D1", "text")["run_id"],
+                         prepared["run_id"])
+        state = catalog.status(self.root)["state_token"]
+        registered = extract.run(self.root, "register", "D1", "text", "test-runner", state)
+        retry = extract.run(self.root, "register", "D1", "text", "test-runner", state)
+        self.assertTrue(registered["registered"])
+        self.assertTrue(retry["idempotent"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        self.assertEqual(child["data"]["coverage"], "deferred")
+        self.assertEqual(child["data"]["sha256"], prepared["rendition_sha256"])
+        self.assertEqual((self.root / "sources/notes.txt").read_bytes(), source_before)
+        self.assertEqual(events.status(self.root)["state_token"], review_before)
+        self.assertEqual(self.manifest.read_bytes(), manifest_before)
+
+    def test_text_lifecycle_refuses_changed_source_and_conflicting_publication(self):
+        self.registration("sources/notes.txt", b"stable\n")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        source = self.root / "sources/notes.txt"
+        source.write_bytes(b"changed\n")
+        with self.assertRaisesRegex(extract.ExtractionError, "catalog hash"):
+            extract.run(self.root, "verify", "D1", "text")
+        source.write_bytes(b"stable\n")
+        rendition = self.root / prepared["rendition"]
+        rendition.write_bytes(b"conflicting bytes")
+        with self.assertRaisesRegex(extract.ExtractionError, "differs from repeat extraction"):
+            extract.run(self.root, "verify", "D1", "text")
+        self.assertEqual(rendition.read_bytes(), b"conflicting bytes")
+
     def test_transcript_dictionary_and_xml_rejection(self):
         text = (ROOT / "AGENTS.md").read_text().splitlines()[0]
         raw = ("Transcript\nReader: " + text + "\n").encode()
