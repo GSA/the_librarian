@@ -41,8 +41,8 @@ directories. The application does not call embedding/model services or start a
 network listener. Your MCP client may forward returned text to a model; choose
 an authorized processing path.
 
-One installation serves one project's data root, policy and stores. Policy is
-loaded from this directory, so a second project needs its own installation; see
+One full-clone installation serves one project's data, policy and stores.
+Policy is loaded from the clone, so a second project needs its own installation; see
 [decision 0004](docs/decisions/0004-instance-topology.md).
 
 ## Initialize an empty installation
@@ -104,11 +104,40 @@ client/preflight when using that selection. Rebuild explicitly:
   --manifest config/selection.local.json --refresh-index
 ```
 
-Policy belongs to this installed toolkit; `--root` selects the data workspace,
-not a second implicit policy file. Separate deployments can have separate
+Policy belongs to this installed toolkit; `--root` selects the complete clone,
+not an arbitrary data workspace or second implicit policy file. Separate
+deployments can have separate
 toolkit configurations. Policy changes invalidate derived retrieval. Changing
 the review audience changes the persisted contract: do not change it on a
 populated store without an explicit migration design.
+
+## Components
+
+- `tools/catalog/` owns append-only metadata storage; `contracts.py` contains
+  record validation independently of SQLite mechanics.
+- `tools/review_events/` owns attributed append-only review history.
+- `tools/context_index/` owns the disposable freshness-bound retrieval index;
+  `cli.py` is its command adapter and `context_index.py` is its engine.
+- `tools/extraction/` contains explicit extraction lifecycles. Docling remains
+  deliberately isolated behind a separate pinned worker process and model
+  namespace; it is not imported by ordinary toolkit commands.
+- `tools/context-mcp/` is a read-only stdio adapter. It accepts a validated
+  full-clone `--root` and runs fixed package modules; arbitrary reader/store
+  script overrides are intentionally unsupported.
+- `tools/schemas/`, `tools/review/`, and `tests/` contain schema snapshots,
+  the local review gate, and temporary-workspace contract tests.
+
+The underscore package paths replace the former `context-index` and
+`review-events` source directories. Run package commands with `python -m` from
+an installation root; direct source-file execution is not a general interface.
+
+Maintainer verification:
+
+```sh
+python -m unittest discover -s tests -v
+python -m tools.schemas.export_schemas --check
+python -m tools.review.test_precommit
+```
 
 ## Interfaces
 

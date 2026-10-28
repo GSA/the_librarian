@@ -857,6 +857,25 @@ class PackageTests(unittest.TestCase):
 
 
 class Documentation(unittest.TestCase):
+    def test_component_map_paths_and_documented_module_commands_are_current(self):
+        readme = (ROOT / "README.md").read_text()
+        manifest = dict(package.release_paths(ROOT))
+        for path in re.findall(r"`((?:tools|tests|docs)/[^` ]+/?)`", readme):
+            if ".local" not in path:
+                with self.subTest(path=path):
+                    prefix = path.rstrip("/") + "/"
+                    self.assertTrue(path in manifest or any(item.startswith(prefix) for item in manifest), path)
+        modules = set(re.findall(
+            r"(?m)^\s*(?:\.venv/bin/)?python\d* -m ([a-zA-Z0-9_.]+)", readme
+        ))
+        for module in modules - {"pip", "venv"}:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-m", module, "--help"], cwd=ROOT,
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_librarian_identity_and_role_documents_are_packaged(self):
         paths = dict(package.release_paths(ROOT))
         self.assertEqual((ROOT / "README.md").read_text().splitlines()[0], "# The Librarian")
