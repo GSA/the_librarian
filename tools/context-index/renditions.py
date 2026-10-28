@@ -6,6 +6,8 @@ import re
 from bisect import bisect_right
 from pathlib import PurePosixPath
 
+import qualification
+
 
 def eligible(path):
     return isinstance(path, str) and bool(re.fullmatch(
@@ -19,13 +21,24 @@ def validate(config, engine):
         engine.fail("renditions must be a list of at most ten explicit selections")
     seen = set()
     for item in selections:
-        engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"), "Rendition selection")
+        engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),
+                      "Rendition selection", optional=("review_event_ids",))
         if (not eligible(item["path"]) or item["path"] in seen
                 or PurePosixPath(item["path"]).parts[3] != item["receipt_id"]
-                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "odt"}
+                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "odt", "docling"}
                 or not isinstance(item["sha256"], str)
                 or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
             engine.fail("Invalid or duplicate rendition selection")
+        review_ids = item.get("review_event_ids")
+        valid_review_ids = (isinstance(review_ids, list) and bool(review_ids)
+                            and all(isinstance(event_id, str)
+                                    and re.fullmatch(r"rev-[a-z0-9-]{1,100}", event_id)
+                                    for event_id in review_ids))
+        if (item["format"] == "docling" and
+                (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
+            engine.fail("Docling selection requires unique review_event_ids")
+        if item["format"] != "docling" and review_ids is not None:
+            engine.fail("review_event_ids are supported only for Docling selections")
         if not item["context"]:
             engine.fail("Rendition selection requires maintained source context")
         engine.validate_context(item["context"])
@@ -35,12 +48,14 @@ def validate(config, engine):
         seen.add(item["path"])
 
 
-def inputs(root, config, engine):
+def inputs(root, config, engine, review_snapshot=None):
     """Pin selected catalog records, original bytes and retained extraction bytes."""
     selections = config.get("renditions", [])
     if not selections:
         return [], ""
     catalog = engine.load_catalog()
+    if any(item["format"] == "docling" for item in selections) and review_snapshot is None:
+        review_snapshot = engine.load_event_reader().read_snapshot(root)
     snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
     state = snapshot["state"]["state_token"]
     result, identities = [], []
@@ -54,19 +69,28 @@ def inputs(root, config, engine):
         if hashlib.sha256(raw).hexdigest() != item["sha256"]:
             engine.fail("Selected rendition hash changed: " + item["path"])
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=engine.strict_object)
-        engine.fields(value, ("schema_version", "run_id", "extractor", "source", "boundary", "payload"),
-                      "Extraction")
-        engine.fields(value["extractor"], ("version", "sha256"), "Extractor identity")
+        if item["format"] == "docling":
+            engine.fields(value, ("schema", "run_id", "extractor", "source", "boundary", "conversion"),
+                          "Docling extraction")
+        else:
+            engine.fields(value, ("schema_version", "run_id", "extractor", "source", "boundary", "payload"),
+                          "Extraction")
+        if item["format"] != "docling":
+            engine.fields(value["extractor"], ("version", "sha256"), "Extractor identity")
         engine.fields(value["source"], ("receipt_id", "artifact_id", "source_ids", "path",
                                        "sha256", "bytes", "audience", "handling_refs"), "Extraction source")
-        payload = value["payload"]
+        payload = value.get("payload")
         required = (("format", "scope", "warnings", "lines", "precedence")
                     if item["format"] == "gemini-txt" else
                     ("format", "scope", "warnings", "lines", "bom_bytes", "ends_with_terminator")
                     if item["format"] == "text" else
                     ("format", "scope", "warnings", "nodes", "xml_sha256", "members", "unrendered_features"))
-        engine.fields(payload, required, "Extraction payload")
-        if (type(value["schema_version"]) is not int
+        if item["format"] != "docling":
+            engine.fields(payload, required, "Extraction payload")
+        if item["format"] == "docling":
+            if value.get("schema") != "docling-rendition-v1":
+                engine.fail("Unsupported Docling extraction schema")
+        elif (type(value["schema_version"]) is not int
                 or not isinstance(payload["warnings"], list)
                 or not all(isinstance(warning, str) for warning in payload["warnings"])):
             engine.fail("Unsupported extraction schema or warnings")
@@ -77,8 +101,9 @@ def inputs(root, config, engine):
         by_id = {record["id"]: record for record in records["records"]}
         source = value["source"]
         run = PurePosixPath(item["path"]).parts[4]
-        child = by_id.get("A-extract-" + run, {})
-        relation = by_id.get("R-extract-" + run, {})
+        prefix = "docling" if item["format"] == "docling" else "extract"
+        child = by_id.get("A-" + prefix + "-" + run, {})
+        relation = by_id.get("R-" + prefix + "-" + run, {})
         expected_source = {
             "receipt_id": item["receipt_id"], "artifact_id": original["id"],
             "source_ids": snapshot["registrations"][item["receipt_id"]]["receipt"]["data"]["source_ids"],
@@ -86,8 +111,11 @@ def inputs(root, config, engine):
         }
         child_data = child.get("data", {})
         relation_data = relation.get("data", {})
-        if (value["schema_version"] != 1 or value["run_id"] != run
-                or value["payload"]["format"] != item["format"] or source != expected_source
+        schema_matches = (value.get("schema") == "docling-rendition-v1"
+                          if item["format"] == "docling" else value.get("schema_version") == 1)
+        format_matches = (item["format"] == "docling" or payload["format"] == item["format"])
+        if (not schema_matches or value["run_id"] != run
+                or not format_matches or source != expected_source
                 or data["role"] != "original" or data["presence"] != "present"
                 or data["coverage"] == "excluded"
                 or child_data.get("path") != item["path"]
@@ -111,30 +139,47 @@ def inputs(root, config, engine):
             original_hash = hashlib.sha256(original_raw).hexdigest()
         if original_hash != source["sha256"]:
             engine.fail("Original source missing or changed: " + source["path"])
-        payload = value["payload"]
-        if payload["format"] == "text":
+        payload = value.get("payload")
+        if item["format"] == "text":
             validate_text_mapping(payload, original_raw, engine)
+        identity = {"original": original, "rendition": child, "relationship": relation,
+                    "source": source, "rendition_sha256": item["sha256"]}
+        docling_qualification = None
+        if item["format"] == "docling":
+            docling_qualification = qualification.docling(
+                item, value, identity, review_snapshot, engine)
+            validate_docling_conversion(value, engine)
         metadata = {
             "source": source, "rendition_path": item["path"], "rendition_sha256": item["sha256"],
             "extractor": value["extractor"], "run_id": run,
             "extraction_boundary": value["boundary"],
-            "format": payload["format"], "extraction_scope": payload["scope"],
-            "warnings": payload["warnings"],
+            "format": item["format"],
+            "extraction_scope": payload["scope"] if payload is not None else "Docling conversion envelope",
+            "warnings": (payload["warnings"] if payload is not None
+                         else value["conversion"]["warnings"]),
             "selection": ("Transcript-classified records only; generated notes and footer not indexed."
                           if item["format"] == "gemini-txt" else
                           "All byte-mapped physical text lines explicitly selected; decoding is not review."
                           if item["format"] == "text" else
+                          "Strictly qualified selected Docling structural records."
+                          if item["format"] == "docling" else
                           "Located XML records only; text rendition, not a rendered or approved view."),
-            "citation_contract": "Packet line ranges cite extraction JSON, not original lines or pages. "
-                                 "Resolve source_location for the original line, byte range or XML member/element. "
-                                 "Extraction and retrieval are not new review, corroboration or acceptance.",
+            "citation_contract": (
+                "Docling packet line ranges are null; source_location gives the exact retained-extraction "
+                "byte range, JSON pointer, self_ref and page/bounding-box provenance."
+                if item["format"] == "docling" else
+                "Packet line ranges cite extraction JSON, not original lines or pages. "
+                "Resolve source_location for the original line, byte range or XML member/element. "
+                "Extraction and retrieval are not new review, corroboration or acceptance."),
         }
         for key in ("precedence", "xml_sha256", "unrendered_features", "bom_bytes", "ends_with_terminator"):
-            if key in payload:
+            if payload is not None and key in payload:
                 metadata[key] = payload[key]
+        if docling_qualification is not None:
+            metadata["qualification"] = docling_qualification
+            identity["qualification"] = docling_qualification
         result.append((item, raw, value, metadata))
-        identities.append({"original": original, "rendition": child, "relationship": relation,
-                           "source": source, "rendition_sha256": item["sha256"]})
+        identities.append(identity)
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
 
 
@@ -183,8 +228,102 @@ def validate_text_mapping(payload, source_raw, engine):
         engine.fail("Invalid text byte mapping or final terminator state")
 
 
+def validate_docling_conversion(value, engine):
+    conversion = value.get("conversion")
+    engine.fields(conversion, ("schema", "format", "document", "pages", "warnings",
+                               "confidence", "omissions"), "Docling conversion")
+    if conversion["schema"] != "docling-conversion-v1" or conversion["format"] not in {"pdf", "image"}:
+        engine.fail("Unsupported Docling conversion schema or format")
+    if (not isinstance(conversion["warnings"], list)
+            or not all(isinstance(warning, dict) for warning in conversion["warnings"])):
+        engine.fail("Invalid Docling conversion warnings")
+    return conversion
+
+
+def docling_records(raw, value, engine):
+    conversion = validate_docling_conversion(value, engine)
+    document = conversion["document"]
+    engine.fields(document, ("texts", "tables"), "Docling document", optional=(
+        "schema_name", "version", "name", "body", "pages", "pictures", "key_value_items",
+        "form_items", "furniture", "groups"))
+    unsupported = ("pictures", "key_value_items", "form_items", "furniture", "groups")
+    if any(document.get(key) not in (None, [], {}) for key in unsupported):
+        engine.fail("Docling document contains unsupported content collections")
+    pages = conversion["pages"]
+    if (not isinstance(pages, list) or not pages
+            or any(not isinstance(page, dict) or type(page.get("page_no")) is not int
+                   for page in pages)):
+        engine.fail("Invalid Docling page inventory")
+    page_numbers = {page["page_no"] for page in pages}
+    if len(page_numbers) != len(pages):
+        engine.fail("Duplicate Docling page inventory")
+    ordinal = 0
+    for kind, items in (("text", document["texts"]), ("table", document["tables"])):
+        if not isinstance(items, list):
+            engine.fail("Invalid Docling document records")
+        for index, item in enumerate(items):
+            expected_ref = f"#/{kind}s/{index}"
+            if (not isinstance(item, dict) or item.get("self_ref") != expected_ref
+                    or ("label" in item and not isinstance(item["label"], str))
+                    or not isinstance(item.get("prov"), list) or not item["prov"]):
+                engine.fail("Invalid Docling record identity or provenance")
+            locations = []
+            for provenance in item["prov"]:
+                bbox = provenance.get("bbox", {}) if isinstance(provenance, dict) else {}
+                if (type(provenance.get("page_no")) is not int
+                        or provenance["page_no"] not in page_numbers
+                        or set(bbox) != {"l", "t", "r", "b", "coord_origin"}
+                        or bbox["coord_origin"] not in {"TOPLEFT", "BOTTOMLEFT"}
+                        or any(type(bbox[key]) not in {int, float}
+                               for key in ("l", "t", "r", "b"))):
+                    engine.fail("Invalid Docling page provenance")
+                locations.append({"page_no": provenance["page_no"], "bbox": bbox})
+            if kind == "text":
+                if not isinstance(item.get("text"), str) or not item["text"]:
+                    engine.fail("Invalid Docling text record")
+                search_text = item["text"]
+            else:
+                data = item.get("data", {})
+                cells = data.get("table_cells") if isinstance(data, dict) else None
+                if (type(data.get("num_rows")) is not int or data["num_rows"] <= 0
+                        or type(data.get("num_cols")) is not int or data["num_cols"] <= 0
+                        or not isinstance(cells, list)):
+                    engine.fail("Invalid Docling table structure")
+                required = {"text", "start_row_offset_idx", "start_col_offset_idx",
+                            "end_row_offset_idx", "end_col_offset_idx"}
+                if any(not isinstance(cell, dict) or not required <= set(cell)
+                       or not isinstance(cell["text"], str)
+                       or any(type(cell[key]) is not int for key in required - {"text"})
+                       or not (0 <= cell["start_row_offset_idx"] < cell["end_row_offset_idx"]
+                               <= data["num_rows"])
+                       or not (0 <= cell["start_col_offset_idx"] < cell["end_col_offset_idx"]
+                               <= data["num_cols"])
+                       for cell in cells):
+                    engine.fail("Invalid Docling table cells")
+                search_text = " ".join(cell["text"] for cell in cells)
+            exact_raw = json.dumps(
+                item, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            byte_start = raw.find(exact_raw)
+            if byte_start < 0 or raw.find(exact_raw, byte_start + 1) >= 0:
+                engine.fail("Docling record does not have a unique exact retained byte range")
+            byte_end = byte_start + len(exact_raw)
+            exact = raw[byte_start:byte_end].decode("utf-8")
+            ordinal += 1
+            yield {"anchor": kind + "-" + str(index + 1),
+                   "title": (item.get("label") or kind).replace("_", " ").title(),
+                   "start": ordinal, "end": ordinal, "text": exact,
+                   "search_text": search_text, "parent": None,
+                   "source_location": {"json_pointer": f"/conversion/document/{kind}s/{index}",
+                                       "byte_start": byte_start, "byte_end": byte_end,
+                                       "self_ref": expected_ref, "page_no": locations[0]["page_no"],
+                                       "bbox": locations[0]["bbox"], "provenance": locations}}
+
+
 def records(raw, value, engine):
     """Return exact on-disk JSON line spans alongside decoded search-only text."""
+    if value.get("schema") == "docling-rendition-v1":
+        yield from docling_records(raw, value, engine)
+        return
     text = raw.decode("utf-8")
     parts = text.split("\n")
     lines = [part + "\n" for part in parts[:-1]]
