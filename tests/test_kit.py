@@ -700,6 +700,11 @@ class Workspace(unittest.TestCase):
             ("bad-page-width", lambda value: value["conversion"]["pages"][0].update(width=-1)),
             ("oversized-page-width", lambda value: value["conversion"]["pages"][0]
              .update(width=10 ** 1000)),
+            ("finite-excessive-page-width", lambda value: value["conversion"]["pages"][0]
+             .update(width=1e308)),
+            ("excessive-page-count", lambda value: value["conversion"].update(
+                pages=[{"page_no": number, "width": 1, "height": 1, "textless": True}
+                       for number in range(1, 102)])),
             ("noncanonical-pages", lambda value: value["conversion"]["pages"][0].update(page_no=2)),
         ):
             value = deepcopy(base)

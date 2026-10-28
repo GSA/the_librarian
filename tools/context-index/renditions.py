@@ -10,6 +10,11 @@ from pathlib import PurePosixPath
 import qualification
 
 
+DOCLING_MAX_PAGES = 100
+DOCLING_RENDER_SCALE = 3.0
+DOCLING_MAX_PAGE_PIXELS = 32_000_000
+
+
 def eligible(path):
     return isinstance(path, str) and bool(re.fullmatch(
         r"data/extractions/\.local/D\d+/[a-f0-9]{64}/extraction\.json", path
@@ -267,12 +272,18 @@ def docling_records(raw, value, engine):
     if any(document.get(key) not in (None, [], {}) for key in unsupported):
         engine.fail("Docling document contains unsupported content collections")
     pages = conversion["pages"]
-    if (not isinstance(pages, list) or not pages
+    if (not isinstance(pages, list) or not pages or len(pages) > DOCLING_MAX_PAGES
             or any(not isinstance(page, dict) or type(page.get("page_no")) is not int
                    or any(not finite_number(page.get(key)) or page[key] <= 0
                           for key in ("width", "height"))
                    for page in pages)):
         engine.fail("Invalid Docling page inventory")
+    for page in pages:
+        scaled_width = page["width"] * DOCLING_RENDER_SCALE
+        scaled_height = page["height"] * DOCLING_RENDER_SCALE
+        if (not finite_number(scaled_width) or not finite_number(scaled_height)
+                or math.ceil(scaled_width) * math.ceil(scaled_height) > DOCLING_MAX_PAGE_PIXELS):
+            engine.fail("Excessive Docling page geometry")
     page_numbers = {page["page_no"] for page in pages}
     if page_numbers != set(range(1, len(pages) + 1)):
         engine.fail("Noncanonical Docling page inventory")
