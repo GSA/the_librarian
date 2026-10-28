@@ -592,7 +592,8 @@ class Workspace(unittest.TestCase):
                                 "pages": [{"page_no": 1, "width": 100, "height": 100,
                                            "textless": False}],
                                 "warnings": [{"code": "low_confidence", "message": "Synthetic warning"}],
-                                "confidence": {}, "omissions": []}}
+                                "confidence": {"layout": 0.75},
+                                "omissions": ["generated_page_images"]}}
         raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
                + "\n").encode()
         rendition = self.root / path
@@ -670,6 +671,10 @@ class Workspace(unittest.TestCase):
                              ["rev-exact"])
             self.assertEqual(text_packet["renditions"][path]["warnings"],
                              value["conversion"]["warnings"])
+            self.assertEqual(text_packet["renditions"][path]["confidence"],
+                             value["conversion"]["confidence"])
+            self.assertEqual(text_packet["renditions"][path]["omissions"],
+                             value["conversion"]["omissions"])
             # A broad context rule attached to the table must not leak into a
             # packet for the distinct non-line-based text record.
             self.config["context_rules"] = {path + "#table-1": ["documents/README.md"]}

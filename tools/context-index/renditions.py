@@ -177,6 +177,8 @@ def inputs(root, config, engine, review_snapshot=None):
                 metadata[key] = payload[key]
         if docling_qualification is not None:
             metadata["qualification"] = docling_qualification
+            metadata["confidence"] = value["conversion"]["confidence"]
+            metadata["omissions"] = value["conversion"]["omissions"]
             identity["qualification"] = docling_qualification
         result.append((item, raw, value, metadata))
         identities.append(identity)
@@ -237,6 +239,11 @@ def validate_docling_conversion(value, engine):
     if (not isinstance(conversion["warnings"], list)
             or not all(isinstance(warning, dict) for warning in conversion["warnings"])):
         engine.fail("Invalid Docling conversion warnings")
+    if not isinstance(conversion["confidence"], dict):
+        engine.fail("Invalid Docling conversion confidence")
+    if (not isinstance(conversion["omissions"], list)
+            or not all(isinstance(omission, str) and omission for omission in conversion["omissions"])):
+        engine.fail("Invalid Docling conversion omissions")
     return conversion
 
 
