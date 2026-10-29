@@ -14,6 +14,7 @@ SOURCES = {
     "catalog.sql": ("tools/catalog/catalog_store.py", "SQL", "VERSION"),
     "review-events.sql": ("tools/review_events/event_store.py", "SQL", "VERSION"),
     "context-index.sql": ("tools/context_index/context_index.py", "DDL", "SCHEMA"),
+    "intake.sql": ("tools/intake/store.py", "DDL", "SCHEMA"),
 }
 
 
