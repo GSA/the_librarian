@@ -1,6 +1,10 @@
 """Fixed native stage adapters; no executable request-defined callbacks."""
 from contextlib import closing
+import errno
+import json
 from pathlib import Path
+import sqlite3
+import subprocess
 
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
@@ -15,6 +19,23 @@ class StageFailure(Exception):
         identifier(code)
         self.category, self.code = category, code
         super().__init__(code)
+
+
+def native_failure(error):
+    """Classify wrapped native failures without persisting private diagnostics."""
+    current = error
+    while current is not None:
+        if (isinstance(current, subprocess.TimeoutExpired)
+                or isinstance(current, docling.AdapterError) and current.code == "timeout"):
+            return StageFailure("retryable", "native-timeout")
+        if isinstance(current, BlockingIOError):
+            return StageFailure("retryable", "native-busy")
+        if (isinstance(current, OSError) and current.errno in
+                {errno.EAGAIN, errno.EBUSY, errno.ENOSPC, errno.EIO, errno.ETIMEDOUT, errno.EINTR}
+                or isinstance(current, sqlite3.OperationalError)):
+            return StageFailure("retryable", "native-transient")
+        current = current.__cause__ or current.__context__
+    return StageFailure("blocked", "native-input")
 
 
 def prepare(root, stage):
@@ -47,6 +68,10 @@ def prepare(root, stage):
                     "rendition": path.relative_to(root).as_posix(), "extractor": value["extractor"]}
         raise StageFailure("blocked", "unsupported-stage")
     except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError, index.IndexError_) as error:
+        raise native_failure(error) from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        if stage["operation"] != "index-build":
+            raise
         raise StageFailure("blocked", "native-input") from error
 
 
@@ -104,6 +129,10 @@ def execute(root, stage, intent, previous=None):
             return evidence
         raise StageFailure("blocked", "unsupported-stage")
     except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError, index.IndexError_) as error:
+        raise native_failure(error) from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        if stage["operation"] != "index-build":
+            raise
         raise StageFailure("blocked", "native-input") from error
 
 

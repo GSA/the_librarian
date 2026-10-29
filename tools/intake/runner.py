@@ -38,8 +38,10 @@ def classify(error):
     return adapters.StageFailure("permanent", "invalid-artifact")
 
 
-def run(root, correlation_id, stage_id, *, now=None):
-    now = time.time() if now is None else now
+def run(root, correlation_id, stage_id, *, now=None, clock=None):
+    # Explicit now retains the fixed-time interface used by existing callers.
+    clock = clock if clock is not None else time.time if now is None else lambda: now
+    started = clock()
     with store.locked(root) as c:
         request, stage, saved = selected(c, correlation_id, stage_id)
         if saved["status"] in {"succeeded", "return-pending"}:
@@ -48,7 +50,7 @@ def run(root, correlation_id, stage_id, *, now=None):
         attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? AND cycle=? ORDER BY ordinal", (correlation_id, stage_id, saved["cycle"])).fetchall()
         unfinished = attempts[-1] if attempts and attempts[-1]["outcome"] is None else None
         if attempts and unfinished is None:
-            require(now >= attempts[-1]["eligible_at"], "backoff_pending")
+            require(started >= attempts[-1]["eligible_at"], "backoff_pending")
         ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
         if unfinished is None:
             require(ordinal <= request["retry"]["max_attempts"], "attempt_limit")
@@ -56,7 +58,7 @@ def run(root, correlation_id, stage_id, *, now=None):
         def begin():
             if unfinished is None:
                 with c:
-                    c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)", (correlation_id, stage_id, saved["cycle"], ordinal, now))
+                    c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)", (correlation_id, stage_id, saved["cycle"], ordinal, started))
                     c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
 
         def failed(error):
@@ -64,8 +66,9 @@ def run(root, correlation_id, stage_id, *, now=None):
             if isinstance(error, IntakeError):
                 failure = adapters.StageFailure("blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
             status = "blocked" if failure.category == "blocked" else "dead-letter" if failure.category == "permanent" or ordinal >= request["retry"]["max_attempts"] else "retryable"
+            ended = clock()
             with c:
-                c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (now, failure.category, failure.code, now + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
+                c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (ended, failure.category, failure.code, ended + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
                 c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
             return store.summary(c, correlation_id)
 
@@ -87,9 +90,10 @@ def run(root, correlation_id, stage_id, *, now=None):
         except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
             return failed(error)
         status = "return-pending" if stage["kind"] == "return" else "succeeded"
+        ended = clock()
         with c:
             save_artifact(c, correlation_id, stage_id, "evidence", evidence)
-            c.execute("UPDATE attempts SET ended=?,outcome=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (now, status, now, correlation_id, stage_id, saved["cycle"], ordinal))
+            c.execute("UPDATE attempts SET ended=?,outcome=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (ended, status, ended, correlation_id, stage_id, saved["cycle"], ordinal))
             c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
         return store.summary(c, correlation_id)
 
@@ -109,7 +113,7 @@ def replay(root, correlation_id, stage_id, *, now=None):
 def acknowledge(root, correlation_id, stage_id, acknowledgment):
     from .contracts import fields, sha, text
     fields(acknowledgment, {"delivery_correlation", "disposition_sha256", "transport_receipt"})
-    text(acknowledgment["delivery_correlation"])
+    text(acknowledgment["delivery_correlation"], 500)
     sha(acknowledgment["disposition_sha256"])
     text(acknowledgment["transport_receipt"], 500)
     with store.locked(root) as c:

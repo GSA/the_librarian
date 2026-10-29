@@ -40,6 +40,78 @@ class NativeTests(unittest.TestCase):
         stage_request(self.root, [stage("publication", "index-build", {"manifest": "config/selection.json", "db": "tools/context_index/.local/index.sqlite3"})])
         return manifest
 
+    def assert_lock_recovery(self, lock):
+        with lock:
+            result = runner.run(self.root, "req-native", "native")
+            self.assertEqual(result["stages"][0]["status"], "retryable")
+            self.assertEqual(result["stages"][0]["attempts"][0]["code"], "native-busy")
+            result = runner.run(self.root, "req-native", "native")
+            self.assertEqual(result["stages"][0]["status"], "dead-letter")
+        runner.replay(self.root, "req-native", "native")
+        self.assertTrue(runner.run(self.root, "req-native", "native")["complete"])
+
+    def test_publication_lock_is_retryable(self):
+        self.publication()
+        self.assert_lock_recovery(adapters.index.publication_lock(self.root / "tools/context_index/.local/index.sqlite3"))
+
+    def test_catalog_lock_is_retryable(self):
+        state = catalog.initialize(self.root)["state"]
+        args = {"records": [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}],
+                "actor": "test-runner", "request_id": "req-source", "reason": "Structural test", "expected_state": state["state_token"]}
+        stage_request(self.root, [stage("receipt", "catalog-submit", args)])
+        self.assert_lock_recovery(catalog.writer_lock(catalog.locations(self.root)[0]))
+
+    def test_review_lock_is_retryable(self):
+        import test_kit
+        event = test_kit.WorkspaceCase.pending(self)
+        state = events.initialize(self.root)
+        args = {"value": events.bundle([event]), "actor": "test-runner", "request_id": "req-review",
+                "expected_revision": 0, "expected_state": state["state_token"]}
+        stage_request(self.root, [stage("review", "review-append", args)])
+        self.assert_lock_recovery(events.writer_lock(events.locations(self.root)[0]))
+
+    def test_publication_decoding_failures_are_durable_without_tracebacks(self):
+        import subprocess
+        import sys
+        manifest = self.publication()
+        valid = json.loads(manifest.read_bytes())
+        for content in (b"{broken", b"\xff", None):
+            with self.subTest(content=content):
+                if content is None:
+                    source = self.root / "documents/invalid.md"
+                    source.parent.mkdir()
+                    source.write_bytes(b"# Invalid\n\xff")
+                    valid["documents"] = [{"path": "documents/invalid.md", "role": "reference", "context": []}]
+                    manifest.write_text(json.dumps(valid))
+                else:
+                    manifest.write_bytes(content)
+                result = subprocess.run([sys.executable, "-m", "tools.intake.cli", "--root", str(self.root),
+                                         "run", "req-native", "--stage", "native"], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                saved = store.inspect(self.root, "req-native")["stages"][0]
+                self.assertEqual(saved["status"], "blocked")
+                self.assertEqual(saved["attempts"][-1]["code"], "native-input")
+                self.assertIsNotNone(saved["attempts"][-1]["ended"])
+                self.assertFalse((self.root / "tools/context_index/.local/index.sqlite3").exists())
+                runner.replay(self.root, "req-native", "native")
+
+    def test_docling_timeout_is_retryable(self):
+        import test_docling
+        fixture = test_docling.DoclingLifecycle()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        store.initialize(fixture.root)
+        args = {"receipt": "D1", "format_name": "pdf", "artifacts_path": "/unused/models", "python": "/unused/python"}
+        stage_request(fixture.root, [stage("extraction", "docling-prepare", args)])
+        fixture.convert.side_effect = adapters.docling.AdapterError("Private worker diagnostic", "timeout")
+        result = runner.run(fixture.root, "req-native", "native")
+        self.assertEqual(result["stages"][0]["status"], "retryable")
+        self.assertEqual(result["stages"][0]["attempts"][0]["code"], "native-timeout")
+        self.assertNotIn("Private worker diagnostic", json.dumps(result))
+        fixture.convert.side_effect = lambda *args: (deepcopy(fixture.report), hashlib.sha256(adapters.docling.WORKER.read_bytes()).hexdigest())
+        self.assertTrue(runner.run(fixture.root, "req-native", "native")["complete"])
+
     def test_publication_lost_ack_reuses_matching_fresh_index(self):
         self.publication()
         real = adapters.execute

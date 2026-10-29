@@ -43,6 +43,15 @@ class LedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
             self.assertEqual(connection.execute("select raw from requests where correlation_id='req-one'").fetchone()[0], raw)
 
+    def test_reserved_uri_characters_in_root(self):
+        for name in ("instance?query", "instance#fragment"):
+            with self.subTest(name=name):
+                root = self.root / name
+                root.mkdir()
+                store.initialize(root)
+                store.stage(root, request())
+                self.assertEqual(store.inspect(root, "req-one")["correlation_id"], "req-one")
+
     def test_private_store_contract_and_integrity(self):
         with self.assertRaises(contracts.IntakeError):
             store.initialize(self.root)
@@ -182,6 +191,31 @@ class RunnerTests(unittest.TestCase):
             runner.run(self.root, "req-one", "delivery", now=8)
         self.assertEqual(len(result["stages"][0]["attempts"]), 3)
 
+    def test_failure_backoff_starts_at_completion(self):
+        from unittest.mock import patch
+        from tools.intake import runner, adapters
+        self.stage_live()
+        clock_value = [100]
+        def execute(*args):
+            clock_value[0] = 120
+            raise adapters.StageFailure("retryable", "busy")
+        with patch.object(adapters, "prepare", return_value={"pinned": "original"}), patch.object(adapters, "execute", side_effect=execute):
+            result = runner.run(self.root, "req-one", "delivery", clock=lambda: clock_value[0])
+        attempt = result["stages"][0]["attempts"][0]
+        self.assertEqual(attempt["started"], 100)
+        self.assertEqual(attempt["ended"], 120)
+        self.assertEqual(attempt["eligible_at"], 125)
+        with self.assertRaisesRegex(contracts.IntakeError, "backoff_pending"):
+            runner.run(self.root, "req-one", "delivery", now=124)
+
+    def test_success_records_completion_time(self):
+        from unittest.mock import patch
+        from tools.intake import runner, adapters
+        self.stage_live()
+        with patch.object(adapters, "prepare", return_value={"pinned": "original"}), patch.object(adapters, "execute", return_value={"boundary": "return-pending"}):
+            result = runner.run(self.root, "req-one", "delivery", clock=iter([100, 120]).__next__)
+        self.assertEqual(result["stages"][0]["attempts"][0]["ended"], 120)
+
     def test_return_pending_and_matching_ack(self):
         from tools.intake import runner
         from tools import policy
@@ -189,10 +223,11 @@ class RunnerTests(unittest.TestCase):
         path.write_bytes(b"private disposition")
         raw = json.loads(request(policy={"version": 1, "sha256": policy.load()[1]}))
         raw["stages"][0]["arguments"]["disposition_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        raw["stages"][0]["arguments"]["delivery_correlation"] = "d" * 500
         store.stage(self.root, json.dumps(raw).encode())
         pending = runner.run(self.root, "req-one", "delivery")
         self.assertEqual(pending["stages"][0]["status"], "return-pending")
-        ack = {"delivery_correlation": "delivery-one", "disposition_sha256": raw["stages"][0]["arguments"]["disposition_sha256"], "transport_receipt": "receipt-1"}
+        ack = {"delivery_correlation": "d" * 500, "disposition_sha256": raw["stages"][0]["arguments"]["disposition_sha256"], "transport_receipt": "receipt-1"}
         with self.assertRaises(contracts.IntakeError):
             runner.acknowledge(self.root, "req-one", "delivery", {**ack, "delivery_correlation": "wrong"})
         self.assertTrue(runner.acknowledge(self.root, "req-one", "delivery", ack)["complete"])

@@ -128,7 +128,7 @@ def locked(root):
     try:
         private(lock)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        c = sqlite3.connect(f"file:{db}?mode=rw", uri=True)
+        c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA foreign_keys=ON")
         c.execute("PRAGMA synchronous=FULL")
