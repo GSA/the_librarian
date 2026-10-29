@@ -289,6 +289,53 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(result["stages"][0]["status"], "blocked")
         self.assertEqual(catalog.status(root)["revision"], 1)
 
+    def docling_fixture(self):
+        import test_docling
+        fixture = test_docling.DoclingLifecycle()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        store.initialize(fixture.root)
+        return fixture
+
+    def test_docling_stage_converts_once_per_execution(self):
+        fixture = self.docling_fixture()
+        args = {"receipt": "D1", "format_name": "pdf", "artifacts_path": "/unused/models", "python": "/unused/python"}
+        stage_request(fixture.root, [stage("extraction", "docling-prepare", args)])
+        real = adapters.execute
+        def crash(*call):
+            real(*call)
+            raise SystemExit()
+        with patch.object(adapters, "execute", side_effect=crash), self.assertRaises(SystemExit):
+            runner.run(fixture.root, "req-native", "native")
+        # One pinned intent conversion plus one conversion for the attempt.
+        self.assertEqual(fixture.convert.call_count, 2)
+        self.assertTrue(runner.run(fixture.root, "req-native", "native")["complete"])
+        self.assertEqual(fixture.convert.call_count, 3)
+
+    def test_source_drift_before_native_snapshot_publishes_nothing(self):
+        from tools.extraction import docling_adapter as docling
+        fixture = self.docling_fixture()
+        args = {"receipt": "D1", "format_name": "pdf", "artifacts_path": "/unused/models", "python": "/unused/python"}
+        stage_request(fixture.root, [stage("extraction", "docling-prepare", args)])
+        real = docling.run
+        def drift(*call, **named):
+            raw = fixture.raw + b" revised"
+            fixture.path.write_bytes(raw)
+            record = {"id": "A-input", "kind": "artifact", "data": {
+                "path": "sources/input.pdf", "parent_id": None, "receipt_id": "D1",
+                "role": "original", "audience": "source", "coverage": "pending-extraction",
+                "reason": "Revised synthetic structural input.", "presence": "present",
+                "sha256": hashlib.sha256(raw).hexdigest(), "hash_basis": "observed",
+                "bytes": len(raw), "extraction": "pending", "handling_refs": [], "provenance": []}}
+            catalog.submit(fixture.root, [record], actor="test-runner", request_id="revise-input",
+                           expected_state=catalog.status(fixture.root)["state_token"],
+                           reason="Source revised between intake pinning and native snapshot")
+            return real(*call, **named)
+        with patch.object(adapters.docling, "run", side_effect=drift):
+            result = runner.run(fixture.root, "req-native", "native")
+        self.assertEqual(result["stages"][0]["status"], "blocked")
+        self.assertEqual(list((fixture.root / docling.HOME).rglob("extraction.json")), [])
+
     def test_docling_stage_boundaries_and_restart(self):
         import test_docling
         from tools.extraction import docling_adapter

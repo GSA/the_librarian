@@ -17,7 +17,10 @@ named stage. The ledger is operational recovery state, never corpus authority.
   another attempt. Catalog/review retries use original request IDs and verified
   native backups; evidence records original committed revisions, not current
   unrelated revisions. Docling reruns the offline native lifecycle, binding
-  source/runtime/rendition identity; no auto-review or selection.
+  source/runtime/rendition identity; no auto-review or selection. Intake passes
+  the pinned identity to the native lifecycle as `expected_identity`, so a
+  source or runtime change refuses before any rendition or registration is
+  published and each attempt converts once.
 - Publication pins manifest bytes, source hashes and native metadata/freshness.
   A matching fresh publication can reconcile without rebuilding. Input drift
   blocks; correction requires a new linked request, not refreshed replay tokens.

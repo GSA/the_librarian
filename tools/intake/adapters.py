@@ -116,11 +116,14 @@ def execute(root, stage, intent, previous=None):
                     "event_ids": [e["event_id"] for e in args["value"]["events"]],
                     "request_id": args["request_id"], "backup": result["backup"]}
         if operation.startswith("docling-"):
-            require(prepare(root, stage) == intent, "changed_extraction_identity")
+            # The native lifecycle validates the pinned identity against its own
+            # snapshot, so one conversion per attempt decides the effect.
+            identity = {key: intent[key] for key in ("run_id", "source", "extractor")}
             result = docling.run(root, operation.removeprefix("docling-"), args["receipt"], args["format_name"],
                                  Path(args["artifacts_path"]), Path(args["python"]),
-                                 actor=args.get("actor"), expected_state=args.get("expected_state"))
-            require(result["run_id"] == intent["run_id"], "changed_extraction_identity")
+                                 actor=args.get("actor"), expected_state=args.get("expected_state"),
+                                 expected_identity=identity)
+            require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"], "changed_extraction_identity")
             evidence = {"boundary": "extraction-" + operation.removeprefix("docling-"),
                         "run_id": result["run_id"], "rendition": result["rendition"],
                         "rendition_sha256": result["rendition_sha256"], "source_sha256": result["source_sha256"]}
