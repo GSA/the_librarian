@@ -264,6 +264,13 @@ def _identity(items, entities):
             for input in item['inputs']:
                 _require(input not in redirects, 'Competing active identity consumers')
                 redirects[input] = item['outputs']
+    # Include historical consumers; array order must not determine NEW identity validity.
+    times = {id: _time(item['decided_at']) for id, item in records.items()}
+    for item in items:
+        for input in item['inputs']:
+            if input in owners:
+                _require(times[owners[input]] <= times[item['id']],
+                         'Identity output cannot be created after consumption')
     # Iterative traversal avoids recursion limits, even with bounded dense histories.
     for start in graph:
         stack = [(start, frozenset())]

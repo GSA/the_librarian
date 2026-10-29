@@ -258,7 +258,11 @@ one entity produce one candidate; literal duplicate list values fail. Superseded
 identity outputs are historical, not current matches, unless explicitly consumed
 by an active redirect. Final outputs must also match namespace/category scope.
 All identity redirects, including historical ones, must be acyclic; each output
-has a unique creating decision. Claim references remain bound to their original
+has a unique creating decision. Within the supplied bundle, an output cannot
+be created after any decision has consumed that ID, including historical
+decisions. Compare `decided_at` as UTC instants independently of array order;
+creation before or at consumption remains valid, including explicit later
+consumption of historical outputs. Claim references remain bound to their original
 entity IDs. Validation cannot establish that IDs were never recycled outside
 the supplied bundle or that historical bytes match retained authority.
 

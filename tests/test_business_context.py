@@ -279,6 +279,47 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope', 'rule'),
                          {'status': 'unknown', 'candidates': []})
 
+    def test_identity_outputs_cannot_recycle_consumed_ids(self):
+        decisions = [decision(), decision('M-two', inputs=('E-four', 'E-five'),
+                    outputs=('E-one',), decided_at='2026-01-02T00:00:00Z')]
+        for reverse in (False, True):
+            data = self.history_bundle(copy.deepcopy(decisions))
+            if reverse:
+                data['entities'].reverse()
+                data['identity_decisions'].reverse()
+            with self.subTest(reverse=reverse), self.assertRaises(bc.BusinessContextError):
+                bc.validate_bundle(data)
+            with self.subTest(resolve=True, reverse=reverse), self.assertRaises(bc.BusinessContextError):
+                bc.resolve_entity(data, 'E-four', 'scope')
+
+    def test_identity_creation_precedes_consumption_in_either_array_order(self):
+        # Compare UTC instants, not local timestamp strings; equal times remain valid.
+        for consumed_at, valid in (('2025-12-31T20:00:00-05:00', True),
+                                   ('2026-01-01T00:00:00Z', True),
+                                   ('2026-01-01T00:30:00+01:00', False)):
+            for reverse in (False, True):
+                decisions = [decision(), decision('M-two', inputs=('E-three', 'E-four'),
+                             outputs=('E-five',), decided_at=consumed_at)]
+                data = self.history_bundle(decisions[::-1] if reverse else decisions)
+                with self.subTest(consumed_at=consumed_at, reverse=reverse):
+                    if valid:
+                        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope'),
+                                         {'status': 'resolved', 'candidates': ['E-five']})
+                    else:
+                        with self.assertRaises(bc.BusinessContextError):
+                            bc.validate_bundle(data)
+
+    def test_historical_outputs_can_be_explicitly_consumed_later(self):
+        decisions = [decision(), decision('M-two', outputs=('E-four',),
+                     supersedes='M-one', decided_at='2026-01-02T00:00:00Z'),
+                     decision('M-three', inputs=('E-three', 'E-five'), outputs=('E-six',),
+                              decided_at='2026-01-03T00:00:00Z')]
+        for reverse in (False, True):
+            data = self.history_bundle(decisions[::-1] if reverse else decisions)
+            with self.subTest(reverse=reverse):
+                self.assertEqual(bc.resolve_entity(data, 'E-three', 'scope'),
+                                 {'status': 'resolved', 'candidates': ['E-six']})
+
     def test_corrections_preserve_claim_evidence(self):
         data = self.history_bundle([decision()])
         data['entities'][1]['category'] = 'workflow'
