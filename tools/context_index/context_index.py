@@ -474,7 +474,7 @@ def publication_lock(db):
         os.close(descriptor)
 
 
-def build(root, manifest, db, config, manifest_hash):
+def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
     review_snapshot = (load_event_reader().read_snapshot(root)
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
@@ -557,6 +557,8 @@ def build(root, manifest, db, config, manifest_hash):
             existing.close()
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
+        if publication_guard is not None:
+            publication_guard()
         os.replace(temporary, db)
         return envelope(command="build", fresh=True, database=str(db), **counts)
     finally:

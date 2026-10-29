@@ -147,6 +147,9 @@ populated store without an explicit migration design.
 - `tools/extraction/` contains explicit extraction lifecycles. Docling remains
   deliberately isolated behind a separate pinned worker process and model
   namespace; it is not imported by ordinary toolkit commands.
+- `tools/intake/` provides private durable named-stage attempts, dead-letter
+  inspection, explicit replay and transport-acknowledgment recording over native
+  writers. It does not acquire sources or schedule work.
 - `tools/context-mcp/` is a read-only stdio adapter. It accepts a validated
   full-clone `--root` and runs fixed package modules; arbitrary reader/store
   script overrides are intentionally unsupported.
@@ -178,6 +181,7 @@ Run toolkit commands from the clone root with `python -m`; each supports `--help
 | `python -m tools.extraction.extract` | Registered strict UTF-8 plain text, Gemini-format transcript and ODT extraction, verification and separate metadata registration |
 | `python -m tools.extraction.docling_extract` | Optional offline PDF/image Docling prepare, repeat verification and separate deferred-rendition registration |
 | `python -m tools.context_index.cli` | Explicit build, freshness status, lexical search, qualified get/get-many and live catalog reads |
+| `python -m tools.intake.cli --root ROOT` | Explicit intake staging, named-stage run/resume, inspect/list/dead-letter, replay and acknowledgment |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics: write, report and prune; never a catalog, review or retrieval authority |
 | `librarian-mcp` | Read-only stdio adapter: status, search, get, get_many, catalog, review_events |
 
@@ -203,6 +207,46 @@ Native review bundles
 use the JSON schema returned by `event_store.py schema`. Supply actual
 attribution, handling, known/unknown metadata and scope; do not fabricate
 review results to satisfy required fields.
+
+### Durable intake
+
+Use one authorized private clone and supply actual source metadata/review events
+through the native contracts. Intake does not seed a corpus or infer a review.
+
+```sh
+python -m tools.intake.cli --root "$ROOT" initialize
+python -m tools.intake.cli --root "$ROOT" stage --request "$REQUEST"
+python -m tools.intake.cli --root "$ROOT" run "$CORRELATION" --stage "$STAGE"
+python -m tools.intake.cli --root "$ROOT" inspect "$CORRELATION"
+python -m tools.intake.cli --root "$ROOT" dead-letter
+python -m tools.intake.cli --root "$ROOT" replay "$CORRELATION" --stage "$STAGE"
+python -m tools.intake.cli --root "$ROOT" resume "$CORRELATION" --stage "$STAGE"
+python -m tools.intake.cli --root "$ROOT" acknowledge "$CORRELATION" --stage "$RETURN_STAGE" --receipt "$ACK"
+```
+
+Request v1 has `version: 1`, a stable `correlation_id`, nullable `correction_of`,
+`policy: {version, sha256}`, `retry: {max_attempts, backoff_seconds}`, and ordered
+`stages: [{id, kind, operation, arguments}]`. Obtain the installed policy hash
+with `python -c 'from tools import policy; print(policy.load()[1])'`.
+`tools/intake/contracts.py` defines the closed native argument sets. A return
+stage uses `kind: "return"`, `operation: "await-ack"` and arguments
+`delivery_correlation`, root-relative `disposition_path`, `disposition_sha256`.
+The acknowledgment is an object with `delivery_correlation`,
+`disposition_sha256` and `transport_receipt`.
+
+Exact request bytes are retained privately; changed bytes under the same
+correlation conflict. Corrections use a new correlation linked by
+`correction_of`. Replay retains the original policy/concurrency tokens and
+prepared identities; it never silently updates authorization. Retry eligibility
+is recorded without sleeping; operators invoke the next eligible attempt.
+Only the explicitly named stage executes. Catalog/review commitment evidence
+refers to the original native revision and verified backup; Docling registration
+remains deferred extraction, not substantive review. Publication confirmation
+is historical: `inspect` reports current selected-index availability separately.
+A return remains `return-pending` until a matching explicit acknowledgment;
+`delivered` records that supplied transport claim, not independent remote
+verification or business acceptance. Return transport remains a separate
+integration. See [the reusable operator contract](context/intake.md).
 
 Retrieval returns original text, hashes and exact spans, together with
 configured qualifications. Search snippets are discovery only. Compact and

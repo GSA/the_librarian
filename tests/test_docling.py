@@ -99,6 +99,20 @@ class DoclingLifecycle(unittest.TestCase):
         self.assertEqual(relation["data"]["relation"], "rendition-of")
         self.assertIn("not visual equivalence", relation["data"]["scope"])
 
+    def test_expected_identity_mismatch_refuses_before_publication(self):
+        prepared = self.call("prepare")
+        identity = adapter.bridge.catalog.decode(
+            (self.root / prepared["rendition"]).read_text())
+        pinned = {"run_id": identity["run_id"], "source": identity["source"],
+                  "extractor": identity["extractor"]}
+        self.call("verify", expected_identity=pinned)
+        with self.assertRaisesRegex(adapter.AdapterError, "Expected identity must name"):
+            self.call("verify", expected_identity={"run_id": pinned["run_id"]})
+        with patch.object(adapter, "_publish") as publish:
+            with self.assertRaisesRegex(adapter.AdapterError, "differs from the expected identity"):
+                self.call("prepare", expected_identity={**pinned, "run_id": "0" * 64})
+            publish.assert_not_called()
+
     def test_catalog_mutation_during_conversion_refuses_before_publication(self):
         def mutate(*args):
             record = {"id": "S2", "kind": "source",
