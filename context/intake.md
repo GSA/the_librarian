@@ -21,7 +21,14 @@ named stage. The ledger is operational recovery state, never corpus authority.
 - Publication pins manifest bytes, source hashes and native metadata/freshness.
   A matching fresh publication can reconcile without rebuilding. Input drift
   blocks; correction requires a new linked request, not refreshed replay tokens.
-  Inspection reports current availability separately from historical completion.
+  Intake passes `index.build` an optional `publication_guard` callback, which the
+  native builder invokes inside the publication lock immediately before
+  atomically replacing the destination; a raising guard preserves the prior
+  index. Inspection reports current availability separately from historical
+  completion, including when a published index later becomes unreadable.
+- Undecodable or invalid native inputs block durably with a recorded attempt
+  outcome instead of surfacing a traceback, and ledger write failures after
+  validation report an unavailable ledger rather than claiming corruption.
 - Retryable failures record eligibility time; nothing sleeps or schedules itself.
   `replay` explicitly resets a blocked/dead-letter stage's bounded cycle while
   retaining exact request, intent and all attempt/replay history. Other requests

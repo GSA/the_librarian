@@ -392,6 +392,18 @@ class WorkspaceTests(WorkspaceCase):
             self.build()
         self.assertEqual(self.db.read_bytes(), before)
 
+    def test_refusing_publication_guard_preserves_prior_index(self):
+        self.docs()
+        before = self.db.read_bytes()
+        config, checksum = index.load_manifest(self.manifest)
+        def refuse():
+            raise index.IndexError_("Caller refused publication")
+        with index.publication_lock(self.db), self.assertRaises(index.IndexError_):
+            index.build(self.root, self.manifest, self.db, config, checksum,
+                        publication_guard=refuse)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertFalse(list(self.db.parent.glob(f".{self.db.name}.build-*")))
+
     def test_stale_content_detected(self):
         self.docs()
         (self.root / "documents/AGENTS.md").write_bytes((ROOT / "README.md").read_bytes())

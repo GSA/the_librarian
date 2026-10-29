@@ -133,12 +133,18 @@ def locked(root):
         c.execute("PRAGMA foreign_keys=ON")
         c.execute("PRAGMA synchronous=FULL")
         validate(c, root)
-        yield c
     except sqlite3.Error as error:
-        raise IntakeError("corrupt_store") from error
-    finally:
         if c is not None:
             c.close()
+        os.close(fd)
+        raise IntakeError("corrupt_store") from error
+    try:
+        # A failure after validation is an unavailable ledger, not a corrupt one.
+        yield c
+    except sqlite3.Error as error:
+        raise IntakeError("ledger_unavailable") from error
+    finally:
+        c.close()
         os.close(fd)
 
 

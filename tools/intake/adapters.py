@@ -70,8 +70,7 @@ def prepare(root, stage):
     except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError, index.IndexError_) as error:
         raise native_failure(error) from error
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        if stage["operation"] != "index-build":
-            raise
+        # Undecodable native inputs block durably rather than escaping as a crash.
         raise StageFailure("blocked", "native-input") from error
 
 
@@ -132,8 +131,7 @@ def execute(root, stage, intent, previous=None):
     except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError, index.IndexError_) as error:
         raise native_failure(error) from error
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        if stage["operation"] != "index-build":
-            raise
+        # Undecodable native inputs block durably rather than escaping as a crash.
         raise StageFailure("blocked", "native-input") from error
 
 

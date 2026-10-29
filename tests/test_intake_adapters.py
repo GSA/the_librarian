@@ -96,6 +96,41 @@ class NativeTests(unittest.TestCase):
                 self.assertFalse((self.root / "tools/context_index/.local/index.sqlite3").exists())
                 runner.replay(self.root, "req-native", "native")
 
+    def test_corrupt_review_payload_blocks_without_traceback(self):
+        import sqlite3 as database
+        import subprocess
+        import sys
+        import test_kit
+        event = test_kit.WorkspaceCase.pending(self)
+        state = events.initialize(self.root)
+        events.append(self.root, events.bundle([event]), "test-runner", "req-prior", 0, state["state_token"])
+        other = deepcopy(event)
+        other["event_id"], other["source"]["locator"] = "rev-next", "sources/next.txt"
+        current = events.status(self.root)
+        args = {"value": events.bundle([other]), "actor": "test-runner", "request_id": "req-review",
+                "expected_revision": current["revision"], "expected_state": current["state_token"]}
+        stage_request(self.root, [stage("review", "review-append", args)])
+        # A decode failure inside a native writer is an input condition, not a crash.
+        with closing(database.connect(events.locations(self.root)[1])) as c, c:
+            c.execute("DROP TRIGGER immutable_events_update")
+            c.execute("UPDATE events SET payload='{broken' WHERE event_id='rev-pending'")
+        result = subprocess.run([sys.executable, "-m", "tools.intake.cli", "--root", str(self.root),
+                                 "run", "req-native", "--stage", "native"], capture_output=True, text=True)
+        self.assertNotIn("Traceback", result.stderr)
+        saved = store.inspect(self.root, "req-native")["stages"][0]
+        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(saved["attempts"][-1]["code"], "native-input")
+        self.assertIsNotNone(saved["attempts"][-1]["ended"])
+
+    def test_ledger_write_failure_is_not_reported_as_corruption(self):
+        import sqlite3 as database
+        self.publication()
+        with patch.object(runner, "save_artifact", side_effect=database.OperationalError("disk I/O error")):
+            with self.assertRaises(adapters.IntakeError) as caught:
+                runner.run(self.root, "req-native", "native")
+        self.assertEqual(caught.exception.code, "ledger_unavailable")
+        self.assertEqual(store.inspect(self.root, "req-native")["stages"][0]["status"], "staged")
+
     def test_docling_timeout_is_retryable(self):
         import test_docling
         fixture = test_docling.DoclingLifecycle()
