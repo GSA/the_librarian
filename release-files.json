@@ -20,6 +20,8 @@
   "docs/decisions/0009-declared-ontology-and-entailment.md",
   "docs/decisions/README.md",
   "release-files.json",
+  "docs/contracts/business-context.md",
+  "docs/decisions/0010-business-context-contract.md",
   "tests/test_business_context.py",
   "tools/business_context.py",
   "tests/test_kit.py",

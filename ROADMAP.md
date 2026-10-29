@@ -1,13 +1,25 @@
 # The Librarian development and ingestion roadmap
 
 **Audience:** maintainers, operators and their agents.
-**Updated:** October 28, 2026.
+**Updated:** October 29, 2026.
 **Status:** capability inventory and proposed work, not an implementation,
 permission grant, delivery commitment or program-readiness register.
 
 This is the canonical generic roadmap. Keep private source inventories,
 access decisions, tickets, job runs, evidence and observations in the program
 instance. No customer content is needed to maintain or distribute this plan.
+
+## Business-context contract baseline
+
+The [business-context contract](docs/contracts/business-context.md) and
+[decision 0010](docs/decisions/0010-business-context-contract.md) ship pure
+bundle/evidence validation, scoped identity resolution and answer conformance.
+Synthetic collision, contradiction, correction, expiration and candidate tests
+are component evidence, not a real engineering-question demonstration. Business
+persistence, extraction, runtime qualification and traversal remain separate
+work; the real-question/exact-evidence-route gate in decision 0006 is still
+unsatisfied. Future authority changes require actual immediate store/narrative
+emptiness inspection or an approved backed-up append-preserving migration.
 
 ## Goal and current baseline
 

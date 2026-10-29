@@ -179,6 +179,13 @@ justify an absence claim, and must never be presented as improving coverage.
    readable only under the shipped default vocabulary; it is never silently
    adopted into a custom one.
 
+## Business context refinement
+
+[0010](0010-business-context-contract.md) defines a separate bounded business
+contract with pure validation and resolution. Reported basis remains distinct
+from qualification. It changes neither the catalog ontology default nor
+review/store schemas and adds no persistence, projection or entailment.
+
 ## Consequences
 
 - The enforced domain model becomes reviewable as a document rather than

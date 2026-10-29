@@ -132,6 +132,13 @@ populated store without an explicit migration design.
 
 ## Components
 
+- `tools/business_context.py` provides pure `validate_bundle`, `resolve_entity`
+  and `validate_answer` Python APIs. See the normative
+  [business-context contract](docs/contracts/business-context.md) and
+  [decision 0010](docs/decisions/0010-business-context-contract.md). These check
+  supplied conformance, not truth, permissions or actual freshness; they perform
+  no persistence, ingestion, qualification, traversal or code-graph copying.
+
 - `tools/catalog/` owns append-only metadata storage; `contracts.py` contains
   record validation independently of SQLite mechanics.
 - `tools/review_events/` owns attributed append-only review history.

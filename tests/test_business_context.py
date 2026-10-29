@@ -1,6 +1,16 @@
 """Synthetic protocol cases; no installed corpus or business acceptance."""
 import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 import unittest
+from zipfile import ZipFile
+
+from tests.support import ROOT, clone_release
+from tools import package
+from tools.catalog import catalog_store as catalog
 
 from tools import business_context as bc
 
@@ -413,6 +423,50 @@ class AnswerTests(unittest.TestCase):
         bc.validate_answer(unknown, bundle())
         self.refuse(answer(status='unknown', limitations=[CAVEAT, 'No records']))
         self.refuse(dict(unknown, limitations=[CAVEAT]))
+
+
+class CompatibilityTests(unittest.TestCase):
+    def test_existing_catalog_refuses_business_kind(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = catalog.initialize(root)
+            records = [{'id': 'S1', 'kind': 'source',
+                        'data': {'category': 'artifact', 'provenance': []}}]
+            catalog.submit(root, records, actor='synthetic-runner', request_id='retain',
+                           expected_state=state['state_token'], reason='Structural preservation test')
+            db = catalog.locations(root)[1]
+            before = db.read_bytes()
+            state = catalog.status(root)
+            with self.assertRaises(catalog.CatalogError):
+                catalog.submit(root, [{'id': 'E-one', 'kind': 'entity', 'data': entity()}],
+                               actor='synthetic-runner', request_id='refused',
+                               expected_state=state['state_token'], reason='Structural refusal test')
+            self.assertEqual(db.read_bytes(), before)
+            with self.assertRaises(catalog.CatalogError):
+                catalog.initialize(root)
+            self.assertEqual(db.read_bytes(), before)
+            self.assertEqual(catalog.status(root)['state_token'], state['state_token'])
+            self.assertEqual(catalog.status(root)['records'], 1)
+
+    def test_release_includes_contract_without_instance_data(self):
+        names = package.load_release_manifest()
+        self.assertTrue({'tools/business_context.py', 'tests/test_business_context.py',
+                         'docs/contracts/business-context.md',
+                         'docs/decisions/0010-business-context-contract.md'} <= set(names))
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = root / 'release.zip'
+            result = subprocess.run([sys.executable, '-m', 'tools.package', '--output', str(archive)],
+                                    cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with ZipFile(archive) as zipfile:
+                self.assertEqual(set(zipfile.namelist()), set(names))
+            clone = root / 'clone'
+            clone_release(clone)
+            result = subprocess.run([sys.executable, '-c',
+                "from tools.business_context import validate_bundle; validate_bundle(dict(contract_version=1, entities=[], claims=[], identity_decisions=[]))"],
+                cwd=clone, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':
