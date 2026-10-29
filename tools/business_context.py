@@ -278,6 +278,86 @@ def _identity(items, entities):
     return redirects, retired
 
 
+OPEN_WORLD_CAVEAT = ('Missing records do not prove absence; reverse navigation is not '
+                     'complete impact; a link is not support.')
+
+
+def validate_answer(answer, bundle):
+    """Check supplied answer metadata; does not verify any runtime authority."""
+    validate_bundle(bundle)
+    _exact(answer, 'contract_version as_of status claim_ids evidence review_event_ids '
+           'handling limitations freshness')
+    _require(type(answer['contract_version']) is int and answer['contract_version'] == 1,
+             'Unsupported answer version')
+    _time(answer['as_of'])
+    _choice(answer['status'], {'qualified', 'partial', 'unknown', 'stale', 'denied'})
+    _strings(answer['claim_ids'], r'C-[A-Za-z0-9][A-Za-z0-9-]{0,99}')
+    _list(answer['evidence'])
+    for item in answer['evidence']:
+        _evidence(item)
+    _strings(answer['review_event_ids'], r'rev-[a-z0-9-]{1,100}')
+    _strings(answer['handling'])
+    _strings(answer['limitations'], nonempty=True)
+    _require(OPEN_WORLD_CAVEAT in answer['limitations'], 'Open-world caveat required')
+    fresh = answer['freshness']
+    _exact(fresh, 'catalog_state review_state vocabulary_hash selection_hash policy_hash '
+           'source_state code_state checked_at')
+    _require(_time(fresh['checked_at']) <= _time(answer['as_of']), 'Future freshness check')
+    for key in ('catalog_state', 'review_state'):
+        if fresh[key] is not None:
+            _text(fresh[key])
+    for key in ('vocabulary_hash', 'selection_hash', 'policy_hash'):
+        if fresh[key] is not None:
+            _pattern(fresh[key], r'[0-9a-f]{64}')
+    _choice(fresh['source_state'], {'current', 'stale', 'unknown', 'denied'})
+    _choice(fresh['code_state'], {'current', 'stale', 'unknown', 'denied', 'not-applicable'})
+    status = answer['status']
+    bindings = ('catalog_state', 'review_state', 'vocabulary_hash', 'selection_hash', 'policy_hash')
+    if status != 'qualified':
+        _require(len(answer['limitations']) >= 2, 'Explicit status limitation required')
+    if status in {'stale', 'denied', 'unknown'}:
+        _require(not answer['claim_ids'] and not answer['evidence']
+                 and not answer['review_event_ids'], 'Status refuses evidence-bearing fields')
+    if status == 'denied':
+        _require(not answer['handling'] and all(fresh[k] is None for k in bindings)
+                 and fresh['source_state'] == 'denied' and fresh['code_state'] == 'denied',
+                 'Denial must remove identifying bindings and handling')
+        return
+    _require(fresh['source_state'] != 'denied' and fresh['code_state'] != 'denied',
+             'Denied source/code requires denied envelope')
+    if answer['claim_ids'] or answer['evidence'] or answer['review_event_ids']:
+        _require(fresh['source_state'] != 'stale' and fresh['code_state'] != 'stale',
+                 'Stale source/code refuses evidence')
+    claims = _records(bundle['claims'])
+    successors = _history(claims)
+    for id in answer['claim_ids']:
+        _require(id in claims, 'Unknown answer claim')
+        item = claims[id]
+        _require(all(e in answer['evidence'] for e in item['evidence'])
+                 and all(r in answer['review_event_ids'] for r in item['review_event_ids'])
+                 and all(h in answer['handling'] for h in item['handling']),
+                 'Missing evidence/review/handling companions')
+        if status == 'qualified':
+            _require(item['qualification'] == 'confirmed' and id not in successors,
+                     'Qualified answer requires active confirmed claims')
+            _require(item['valid_from'] is not None and item['valid_until'] is not None,
+                     'Unknown validity cannot qualify')
+            _require(_time(item['valid_from']) <= _time(answer['as_of']) < _time(item['valid_until']),
+                     'Claim is outside half-open validity')
+            for other in claims.values():
+                if other['id'] not in successors and other['qualification'] not in {'rejected', 'retracted'}:
+                    _require(other['id'] not in item['contradicts'] and id not in other['contradicts'],
+                             'Unresolved active contradiction')
+    has_code = any(claims[id]['external_reference'] is not None for id in answer['claim_ids'])
+    _require(not has_code or fresh['code_state'] != 'not-applicable',
+             'Code reference requires applicable freshness')
+    if status == 'qualified':
+        _require(bool(answer['claim_ids']) and all(fresh[k] is not None for k in bindings)
+                 and fresh['source_state'] == 'current'
+                 and fresh['code_state'] in {'current', 'not-applicable'},
+                 'Qualified answer requires complete current bindings')
+
+
 def _normalize(value):
     return ' '.join(unicodedata.normalize('NFC', value).casefold().split())
 

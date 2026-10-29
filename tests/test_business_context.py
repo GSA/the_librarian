@@ -280,5 +280,140 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(data['claims'][0]['subject_id'], 'E-one')
 
 
+CAVEAT = 'Missing records do not prove absence; reverse navigation is not complete impact; a link is not support.'
+
+
+def answer(**overrides):
+    """Bindings are supplied assertions, not authenticated authorities."""
+    result = dict(contract_version=1, as_of=TIME, status='qualified',
+                  claim_ids=['C-one'], evidence=[evidence()], review_event_ids=['rev-one'],
+                  handling=['restricted'], limitations=[CAVEAT],
+                  freshness=dict(catalog_state='catalog-token', review_state='review-token',
+                                 vocabulary_hash='a' * 64, selection_hash='b' * 64,
+                                 policy_hash='c' * 64, source_state='current',
+                                 code_state='not-applicable', checked_at=TIME))
+    result.update(overrides)
+    return result
+
+
+class AnswerTests(unittest.TestCase):
+    def data(self, **changes):
+        return bundle(entity(), entity('E-two', 'workflow'),
+                      claims=[claim(qualification='confirmed', review_event_ids=['rev-one'], **changes)])
+
+    def test_qualified_complete_current_answer(self):
+        data, envelope = self.data(), answer()
+        before = copy.deepcopy((data, envelope))
+        self.assertIsNone(bc.validate_answer(envelope, data))
+        self.assertEqual((data, envelope), before)
+
+    def refuse(self, envelope, data=None):
+        with self.assertRaises(bc.BusinessContextError):
+            bc.validate_answer(envelope, self.data() if data is None else data)
+
+    def test_qualification_and_companion_refusals(self):
+        for status in ('extracted', 'inferred-candidate', 'rejected', 'retracted'):
+            data = self.data()
+            data['claims'][0]['qualification'] = status
+            self.refuse(answer(), data)
+        for key, value in [('claim_ids', []), ('claim_ids', ['C-missing']),
+                           ('claim_ids', [[]]), ('claim_ids', ['C-one', 'C-one']),
+                           ('evidence', []), ('review_event_ids', []), ('handling', []),
+                           ('contract_version', True), ('freshness', None),
+                           ('limitations', []), ('evidence', [None])]:
+            self.refuse(answer(**{key: value}))
+        for key in ('catalog_state', 'review_state', 'vocabulary_hash', 'selection_hash', 'policy_hash'):
+            env = answer()
+            env['freshness'][key] = None
+            self.refuse(env)
+        for key in ('source_state', 'code_state'):
+            for state in ('unknown', 'stale', 'denied'):
+                env = answer()
+                env['freshness'][key] = state
+                self.refuse(env)
+        data = self.data()
+        data['claims'].append(claim('C-two', supersedes='C-one', correction_reason='correction'))
+        self.refuse(answer(), data)
+        # A contradiction can be declared only by the uncited side.
+        for outgoing in (True, False):
+            data = self.data()
+            data['claims'].append(claim('C-two'))
+            data['claims'][0 if outgoing else 1]['contradicts'] = ['C-two' if outgoing else 'C-one']
+            self.refuse(answer(), data)
+            data['claims'][1]['qualification'] = 'rejected'
+            data['claims'][1]['review_event_ids'] = ['rev-rejected']
+            bc.validate_answer(answer(), data)
+        data = self.data()
+        data['claims'][0].update(relation='references-code', object_id=None,
+            external_reference=dict(provider='knowitall', repository='repo-id',
+                                    revision='rev-id', snapshot='snapshot-id', locator='symbol-id'))
+        self.refuse(answer(), data)
+        env = answer()
+        env['freshness']['code_state'] = 'current'
+        bc.validate_answer(env, data)
+
+    def test_temporal_instants_and_half_open_bounds(self):
+        data = self.data(valid_from='2025-12-31T19:00:00-05:00')
+        env = answer(as_of='2026-01-01T01:00:00+01:00')
+        bc.validate_answer(env, data)
+        for time in ('2025-12-31T23:59:59Z', '2027-01-01T00:00:00Z', '2026-01-01'):
+            env = answer(as_of=time)
+            env['freshness']['checked_at'] = '2025-01-01T00:00:00Z'
+            self.refuse(env, data)
+        for key in ('valid_from', 'valid_until'):
+            data = self.data(**{key: None})
+            self.refuse(answer(), data)
+        env = answer()
+        env['freshness']['checked_at'] = '2026-01-01T00:00:01Z'
+        self.refuse(env)
+
+    def test_stale_and_denied_leakage(self):
+        self.refuse(answer(status='stale'))
+        stale = answer(status='stale', claim_ids=[], evidence=[], review_event_ids=[],
+                       limitations=[CAVEAT, 'Source is stale'])
+        stale['freshness']['source_state'] = 'stale'
+        bc.validate_answer(stale, self.data())
+        denied = copy.deepcopy(stale)
+        denied.update(status='denied', handling=[], limitations=[CAVEAT, 'Access denied'])
+        for key in ('catalog_state', 'review_state', 'vocabulary_hash', 'selection_hash', 'policy_hash'):
+            denied['freshness'][key] = None
+        denied['freshness'].update(source_state='denied', code_state='denied')
+        bc.validate_answer(denied, bundle())
+        for key, value in [('claim_ids', ['C-one']), ('evidence', [evidence()]),
+                           ('review_event_ids', ['rev-one']), ('handling', ['restricted'])]:
+            env = copy.deepcopy(denied)
+            env[key] = value
+            self.refuse(env)
+        for key, value in [('catalog_state', 'identifying-token'), ('review_state', 'identifying-token'),
+                           ('policy_hash', 'a' * 64), ('source_state', 'current'), ('code_state', 'unknown')]:
+            env = copy.deepcopy(denied)
+            env['freshness'][key] = value
+            self.refuse(env)
+        for status in ('stale', 'denied'):
+            self.refuse(answer(status=status, claim_ids=[], evidence=[], review_event_ids=[],
+                               handling=[]))
+
+    def test_partial_unknown_do_not_promote_candidates(self):
+        data = self.data()
+        data['claims'][0]['qualification'] = 'inferred-candidate'
+        partial = answer(status='partial', limitations=[CAVEAT, 'Candidate only'])
+        bc.validate_answer(partial, data)
+        self.refuse(answer(), data)
+        self.refuse(answer(status='partial'), data)
+        for key in ('evidence', 'review_event_ids', 'handling'):
+            self.refuse(dict(partial, **{key: []}), data)
+        for key in ('source_state', 'code_state'):
+            for state in ('denied', 'stale'):
+                env = copy.deepcopy(partial)
+                env['freshness'][key] = state
+                self.refuse(env, data)
+        unknown = answer(status='unknown', claim_ids=[], evidence=[], review_event_ids=[],
+                         handling=[], limitations=[CAVEAT, 'No selected records'])
+        unknown['freshness'].update(source_state='unknown', code_state='unknown')
+        bc.validate_answer(unknown, bundle())
+        self.refuse(answer(status='unknown', limitations=[CAVEAT, 'No records']))
+        self.refuse(dict(unknown, limitations=[CAVEAT]))
+
+
 if __name__ == '__main__':
     unittest.main()
