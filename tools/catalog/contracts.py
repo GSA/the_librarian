@@ -6,6 +6,8 @@ import json
 import re
 import unicodedata
 
+from tools import ontology
+
 
 class CatalogError(ValueError):
     """A catalog contract or integrity violation."""
@@ -106,6 +108,10 @@ def refs(value):
                 "Reference line bounds must both be null or positive ordered integers")
 
 
+def resolve_endpoint(value):
+    return "artifact" if value.startswith("A-") else "source"
+
+
 def validate_record(record):
     exact(record, {"id", "kind", "data"}, "record")
     kind, data = record["kind"], record["data"]
@@ -123,15 +129,24 @@ def validate_record(record):
         category = {"S": "artifact", "I": "live-note", "O": "owner-direction"}[record["id"][0]]
         require(data["category"] == category, "Source category must agree with ID prefix")
     elif kind == "relationship":
+        endpoint_kinds = {}
         for endpoint in ("from_id", "to_id"):
             value = data[endpoint]
             require(isinstance(value, str), "Relationship endpoint must be an artifact or source ID")
-            identifier(value, "artifact" if value.startswith("A-") else "source")
-        require(data["from_id"] != data["to_id"], "Relationship cannot link an endpoint to itself")
-        choice(data["relation"], {"version-of", "duplicate-of", "rendition-of", "same-event"},
-               "relationship relation")
+            endpoint_kinds[endpoint] = resolve_endpoint(value)
+            identifier(value, endpoint_kinds[endpoint])
+        relation = data["relation"]
+        require(isinstance(relation, str) and relation in ontology.RELATIONS,
+                "Invalid relationship relation")
+        declared = ontology.RELATIONS[relation]
+        for endpoint, side in (("from_id", "from_kinds"), ("to_id", "to_kinds")):
+            require(endpoint_kinds[endpoint] in declared[side],
+                    f"Relation {relation} does not accept a {endpoint_kinds[endpoint]} {endpoint}")
+        if declared["irreflexive"]:
+            require(data["from_id"] != data["to_id"], "Relationship cannot link an endpoint to itself")
         text(data["scope"], "Relationship scope")
-        require(data["basis"] == "reported", "Relationship basis must be reported")
+        require(data["basis"] in ontology.BASES,
+                "Relationship basis is not a declared basis; entailed edges are never authority records")
     elif kind == "policy":
         require(data["default_audience"] == "agent", "Default audience must be agent")
         require(isinstance(data["human_documents"], list), "human_documents must be a list")
@@ -175,7 +190,7 @@ def validate_records(records):
 
 
 def validate_graph(records):
-    paths, parents = {}, {}
+    paths, parents, asserted = {}, {}, {}
 
     def target(record_id, kind):
         require(record_id in records and records[record_id]["kind"] == kind,
@@ -194,6 +209,16 @@ def validate_graph(records):
                 endpoint_id = data[endpoint]
                 require(endpoint_id in records and records[endpoint_id]["kind"] in {"artifact", "source"},
                         f"Missing artifact/source relationship endpoint: {endpoint_id}")
+            relation = data["relation"]
+            keys = [(data["from_id"], data["to_id"])]
+            if ontology.RELATIONS[relation]["symmetric"]:
+                keys.append((data["to_id"], data["from_id"]))
+            for key in keys:
+                for other in asserted.get(key, ()):
+                    require(not ontology.conflicts(relation, other),
+                            f"Disjoint relations asserted for the same endpoints: {relation} and {other}")
+            for key in keys:
+                asserted.setdefault(key, set()).add(relation)
         elif record["kind"] == "artifact":
             path = data["path"]
             if path is not None:

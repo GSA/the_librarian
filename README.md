@@ -75,8 +75,9 @@ project's environment as the distributed installation.
 
 `config/policy.json` contains neutral deployment defaults. An optional ignored
 `config/policy.local.json` overrides selected top-level fields. Path roots,
-filename-exclusion regular expressions and transcript section dictionaries
-are configuration, not code. Do not commit a private dictionary or include
+filename-exclusion regular expressions, transcript section dictionaries and the
+declared relation vocabulary in `config/ontology.json` are configuration, not
+code. Do not commit a private dictionary or include
 it in a release. Format labels are parser rules, not supplied document content.
 
 Put authorized Markdown beneath a configured `markdown_roots` directory and
@@ -131,6 +132,13 @@ populated store without an explicit migration design.
 
 ## Components
 
+- `tools/business_context.py` provides pure `validate_bundle`, `resolve_entity`
+  and `validate_answer` Python APIs. See the normative
+  [business-context contract](docs/contracts/business-context.md) and
+  [decision 0010](docs/decisions/0010-business-context-contract.md). These check
+  supplied conformance, not truth, permissions or actual freshness; they perform
+  no persistence, ingestion, qualification, traversal or code-graph copying.
+
 - `tools/catalog/` owns append-only metadata storage; `contracts.py` contains
   record validation independently of SQLite mechanics.
 - `tools/review_events/` owns attributed append-only review history.
@@ -177,7 +185,21 @@ Catalog submissions are an object with a `records` array. Catalog records use
 `id`, `kind` and `data`; the validator defines exact fields for receipt, source,
 artifact, policy and relationship records. Protocol identifiers use D for
 receipts, S/I/O for source classes, A- for artifacts and R- for relationships;
-these are identifier syntax, not preloaded identities. Native review bundles
+these are identifier syntax, not preloaded identities.
+
+`config/ontology.json` declares the relation vocabulary the validator enforces:
+the relation terms, the endpoint kinds each accepts, and any disjoint pairs.
+An optional ignored `config/ontology.local.json` overrides selected top-level
+fields. A store records the vocabulary it was written under and refuses a
+changed one, so extending the vocabulary on a populated store requires explicit
+migration; a store predating this binding is readable only under the shipped
+default. The declared `symmetric` and `transitive` properties are **recorded
+and never applied** — nothing computes an entailment. Evidentiary grade is
+deliberately not configurable: an authority store accepts only a `reported`
+basis, so no local vocabulary can admit an entailed edge into the catalog. See
+[decision 0009](docs/decisions/0009-declared-ontology-and-entailment.md).
+
+Native review bundles
 use the JSON schema returned by `event_store.py schema`. Supply actual
 attribution, handling, known/unknown metadata and scope; do not fabricate
 review results to satisfy required fields.
@@ -239,7 +261,8 @@ before publishing. Do not infer release permission from absence of names.
 ## Boundaries
 
 This toolkit does not include historical corpus-import mappings, domain-specific
-coverage parsers, live external connectors, semantic search, rendered-document
+coverage parsers, live external connectors, semantic search, relationship
+traversal, entailment or any reasoner that derives records, rendered-document
 verification, cloud hosting, multi-user authorization or enforced agent
 sandboxes. Native event queries replace no missing historical review evidence.
 Source-specific extensions should be separate private adapters/configuration,
