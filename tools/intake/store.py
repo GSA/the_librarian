@@ -1,5 +1,5 @@
 """Private transactional intake intent and recovery ledger."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import os
 from pathlib import Path
@@ -76,7 +76,7 @@ def initialize(root):
     home.mkdir(mode=0o700)
     fd = os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     os.close(fd)
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c, c:
         c.execute("PRAGMA synchronous=FULL")
         c.executescript(f"PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={SCHEMA};" + DDL)
     sync_directory(home)

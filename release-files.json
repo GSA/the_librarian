@@ -23,6 +23,8 @@
   "tools/intake/__init__.py",
   "tools/intake/contracts.py",
   "tools/intake/store.py",
+  "tools/intake/runner.py",
+  "tools/intake/adapters.py",
   "tools/schemas/intake.sql",
   "tests/support.py",
   "tests/test_mcp.py",
