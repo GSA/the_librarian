@@ -126,25 +126,24 @@ def locked(root):
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     c = None
     try:
-        private(lock)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA foreign_keys=ON")
-        c.execute("PRAGMA synchronous=FULL")
-        validate(c, root)
-    except sqlite3.Error as error:
+        try:
+            private(lock)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys=ON")
+            c.execute("PRAGMA synchronous=FULL")
+            validate(c, root)
+        except sqlite3.Error as error:
+            raise IntakeError("corrupt_store") from error
+        try:
+            # A failure after validation is an unavailable ledger, not a corrupt one.
+            yield c
+        except sqlite3.Error as error:
+            raise IntakeError("ledger_unavailable") from error
+    finally:
         if c is not None:
             c.close()
-        os.close(fd)
-        raise IntakeError("corrupt_store") from error
-    try:
-        # A failure after validation is an unavailable ledger, not a corrupt one.
-        yield c
-    except sqlite3.Error as error:
-        raise IntakeError("ledger_unavailable") from error
-    finally:
-        c.close()
         os.close(fd)
 
 

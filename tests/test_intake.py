@@ -109,6 +109,27 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(contracts.IntakeError):
             store.inspect(self.root, "req-one")
 
+    def test_rejected_ledger_releases_lock_for_later_operations(self):
+        import multiprocessing
+        store.stage(self.root, request())
+        db = self.root / ".local/intake/intake.sqlite3"
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute("update stages set status='succeeded'")
+        with self.assertRaises(contracts.IntakeError):
+            store.inspect(self.root, "req-one")
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute("update stages set status='staged'")
+        # A separate process would block forever on a leaked exclusive lock.
+        def probe(root, sink):
+            sink.send(store.inspect(root, "req-one")["stages"][0]["status"])
+            sink.close()
+        receiver, sender = multiprocessing.Pipe(duplex=False)
+        worker = multiprocessing.get_context("fork").Process(target=probe, args=(self.root, sender))
+        worker.start()
+        self.addCleanup(worker.join)
+        self.assertTrue(receiver.poll(30), "intake lock was not released")
+        self.assertEqual(receiver.recv(), "staged")
+
 
 class RunnerTests(unittest.TestCase):
     setUp = LedgerTests.setUp
