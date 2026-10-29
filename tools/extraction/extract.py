@@ -17,11 +17,8 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "catalog"))
-import catalog_store as catalog
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+from tools import policy
+from tools.catalog import catalog_store as catalog
 
 
 HOME = Path("data/extractions/.local")
@@ -63,6 +60,45 @@ def encoded(value):
 
 def tag(prefix, name):
     return "{" + NS[prefix] + "}" + name
+
+
+def text(raw):
+    unsupported_boms = (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff", b"\xff\xfe", b"\xfe\xff")
+    require(not raw.startswith(unsupported_boms), "Unsupported text encoding; strict UTF-8 is required")
+    bom_bytes = 3 if raw.startswith(b"\xef\xbb\xbf") else 0
+    try:
+        decoded = raw[bom_bytes:].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ExtractionError("Invalid UTF-8 text") from error
+    require("\x00" not in decoded, "NUL in UTF-8 text")
+    result = []
+    output_bytes = 0
+    offset = bom_bytes
+    for number, match in enumerate(re.finditer(r".*?(?:\r\n|\r|\n|\Z)", decoded), 1):
+        line = match.group()
+        if not line:
+            continue
+        require(number <= MAX_ELEMENTS, "Text line record limit exceeded")
+        terminator = ("crlf" if line.endswith("\r\n") else "lf" if line.endswith("\n")
+                      else "cr" if line.endswith("\r") else "none")
+        size = len(line.encode("utf-8"))
+        record = {"line": number, "text": line, "terminator": terminator,
+                  "byte_start": offset, "byte_end": offset + size}
+        output_bytes += len(encoded(record))
+        require(output_bytes <= MAX_EXPANDED, "Text rendition exceeds output limit")
+        result.append(record)
+        offset += size
+    require(offset == len(raw), "Text line extraction is not byte-preserving")
+    return {
+        "format": "text",
+        "scope": "all supplied UTF-8 text, byte-mapped without line-ending normalization",
+        "bom_bytes": bom_bytes,
+        "ends_with_terminator": bool(result and result[-1]["terminator"] != "none"),
+        "lines": result,
+        "warnings": [
+            "Strict UTF-8 text decoding only; successful decoding is not review or qualification."
+        ],
+    }
 
 
 def gemini(raw):
@@ -244,7 +280,7 @@ def source(root, receipt, format_name):
     relative = Path(data["path"])
     require(policy.allowed(relative.as_posix(), "original_roots"),
             "Original path is outside configured extraction roots or excluded by policy")
-    suffix = {"gemini-txt": ".txt", "odt": ".odt"}[format_name]
+    suffix = {"gemini-txt": ".txt", "text": ".txt", "odt": ".odt"}[format_name]
     require(relative.suffix.lower() == suffix, "Selected format disagrees with source extension")
     path = catalog.safe_path(root / relative)
     raw = read_source(path)
@@ -264,7 +300,7 @@ def bundle(root, receipt, format_name):
     state, original, identity, raw = source(root, receipt, format_name)
     engine = {"version": VERSION, "sha256": digest(Path(__file__).read_bytes() + policy.fingerprint().encode())}
     run = digest(encoded({"source": identity, "extractor": engine, "format": format_name}))
-    payload = gemini(raw) if format_name == "gemini-txt" else odt(raw)
+    payload = {"gemini-txt": gemini, "text": text, "odt": odt}[format_name](raw)
     value = {"schema_version": VERSION, "run_id": run, "extractor": engine,
              "source": identity, "boundary": BOUNDARY + " " + policy.SETTINGS["handling"], "payload": payload}
     path = root / HOME / receipt / run / "extraction.json"
@@ -311,7 +347,7 @@ def registration_records(root, original, path, value):
     data = parent["data"]
     data.update(sha256=value["source"]["sha256"], hash_basis="observed",
                 bytes=value["source"]["bytes"], extraction="existing-rendition")
-    if value["payload"]["format"] == "gemini-txt":
+    if value["payload"]["format"] in {"gemini-txt", "text"}:
         data["coverage"] = "deferred"
         data["reason"] = "All supplied UTF-8 lines preserved in a machine rendition; review/indexing remain separate."
     else:
@@ -414,7 +450,7 @@ def main(argv=None):
     for name in ("prepare", "verify", "register"):
         command = commands.add_parser(name)
         command.add_argument("receipt")
-        command.add_argument("--format", choices=("gemini-txt", "odt"), required=True)
+        command.add_argument("--format", choices=("gemini-txt", "text", "odt"), required=True)
         if name == "register":
             command.add_argument("--actor", required=True)
             command.add_argument("--expected-state", required=True)

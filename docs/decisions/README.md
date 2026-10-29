@@ -21,6 +21,8 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0008](0008-proof-of-concept-closure.md) | Concluded proof of concept and adopted reusable lessons | Accepted |
 | [0009](0009-declared-ontology-and-entailment.md) | A declared ontology, and which half of a reasoner is adopted | Accepted; declared vocabulary, contract binding and constraint checking implemented, entailment deferred to a projection that does not exist |
 
+| [0010](0010-business-context-contract.md) | Business entity, claim and relationship contracts | Accepted; pure conformance/resolution implemented, business persistence and traversal remain gated |
+
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in
 [AGENTS.md](../../AGENTS.md). These documents contain no program content,

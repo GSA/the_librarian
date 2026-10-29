@@ -1,13 +1,25 @@
 # The Librarian development and ingestion roadmap
 
 **Audience:** maintainers, operators and their agents.
-**Updated:** October 26, 2026.
+**Updated:** October 29, 2026.
 **Status:** capability inventory and proposed work, not an implementation,
 permission grant, delivery commitment or program-readiness register.
 
 This is the canonical generic roadmap. Keep private source inventories,
 access decisions, tickets, job runs, evidence and observations in the program
 instance. No customer content is needed to maintain or distribute this plan.
+
+## Business-context contract baseline
+
+The [business-context contract](docs/contracts/business-context.md) and
+[decision 0010](docs/decisions/0010-business-context-contract.md) ship pure
+bundle/evidence validation, scoped identity resolution and answer conformance.
+Synthetic collision, contradiction, correction, expiration and candidate tests
+are component evidence, not a real engineering-question demonstration. Business
+persistence, extraction, runtime qualification and traversal remain separate
+work; the real-question/exact-evidence-route gate in decision 0006 is still
+unsatisfied. Future authority changes require actual immediate store/narrative
+emptiness inspection or an approved backed-up append-preserving migration.
 
 ## Goal and current baseline
 
@@ -17,11 +29,13 @@ and engineering; and return supported discoveries to that knowledge base.
 The operator should not need to identify relevant documents before asking
 a question or refining a ticket.
 
-The October 3 data-empty extraction includes native catalog/review stores,
-verified local backups, configurable source restrictions, metadata inventory,
-Gemini TXT/ODT extraction, explicit retrieval selection, exact/compact/batched
-reads and read-only MCP. Empty initialization and source-only packaging remain
-requirements, not temporary demo limitations.
+The current data-empty toolkit includes native catalog/review stores, verified
+local backups, configurable source restrictions, metadata inventory, strict
+ordinary UTF-8 text, Gemini TXT and ODT extraction, explicitly selected strictly
+reviewed Docling text/table retrieval, exact/compact/batched reads and read-only
+MCP. The October 3 extraction established the initial data-empty baseline;
+later dated sections record subsequent increments. Empty initialization and
+source-only packaging remain requirements, not temporary demo limitations.
 
 The October 19 update names the project **The Librarian** and adds the
 [Librarian](agents/librarian.md), [ticket/refinement](agents/refiner.md),
@@ -97,7 +111,8 @@ body-free log records that classification without the query.
 The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extraction/docling_extract.py`, `docling_adapter.py`, `docling_bridge.py`, `docling_worker.py`, and `tools/extraction/README.md`) is implemented and verified:
 - Prepare twice with independent offline conversions, verify identical rendition bytes, and register deferred renditions in the catalog with idempotent retry.
 - Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries (`docs/decisions/0008-proof-of-concept-closure.md`).
-- Qualified retrieval selection of registered Docling renditions is tracked in the Kata backlog (`librarian#zqdh`).
+- Qualified retrieval can explicitly select exact-rendition, substantively reviewed Docling text and table records, with retained-byte, JSON-pointer, and page provenance. Unsupported content collections fail closed.
+- Automatic review, qualification, intake advancement, selection, and indexing are not added. Real-document OCR accuracy remains unmeasured.
 
 
 ## Reuse gaps identified on October 19
@@ -112,11 +127,11 @@ to exist in this distribution.
 | Capability | State in this repository | Required action |
 |---|---|---|
 | Three-agent collaboration and returned findings | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
-| Broader extraction | Gemini TXT and ODT only | Port ordinary TXT, DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
+| Broader extraction | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT and ODT; optional offline Docling PDF/image conversion | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
 | Archive-member and large-workbook handling | No explicit retained-member extraction selector or row-chunk engine | Port member-policy/ancestor checks and versioned XLSX chunking without automatic recursive expansion or legacy-run rewriting |
 | Bounded ingestion cohorts | No cohort driver or operation-local catalog snapshot API | Adapt `cohort.py` and `ReceiptMetadataSnapshot`; retain source/state checks, serialized writes, saved requests, explicit partial failures and backups |
 | Read-only remote discovery | No remote connector; local explicit-root inventory exists | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
-| Continuous copy and intake | Not implemented in either inspected installation | Design and implement the durable pipeline below; a read-only mount is not a local copy or ingestion service |
+| Continuous copy and intake | Private exact-request intake ledger, explicit native writer stages, bounded attempts/DLQ/replay and acknowledgment recording; no acquisition or scheduler | Add separately authorized connectors, scheduling and return transport; a read-only mount is not a local copy or ingestion service |
 | MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); no general operation audit, no cohort metrics | Adapt the remaining opt-in audit/`metrics.py` and cohort metrics; private modes, explicit logging failures and no telemetry-as-job-authority. Dead weight is withdrawn, not pending, per [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
 | Retrieval refinements | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
 | Reader diagnostics and regressions | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
@@ -234,6 +249,12 @@ disposition rules, not because it downloaded or extracted successfully.
 Record refresh failures and unavailable return routes explicitly.
 
 ### 6. Operate, retry and reconcile
+
+The shipped `tools.intake` interface implements the private exact-request ledger,
+named-stage native writer recovery, bounded retries, explicit dead-letter replay,
+pinned publication and supplied transport acknowledgment described in
+[context/intake.md](context/intake.md). Acquisition, orchestration and return
+transport remain separate planned integrations; this does not install a service.
 
 Keep a durable bounded job record with source/version/representation,
 operation/phase, stable request IDs, attempts, committed catalog/event

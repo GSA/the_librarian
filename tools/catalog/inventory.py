@@ -6,8 +6,7 @@ import os
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+from tools import policy
 
 
 def inventory(root, directory, limit):
@@ -47,12 +46,16 @@ def inventory(root, directory, limit):
             "notice": "Filesystem metadata only; not registration, content review or release clearance."}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--limit", type=int, default=1000)
-    parser.add_argument("directory")
-    args = parser.parse_args()
+def parser():
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    value.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+    value.add_argument("--limit", type=int, default=1000)
+    value.add_argument("directory")
+    return value
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
     try:
         print(json.dumps(inventory(args.root, args.directory, args.limit)))
         return 0

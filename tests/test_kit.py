@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import io
+import importlib
 import json
 import os
 from pathlib import Path
@@ -22,26 +23,103 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-for directory in ("tools", "tools/catalog", "tools/context-index", "tools/review-events", "tools/extraction", "tools/diagnostics"):
-    sys.path.insert(0, str(ROOT / directory))
-import policy
-import ontology
-import catalog_store as catalog
-import context_index as index
-import compact_records
-import event_reader
-import event_store as events
-import review_events as contract
-import extract
-import package
-import retrieval_log as diagnostics
+from tools import ontology, package, policy
+from tools.catalog import catalog_store as catalog
+from tools.context_index import compact_records
+from tools.context_index import context_index as index
+from tools.context_index import qualification
+from tools.diagnostics import retrieval_log as diagnostics
+from tools.extraction import docling_bridge, extract
+from tools.review_events import event_reader
+from tools.review_events import event_store as events
+from tools.review_events import review_events as contract
+from tests.support import clone_release
 
 
-def clone(destination):
-    for name, source in package.release_paths(ROOT):
-        target = destination / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+class PackageLayoutTests(unittest.TestCase):
+    MODULES = (
+        "tools.catalog.inventory",
+        "tools.context_index.context_index",
+        "tools.review_events.event_store",
+        "tools.extraction.extract",
+        "tools.diagnostics.retrieval_log",
+    )
+
+    def test_modules_import_without_path_mutation(self):
+        before = list(sys.path)
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(name)
+                self.assertTrue(Path(module.__file__).resolve().is_relative_to(ROOT / "tools"))
+        self.assertEqual(sys.path, before)
+
+    def test_contracts_and_index_engine_avoid_adapter_dependencies(self):
+        code = (
+            "import sys; "
+            "import tools.catalog.contracts; "
+            "assert 'sqlite3' not in sys.modules; "
+            "import tools.context_index.context_index; "
+            "assert 'argparse' not in sys.modules"
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", code], cwd=ROOT,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_context_cli_and_transitional_module_expose_same_commands(self):
+        outputs = []
+        for name in ("tools.context_index.cli", "tools.context_index.context_index"):
+            result = subprocess.run(
+                [sys.executable, "-m", name, "--help"], cwd=ROOT,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(result.stdout)
+        for command in ("build", "status", "search", "get", "get-many", "catalog"):
+            self.assertTrue(all(command in output for output in outputs), command)
+
+    def test_context_cli_formats_engine_failures_without_traceback(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "tools.context_index.cli", "--root", "/missing", "status"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("context-index:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_operator_modules_expose_help(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                result = subprocess.run(
+                    [sys.executable, "-m", name, "--help"], cwd=ROOT,
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage:", result.stdout.lower())
+
+
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_workspace_scenarios_are_not_inherited_by_absence_tests(self):
+        def flatten(suite):
+            for test in suite:
+                if isinstance(test, unittest.TestSuite):
+                    yield from flatten(test)
+                else:
+                    yield test.id()
+
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
+        ids = list(flatten(suite))
+        workspace = {name.rsplit(".", 1)[-1] for name in ids if ".WorkspaceTests." in name}
+        absence = {name.rsplit(".", 1)[-1] for name in ids if ".AbsenceClassificationTests." in name}
+        self.assertFalse(workspace & absence)
+        worker_modules = {
+            name.rsplit(".", 2)[0] for name in ids
+            if "docling_worker_contract_tests." in name
+        }
+        self.assertEqual(worker_modules, {"docling_worker_contract_tests"})
 
 
 class StoreIdentity(unittest.TestCase):
@@ -75,13 +153,13 @@ class DoclingCleanCopy(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.kit = self.root / "kit"
         self.kit.mkdir()
-        clone(self.kit)
+        clone_release(self.kit)
 
     def test_bridge_is_the_only_installation_specific_file(self):
         bridge = self.kit / "tools/extraction/docling_bridge.py"
         bridge.unlink()
         process = subprocess.run(
-            [sys.executable, "tools/extraction/docling_extract.py", "--help"],
+            [sys.executable, "-m", "tools.extraction.docling_extract", "--help"],
             cwd=self.kit, capture_output=True, text=True)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("docling_bridge", process.stderr)
@@ -97,10 +175,9 @@ class DoclingCleanCopy(unittest.TestCase):
 import hashlib,json,sys,subprocess
 from pathlib import Path
 from unittest.mock import patch
-sys.path[:0]=['tools/extraction','tools/catalog','tools']
-import catalog_store as c
-import docling_adapter as a
-import docling_bridge as b
+from tools.catalog import catalog_store as c
+from tools.extraction import docling_adapter as a
+from tools.extraction import docling_bridge as b
 root=Path.cwd()
 raw=b'%PDF-1.7\nclean-copy structural fixture'
 (root/'sources').mkdir(); (root/'sources/refused.pdf').write_bytes(raw)
@@ -134,15 +211,14 @@ def invoke(command,receipt='D2',extra=()):
  seam="""import sys,json,runpy,hashlib
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,'tools/extraction')
-import docling_adapter as a
+from tools.extraction import docling_adapter as a
 report=json.loads(sys.argv.pop(1))
-sys.argv[0]='tools/extraction/docling_extract.py'
+sys.argv[0]='tools.extraction.docling_extract'
 def convert(*args):
  with Path('inference-calls').open('a') as log: log.write('convert\\n')
  return report,hashlib.sha256(a.WORKER.read_bytes()).hexdigest()
 with patch.object(a,'_convert_with_identity',side_effect=convert):
- runpy.run_path(sys.argv[0],run_name='__main__')
+ runpy.run_module(sys.argv[0],run_name='__main__')
 """
  result=subprocess.run([sys.executable,'-c',seam,json.dumps(report),*args],
                        cwd=root,capture_output=True,text=True)
@@ -173,7 +249,7 @@ print(json.dumps({'prepared':prepared['created'],'registered':registered['regist
         self.assertTrue(any(value.startswith("A-docling-") for value in result["records"]))
 
 
-class Workspace(unittest.TestCase):
+class WorkspaceCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -182,7 +258,7 @@ class Workspace(unittest.TestCase):
         self.manifest.parent.mkdir()
         self.config = {"schema_version": 1, "audience": policy.SETTINGS["audience"],
                        "documents": [], "context_rules": {}, "renditions": []}
-        self.db = self.root / "tools/context-index/.local/index.sqlite3"
+        self.db = self.root / "tools/context_index/.local/index.sqlite3"
         self.save_config()
 
     def save_config(self):
@@ -254,6 +330,9 @@ class Workspace(unittest.TestCase):
             "relationships": [], "supersedes": [], "correction_reason": None,
         }
 
+
+
+class WorkspaceTests(WorkspaceCase):
     def test_empty_initialization(self):
         self.assertEqual(catalog.initialize(self.root)["records"], 0)
         self.assertEqual(events.initialize(self.root)["events"], 0)
@@ -289,6 +368,18 @@ class Workspace(unittest.TestCase):
         with self.assertRaises(index.IndexError_):
             self.build()
         self.assertEqual(self.db.read_bytes(), before)
+
+    def test_refusing_publication_guard_preserves_prior_index(self):
+        self.docs()
+        before = self.db.read_bytes()
+        config, checksum = index.load_manifest(self.manifest)
+        def refuse():
+            raise index.IndexError_("Caller refused publication")
+        with index.publication_lock(self.db), self.assertRaises(index.IndexError_):
+            index.build(self.root, self.manifest, self.db, config, checksum,
+                        publication_guard=refuse)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertFalse(list(self.db.parent.glob(f".{self.db.name}.build-*")))
 
     def test_stale_content_detected(self):
         self.docs()
@@ -369,6 +460,489 @@ class Workspace(unittest.TestCase):
         with self.assertRaises(contract.ReviewError):
             events.prepare_submission(events.bundle([event]), self.root)
 
+    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast"):
+        self.registration("sources/notes.txt", raw)
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "verify", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-text-rendition",
+                       expected_state=catalog.status(self.root)["state_token"],
+                       reason="Explicit synthetic text selection")
+        self.docs()
+        self.config["renditions"] = [{"path": prepared["rendition"],
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "context": ["documents/AGENTS.md"]}]
+        self.build()
+        return prepared
+
+    def test_selected_text_round_trips_exact_lines_and_byte_locations(self):
+        prepared = self.selected_text()
+        with closing(index.readonly(self.db)) as db:
+            rows = db.execute("SELECT locator, payload FROM rendition_locations "
+                              "ORDER BY locator").fetchall()
+            self.assertEqual([row[0].rsplit("#", 1)[1] for row in rows],
+                             ["line-1", "line-2", "line-3"])
+            self.assertEqual(json.loads(rows[0][1]), {
+                "json_pointer": "/payload/lines/0", "original_line": 1,
+                "byte_start": 0, "byte_end": 7, "terminator": "crlf",
+            })
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            piece = next(piece for piece in packet["pieces"] if piece["locator"].endswith("#line-2"))
+            self.assertIn('"text": "β\\n"', piece["text"])
+            metadata = packet["renditions"][prepared["rendition"]]
+            self.assertEqual(metadata["format"], "text")
+            self.assertEqual(metadata["bom_bytes"], 0)
+            found = index.search(db, "β", 10, None)
+            self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
+            self.assertIsInstance(found["hits"][0]["line_start"], int)
+            self.assertGreaterEqual(found["hits"][0]["line_end"], found["hits"][0]["line_start"])
+            self.assertEqual(found["hits"][0]["line_basis"],
+                             "extraction-json; source_location identifies original line or XML element")
+
+    def test_selected_text_unicode_separators_keep_physical_json_line_citations(self):
+        content = "a\u0085b\u2028c\u2029d"
+        prepared = self.selected_text(content.encode("utf-8"))
+        locator = prepared["rendition"] + "#line-1"
+        with closing(index.readonly(self.db)) as db:
+            packet = index.packet(db, self.config, locator, 60000)
+        piece = next(piece for piece in packet["pieces"] if piece["locator"] == locator)
+        physical = (self.root / prepared["rendition"]).read_text().splitlines(keepends=True)
+        # splitlines() is intentionally unsuitable here; derive physical JSON
+        # lines solely from the encoder's LF bytes.
+        raw_text = (self.root / prepared["rendition"]).read_text()
+        physical = [part + "\n" for part in raw_text.split("\n")[:-1]]
+        self.assertEqual(piece["text"], "".join(physical[piece["line_start"] - 1:piece["line_end"]]))
+        self.assertIn(content, piece["text"])
+        self.assertEqual(piece["line_end"] - piece["line_start"], 6)
+
+    def test_text_rendition_refuses_inconsistent_byte_mapping(self):
+        api = index.rendition_api()
+        payload = extract.text(b"one\r\ntwo")
+        payload["lines"][1]["byte_start"] = 4
+        with self.assertRaisesRegex(index.IndexError_, "line mapping"):
+            index.renditions.validate_text_mapping(payload, b"one\r\ntwo", api)
+
+        for label, mutate in (
+            ("truncated", lambda payload: payload["lines"].pop()),
+            ("final-state", lambda payload: payload.update(ends_with_terminator=True)),
+        ):
+            payload = extract.text(b"one\ntwo")
+            mutate(payload)
+            with self.subTest(label=label), self.assertRaisesRegex(index.IndexError_, "mapping"):
+                index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+        payload = extract.text(b"one\ntwo")
+        payload.update(bom_bytes=3)
+        for record in payload["lines"]:
+            record["byte_start"] += 3
+            record["byte_end"] += 3
+        with self.assertRaisesRegex(index.IndexError_, "BOM declaration"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+        for label, lines in (
+            ("merged-lines", [{"line": 1, "text": "a\nb\n", "terminator": "lf",
+                               "byte_start": 0, "byte_end": 4}]),
+            ("split-crlf", [{"line": 1, "text": "a\r", "terminator": "cr",
+                             "byte_start": 0, "byte_end": 2},
+                            {"line": 2, "text": "\n", "terminator": "lf",
+                             "byte_start": 2, "byte_end": 3}]),
+        ):
+            payload = extract.text(b"a\nb\n" if label == "merged-lines" else b"a\r\n")
+            payload["lines"] = lines
+            with self.subTest(label=label), self.assertRaisesRegex(index.IndexError_, "physical line mapping"):
+                index.renditions.validate_text_mapping(
+                    payload, b"a\nb\n" if label == "merged-lines" else b"a\r\n", api)
+
+        payload = extract.text(b"one\ntwo")
+        payload["lines"][0]["text"] = "six\n"
+        with self.assertRaisesRegex(index.IndexError_, "mapping"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+        payload["lines"][0]["text"] = None
+        with self.assertRaisesRegex(index.IndexError_, "field types"):
+            index.renditions.validate_text_mapping(payload, b"one\ntwo", api)
+
+    def docling_qualification_fixture(self, *, tables=False):
+        path = "data/extractions/.local/D1/" + "a" * 64 + "/extraction.json"
+        sha = "b" * 64
+        selection = {"path": path, "sha256": sha, "receipt_id": "D1", "format": "docling",
+                     "context": ["documents/README.md"], "review_event_ids": ["rev-exact"]}
+        value = {"schema": "docling-rendition-v1", "source": {
+            "receipt_id": "D1", "source_ids": ["S1"], "path": "sources/input.pdf",
+            "sha256": "c" * 64}, "conversion": {
+                "schema": "docling-rendition-v1", "format": "pdf",
+                "document": {"texts": [], "tables": [{}] if tables else []}, "pages": []}}
+        event = self.pending(path)
+        event.update(event_id="rev-exact", outcome="reviewed", reviewer="test-reviewer",
+                     reviewed_on="2026-10-28")
+        event["source"].update(parent_locator="sources/input.pdf",
+                               checksum={"sha256": sha, "basis": "reported"})
+        event["scope"].update(content=["text", "tables"] if tables else ["text"],
+                              description="Complete exact Docling rendition review.")
+        event["evidence"] = [{"kind": "agent_statement", "pointer": None,
+                              "quote": "Reviewed the complete exact retained rendition."}]
+        event["uncertainties"] = []
+        event["counts"].update(reviewed=1, pending=0)
+        return selection, value, event
+
+    def test_strict_docling_qualification_accepts_only_active_exact_file_review(self):
+        api = index.rendition_api()
+        selection, value, event = self.docling_qualification_fixture(tables=True)
+        snapshot = event_reader.Snapshot({"state_token": "d" * 64}, [event], {})
+        result = qualification.docling(selection, value, {}, snapshot, api)
+        self.assertEqual(result["policy_version"], qualification.POLICY_VERSION)
+        self.assertEqual(result["review_event_ids"], ["rev-exact"])
+        self.assertEqual(result["review_state"], "d" * 64)
+        self.assertEqual(result["reviewed_content"], ["tables", "text"])
+        text_event = deepcopy(event)
+        text_event["scope"]["content"] = ["text"]
+        table_event = deepcopy(event)
+        table_event["event_id"] = "rev-table"
+        table_event["scope"]["content"] = ["tables"]
+        split_selection = deepcopy(selection)
+        split_selection["review_event_ids"] = ["rev-exact", "rev-table"]
+        split = qualification.docling(split_selection, value, {}, event_reader.Snapshot(
+            {"state_token": "d" * 64}, [text_event, table_event], {}), api)
+        self.assertEqual(split["reviewed_content"], ["tables", "text"])
+
+        def assert_refused(label, mutate=None, *, events_=None, successors=None):
+            selected, envelope, candidate = self.docling_qualification_fixture(tables=True)
+            if mutate:
+                mutate(selected, envelope, candidate)
+            history = [candidate] if events_ is None else events_
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                qualification.docling(selected, envelope, {}, event_reader.Snapshot(
+                    {"state_token": "e" * 64}, history, successors or {}), api)
+
+        assert_refused("original-only", lambda s, v, e: e["source"].update(
+            locator=v["source"]["path"], parent_locator=None,
+            checksum={"sha256": v["source"]["sha256"], "basis": "reported"}))
+        assert_refused("wrong-receipt", lambda s, v, e: e["source"].update(receipt_id="D2"))
+        assert_refused("wrong-source", lambda s, v, e: e["source"].update(source_id="S2"))
+        assert_refused("wrong-path", lambda s, v, e: e["source"].update(locator="other.json"))
+        assert_refused("wrong-hash", lambda s, v, e: e["source"].update(
+            checksum={"sha256": "f" * 64, "basis": "reported"}))
+        assert_refused("partial", lambda s, v, e: e.update(outcome="partial"))
+        assert_refused("uncertain", lambda s, v, e: e.update(
+            uncertainties=["Table review completeness is unresolved."]))
+        assert_refused("ranged", lambda s, v, e: e["scope"].update(
+            extent="selected_ranges", unit="page", coordinates="one_based_inclusive",
+            ranges=[{"start": 1, "end": 1}]))
+        assert_refused("narrow-defined-scope", lambda s, v, e: e["scope"].update(
+            description="Only selected paragraphs of the exact retained rendition."))
+        assert_refused("missing-table-scope", lambda s, v, e: e["scope"].update(content=["text"]))
+        assert_refused("missing", events_=[])
+        _, _, superseded = self.docling_qualification_fixture(tables=True)
+        assert_refused("superseded", events_=[superseded], successors={"rev-exact": "rev-new"})
+
+    def selected_docling(self, *, missing_page=False):
+        raw_source = b"%PDF-synthetic-structural-test"
+        records, _ = self.registration("sources/input.pdf", raw_source)
+        run = "a" * 64
+        path = f"data/extractions/.local/D1/{run}/extraction.json"
+        source = {"receipt_id": "D1", "artifact_id": "A-input", "source_ids": ["S1"],
+                  "path": "sources/input.pdf", "sha256": hashlib.sha256(raw_source).hexdigest(),
+                  "bytes": len(raw_source), "audience": "source", "handling_refs": []}
+        bbox = {"l": 1, "t": 2, "r": 80, "b": 40, "coord_origin": "TOPLEFT"}
+        text_item = {"self_ref": "#/texts/0", "label": "text", "text": "Reviewed phrase",
+                     "prov": [{"page_no": 2 if missing_page else 1, "bbox": bbox}]}
+        table = {"self_ref": "#/tables/0", "label": "table",
+                 "prov": [{"page_no": 1, "bbox": bbox}], "data": {
+                     "table_cells": [{"text": "Cell", "start_row_offset_idx": 0,
+                                      "start_col_offset_idx": 0, "end_row_offset_idx": 1,
+                                      "end_col_offset_idx": 1}], "num_rows": 1, "num_cols": 1}}
+        value = {"schema": "docling-rendition-v1", "run_id": run,
+                 "extractor": {"schema_version": 1, "label": "synthetic-docling"},
+                 "source": source, "boundary": "Machine rendition; exact review still required.",
+                 "conversion": {"schema": "docling-conversion-v1", "format": "pdf",
+                                "document": {"texts": [text_item], "tables": [table]},
+                                "pages": [{"page_no": 1, "width": 100, "height": 100,
+                                           "textless": False}],
+                                "warnings": [{"code": "low_confidence", "message": "Synthetic warning"}],
+                                "confidence": {"layout": 0.75},
+                                "omissions": ["generated_page_images"]}}
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        rendition = self.root / path
+        rendition.parent.mkdir(parents=True)
+        rendition.write_bytes(raw)
+        registered_value = deepcopy(value)
+        registered_value["canonical_bytes"] = raw
+        catalog.submit(self.root, docling_bridge.registration_records(
+            self.root, records[2], rendition, registered_value), actor="test-runner",
+            request_id="register-docling", expected_state=catalog.status(self.root)["state_token"],
+            reason="Synthetic Docling registration")
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["id"] == "A-docling-" + run)
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-docling",
+                       expected_state=catalog.status(self.root)["state_token"],
+                       reason="Explicit synthetic Docling selection")
+        event = self.pending(path)
+        event.update(event_id="rev-exact", outcome="reviewed", reviewer="test-reviewer",
+                     reviewed_on=datetime.now(timezone.utc).date().isoformat())
+        event["source"].update(parent_locator=source["path"],
+                               checksum={"sha256": hashlib.sha256(raw).hexdigest(),
+                                         "basis": "reported"})
+        event["scope"].update(content=["text", "tables"],
+                              description="Complete exact Docling rendition review.")
+        event["evidence"] = [{"kind": "agent_statement", "pointer": None,
+                              "quote": "Reviewed the complete exact retained rendition."}]
+        event["uncertainties"] = []
+        event["counts"].update(reviewed=1, pending=0)
+        events.initialize(self.root)
+        events.append(self.root, events.bundle([event]), "test-reviewer", "req-review-docling", 0,
+                      events.status(self.root)["state_token"])
+        self.docs()
+        self.config["renditions"] = [{"path": path, "sha256": hashlib.sha256(raw).hexdigest(),
+                                     "receipt_id": "D1", "format": "docling",
+                                     "context": ["documents/AGENTS.md"],
+                                     "review_event_ids": ["rev-exact"]}]
+        return path, value
+
+    def test_selected_docling_builds_exact_text_and_table_records(self):
+        path, value = self.selected_docling()
+        self.build()
+        with closing(index.readonly(self.db)) as db:
+            rows = db.execute("SELECT locator,payload FROM rendition_locations ORDER BY locator").fetchall()
+            self.assertEqual([row[0] for row in rows], [path + "#table-1", path + "#text-1"])
+            text_packet = index.packet(db, self.config, path + "#text-1", 60000)
+            text_piece = next(piece for piece in text_packet["pieces"]
+                              if piece["locator"] == path + "#text-1")
+            self.assertEqual(json.loads(text_piece["text"]), value["conversion"]["document"]["texts"][0])
+            self.assertIsNone(text_piece["line_start"])
+            self.assertIsNone(text_piece["line_end"])
+            rendition_raw = (self.root / path).read_bytes()
+            text_location = text_piece["source_location"]
+            self.assertEqual(text_piece["text"].encode(),
+                             rendition_raw[text_location["byte_start"]:text_location["byte_end"]])
+            table_packet = index.packet(db, self.config, path + "#table-1", 60000)
+            table_piece = next(piece for piece in table_packet["pieces"]
+                               if piece["locator"] == path + "#table-1")
+            self.assertEqual(json.loads(table_piece["text"]), value["conversion"]["document"]["tables"][0])
+            location = json.loads(dict(rows)[path + "#table-1"])
+            self.assertEqual(table_piece["text"].encode(),
+                             rendition_raw[location["byte_start"]:location["byte_end"]])
+            self.assertIsNone(table_piece["line_start"])
+            self.assertIsNone(table_piece["line_end"])
+            self.assertEqual(location["page_no"], 1)
+            self.assertEqual(location["json_pointer"], "/conversion/document/tables/0")
+            hit = index.search(db, "Reviewed phrase", 10, None)["hits"][0]
+            self.assertEqual(hit["locator"], path + "#text-1")
+            self.assertIsNone(hit["line_start"])
+            self.assertIsNone(hit["line_end"])
+            self.assertEqual(hit["source_location"], text_location)
+            self.assertEqual(hit["line_basis"], "retained-extraction-byte-range-and-json-pointer")
+            self.assertEqual(text_packet["renditions"][path]["qualification"]["review_event_ids"],
+                             ["rev-exact"])
+            self.assertEqual(text_packet["renditions"][path]["warnings"],
+                             value["conversion"]["warnings"])
+            self.assertEqual(text_packet["renditions"][path]["confidence"],
+                             value["conversion"]["confidence"])
+            self.assertEqual(text_packet["renditions"][path]["omissions"],
+                             value["conversion"]["omissions"])
+            # A broad context rule attached to the table must not leak into a
+            # packet for the distinct non-line-based text record.
+            self.config["context_rules"] = {path + "#table-1": ["documents/README.md"]}
+            isolated = index.packet(db, self.config, path + "#text-1", 60000)
+            self.assertNotIn("documents/README.md", {piece["path"] for piece in isolated["pieces"]})
+            self.assertIn("null", text_packet["renditions"][path]["citation_contract"])
+            self.assertIn("byte", text_packet["renditions"][path]["citation_contract"])
+
+    def test_malformed_docling_page_and_bbox_geometry_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        base = json.loads(rendition.read_text())
+        before = self.db.read_bytes()
+        bbox = lambda value: value["conversion"]["document"]["texts"][0]["prov"][0]["bbox"]
+        for label, mutate in (
+            ("negative", lambda value: bbox(value).update(l=-1)),
+            ("inverted", lambda value: bbox(value).update(l=60, r=40)),
+            ("outside", lambda value: bbox(value).update(r=101)),
+            ("nonfinite", lambda value: bbox(value).update(l=float("nan"))),
+            ("oversized-coordinate", lambda value: bbox(value).update(r=10 ** 1000)),
+            ("non-object", lambda value: value["conversion"]["document"]["texts"][0]
+             ["prov"][0].update(bbox=[])),
+            ("bad-page-width", lambda value: value["conversion"]["pages"][0].update(width=-1)),
+            ("oversized-page-width", lambda value: value["conversion"]["pages"][0]
+             .update(width=10 ** 1000)),
+            ("finite-excessive-page-width", lambda value: value["conversion"]["pages"][0]
+             .update(width=1e308)),
+            ("excessive-page-count", lambda value: value["conversion"].update(
+                pages=[{"page_no": number, "width": 1, "height": 1, "textless": True}
+                       for number in range(1, 102)])),
+            ("noncanonical-pages", lambda value: value["conversion"]["pages"][0].update(page_no=2)),
+        ):
+            value = deepcopy(base)
+            mutate(value)
+            raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                   + "\n").encode()
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_excessive_docling_record_count_is_refused(self):
+        _, value, _ = self.docling_qualification_fixture()
+        value["conversion"].update(
+            schema="docling-conversion-v1", format="pdf",
+            pages=[{"page_no": 1, "width": 1, "height": 1}],
+            warnings=[], confidence={}, omissions=[])
+        value["conversion"]["document"]["texts"] = [None] * (
+            index.renditions.DOCLING_MAX_RECORDS + 1)
+        with self.assertRaisesRegex(index.IndexError_, "record count"):
+            list(index.renditions.records(b"{}", value, index.rendition_api()))
+
+    def test_malformed_docling_table_geometry_and_label_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        base = json.loads(rendition.read_text())
+        before = self.db.read_bytes()
+        for label, mutate in (
+            ("geometry", lambda value: value["conversion"]["document"]["tables"][0]
+             ["data"]["table_cells"][0].update(start_row_offset_idx=5, end_row_offset_idx=6)),
+            ("label", lambda value: value["conversion"]["document"]["texts"][0].update(label={})),
+        ):
+            value = deepcopy(base)
+            mutate(value)
+            raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                   + "\n").encode()
+            with self.subTest(label=label), self.assertRaises(index.IndexError_):
+                list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_unsupported_docling_content_collection_preserves_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        value = json.loads(rendition.read_text())
+        value["conversion"]["document"]["key_value_items"] = [{"self_ref": "#/key_value_items/0"}]
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "unsupported content"):
+            list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_malformed_docling_warnings_preserve_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        value = json.loads(rendition.read_text())
+        value["conversion"]["warnings"] = "not-a-list"
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "warnings"):
+            list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_unknown_docling_conversion_schema_preserves_prior_index(self):
+        self.selected_docling()
+        rendition = next(self.root.glob("data/extractions/.local/D1/*/extraction.json"))
+        value = json.loads(rendition.read_text())
+        value["conversion"]["schema"] = "docling-conversion-v2"
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+               + "\n").encode()
+        # Exercise the parser atomically without weakening catalog/hash checks.
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "conversion schema"):
+            list(index.renditions.records(raw, value, index.rendition_api()))
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_docling_missing_page_preserves_prior_index(self):
+        self.selected_docling(missing_page=True)
+        before = self.db.read_bytes()
+        with self.assertRaisesRegex(index.IndexError_, "page provenance"):
+            self.build()
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_docling_mid_build_review_change_preserves_prior_index(self):
+        # Build-start qualification sees the active event; the publication
+        # recheck must observe the newer successor map and refuse replacement.
+        self.selected_docling()
+        before = self.db.read_bytes()
+        active = event_reader.read_snapshot(self.root)
+        changed = event_reader.Snapshot({**active.state, "state_token": "f" * 64},
+                                        active.events, {"rev-exact": "rev-correction"})
+        with patch.object(event_reader, "read_snapshot", side_effect=[active, changed]):
+            with self.assertRaisesRegex(index.IndexError_, "missing or superseded"):
+                self.build()
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_qualification_code_is_bound_into_engine_fingerprint(self):
+        qualification_path = ROOT / "tools/context_index/qualification.py"
+        before = index.engine_fingerprint()
+        paths = [Path(index.__file__), ROOT / "tools/context_index/compact_records.py",
+                 ROOT / "tools/context_index/renditions.py", qualification_path,
+                 Path(policy.__file__)]
+        contents = {path: path.read_bytes() for path in paths}
+        with patch.object(Path, "read_bytes", autospec=True,
+                          side_effect=lambda path: contents[path]
+                          + (b"# changed" if path == qualification_path else b"")):
+            self.assertNotEqual(index.engine_fingerprint(), before)
+
+    def test_docling_review_state_binds_freshness_and_failed_rebuild_preserves_index(self):
+        selection, value, event = self.docling_qualification_fixture()
+        api = index.rendition_api()
+        first = qualification.docling(selection, value, {}, event_reader.Snapshot(
+            {"state_token": "1" * 64}, [event], {}), api)
+        second = qualification.docling(selection, value, {}, event_reader.Snapshot(
+            {"state_token": "2" * 64}, [event], {}), api)
+        self.assertNotEqual(
+            index.metadata_expected(self.root, "manifest", rendition_identity=api.digest(
+                json.dumps(first, sort_keys=True).encode())),
+            index.metadata_expected(self.root, "manifest", rendition_identity=api.digest(
+                json.dumps(second, sort_keys=True).encode())))
+
+        self.docs()
+        before = self.db.read_bytes()
+        config, manifest_hash = index.load_manifest(self.manifest)
+        with patch.object(index.renditions, "inputs", side_effect=index.IndexError_(
+                "Configured Docling review event is missing or superseded")):
+            with self.assertRaisesRegex(index.IndexError_, "missing or superseded"):
+                index.build(self.root, self.manifest, self.db, config, manifest_hash)
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_docling_selection_requires_explicit_unique_review_events(self):
+        api = index.rendition_api()
+        base = {"path": "data/extractions/.local/D1/" + "a" * 64 + "/extraction.json",
+                "sha256": "b" * 64, "receipt_id": "D1", "format": "docling",
+                "context": ["documents/README.md"], "review_event_ids": ["rev-exact"]}
+        index.renditions.validate({"renditions": [base]}, api)
+        for review_ids in ([], ["rev-exact", "rev-exact"], [1], [{}]):
+            invalid = deepcopy(base)
+            invalid["review_event_ids"] = review_ids
+            with self.subTest(review_ids=review_ids), self.assertRaises(index.IndexError_):
+                index.renditions.validate({"renditions": [invalid]}, api)
+        invalid = deepcopy(base)
+        invalid["format"] = "text"
+        with self.assertRaises(index.IndexError_):
+            index.renditions.validate({"renditions": [invalid]}, api)
+
+    def test_selected_empty_text_is_refused_without_replacing_index(self):
+        self.docs()
+        preserved = self.db.read_bytes()
+        self.config["renditions"] = []
+        # Build the empty rendition lifecycle in a fresh workspace state would
+        # duplicate the same receipt IDs, so use the current empty selection as
+        # the prior index and then register the zero-record source.
+        self.registration("sources/empty.txt", b"\xef\xbb\xbf")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="select-empty-text",
+                       expected_state=catalog.status(self.root)["state_token"], reason="Synthetic empty selection")
+        self.config["renditions"] = [{"path": prepared["rendition"],
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "context": ["documents/AGENTS.md"]}]
+        with self.assertRaisesRegex(index.IndexError_, "no retrievable records"):
+            self.build()
+        self.assertEqual(self.db.read_bytes(), preserved)
+
     def selected_odt(self):
         text = (ROOT / "AGENTS.md").read_text()
         content = ('<office:document-content xmlns:office="' + extract.NS["office"] +
@@ -445,6 +1019,88 @@ class Workspace(unittest.TestCase):
         with closing(index.readonly(self.db)) as db:
             self.assertTrue(index.packet(db, self.config, locator, 60000)["pieces"])
 
+    def test_text_extraction_contract(self):
+        raw = b"\xef\xbb\xbfalpha\r\n\r\n\xce\xb2\nlast\r"
+        self.assertEqual(extract.text(raw), {
+            "format": "text",
+            "scope": "all supplied UTF-8 text, byte-mapped without line-ending normalization",
+            "bom_bytes": 3,
+            "ends_with_terminator": True,
+            "lines": [
+                {"line": 1, "text": "alpha\r\n", "terminator": "crlf",
+                 "byte_start": 3, "byte_end": 10},
+                {"line": 2, "text": "\r\n", "terminator": "crlf",
+                 "byte_start": 10, "byte_end": 12},
+                {"line": 3, "text": "β\n", "terminator": "lf",
+                 "byte_start": 12, "byte_end": 15},
+                {"line": 4, "text": "last\r", "terminator": "cr",
+                 "byte_start": 15, "byte_end": 20},
+            ],
+            "warnings": ["Strict UTF-8 text decoding only; successful decoding is not review or qualification."],
+        })
+        self.assertEqual(extract.text(b"one\ntwo")["lines"][-1],
+                         {"line": 2, "text": "two", "terminator": "none",
+                          "byte_start": 4, "byte_end": 7})
+        self.assertFalse(extract.text(b"one\ntwo")["ends_with_terminator"])
+        unicode_separators = "a\u0085b\u2028c\u2029d".encode("utf-8")
+        self.assertEqual(extract.text(unicode_separators)["lines"], [
+            {"line": 1, "text": "a\u0085b\u2028c\u2029d", "terminator": "none",
+             "byte_start": 0, "byte_end": len(unicode_separators)},
+        ])
+        self.assertEqual(extract.text(b"")["lines"], [])
+        self.assertEqual(extract.text(b"\xef\xbb\xbf")["lines"], [])
+        for raw in (b"\xff", b"\xc3(", b"\xff\xfeA\x00", b"\xfe\xff\x00A",
+                    b"\xff\xfe\x00\x00A\x00\x00\x00", b"\x00\x00\xfe\xff\x00\x00\x00A",
+                    b"valid\x00text"):
+            with self.subTest(raw=raw), self.assertRaises(extract.ExtractionError):
+                extract.text(raw)
+        with self.assertRaisesRegex(extract.ExtractionError, "line record limit"):
+            extract.text(b"x\n" * (extract.MAX_ELEMENTS + 1))
+        with patch.object(extract, "MAX_EXPANDED", 100):
+            with self.assertRaisesRegex(extract.ExtractionError, "rendition exceeds output limit"):
+                extract.text(b"one\ntwo\n")
+
+    def test_text_extraction_lifecycle_is_deferred_and_idempotent(self):
+        raw = b"first\r\n\xce\xb2\nlast"
+        self.registration("sources/notes.txt", raw)
+        source_before = (self.root / "sources/notes.txt").read_bytes()
+        events.initialize(self.root)
+        review_before = events.status(self.root)["state_token"]
+        manifest_before = self.manifest.read_bytes()
+
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        repeated = extract.run(self.root, "prepare", "D1", "text")
+        self.assertTrue(prepared["created"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(extract.run(self.root, "verify", "D1", "text")["run_id"],
+                         prepared["run_id"])
+        state = catalog.status(self.root)["state_token"]
+        registered = extract.run(self.root, "register", "D1", "text", "test-runner", state)
+        retry = extract.run(self.root, "register", "D1", "text", "test-runner", state)
+        self.assertTrue(registered["registered"])
+        self.assertTrue(retry["idempotent"])
+        child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
+                     if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
+        self.assertEqual(child["data"]["coverage"], "deferred")
+        self.assertEqual(child["data"]["sha256"], prepared["rendition_sha256"])
+        self.assertEqual((self.root / "sources/notes.txt").read_bytes(), source_before)
+        self.assertEqual(events.status(self.root)["state_token"], review_before)
+        self.assertEqual(self.manifest.read_bytes(), manifest_before)
+
+    def test_text_lifecycle_refuses_changed_source_and_conflicting_publication(self):
+        self.registration("sources/notes.txt", b"stable\n")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        source = self.root / "sources/notes.txt"
+        source.write_bytes(b"changed\n")
+        with self.assertRaisesRegex(extract.ExtractionError, "catalog hash"):
+            extract.run(self.root, "verify", "D1", "text")
+        source.write_bytes(b"stable\n")
+        rendition = self.root / prepared["rendition"]
+        rendition.write_bytes(b"conflicting bytes")
+        with self.assertRaisesRegex(extract.ExtractionError, "differs from repeat extraction"):
+            extract.run(self.root, "verify", "D1", "text")
+        self.assertEqual(rendition.read_bytes(), b"conflicting bytes")
+
     def test_transcript_dictionary_and_xml_rejection(self):
         text = (ROOT / "AGENTS.md").read_text().splitlines()[0]
         raw = ("Transcript\nReader: " + text + "\n").encode()
@@ -457,8 +1113,24 @@ class Workspace(unittest.TestCase):
         with self.assertRaises(extract.ExtractionError):
             extract.xml(b'<!DOCTYPE x><x/>', "content.xml")
 
+    def test_initialize_refuses_an_unmigrated_legacy_index(self):
+        clone_release(self.root / "kit")
+        kit = self.root / "kit"
+        legacy = kit / "tools/context-index/.local/index.sqlite3"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy derived index")
+        result = subprocess.run(
+            [sys.executable, "tools/initialize.py"], cwd=kit,
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("legacy derived index", result.stderr.lower())
+        self.assertFalse((kit / "tools/context_index/.local/index.sqlite3").exists())
+        self.assertFalse((kit / ".local/catalog").exists())
+        self.assertFalse((kit / ".local/review-events").exists())
+
     def test_clean_copy_and_policy_freshness(self):
-        clone(self.root / "kit")
+        clone_release(self.root / "kit")
         kit = self.root / "kit"
         def run(*args):
             result = subprocess.run([sys.executable, *args], cwd=kit, capture_output=True, text=True)
@@ -467,11 +1139,11 @@ class Workspace(unittest.TestCase):
         report = run("tools/initialize.py")
         self.assertEqual(report["seeded_records"], 0)
         (kit / "config/policy.local.json").write_text(json.dumps({"excluded_name_patterns": ["private"]}))
-        result = subprocess.run([sys.executable, "tools/context-index/context_index.py", "status"],
+        result = subprocess.run([sys.executable, "-m", "tools.context_index.context_index", "status"],
                                 cwd=kit, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stale", result.stderr.lower())
-        self.assertEqual(run("tools/context-index/context_index.py", "build")["documents"], 0)
+        self.assertEqual(run("-m", "tools.context_index.context_index", "build")["documents"], 0)
         output = kit / "bundle.zip"
         run("tools/package.py", "--output", str(output))
         with ZipFile(output) as archive:
@@ -479,7 +1151,7 @@ class Workspace(unittest.TestCase):
             self.assertNotIn("config/policy.local.json", archive.namelist())
 
 
-class DeclaredVocabulary(Workspace):
+class DeclaredVocabulary(WorkspaceCase):
     """The relation model is configuration the validator reads, not embedded constants."""
 
     def relate(self, relation="version-of", basis="reported", extra=()):
@@ -533,6 +1205,26 @@ class DeclaredVocabulary(Workspace):
         self.assertEqual(catalog.status(self.root)["state_token"], state)
         self.assertEqual(catalog.status(self.root)["records"], 3)
 
+    def test_precommit_vocabulary_changes_roll_back(self):
+        records = [{"id": "S1", "kind": "source",
+                    "data": {"category": "artifact", "provenance": []}}]
+        override = self.root / "ontology.local.json"
+        for contents in ('{"notice": "Changed vocabulary during submission"}', 'invalid json'):
+            with self.subTest(contents=contents):
+                shutil.rmtree(self.root / catalog.HOME, ignore_errors=True)
+                override.unlink(missing_ok=True)
+                state = catalog.initialize(self.root)["state"]
+                with patch.object(ontology, "LOCAL", override):
+                    with patch.object(catalog, "ONTOLOGY_FINGERPRINT", ontology.fingerprint()):
+                        with self.assertRaises(catalog.CatalogError):
+                            catalog.submit(self.root, records, actor="test-runner",
+                                           request_id="precommit-vocabulary", reason="Transaction guard",
+                                           expected_state=state["state_token"],
+                                           precommit_check=lambda: override.write_text(contents))
+                        override.unlink(missing_ok=True)
+                        self.assertEqual(catalog.status(self.root)["state_token"], state["state_token"])
+                        self.assertEqual(catalog.status(self.root)["records"], 0)
+
     def test_a_relation_over_an_unresolvable_entity_kind_is_refused(self):
         """Declaring a business entity kind is a code change, not a config edit."""
         widened = dict(ontology.SETTINGS,
@@ -583,7 +1275,7 @@ class DeclaredVocabulary(Workspace):
                     catalog.inspect(connection)
 
 
-class AbsenceClassification(Workspace):
+class AbsenceClassificationTests(WorkspaceCase):
     """A zero-result search must explain itself without quoting the corpus."""
 
     def corpus(self, documents):
@@ -783,7 +1475,86 @@ class RetrievalDiagnostics(unittest.TestCase):
                 diagnostics.log_path(self.root, value)
 
 
+class ScriptConventionTests(unittest.TestCase):
+    MODULES = (
+        "tools.initialize", "tools.package", "tools.schemas.export_schemas",
+        "tools.catalog.inventory", "tools.extraction.docling_extract",
+    )
+
+    def test_commands_expose_strict_parser_and_injectable_main(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(name)
+                self.assertTrue(callable(module.parser))
+                with self.assertRaises(SystemExit):
+                    module.parser().parse_args(["--roo", "/tmp"])
+                with self.assertRaises(SystemExit) as stopped:
+                    module.main(["--help"])
+                self.assertEqual(stopped.exception.code, 0)
+
+
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "file.txt").write_text("release")
+
+    def manifest(self, value):
+        (self.root / "release-files.json").write_text(json.dumps(value))
+
+    def test_manifest_rejects_invalid_entries_before_filesystem_access(self):
+        for value, message in (
+            (["file.txt", "file.txt"], "unique"),
+            (["file.txt", 7], "entry 2"),
+            (["../file.txt"], "unsafe"),
+            (["store.sqlite3"], "unsafe"),
+        ):
+            with self.subTest(value=value):
+                self.manifest(value)
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    package.load_release_manifest(self.root)
+
+    def test_release_paths_rejects_missing_and_symlinked_files(self):
+        self.manifest(["missing.txt"])
+        with self.assertRaisesRegex(ValueError, "Missing"):
+            package.release_paths(self.root)
+        (self.root / "target.txt").write_text("target")
+        (self.root / "link.txt").symlink_to("target.txt")
+        self.manifest(["link.txt"])
+        with self.assertRaisesRegex(ValueError, "symlinked"):
+            package.release_paths(self.root)
+
+    def test_package_rejects_symlinked_output_parent(self):
+        real = self.root / "real"
+        real.mkdir()
+        linked = self.root / "linked"
+        linked.symlink_to(real, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            package.validate_output_path(linked / "release.zip")
+
+
 class Documentation(unittest.TestCase):
+    def test_component_map_paths_and_documented_module_commands_are_current(self):
+        readme = (ROOT / "README.md").read_text()
+        manifest = dict(package.release_paths(ROOT))
+        for path in re.findall(r"`((?:tools|tests|docs)/[^` ]+/?)`", readme):
+            if ".local" not in path:
+                with self.subTest(path=path):
+                    prefix = path.rstrip("/") + "/"
+                    self.assertTrue(path in manifest or any(item.startswith(prefix) for item in manifest), path)
+        modules = set(re.findall(
+            r"(?:\.venv/bin/)?python\d* -m ([a-zA-Z0-9_.]+)", readme
+        ))
+        self.assertIn("tools.catalog.catalog_store", modules)
+        for module in modules - {"pip", "venv"}:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-m", module, "--help"], cwd=ROOT,
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_librarian_identity_and_role_documents_are_packaged(self):
         paths = dict(package.release_paths(ROOT))
         self.assertEqual((ROOT / "README.md").read_text().splitlines()[0], "# The Librarian")
@@ -791,6 +1562,16 @@ class Documentation(unittest.TestCase):
             "ROADMAP.md", "agents/librarian.md", "agents/contributions.md",
             "agents/refiner.md", "agents/coder.md",
         }.issubset(paths))
+
+    def test_retired_execution_documents_are_not_packaged(self):
+        paths = dict(package.release_paths(ROOT))
+        for name in (
+            "docs/superpowers/plans/2026-10-20-docling-ingestion.md",
+            "docs/superpowers/plans/2026-10-22-ingestion-completion.md",
+            "docs/superpowers/specs/2026-10-20-docling-ingestion-design.md",
+            "docs/superpowers/specs/2026-10-22-ingestion-completion-design.md",
+        ):
+            self.assertNotIn(name, paths)
 
     def test_relative_document_links_are_packaged(self):
         paths = dict(package.release_paths(ROOT))

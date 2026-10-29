@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-import docling_bridge as bridge
+from tools.extraction import docling_bridge as bridge
 
 
 LOADED_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -371,11 +371,20 @@ def _unchanged(root, receipt, format_name, expected_source, expected_binding,
 
 
 def run(root: Path, command: str, receipt: str, format_name: str,
-        artifacts_path: Path, python: Path, actor=None, expected_state=None):
+        artifacts_path: Path, python: Path, actor=None, expected_state=None,
+        expected_identity=None):
     require(command in ("prepare", "verify", "register"), "Unsupported Docling command")
     root = bridge.catalog.safe_path(root)
     state, original, path, value, raw = _bundle(
         root, receipt, format_name, artifacts_path, python)
+    if expected_identity is not None:
+        # A caller holding a pinned identity refuses before any publication or
+        # registration instead of discovering the difference afterward.
+        require(isinstance(expected_identity, dict)
+                and set(expected_identity) == {"run_id", "source", "extractor"},
+                "Expected identity must name run, source and extractor", "invalid_request")
+        require(all(expected_identity[key] == value[key] for key in expected_identity),
+                "Computed identity differs from the expected identity", "mutation")
     binding = value["extractor"]["installation"]
     worker_sha = value["extractor"]["worker_sha256"]
     home = root / HOME

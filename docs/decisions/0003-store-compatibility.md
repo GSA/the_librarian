@@ -21,6 +21,15 @@ whole basis of the upgrade story.
   `contract_hash` derived from the published event schema and checked against
   stored metadata, and append-only triggers verified by exact SQL text.
 
+**Operational recovery stores** retain private work intent, not corpus authority:
+
+- Intake: `.local/intake/intake.sqlite3`, `application_id` `0x4C494E54` (`LINT`),
+  `user_version` 1; exact request bytes/root binding, prepared stage intents,
+  attempts, replay cycles and acknowledgments. FULL synchronous transactions
+  and a local process lock serialize effects. Missing, incompatible or detected
+  corrupt ledgers refuse operation; they cannot reconstruct catalog/review
+  authority. No automatic migration or cross-root portability is implemented.
+
 **Derived stores** hold what can be rebuilt from the authority stores and the
 retained sources:
 

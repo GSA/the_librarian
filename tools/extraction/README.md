@@ -1,4 +1,31 @@
-# Optional Docling ingestion
+# Extraction workflows
+
+## Ordinary strict UTF-8 text
+
+A registered `.txt` original can use the stdlib extraction lifecycle without
+Docling or model assets:
+
+```sh
+PY=.venv/bin/python
+$PY tools/extraction/extract.py prepare D-receipt --format text
+$PY tools/extraction/extract.py verify D-receipt --format text
+$PY tools/extraction/extract.py register D-receipt --format text \
+  --actor operator --expected-state CATALOG_STATE_TOKEN
+```
+
+The format accepts strict UTF-8 with an optional UTF-8 BOM. It preserves CRLF,
+LF and CR terminators, blank lines, final-line state and original byte offsets.
+Malformed UTF-8, UTF-16/32 BOMs, NUL, excessive line records and oversized
+renditions fail visibly; no replacement decoding or charset guessing occurs.
+Preparation and registration create a deferred rendition only. They do not
+review, qualify, select, index or publish its text. After a separate supported
+catalog update marks the generated child `indexed`, an operator may explicitly
+select it in `config/selection.local.json` with `format: "text"`, its exact
+rendition hash, receipt ID and maintained Markdown context. Retrieval then uses
+stable `#line-N` locators and reports original byte ranges and terminator kinds.
+Empty and BOM-only renditions have no records and are refused for selection.
+
+## Optional Docling ingestion
 
 Docling ingestion is an explicit local `prepare` / `verify` / `register`
 lifecycle. It produces a deferred machine OCR/layout rendition. It does not
@@ -116,13 +143,13 @@ PY=.venv/bin/python
 DOCLING_PY=$PWD/tools/extraction/.local/venv-docling/bin/python
 MODELS=$PWD/tools/extraction/.local/models
 
-$PY tools/extraction/docling_extract.py inspect \
+$PY -m tools.extraction.docling_extract inspect \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY tools/extraction/docling_extract.py prepare D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract prepare D-receipt --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY tools/extraction/docling_extract.py verify D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract verify D-receipt --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY tools/extraction/docling_extract.py register D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract register D-receipt --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY" \
   --actor operator --expected-state CATALOG_STATE_TOKEN
 ```

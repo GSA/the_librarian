@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Local, derived Markdown retrieval. No source writes or remote access."""
 
-import argparse
 from collections import Counter
 from contextlib import contextmanager
 import hashlib
@@ -11,15 +10,13 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import sqlite3
-import sys
 import types
 import unicodedata
 from urllib.parse import quote, unquote, urlsplit
 import uuid
-import renditions
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import policy
+from tools import policy
+from tools.context_index import renditions
 
 
 SCHEMA = 1
@@ -68,6 +65,7 @@ def engine_fingerprint():
     return digest(b"\0".join(path.read_bytes() for path in (
         Path(__file__), no_symlinks(Path(__file__).with_name("compact_records.py")),
         no_symlinks(Path(__file__).with_name("renditions.py")),
+        no_symlinks(Path(__file__).with_name("qualification.py")),
         no_symlinks(Path(policy.__file__)),
     )))
 
@@ -139,26 +137,18 @@ def fields(value, expected, description, optional=()):
 
 
 def load_event_reader():
-    directory = no_symlinks(Path(__file__).resolve().parents[1] / "review-events")
-    sys.path.insert(0, str(directory))
     try:
-        import event_reader
+        from tools.review_events import event_reader
     except ImportError as error:
-        fail(f"Event reader unavailable; install tools/review-events/requirements.txt: {error}")
-    finally:
-        sys.path.pop(0)
+        fail(f"Event reader unavailable; install tools/review_events/requirements.txt: {error}")
     return event_reader
 
 
 def load_catalog():
-    directory = no_symlinks(Path(__file__).resolve().parents[1] / "catalog")
-    sys.path.insert(0, str(directory))
     try:
-        import catalog_store
+        from tools.catalog import catalog_store
     except ImportError as error:
         fail(f"Catalog reader unavailable: {error}")
-    finally:
-        sys.path.pop(0)
     return catalog_store
 
 
@@ -181,7 +171,7 @@ def rendition_api():
     return types.SimpleNamespace(**{
         name: globals()[name] for name in (
             "fail", "fields", "validate_context", "no_symlinks", "relative_name", "digest",
-            "load_catalog", "strict_object", "eligible", "canonical_locator", "original_allowed",
+            "load_catalog", "load_event_reader", "strict_object", "eligible", "canonical_locator", "original_allowed",
         )
     })
 
@@ -403,9 +393,10 @@ def readonly(path):
     return connection
 
 
-def metadata_expected(root, manifest_hash, config=None, rendition_identity=None):
+def metadata_expected(root, manifest_hash, config=None, rendition_identity=None, review_snapshot=None):
     if rendition_identity is None:
-        _, rendition_identity = renditions.inputs(root, config or {}, rendition_api())
+        _, rendition_identity = renditions.inputs(
+            root, config or {}, rendition_api(), review_snapshot=review_snapshot)
     return {
         "schema_version": str(SCHEMA), "engine_fingerprint": engine_fingerprint(),
         "manifest_hash": manifest_hash, "corpus_root": str(root),
@@ -483,16 +474,20 @@ def publication_lock(db):
         os.close(descriptor)
 
 
-def build(root, manifest, db, config, manifest_hash):
-    selected, rendition_identity = renditions.inputs(root, config, rendition_api())
-    expected = metadata_expected(root, manifest_hash, config, rendition_identity)
+def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
+    review_snapshot = (load_event_reader().read_snapshot(root)
+                       if any(item["format"] == "docling" for item in config.get("renditions", []))
+                       else None)
+    selected, rendition_identity = renditions.inputs(
+        root, config, rendition_api(), review_snapshot=review_snapshot)
+    expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
         existing = readonly(db)
         existing.close()
     db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     no_symlinks(db.parent)
     # Only dedicated generated directories receive a permission change.
-    local = root / "tools/context-index/.local"
+    local = root / "tools/context_index/.local"
     if local.exists():
         no_symlinks(local)
         local.chmod(0o700)
@@ -562,6 +557,8 @@ def build(root, manifest, db, config, manifest_hash):
             existing.close()
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
+        if publication_guard is not None:
+            publication_guard()
         os.replace(temporary, db)
         return envelope(command="build", fresh=True, database=str(db), **counts)
     finally:
@@ -581,7 +578,10 @@ def count_index(connection):
 def freshness(connection, root, manifest, db, config, manifest_hash):
     no_symlinks(db)
     actual = dict(connection.execute("SELECT key,value FROM metadata"))
-    expected = metadata_expected(root, manifest_hash, config)
+    review_snapshot = (load_event_reader().read_snapshot(root)
+                       if any(item["format"] == "docling" for item in config.get("renditions", []))
+                       else None)
+    expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)
     reasons = [f"metadata changed: {key}" for key in expected if actual.get(key) != expected[key]]
     if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rendition_documents'").fetchone():
@@ -675,6 +675,8 @@ def search(connection, query, limit, path):
         "JOIN documents d ON d.path=s.path WHERE search_fts MATCH ?" + restriction
         + " ORDER BY bm25(search_fts),s.path,s.line_start LIMIT ?", parameters,
     ).fetchall()
+    rendition_formats = {path: json.loads(payload)["format"] for path, payload in
+                         connection.execute("SELECT path,payload FROM rendition_documents")}
     hits = [{
         "locator": row["locator"], "path": row["path"], "title": row["title"],
         "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
@@ -685,7 +687,12 @@ def search(connection, query, limit, path):
                                       (hit["locator"],)).fetchone()
         if location:
             hit["source_location"] = json.loads(location[0])
-            hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
+            if rendition_formats.get(hit["path"]) == "docling":
+                hit["line_start"] = None
+                hit["line_end"] = None
+                hit["line_basis"] = "retained-extraction-byte-range-and-json-pointer"
+            else:
+                hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
     result = envelope(command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
     if not hits:
         result["absence"] = classify_absence(connection, query, path)
@@ -779,6 +786,9 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
             location = connection.execute("SELECT payload FROM rendition_locations WHERE locator=?",
                                           (row["locator"],)).fetchone()
             value["source_location"] = json.loads(location[0])
+            if json.loads(rendition_metadata[row["path"]])["format"] == "docling":
+                value["line_start"] = None
+                value["line_end"] = None
         piece_keys[key] = value
         pieces.append(value)
 
@@ -975,110 +985,18 @@ def render_result(result, *, compact=False, max_output_chars=None):
     return output
 
 
+
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--db", type=Path)
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("build")
-    commands.add_parser("status")
-    find = commands.add_parser("search")
-    find.add_argument("query")
-    find.add_argument("--limit", type=int, default=5)
-    find.add_argument("--path")
-    get = commands.add_parser("get")
-    get.add_argument("locator")
-    get.add_argument("--max-chars", type=int, default=30000)
-    get.add_argument("--format", choices=("full", "compact"), default="full",
-                     help="Compact shares document metadata and omits only the navigation inventory")
-    get.add_argument("--max-output-chars", type=int,
-                     help="Limit the complete serialized get response, including its final newline")
-    many = commands.add_parser("get-many", help="Retrieve 1..10 complete packets sharing exact source spans")
-    many.add_argument("locators", nargs="*")
-    many.add_argument("--max-chars", type=int, default=30000,
-                      help="Combined unique exact-span source-character budget (default: 30000)")
-    many.add_argument("--format", choices=("full", "compact"), default="compact",
-                      help="Compact omits only each packet's navigation inventory (default: compact)")
-    many.add_argument("--max-output-chars", type=int, default=60000,
-                      help="Complete serialized response budget including newline (default: 60000)")
-    catalog = commands.add_parser("catalog", help="Query live metadata without requiring a document index")
-    for option in ("kind", "receipt", "source", "path", "coverage", "audience", "after", "expected-state"):
-        catalog.add_argument("--" + option)
-    catalog.add_argument("--limit", type=int, default=25)
-    catalog.add_argument("--max-chars", type=int, default=60000)
-    catalog.add_argument("--format", choices=("full", "compact"), default="full")
-    return parser.parse_args(argv)
+    """Transitional lazy delegation to the command adapter."""
+    from tools.context_index.cli import arguments as parse
+    return parse(argv)
 
 
 def main(argv=None):
-    connection = None
-    try:
-        args = arguments(argv)
-        if args.command == "get-many":
-            validate_many_limits(args.locators, args.max_chars, args.max_output_chars)
-        root = no_symlinks(args.root)
-        if not root.is_dir():
-            fail(f"Corpus root is not a directory: {root}")
-        if args.command == "catalog":
-            fingerprint = engine_fingerprint()
-            catalog = load_catalog()
-            result = catalog.read_records(root, **{key: getattr(args, key) for key in
-                ("kind", "receipt", "source", "path", "coverage", "audience", "after", "limit", "expected_state")})
-            if args.format == "compact":
-                result = load_compaction().compact_catalog(result)
-            output = render_result(result, compact=args.format == "compact")
-            if engine_fingerprint() != fingerprint:
-                fail("Catalog presentation code changed during read; retry")
-            if args.max_chars < 1 or len(output) > args.max_chars:
-                fail("Complete catalog output exceeds budget; no fields were truncated")
-            sys.stdout.write(output)
-            return 0
-        manifest = args.manifest or root / "config/selection.json"
-        if not manifest.is_absolute():
-            manifest = root / manifest
-        config, manifest_hash = load_manifest(manifest)
-        db = validate_db_path(root, args.db or root / "tools/context-index/.local/index.sqlite3")
-        if db == no_symlinks(manifest):
-            fail("Database output cannot overwrite the manifest")
-        if args.command == "build":
-            with publication_lock(db):
-                result = build(root, manifest, db, config, manifest_hash)
-        else:
-            connection = readonly(db)
-            reasons = freshness(connection, root, manifest, db, config, manifest_hash)
-            if reasons:
-                if args.command == "status":
-                    print(json.dumps(envelope(command="status", fresh=False, reasons=reasons,
-                                              database=str(db), **count_index(connection)), ensure_ascii=False))
-                fail("Index is stale; run build. " + "; ".join(reasons))
-            if args.command == "status":
-                result = envelope(command="status", fresh=True, database=str(db), **count_index(connection))
-            elif args.command == "search":
-                result = search(connection, args.query, args.limit, args.path)
-            elif args.command == "get":
-                result = packet(connection, config, args.locator, args.max_chars)
-                if args.format == "compact":
-                    result = compact_packet(result)
-            elif args.command == "get-many":
-                result = packet_many(connection, config, args.locators, args.max_chars,
-                                     format_=args.format)
-            # Refuse a result if the inputs changed while assembling it.
-            reasons = freshness(connection, root, manifest, db, config, manifest_hash)
-            if reasons:
-                fail("Index became stale during read; run build. " + "; ".join(reasons))
-        sys.stdout.write(render_result(
-            result, compact=args.command in ("get", "get-many") and args.format == "compact",
-            max_output_chars=args.max_output_chars if args.command in ("get", "get-many") else None,
-        ))
-        return 0
-    except (IndexError_, OSError, UnicodeError, ValueError, sqlite3.Error) as error:
-        print(f"context-index: {error}", file=sys.stderr)
-        return 1
-    finally:
-        if connection is not None:
-            connection.close()
+    """Transitional lazy delegation to the command adapter."""
+    from tools.context_index.cli import main as run
+    return run(argv)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
