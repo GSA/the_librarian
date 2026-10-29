@@ -32,6 +32,55 @@ class NativeTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         store.initialize(self.root)
 
+    def publication(self):
+        manifest = self.root / "config/selection.json"
+        manifest.parent.mkdir()
+        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.SETTINGS["audience"],
+                                        "documents": [], "context_rules": {}, "renditions": []}))
+        stage_request(self.root, [stage("publication", "index-build", {"manifest": "config/selection.json", "db": "tools/context_index/.local/index.sqlite3"})])
+        return manifest
+
+    def test_publication_lost_ack_reuses_matching_fresh_index(self):
+        self.publication()
+        real = adapters.execute
+        def crash(*args):
+            real(*args)
+            raise SystemExit()
+        with patch.object(adapters, "execute", side_effect=crash), self.assertRaises(SystemExit):
+            runner.run(self.root, "req-native", "native")
+        db = self.root / "tools/context_index/.local/index.sqlite3"
+        before = db.stat().st_mtime_ns
+        result = runner.run(self.root, "req-native", "native")
+        self.assertTrue(result["complete"])
+        self.assertEqual(db.stat().st_mtime_ns, before)
+        self.assertTrue(result["stages"][0]["evidence"]["selection_validated"])
+
+    def test_publication_changed_inputs_block_and_preserve_prior_index(self):
+        manifest = self.publication()
+        real = adapters.execute
+        def crash(*args):
+            real(*args)
+            raise SystemExit()
+        with patch.object(adapters, "execute", side_effect=crash), self.assertRaises(SystemExit):
+            runner.run(self.root, "req-native", "native")
+        db = self.root / "tools/context_index/.local/index.sqlite3"
+        before = db.read_bytes()
+        manifest.write_bytes(manifest.read_bytes() + b"\n")
+        result = runner.run(self.root, "req-native", "native")
+        self.assertFalse(result["complete"])
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_completed_publication_reports_current_staleness(self):
+        manifest = self.publication()
+        result = runner.run(self.root, "req-native", "native")
+        self.assertTrue(result["complete"])
+        evidence = result["stages"][0]["evidence"]
+        saved_stage = stage("publication", "index-build", {"manifest": "config/selection.json", "db": "tools/context_index/.local/index.sqlite3"})
+        self.assertTrue(adapters.availability(self.root, saved_stage, evidence)["available"])
+        manifest.write_bytes(manifest.read_bytes() + b"\n")
+        self.assertFalse(adapters.availability(self.root, saved_stage, evidence)["available"])
+        self.assertTrue(store.inspect(self.root, "req-native")["complete"])
+
     def test_catalog_commit_lost_ack_reconciles_original_revision(self):
         state = catalog.initialize(self.root)["state"]
         record = {"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}
