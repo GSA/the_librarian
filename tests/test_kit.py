@@ -1216,6 +1216,26 @@ class DeclaredVocabulary(WorkspaceCase):
         self.assertEqual(catalog.status(self.root)["state_token"], state)
         self.assertEqual(catalog.status(self.root)["records"], 3)
 
+    def test_precommit_vocabulary_changes_roll_back(self):
+        records = [{"id": "S1", "kind": "source",
+                    "data": {"category": "artifact", "provenance": []}}]
+        override = self.root / "ontology.local.json"
+        for contents in ('{"notice": "Changed vocabulary during submission"}', 'invalid json'):
+            with self.subTest(contents=contents):
+                shutil.rmtree(self.root / catalog.HOME, ignore_errors=True)
+                override.unlink(missing_ok=True)
+                state = catalog.initialize(self.root)["state"]
+                with patch.object(ontology, "LOCAL", override):
+                    with patch.object(catalog, "ONTOLOGY_FINGERPRINT", ontology.fingerprint()):
+                        with self.assertRaises(catalog.CatalogError):
+                            catalog.submit(self.root, records, actor="test-runner",
+                                           request_id="precommit-vocabulary", reason="Transaction guard",
+                                           expected_state=state["state_token"],
+                                           precommit_check=lambda: override.write_text(contents))
+                        override.unlink(missing_ok=True)
+                        self.assertEqual(catalog.status(self.root)["state_token"], state["state_token"])
+                        self.assertEqual(catalog.status(self.root)["records"], 0)
+
     def test_a_relation_over_an_unresolvable_entity_kind_is_refused(self):
         """Declaring a business entity kind is a code change, not a config edit."""
         widened = dict(ontology.SETTINGS,

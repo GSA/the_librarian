@@ -61,7 +61,11 @@ def require_loaded_vocabulary():
     under a live process would otherwise validate writes against a vocabulary
     the store no longer declares.
     """
-    require(ontology.fingerprint() == ONTOLOGY_FINGERPRINT,
+    try:
+        loaded_fingerprint = ontology.fingerprint()
+    except (OSError, ontology.OntologyError) as error:
+        raise CatalogError("Declared vocabulary could not be loaded; restart the process") from error
+    require(loaded_fingerprint == ONTOLOGY_FINGERPRINT,
             "Declared vocabulary changed after import; restart the process")
     unreachable = sorted(set(ontology.SETTINGS["endpoint_kinds"]) - RESOLVABLE_KINDS)
     require(not unreachable,
@@ -524,6 +528,7 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
                     "SET revision=excluded.revision, ordinal=excluded.ordinal", (record["id"], revision, ordinal))
             if precommit_check is not None:
                 precommit_check()
+            require_loaded_vocabulary()
             connection.execute("COMMIT")
             committed = True
             seal(db)
