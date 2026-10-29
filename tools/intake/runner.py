@@ -62,7 +62,7 @@ def run(root, correlation_id, stage_id, *, now=None):
         def failed(error):
             failure = classify(error)
             if isinstance(error, IntakeError):
-                failure = adapters.StageFailure("blocked", "policy-changed" if error.code == "policy_changed" else error.code)
+                failure = adapters.StageFailure("blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
             status = "blocked" if failure.category == "blocked" else "dead-letter" if failure.category == "permanent" or ordinal >= request["retry"]["max_attempts"] else "retryable"
             with c:
                 c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (now, failure.category, failure.code, now + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
