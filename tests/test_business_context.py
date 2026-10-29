@@ -181,5 +181,104 @@ class BundleTests(unittest.TestCase):
         self.refuse(data)
 
 
+def decision(id='M-one', operation='merge', inputs=('E-one', 'E-two'),
+             outputs=('E-three',), **overrides):
+    result = dict(id=id, operation=operation, inputs=list(inputs), outputs=list(outputs),
+                  actor='synthetic-reviewer', decided_at=TIME, reason='explicit identity decision',
+                  evidence=[evidence()], supersedes=None)
+    result.update(overrides)
+    return result
+
+
+class ResolutionTests(unittest.TestCase):
+    def test_collision_scope_and_normalization(self):
+        data = bundle(entity(name='Café  Item', aliases=['CAFÉ Item', 'cafe\u0301 item']),
+                      entity('E-two', 'workflow', name='cafe\u0301 item'),
+                      entity('E-three', name='Café Item', namespace='other'))
+        before = copy.deepcopy(data)
+        self.assertEqual(bc.resolve_entity(data, '  CAFÉ   ITEM ', 'scope'),
+                         {'status': 'ambiguous', 'candidates': ['E-one', 'E-two']})
+        self.assertEqual(bc.resolve_entity(data, 'CAFÉ Item', 'scope', 'rule'),
+                         {'status': 'resolved', 'candidates': ['E-one']})
+        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope'),
+                         {'status': 'resolved', 'candidates': ['E-one']})
+        for query in ('E-three', 'E-absent', 'missing'):
+            self.assertEqual(bc.resolve_entity(data, query, 'scope'),
+                             {'status': 'unknown', 'candidates': []})
+        for query, namespace, category in ((None, 'scope', None), ('x', [], None),
+                                           ('x', 'scope', 'code'), ('', 'scope', None)):
+            with self.assertRaises(bc.BusinessContextError):
+                bc.resolve_entity(data, query, namespace, category)
+        self.assertEqual(data, before)
+
+    def history_bundle(self, decisions):
+        return bundle(*(entity('E-' + name, name=name) for name in
+                        ('one', 'two', 'three', 'four', 'five', 'six')),
+                      identity_decisions=decisions)
+
+    def test_merge_split_and_chained_resolution(self):
+        data = self.history_bundle([decision(), decision('M-two', 'split',
+                                   ('E-three',), ('E-four', 'E-five'))])
+        before = copy.deepcopy(data)
+        for query in ('E-one', 'one', 'E-two', 'E-three'):
+            self.assertEqual(bc.resolve_entity(data, query, 'scope'),
+                             {'status': 'ambiguous', 'candidates': ['E-five', 'E-four']})
+        self.assertEqual(data, before)
+        data['entities'].reverse()
+        data['identity_decisions'].reverse()
+        self.assertEqual(bc.resolve_entity(data, 'one', 'scope'),
+                         {'status': 'ambiguous', 'candidates': ['E-five', 'E-four']})
+        data = self.history_bundle([decision()])
+        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope'),
+                         {'status': 'resolved', 'candidates': ['E-three']})
+
+    def test_invalid_identity_history(self):
+        invalid = [
+            [decision(inputs=('E-missing', 'E-two'))],
+            [decision(outputs=('E-one',))],
+            [decision(inputs=('E-one',))],
+            [decision(operation='split', outputs=('E-three',))],
+            [decision(), decision('M-two', inputs=('E-four', 'E-five'))],
+            [decision(), decision('M-two', inputs=('E-one', 'E-four'), outputs=('E-five',))],
+            [decision(), decision('M-two', inputs=('E-three', 'E-four'), outputs=('E-one',))],
+            [decision(), decision('M-two', inputs=('E-one', 'E-four'), outputs=('E-five',),
+                                  supersedes='M-one')],
+            [decision(), decision('M-two', outputs=('E-four',), supersedes='M-one'),
+             decision('M-three', outputs=('E-five',), supersedes='M-one')],
+            [decision(supersedes='M-missing')],
+            [decision(supersedes='M-two'), decision('M-two', outputs=('E-four',), supersedes='M-one')],
+            [None], [dict(decision(), extra='no')], [decision(inputs=[[]])],
+        ]
+        for decisions in invalid:
+            with self.subTest(decisions=decisions), self.assertRaises(bc.BusinessContextError):
+                bc.validate_bundle(self.history_bundle(decisions))
+
+    def test_superseded_output_and_cross_scope_redirect(self):
+        data = self.history_bundle([decision(), decision('M-two', outputs=('E-four',),
+                                                        supersedes='M-one')])
+        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope'),
+                         {'status': 'resolved', 'candidates': ['E-four']})
+        for query in ('E-three', 'three'):
+            self.assertEqual(bc.resolve_entity(data, query, 'scope'),
+                             {'status': 'unknown', 'candidates': []})
+        data['entities'][3]['namespace'] = 'other'
+        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope'),
+                         {'status': 'unknown', 'candidates': []})
+        data['entities'][3]['namespace'] = 'scope'
+        data['entities'][3]['category'] = 'workflow'
+        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope', 'rule'),
+                         {'status': 'unknown', 'candidates': []})
+
+    def test_corrections_preserve_claim_evidence(self):
+        data = self.history_bundle([decision()])
+        data['entities'][1]['category'] = 'workflow'
+        data['claims'] = [claim()]
+        before = copy.deepcopy(data)
+        self.assertEqual(bc.resolve_entity(data, 'E-one', 'scope'),
+                         {'status': 'resolved', 'candidates': ['E-three']})
+        self.assertEqual(data, before)
+        self.assertEqual(data['claims'][0]['subject_id'], 'E-one')
+
+
 if __name__ == '__main__':
     unittest.main()

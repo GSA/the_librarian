@@ -223,4 +223,93 @@ def validate_bundle(bundle):
         for target in item['contradicts']:
             _require(target in claims and target != item['id'], 'Invalid contradiction')
     _history(claims)
+    _identity(bundle['identity_decisions'], entities)
+
+
+def _identity(items, entities):
+    for item in items:
+        _exact(item, 'id operation inputs outputs actor decided_at reason evidence supersedes')
+        _identifier(item['id'], 'M')
+        _choice(item['operation'], {'merge', 'split'})
+        for key in ('inputs', 'outputs'):
+            _strings(item[key], r'E-[A-Za-z0-9][A-Za-z0-9-]{0,99}', nonempty=True)
+            _require(all(id in entities for id in item[key]), 'Missing identity entity')
+        _require(not set(item['inputs']) & set(item['outputs']), 'Overlapping identity endpoints')
+        _require((item['operation'] == 'merge' and len(item['inputs']) >= 2
+                  and len(item['outputs']) == 1) or
+                 (item['operation'] == 'split' and len(item['inputs']) == 1
+                  and len(item['outputs']) >= 2), 'Invalid identity operation arity')
+        _text(item['actor'])
+        _text(item['reason'])
+        _time(item['decided_at'])
+        _evidence_list(item['evidence'])
+        if item['supersedes'] is not None:
+            _identifier(item['supersedes'], 'M')
+    records = _records(items)
+    successors = _history(records)
+    owners, graph, redirects, retired = {}, {}, {}, set()
+    for item in items:
+        predecessor = item['supersedes']
+        if predecessor is not None:
+            _require(set(item['inputs']) == set(records[predecessor]['inputs']),
+                     'Corrected identity must consume same inputs')
+        for output in item['outputs']:
+            _require(output not in owners, 'Output must have one new identity owner')
+            owners[output] = item['id']
+        for input in item['inputs']:
+            graph.setdefault(input, set()).update(item['outputs'])
+        if item['id'] in successors:
+            retired.update(item['outputs'])
+        else:
+            for input in item['inputs']:
+                _require(input not in redirects, 'Competing active identity consumers')
+                redirects[input] = item['outputs']
+    # Iterative traversal avoids recursion limits, even with bounded dense histories.
+    for start in graph:
+        stack = [(start, frozenset())]
+        visited = set()
+        while stack:
+            node, path = stack.pop()
+            _require(node not in path, 'Cyclic identity redirects')
+            if node in visited:
+                continue
+            visited.add(node)
+            stack.extend((target, path | {node}) for target in graph.get(node, ()))
+    return redirects, retired
+
+
+def _normalize(value):
+    return ' '.join(unicodedata.normalize('NFC', value).casefold().split())
+
+
+def resolve_entity(bundle, query, namespace, category=None):
+    """Return scoped exact-ID/name resolution; collisions remain ambiguous."""
+    validate_bundle(bundle)
+    _text(query)
+    _text(namespace)
+    if category is not None:
+        _choice(category, CATEGORIES)
+    scoped = {e['id']: e for e in bundle['entities']
+              if e['namespace'] == namespace and (category is None or e['category'] == category)}
+    if re.fullmatch(r'E-[A-Za-z0-9][A-Za-z0-9-]{0,99}', query):
+        candidates = [query] if query in scoped else []
+    else:
+        key = _normalize(query)
+        candidates = sorted(e['id'] for e in scoped.values()
+                            if key in {_normalize(x) for x in [e['name'], *e['aliases']]})
+    entities = _records(bundle['entities'])
+    redirects, retired = _identity(bundle['identity_decisions'], entities)
+    pending, targets, visited = list(candidates), set(), set()
+    while pending:
+        id = pending.pop()
+        if id in visited:
+            continue
+        visited.add(id)
+        if id in redirects:
+            pending.extend(redirects[id])
+        elif id not in retired and id in scoped:
+            targets.add(id)
+    candidates = sorted(targets)
+    return {'status': 'resolved' if len(candidates) == 1 else
+            'ambiguous' if candidates else 'unknown', 'candidates': candidates}
 
