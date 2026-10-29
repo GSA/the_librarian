@@ -93,7 +93,8 @@ def execute(root, stage, intent, previous=None):
                     with closing(index.readonly(db)) as connection:
                         fresh = not index.freshness(connection, root, manifest, db, config, checksum)
                 if not fresh:
-                    index.build(root, manifest, db, config, checksum)
+                    index.build(root, manifest, db, config, checksum,
+                                publication_guard=lambda: require(prepare(root, stage) == intent, "changed_publication_inputs"))
                 require(prepare(root, stage) == intent, "changed_publication_inputs")
                 with closing(index.readonly(db)) as connection:
                     require(not index.freshness(connection, root, manifest, db, config, checksum), "stale_publication")
@@ -148,5 +149,5 @@ def availability(root, stage, evidence):
         return {"available": fresh and checksum == evidence["manifest_sha256"]
                 and index.metadata_expected(root, checksum, config) == evidence["metadata"],
                 "scope": "selected-index"}
-    except (OSError, ValueError, index.IndexError_, KeyError):
+    except (OSError, ValueError, index.IndexError_, KeyError, sqlite3.Error):
         return {"available": False, "reason": "unavailable-or-stale", "scope": "selected-index"}

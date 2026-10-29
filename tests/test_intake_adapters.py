@@ -142,6 +142,42 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertEqual(db.read_bytes(), before)
 
+    def test_corrupt_index_inspection_preserves_historical_completion(self):
+        from tools.intake.cli import inspection
+        self.publication()
+        self.assertTrue(runner.run(self.root, "req-native", "native")["complete"])
+        db = self.root / "tools/context_index/.local/index.sqlite3"
+        db.write_bytes(b"invalid SQLite bytes")
+        result = inspection(self.root, "req-native")
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["stages"][0]["availability"]["available"])
+
+    def test_drift_before_build_snapshot_preserves_prior_index(self):
+        manifest = self.publication()
+        source = self.root / "documents/document.md"
+        source.parent.mkdir()
+        source.write_text("# Original\nOriginal text\n")
+        config = json.loads(manifest.read_bytes())
+        config["documents"] = [{"path": "documents/document.md", "role": "reference", "context": []}]
+        manifest.write_text(json.dumps(config))
+        index = adapters.index
+        db = self.root / "tools/context_index/.local/index.sqlite3"
+        config, checksum = index.load_manifest(manifest)
+        with index.publication_lock(db):
+            index.build(self.root, manifest, db, config, checksum)
+        before = db.read_bytes()
+        real_build = index.build
+        def drift(*args, **kwargs):
+            source.write_text("# Changed\nChanged text\n")
+            return real_build(*args, **kwargs)
+        # Force rebuild with a valid stale prior index. Drift occurs after the
+        # intake intent check but before the native builder snapshots sources.
+        source.write_text("# Pinned\nPinned text\n")
+        with patch.object(index, "build", side_effect=drift):
+            result = runner.run(self.root, "req-native", "native")
+        self.assertEqual(result["stages"][0]["status"], "blocked")
+        self.assertEqual(db.read_bytes(), before)
+
     def test_completed_publication_reports_current_staleness(self):
         manifest = self.publication()
         result = runner.run(self.root, "req-native", "native")
