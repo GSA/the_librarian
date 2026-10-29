@@ -23,4 +23,5 @@ build/
 /.roborev.toml
 /.roborev/
 /.superpowers/
+/AGENTS.override.md
 
