@@ -2,6 +2,7 @@
   ".gitignore",
   "AGENTS.md",
   "README.md",
+  "context/intake.md",
   "ROADMAP.md",
   "agents/coder.md",
   "agents/contributions.md",
