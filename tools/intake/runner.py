@@ -49,33 +49,43 @@ def run(root, correlation_id, stage_id, *, now=None):
         unfinished = attempts[-1] if attempts and attempts[-1]["outcome"] is None else None
         if attempts and unfinished is None:
             require(now >= attempts[-1]["eligible_at"], "backoff_pending")
+        ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
         if unfinished is None:
-            require(len(attempts) < request["retry"]["max_attempts"], "attempt_limit")
-            ordinal = len(attempts) + 1
-            with c:
-                c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)", (correlation_id, stage_id, saved["cycle"], ordinal, now))
-                c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
-        else:
-            ordinal = unfinished["ordinal"]
-        # Native errors only are classified. Ledger acknowledgment failures propagate,
-        # leaving the durable unfinished attempt available for reconciliation.
-        try:
-            require(policy.load()[1] == request["policy"]["sha256"], "policy_changed")
-            intent = decode(saved["intent"].encode()) if saved["intent"] else adapters.prepare(store.safe(root), stage)
-            if saved["intent"] is None:
+            require(ordinal <= request["retry"]["max_attempts"], "attempt_limit")
+
+        def begin():
+            if unfinished is None:
                 with c:
-                    save_artifact(c, correlation_id, stage_id, "intent", intent)
-            previous = decode(saved["evidence"].encode()) if saved["evidence"] else None
-            evidence = adapters.execute(store.safe(root), stage, intent, previous)
-        except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+                    c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)", (correlation_id, stage_id, saved["cycle"], ordinal, now))
+                    c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
+
+        def failed(error):
             failure = classify(error)
-            if isinstance(error, IntakeError) and error.code == "policy_changed":
-                failure = adapters.StageFailure("blocked", "policy-changed")
+            if isinstance(error, IntakeError):
+                failure = adapters.StageFailure("blocked", "policy-changed" if error.code == "policy_changed" else error.code)
             status = "blocked" if failure.category == "blocked" else "dead-letter" if failure.category == "permanent" or ordinal >= request["retry"]["max_attempts"] else "retryable"
             with c:
                 c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (now, failure.category, failure.code, now + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
                 c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
             return store.summary(c, correlation_id)
+
+        # Separate native preparation from ledger transactions: a failed ledger
+        # commit is never a native failure and cannot consume the retry budget.
+        try:
+            require(policy.load()[1] == request["policy"]["sha256"], "policy_changed")
+            intent = decode(saved["intent"].encode()) if saved["intent"] else adapters.prepare(store.safe(root), stage)
+        except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+            begin()
+            return failed(error)
+        if saved["intent"] is None:
+            with c:
+                save_artifact(c, correlation_id, stage_id, "intent", intent)
+        begin()
+        previous = decode(saved["evidence"].encode()) if saved["evidence"] else None
+        try:
+            evidence = adapters.execute(store.safe(root), stage, intent, previous)
+        except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+            return failed(error)
         status = "return-pending" if stage["kind"] == "return" else "succeeded"
         with c:
             save_artifact(c, correlation_id, stage_id, "evidence", evidence)
@@ -93,4 +103,32 @@ def replay(root, correlation_id, stage_id, *, now=None):
         with c:
             c.execute("INSERT INTO replays VALUES (?,?,?,?)", (correlation_id, stage_id, cycle, now))
             c.execute("UPDATE stages SET status='staged',cycle=? WHERE correlation_id=? AND stage_id=?", (cycle, correlation_id, stage_id))
+        return store.summary(c, correlation_id)
+
+
+def acknowledge(root, correlation_id, stage_id, acknowledgment):
+    from .contracts import fields, sha, text
+    fields(acknowledgment, {"delivery_correlation", "disposition_sha256", "transport_receipt"})
+    text(acknowledgment["delivery_correlation"])
+    sha(acknowledgment["disposition_sha256"])
+    text(acknowledgment["transport_receipt"], 500)
+    with store.locked(root) as c:
+        request, stage, saved = selected(c, correlation_id, stage_id)
+        require(stage["kind"] == "return" and saved["status"] in {"return-pending", "succeeded"}, "not_awaiting_ack")
+        raw = canonical(acknowledgment)
+        prior = c.execute("SELECT payload FROM acknowledgments WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id)).fetchone()
+        if prior:
+            require(prior[0] == raw, "acknowledgment_conflict")
+            return store.summary(c, correlation_id)
+        require(policy.load()[1] == request["policy"]["sha256"], "policy_changed")
+        intent = decode(saved["intent"].encode())
+        try:
+            require(adapters.prepare(store.safe(root), stage) == intent, "changed_disposition")
+        except (OSError, adapters.StageFailure) as error:
+            raise IntakeError("disposition_unavailable") from error
+        require(all(acknowledgment[k] == intent[k] for k in ("delivery_correlation", "disposition_sha256")), "acknowledgment_mismatch")
+        with c:
+            c.execute("INSERT INTO acknowledgments VALUES (?,?,?,?)", (correlation_id, stage_id, raw, digest(raw.encode())))
+            save_artifact(c, correlation_id, stage_id, "evidence", {"boundary": "delivered", "acknowledgment": acknowledgment, "basis": "explicit-transport-acknowledgment"})
+            c.execute("UPDATE stages SET status='succeeded' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
         return store.summary(c, correlation_id)

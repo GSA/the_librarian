@@ -26,6 +26,7 @@
   "tools/intake/store.py",
   "tools/intake/runner.py",
   "tools/intake/adapters.py",
+  "tools/intake/cli.py",
   "tools/schemas/intake.sql",
   "tests/support.py",
   "tests/test_mcp.py",

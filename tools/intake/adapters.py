@@ -21,6 +21,11 @@ def prepare(root, stage):
     try:
         args = stage["arguments"]
         operation = stage["operation"]
+        if operation == "await-ack":
+            path = catalog.safe_path(root / args["disposition_path"])
+            raw = docling.bridge._read_source(path)
+            require(len(raw) <= 1024 * 1024 and docling.digest(raw) == args["disposition_sha256"], "changed_disposition")
+            return {"operation": operation, "delivery_correlation": args["delivery_correlation"], "disposition_sha256": args["disposition_sha256"]}
         if operation == "index-build":
             manifest = index.no_symlinks(root / args["manifest"])
             config, manifest_hash = index.load_manifest(manifest)
@@ -49,6 +54,9 @@ def execute(root, stage, intent, previous=None):
     try:
         args = stage["arguments"]
         operation = stage["operation"]
+        if operation == "await-ack":
+            require(prepare(root, stage) == intent, "changed_disposition")
+            return {"boundary": "return-pending", **intent}
         if operation == "index-build":
             require(prepare(root, stage) == intent, "changed_publication_inputs")
             manifest = root / args["manifest"]

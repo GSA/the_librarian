@@ -124,6 +124,27 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["stages"][0]["status"], "return-pending")
         self.assertFalse(result["complete"])
 
+    def test_prepared_intent_commits_before_attempt(self):
+        from unittest.mock import patch
+        from tools.intake import runner
+        self.stage_live()
+        original = runner.save_artifact
+        def persist(c, correlation, stage_id, key, value):
+            if key == "intent":
+                self.assertEqual(c.execute("select count(*) from attempts").fetchone()[0], 0)
+            return original(c, correlation, stage_id, key, value)
+        with patch.object(runner, "save_artifact", side_effect=persist), patch("tools.intake.adapters.prepare", return_value={"pinned": "original"}), patch("tools.intake.adapters.execute", return_value={"boundary": "return-pending"}):
+            runner.run(self.root, "req-one", "delivery")
+
+    def test_intent_ledger_failure_does_not_consume_native_attempt(self):
+        from unittest.mock import patch
+        from tools.intake import runner
+        self.stage_live()
+        with patch("tools.intake.adapters.prepare", return_value={"pinned": "original"}), patch.object(runner, "save_artifact", side_effect=sqlite3.OperationalError("test failure")):
+            with self.assertRaises(contracts.IntakeError):
+                runner.run(self.root, "req-one", "delivery")
+        self.assertEqual(store.inspect(self.root, "req-one")["stages"][0]["attempts"], [])
+
     def test_restart_ambiguous_attempt(self):
         from unittest.mock import patch
         from tools.intake import runner
@@ -160,6 +181,63 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(contracts.IntakeError):
             runner.run(self.root, "req-one", "delivery", now=8)
         self.assertEqual(len(result["stages"][0]["attempts"]), 3)
+
+    def test_return_pending_and_matching_ack(self):
+        from tools.intake import runner
+        from tools import policy
+        path = self.root / "disposition.json"
+        path.write_bytes(b"private disposition")
+        raw = json.loads(request(policy={"version": 1, "sha256": policy.load()[1]}))
+        raw["stages"][0]["arguments"]["disposition_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        store.stage(self.root, json.dumps(raw).encode())
+        pending = runner.run(self.root, "req-one", "delivery")
+        self.assertEqual(pending["stages"][0]["status"], "return-pending")
+        ack = {"delivery_correlation": "delivery-one", "disposition_sha256": raw["stages"][0]["arguments"]["disposition_sha256"], "transport_receipt": "receipt-1"}
+        with self.assertRaises(contracts.IntakeError):
+            runner.acknowledge(self.root, "req-one", "delivery", {**ack, "delivery_correlation": "wrong"})
+        self.assertTrue(runner.acknowledge(self.root, "req-one", "delivery", ack)["complete"])
+        self.assertTrue(runner.acknowledge(self.root, "req-one", "delivery", ack)["complete"])
+        with self.assertRaises(contracts.IntakeError):
+            runner.acknowledge(self.root, "req-one", "delivery", {**ack, "transport_receipt": "receipt-2"})
+
+    def test_return_artifact_changed_or_missing_blocks_ack(self):
+        from tools.intake import runner
+        from tools import policy
+        path = self.root / "disposition.json"
+        path.write_bytes(b"private disposition")
+        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        raw = json.loads(request(policy={"version": 1, "sha256": policy.load()[1]}))
+        raw["stages"][0]["arguments"]["disposition_sha256"] = checksum
+        store.stage(self.root, json.dumps(raw).encode())
+        runner.run(self.root, "req-one", "delivery")
+        path.unlink()
+        with self.assertRaises(contracts.IntakeError):
+            runner.acknowledge(self.root, "req-one", "delivery", {"delivery_correlation": "delivery-one", "disposition_sha256": checksum, "transport_receipt": "receipt"})
+        self.assertFalse(store.inspect(self.root, "req-one")["complete"])
+
+    def test_cli_clean_copy_end_to_end(self):
+        from support import clone_release
+        import subprocess
+        import sys
+        clone = self.root / "clone"
+        clone_release(clone)
+        instance = clone / "instance"
+        instance.mkdir()
+        def command(*args, expected=0):
+            result = subprocess.run([sys.executable, "-m", "tools.intake.cli", "--root", str(instance), *args], cwd=clone, capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            return json.loads(result.stdout)
+        command("initialize")
+        payload = clone / "request.json"
+        payload.write_bytes(request())
+        command("stage", "--request", str(payload))
+        self.assertFalse(command("inspect", "req-one")["complete"])
+        self.assertEqual(len(command("list")["requests"]), 1)
+        self.assertEqual(command("run", "req-one", "--stage", "delivery")["stages"][0]["status"], "blocked")
+        command("replay", "req-one", "--stage", "delivery")
+        command("resume", "req-one", "--stage", "delivery")
+        self.assertNotIn("private disposition", json.dumps(command("inspect", "req-one")))
 
     def test_concurrent_duplicate_execution(self):
         import multiprocessing
