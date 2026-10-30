@@ -8,7 +8,6 @@ __pycache__/
 *.tar*
 .env
 .env.*
-config/ontology.local.json
 config/policy.local.json
 config/selection.local.json
 documents/

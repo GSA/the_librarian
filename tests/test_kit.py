@@ -23,7 +23,7 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-from tools import ontology, package, policy
+from tools import package, policy
 from tools.catalog import catalog_store as catalog
 from tools.context_index import compact_records
 from tools.context_index import context_index as index
@@ -669,6 +669,7 @@ class WorkspaceTests(WorkspaceCase):
         rendition = self.root / path
         rendition.parent.mkdir(parents=True)
         rendition.write_bytes(raw)
+        rendition.chmod(0o600)
         registered_value = deepcopy(value)
         registered_value["canonical_bytes"] = raw
         catalog.submit(self.root, docling_bridge.registration_records(
@@ -1149,130 +1150,6 @@ class WorkspaceTests(WorkspaceCase):
         with ZipFile(output) as archive:
             self.assertEqual(set(archive.namelist()), set(json.loads((kit / "release-files.json").read_text())))
             self.assertNotIn("config/policy.local.json", archive.namelist())
-
-
-class DeclaredVocabulary(WorkspaceCase):
-    """The relation model is configuration the validator reads, not embedded constants."""
-
-    def relate(self, relation="version-of", basis="reported", extra=()):
-        home = self.root / catalog.HOME
-        if home.exists():
-            shutil.rmtree(home)
-        records = [
-            {"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}},
-            {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}},
-            {"id": "R-link", "kind": "relationship", "data": {
-                "from_id": "S1", "to_id": "S2", "relation": relation,
-                "scope": "Structural contract test; no reported content claim.",
-                "basis": basis, "provenance": []}},
-            *extra,
-        ]
-        state = catalog.initialize(self.root)["state"]
-        return catalog.submit(self.root, records, actor="test-runner", request_id="relate",
-                              expected_state=state["state_token"], reason="Vocabulary contract test")
-
-    def test_relation_terms_come_from_the_declared_vocabulary(self):
-        with self.assertRaises(catalog.CatalogError):
-            self.relate(relation="supersedes")
-        declared = dict(ontology.RELATIONS["version-of"], description="Declared only for this test.")
-        with patch.dict(ontology.RELATIONS, {"supersedes": declared}):
-            self.assertEqual(self.relate(relation="supersedes")["records"], 3)
-
-    def test_entailed_edges_are_never_authority_records(self):
-        with self.assertRaises(catalog.CatalogError):
-            self.relate(basis="entailed")
-
-    def test_local_configuration_cannot_admit_an_entailed_basis(self):
-        override = self.root / "ontology.local.json"
-        override.write_text(json.dumps({"bases": list(ontology.RESERVED_BASES)}))
-        with patch.object(ontology, "LOCAL", override):
-            with self.assertRaises(ontology.OntologyError):
-                ontology.load()
-        self.assertEqual(ontology.BASES, ontology.AUTHORITY_BASES)
-        self.assertFalse(ontology.AUTHORITY_BASES & ontology.RESERVED_BASES)
-
-    def test_a_vocabulary_edited_after_import_refuses_reads_and_writes(self):
-        self.assertEqual(self.relate()["records"], 3)
-        state = catalog.status(self.root)["state_token"]
-        records = [{"id": "S3", "kind": "source",
-                    "data": {"category": "artifact", "provenance": []}}]
-        with patch.object(catalog.ontology, "fingerprint", lambda: "edited-after-import"):
-            with self.assertRaises(catalog.CatalogError) as refusal:
-                catalog.submit(self.root, records, actor="test-runner", request_id="stale",
-                               expected_state=state, reason="Write under a changed vocabulary")
-            self.assertIn("restart", str(refusal.exception))
-        # The refused write left no trace; the store is readable and unchanged.
-        self.assertEqual(catalog.status(self.root)["state_token"], state)
-        self.assertEqual(catalog.status(self.root)["records"], 3)
-
-    def test_precommit_vocabulary_changes_roll_back(self):
-        records = [{"id": "S1", "kind": "source",
-                    "data": {"category": "artifact", "provenance": []}}]
-        override = self.root / "ontology.local.json"
-        for contents in ('{"notice": "Changed vocabulary during submission"}', 'invalid json'):
-            with self.subTest(contents=contents):
-                shutil.rmtree(self.root / catalog.HOME, ignore_errors=True)
-                override.unlink(missing_ok=True)
-                state = catalog.initialize(self.root)["state"]
-                with patch.object(ontology, "LOCAL", override):
-                    with patch.object(catalog, "ONTOLOGY_FINGERPRINT", ontology.fingerprint()):
-                        with self.assertRaises(catalog.CatalogError):
-                            catalog.submit(self.root, records, actor="test-runner",
-                                           request_id="precommit-vocabulary", reason="Transaction guard",
-                                           expected_state=state["state_token"],
-                                           precommit_check=lambda: override.write_text(contents))
-                        override.unlink(missing_ok=True)
-                        self.assertEqual(catalog.status(self.root)["state_token"], state["state_token"])
-                        self.assertEqual(catalog.status(self.root)["records"], 0)
-
-    def test_a_relation_over_an_unresolvable_entity_kind_is_refused(self):
-        """Declaring a business entity kind is a code change, not a config edit."""
-        widened = dict(ontology.SETTINGS,
-                       endpoint_kinds=[*ontology.SETTINGS["endpoint_kinds"], "rule"])
-        with patch.object(catalog.ontology, "SETTINGS", widened):
-            with self.assertRaises(catalog.CatalogError) as refusal:
-                self.relate()
-        self.assertIn("cannot resolve", str(refusal.exception))
-        self.assertIn("rule", str(refusal.exception))
-
-    def test_endpoint_kinds_are_enforced_per_relation(self):
-        artifact_only = dict(ontology.RELATIONS["version-of"], from_kinds=["artifact"])
-        with patch.dict(ontology.RELATIONS, {"version-of": artifact_only}):
-            with self.assertRaises(catalog.CatalogError):
-                self.relate(relation="version-of")
-
-    def test_declared_disjointness_refuses_contradictory_edges(self):
-        second = {"id": "R-other", "kind": "relationship", "data": {
-            "from_id": "S1", "to_id": "S2", "relation": "duplicate-of",
-            "scope": "Structural contract test; no reported content claim.",
-            "basis": "reported", "provenance": []}}
-        self.assertEqual(self.relate(extra=[second])["records"], 4)
-        with patch.object(ontology, "DISJOINT",
-                          frozenset([frozenset({"version-of", "duplicate-of"})])):
-            with self.assertRaises(catalog.CatalogError):
-                self.relate(extra=[second])
-
-    def test_store_refuses_a_changed_vocabulary(self):
-        catalog.initialize(self.root)
-        self.assertEqual(catalog.status(self.root, audit=True)["records"], 0)
-        with patch.object(ontology, "HASH", "0" * 64):
-            with self.assertRaises(catalog.CatalogError):
-                catalog.status(self.root, audit=True)
-
-    def test_store_predating_the_binding_requires_the_shipped_vocabulary(self):
-        with closing(sqlite3.connect(":memory:")) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.executescript(catalog.schema_sql())
-            connection.executemany("INSERT INTO metadata VALUES (?,?)", {
-                "store_id": str(uuid.uuid4()),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "authority": catalog.AUTHORITY,
-                "contract_version": str(catalog.VERSION),
-            }.items())
-            self.assertEqual(catalog.inspect(connection)[0]["records"], 0)
-            with patch.object(ontology, "HASH", "0" * 64):
-                with self.assertRaises(catalog.CatalogError):
-                    catalog.inspect(connection)
 
 
 class AbsenceClassificationTests(WorkspaceCase):

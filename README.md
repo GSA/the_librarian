@@ -14,7 +14,7 @@ qualified, source-cited context to agents through a read-only **MCP** server.
 GitHub: `GSA/the_librarian`. Local checkout: `~/the_librarian`. Kata project: `the_librarian`.
 
 The repo ships with no data. Each program uses its own **instance copy**, which
-holds that program's content and config. Code questions go to **The Knowitall**.
+holds that program's content and config.
 
 ## Setup
 
@@ -38,7 +38,6 @@ If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 | --- | --- |
 | `config/policy.json` | Defaults: `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, and handling text |
 | `config/policy.local.json` | Instance overrides, ignored by Git |
-| `config/ontology.json` | Allowed relationship types (`config/ontology.local.json` to override) |
 | `config/selection.local.json` | List of documents agents can retrieve, ignored by Git. It uses the same format as `config/selection.json`. |
 
 Stores: `.local/catalog` (metadata), `.local/review-events` (reviews), and
@@ -153,5 +152,4 @@ listed in `release-files.json`.
 - Track work in Kata (`kata ready --agent`). roborev hooks review every 5 commits.
 
 More detail: [AGENTS.md](AGENTS.md), role contracts in `agents/`,
-[ROADMAP.md](ROADMAP.md), [docs/decisions/](docs/decisions/README.md), and the
-[business-context contract](docs/contracts/business-context.md).
+[ROADMAP.md](ROADMAP.md), and [docs/decisions/](docs/decisions/README.md).

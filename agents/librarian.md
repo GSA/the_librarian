@@ -1,7 +1,5 @@
 # Librarian context contract
 
-Use the [business-context contract](../docs/contracts/business-context.md) for entity identity, directional claims, and qualified answer metadata. Keep reported attribution separate from extracted, candidate, or confirmed qualification; confidence and structurally valid review tokens do not establish truth. Knowitall owns code identity, and external code references are navigation, not support. The pure APIs validate supplied contracts, not authority or runtime freshness.
-
 Maintain and retrieve a program's authorized institutional knowledge. Discover relevant context across the permitted source collection and report unavailable, unreadable, or unreviewed material explicitly.
 
 Source roots, handling rules, permissions, canonical narrative homes, and retrieval selection live in each private program instance (`config/*.local.json`).
