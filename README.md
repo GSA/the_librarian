@@ -50,6 +50,7 @@ To stage and register a file in one step, use the upload intake (see
 [context/intake.md](context/intake.md#manual-upload-and-local-drop)):
 
 ```sh
+.venv/bin/python -m tools.intake.cli --root . initialize   # once per instance
 .venv/bin/python -m tools.intake.cli --root . submit-file ~/memo.pdf \
   --submission-id memo-001 --format pdf --actor "$USER" --reason "Register memo"
 ```

@@ -158,16 +158,19 @@ def sync_directory(path):
         os.close(fd)
 
 
-def private_directory(root, relative):
-    """Create missing directories below root as durable 0700 directories."""
+def private_directory(root, relative, owned):
+    """Create missing directories below root; the last ``owned`` levels must be 0700."""
+    parts = Path(relative).parts
     cursor = root
-    for part in Path(relative).parts:
+    for index, part in enumerate(parts):
         cursor = cursor / part
         require(not cursor.is_symlink(), "unsafe_path")
         if not cursor.exists():
             cursor.mkdir(mode=0o700)
             sync_directory(cursor.parent)
         require(cursor.is_dir(), "unsafe_path")
+        if index >= len(parts) - owned:
+            require(stat.S_IMODE(cursor.stat(follow_symlinks=False).st_mode) == 0o700, "not_private")
     return cursor
 
 
@@ -183,6 +186,7 @@ def publish(directory, name, raw):
             stale.unlink()
     if final.exists() or final.is_symlink():
         require(not final.is_symlink() and final.is_file(), "destination_conflict")
+        require(stat.S_IMODE(final.stat(follow_symlinks=False).st_mode) == 0o600, "not_private")
         try:
             existing = read_file(final, len(raw))
         except IntakeError as error:
@@ -400,10 +404,13 @@ def submit(root, path, value):
                                    "arguments": {"records": records, "actor": value["actor"],
                                                  "request_id": correlation_id, "expected_state": state["state_token"],
                                                  "reason": "Manual upload: " + value["reason"][:400]}}]}
-            store.stage(root, canonical(request).encode())
-        target = private_directory(root, directory)
+        # Retained bytes are durable before the receipt stage exists, so no
+        # run/resume can commit a present artifact whose file is missing.
+        target = private_directory(root, directory, 2)
         publish(target, value["name"], raw)
         publish(target, SIDECAR, sidecar)
+        if not existing:
+            store.stage(root, canonical(request).encode())
         if status_of(root, correlation_id) in {"staged", "running", "retryable"}:
             # Blocked and dead-letter receipts stay visible; recovery is explicit replay.
             runner.run(root, correlation_id, "receipt")

@@ -199,10 +199,11 @@ class RecoveryTests(UploadCase):
             upload.submit(self.root, self.file(), value())
         directory = self.root / "sources/intake/sub-1"
         self.assertEqual(list(directory.iterdir()), [])
-        self.assertEqual(store.inspect(self.root, "upload-sub-1")["stages"][0]["status"], "staged")
+        # No receipt stage exists to run before retained bytes are published.
+        self.assertEqual(store.list_requests(self.root), [])
         self.assertEqual(self.records(), {})
         ack = upload.submit(self.root, self.file(), value())
-        self.assertTrue(ack["existing"])
+        self.assertFalse(ack["existing"])
         self.assertEqual(ack["receipt"]["state"], "committed")
         self.assertEqual((self.root / ack["original"]["path"]).read_bytes(), TEXT)
 
@@ -257,6 +258,18 @@ class RecoveryTests(UploadCase):
         self.assertEqual(ack["receipt"]["state"], "blocked")
         self.assertIn("code", ack["receipt"])
         self.assertFalse(ack["processing"]["qualified"])
+
+
+    def test_public_existing_destinations_are_refused(self):
+        directory = self.root / "sources/intake/sub-1"
+        directory.mkdir(parents=True, mode=0o755)
+        directory.chmod(0o755)
+        self.assertCode("not_private", upload.submit, self.root, self.file(), value())
+        directory.chmod(0o700)
+        (directory / "notes.txt").write_bytes(TEXT)
+        (directory / "notes.txt").chmod(0o644)
+        self.assertCode("not_private", upload.submit, self.root, self.file(), value())
+        self.assertEqual(store.list_requests(self.root), [])
 
 
 class DropTests(UploadCase):
