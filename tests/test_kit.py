@@ -1323,8 +1323,8 @@ class WorkspaceTests(WorkspaceCase):
             ],
             "context_rules": {},
         }))
-        # Remove default selection.json so selection_manifest comes from custom-selection.json
-        (kit / "config/selection.json").unlink()
+        # Keep shipped default config/selection.json template alongside custom-selection.json
+        self.assertTrue((kit / "config/selection.json").is_file())
 
         def run_in(target, *args, check=True):
             result = subprocess.run([sys.executable, *args], cwd=target, capture_output=True, text=True)
@@ -1418,10 +1418,66 @@ class WorkspaceTests(WorkspaceCase):
         self.assertTrue((kit / ".local/moved/diagnostics.jsonl").is_file())
         self.assertTrue((kit / "config/moved-selection.json").is_file())
 
-        # 6. Populated extractions_home refuses auto-migration before moving anything
-        ext_file = kit / "data/extractions/.local/custom-runs/D1" / ("a" * 64) / "extraction.json"
-        ext_file.parent.mkdir(parents=True, exist_ok=True)
-        ext_file.write_text("{}\n")
+        # 6. Docling prepare/verify/register succeeds on an instance with custom policy and extractions_home
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": next_roots,
+        }))
+        self.assertEqual(docling_bridge.binding(kit)["policy_sha256"], policy.for_root(kit)[1])
+        self.assertEqual(docling_adapter._extractions_home(kit), Path("data/extractions/.local/custom-runs"))
+        raw_pdf = b"%PDF-1.7\ncustom instance docling input"
+        (kit / "custom_sources").mkdir(exist_ok=True)
+        (kit / "custom_sources/input.pdf").write_bytes(raw_pdf)
+        cat_state = catalog.status(kit)["state_token"]
+        catalog.submit(
+            kit,
+            [
+                {"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}},
+                {"id": "D1", "kind": "receipt", "data": {
+                    "source_ids": ["S1"], "artifact_id": "A-pdf", "provenance": []}},
+                {"id": "A-pdf", "kind": "artifact", "data": {
+                    "path": "custom_sources/input.pdf", "parent_id": None, "receipt_id": "D1",
+                    "role": "original", "audience": "source", "coverage": "pending-extraction",
+                    "reason": "Custom instance Docling test.", "presence": "present",
+                    "sha256": hashlib.sha256(raw_pdf).hexdigest(), "hash_basis": "observed",
+                    "bytes": len(raw_pdf), "extraction": "pending", "handling_refs": [],
+                    "provenance": [],
+                }},
+            ],
+            actor="operator", request_id="seed-custom-docling", expected_state=cat_state,
+            reason="Seed custom instance Docling receipt",
+        )
+        stub_report = {
+            "conversion": {"schema": "docling-rendition-v1", "format": "pdf",
+                           "document": {"texts": [], "tables": []}, "pages": [],
+                           "confidence": {}, "warnings": [], "omissions": []},
+            "runtime": {"docling": "test"},
+            "profile": {"version": 2, "limits": {}},
+            "assets": {"schema": "docling-assets-v1", "files": [], "sha256": "a" * 64},
+        }
+        worker_sha = hashlib.sha256(docling_adapter.WORKER.read_bytes()).hexdigest()
+        with patch.object(
+            docling_adapter,
+            "_convert_with_identity",
+            side_effect=lambda *args: (deepcopy(stub_report), worker_sha),
+        ):
+            prep = docling_adapter.run(
+                kit, "prepare", "D1", "pdf", Path("/unused/models"), Path("/unused/python")
+            )
+            self.assertTrue(prep["rendition"].startswith("data/extractions/.local/custom-runs/D1/"))
+            docling_adapter.run(
+                kit, "verify", "D1", "pdf", Path("/unused/models"), Path("/unused/python")
+            )
+            reg = docling_adapter.run(
+                kit, "register", "D1", "pdf", Path("/unused/models"), Path("/unused/python"),
+                actor="operator", expected_state=catalog.status(kit)["state_token"],
+            )
+            self.assertTrue(reg["registered"])
+
+        # 7. Populated extractions_home refuses auto-migration before moving anything
         bad_roots = dict(next_roots, extractions_home="data/extractions/.local/other-runs")
         (kit / "config/policy.local.json").write_text(json.dumps({
             "audience": "custom-instance-audience",
@@ -1433,17 +1489,6 @@ class WorkspaceTests(WorkspaceCase):
         with self.assertRaisesRegex(ValueError, "populated extractions_home"):
             policy.migrate_storage(kit)
         self.assertFalse((kit / ".local/migration.json").exists())
-
-        # 7. Docling bridge and adapter bind to instance root policy and extractions_home
-        (kit / "config/policy.local.json").write_text(json.dumps({
-            "audience": "custom-instance-audience",
-            "handling": "Custom instance handling notice.",
-            "markdown_roots": ["documents", "custom_docs"],
-            "original_roots": ["sources", "custom_sources"],
-            "storage_roots": next_roots,
-        }))
-        self.assertEqual(docling_bridge.binding(kit)["policy_sha256"], policy.for_root(kit)[1])
-        self.assertEqual(docling_adapter._extractions_home(kit), Path("data/extractions/.local/custom-runs"))
 
 
 class AbsenceClassificationTests(WorkspaceCase):

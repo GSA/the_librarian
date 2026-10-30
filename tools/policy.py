@@ -256,11 +256,29 @@ def _fsync_dir(path):
         os.close(fd)
 
 
+def _durable_mkdir(path):
+    target = _no_symlinks(path)
+    missing = []
+    current = target
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    existing_parent = current
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if directory.stat().st_mode & 0o077:
+            directory.chmod(0o700)
+        _fsync_dir(directory.parent)
+        _fsync_dir(directory)
+    if not missing and (target.stat().st_mode & 0o077):
+        target.chmod(0o700)
+        _fsync_dir(existing_parent)
+        _fsync_dir(target)
+
+
 def _write_private_json(path, payload):
     path = _no_symlinks(path)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.parent.stat().st_mode & 0o077:
-        path.parent.chmod(0o700)
+    _durable_mkdir(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
@@ -328,7 +346,6 @@ def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=Fal
         ("intake_home", "intake.sqlite3"),
         ("context_index_db", None),
         ("diagnostics_log", None),
-        ("selection_manifest", None),
     )
     for key, filename in store_artifacts:
         configured_rel = roots[key]
@@ -345,6 +362,16 @@ def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=Fal
                 )
     instance = read_instance_binding(instance_root)
     if instance is not None:
+        prev_sel = instance["storage_roots"].get("selection_manifest")
+        curr_sel = roots["selection_manifest"]
+        if (prev_sel and prev_sel != curr_sel
+                and prev_sel != DEFAULT_STORAGE_ROOTS["selection_manifest"]
+                and (instance_root / prev_sel).exists()
+                and (instance_root / curr_sel).exists()):
+            raise ValueError(
+                "Ambiguous or partially moved storage root for selection_manifest; "
+                "reconcile or run initialize --migrate-storage"
+            )
         if instance["storage_roots"] != roots:
             raise ValueError(
                 "Configured storage_roots differ from initialized instance layout; "
@@ -471,7 +498,7 @@ def migrate_storage(root, *, interrupt_after=None, interrupt_before_journal=None
         key, src_rel, dst_rel = item["key"], item["from"], item["to"]
         src = instance_root / src_rel
         dst = instance_root / dst_rel
-        dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _durable_mkdir(dst.parent)
         shutil.move(str(src), str(dst))
         if key in ("context_index_db", "diagnostics_log"):
             src_lock = src.with_name(src.name + ".lock")
@@ -521,7 +548,7 @@ def recover_migration(root):
         if dst.exists() and src.exists():
             raise ValueError(f"Ambiguous rollback state for {move['key']}: both source and destination exist")
         if dst.exists():
-            src.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _durable_mkdir(src.parent)
             shutil.move(str(dst), str(src))
             if move["key"] in ("context_index_db", "diagnostics_log"):
                 src_lock = src.with_name(src.name + ".lock")

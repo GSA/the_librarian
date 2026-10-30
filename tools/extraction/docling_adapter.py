@@ -483,7 +483,7 @@ def run(root: Path, command: str, receipt: str, format_name: str,
                         bridge.catalog.require(digest(current_source) == value["source"]["sha256"]
                                                and len(current_source) == value["source"]["bytes"],
                                                "Source changed before catalog commit")
-                        bridge.catalog.require(bridge.binding() == binding,
+                        bridge.catalog.require(_bridge_binding(root) == binding,
                                                "Policy or code changed before catalog commit")
                         _require_worker(worker_sha)
                     except (OSError, bridge.BridgeError, AdapterError) as error:
