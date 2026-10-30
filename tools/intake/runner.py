@@ -75,7 +75,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
         # Separate native preparation from ledger transactions: a failed ledger
         # commit is never a native failure and cannot consume the retry budget.
         try:
-            require(policy.load()[1] == request["policy"]["sha256"], "policy_changed")
+            require(policy.for_root(root)[1] == request["policy"]["sha256"], "policy_changed")
             intent = decode(saved["intent"].encode()) if saved["intent"] else adapters.prepare(store.safe(root), stage)
         except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
             begin()
@@ -124,7 +124,7 @@ def acknowledge(root, correlation_id, stage_id, acknowledgment):
         if prior:
             require(prior[0] == raw, "acknowledgment_conflict")
             return store.summary(c, correlation_id)
-        require(policy.load()[1] == request["policy"]["sha256"], "policy_changed")
+        require(policy.for_root(root)[1] == request["policy"]["sha256"], "policy_changed")
         intent = decode(saved["intent"].encode())
         try:
             require(adapters.prepare(store.safe(root), stage) == intent, "changed_disposition")

@@ -63,7 +63,7 @@ def timestamp(value):
         raise ReviewError("Invalid recorded_at calendar, clock or offset; leap seconds are unsupported") from error
 
 
-def schema_validate(bundle, schema=None):
+def schema_validate(bundle, schema=None, *, root=None):
     try:
         from jsonschema import Draft202012Validator, FormatChecker
         from referencing import Registry
@@ -72,7 +72,8 @@ def schema_validate(bundle, schema=None):
         raise ReviewError("Install tools/review_events/requirements.txt in a local environment") from error
     if schema is None:
         schema, _ = read_json(SCHEMA)
-        schema["properties"]["audience"] = {"const": policy.SETTINGS["audience"]}
+        audience = policy.for_root(root)[0]["audience"] if root is not None else policy.SETTINGS["audience"]
+        schema["properties"]["audience"] = {"const": audience}
     def offline(uri):
         raise NoSuchResource(ref=uri)
     Draft202012Validator.check_schema(schema)
@@ -90,8 +91,8 @@ def schema_validate(bundle, schema=None):
 
 
 def validate(bundle, root=ROOT, *, schema=None, stored=False):
-    schema_validate(bundle, schema)
     root = safe_path(root)
+    schema_validate(bundle, schema, root=root)
     events = {}
     for event in bundle["events"]:
         event_id = event["event_id"]

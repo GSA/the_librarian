@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import sys
 
+from tools import policy
 from tools.context_index.context_index import (
     IndexError_, build, compact_packet, count_index, engine_fingerprint, envelope,
     fail, freshness, load_catalog, load_compaction, load_manifest, no_symlinks,
@@ -74,11 +75,10 @@ def main(argv=None):
                 fail("Complete catalog output exceeds budget; no fields were truncated")
             sys.stdout.write(output)
             return 0
-        manifest = args.manifest or root / "config/selection.json"
-        if not manifest.is_absolute():
-            manifest = root / manifest
-        config, manifest_hash = load_manifest(manifest)
-        db = validate_db_path(root, args.db or root / "tools/context_index/.local/index.sqlite3")
+        manifest = policy.selection_path(root, args.manifest)
+        config, manifest_hash = load_manifest(manifest, root)
+        default_db = root / policy.validate_instance_roots(root)["context_index_db"]
+        db = validate_db_path(root, args.db or default_db)
         if db == no_symlinks(manifest):
             fail("Database output cannot overwrite the manifest")
         if args.command == "build":
@@ -89,20 +89,20 @@ def main(argv=None):
             reasons = freshness(connection, root, manifest, db, config, manifest_hash)
             if reasons:
                 if args.command == "status":
-                    print(json.dumps(envelope(command="status", fresh=False, reasons=reasons,
+                    print(json.dumps(envelope(root=root, command="status", fresh=False, reasons=reasons,
                                               database=str(db), **count_index(connection)), ensure_ascii=False))
                 fail("Index is stale; run build. " + "; ".join(reasons))
             if args.command == "status":
-                result = envelope(command="status", fresh=True, database=str(db), **count_index(connection))
+                result = envelope(root=root, command="status", fresh=True, database=str(db), **count_index(connection))
             elif args.command == "search":
                 result = search(connection, args.query, args.limit, args.path)
             elif args.command == "get":
-                result = packet(connection, config, args.locator, args.max_chars)
+                result = packet(connection, config, args.locator, args.max_chars, root=root)
                 if args.format == "compact":
                     result = compact_packet(result)
             elif args.command == "get-many":
                 result = packet_many(connection, config, args.locators, args.max_chars,
-                                     format_=args.format)
+                                     format_=args.format, root=root)
             # Refuse a result if the inputs changed while assembling it.
             reasons = freshness(connection, root, manifest, db, config, manifest_hash)
             if reasons:

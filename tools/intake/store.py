@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import stat
 
+from tools import policy
 from .contracts import IntakeError, canonical, decode, decode_request, digest, require
 
 APPLICATION_ID = 0x4C494E54
@@ -45,7 +46,11 @@ def safe(path):
 def locations(root):
     root = safe(root)
     require(root.is_dir(), "missing_root")
-    home = root / ".local/intake"
+    try:
+        rel_home = policy.validate_instance_roots(root)["intake_home"]
+    except ValueError as error:
+        raise IntakeError(str(error)) from error
+    home = safe(root / rel_home)
     return root, home, home / "intake.sqlite3"
 
 
@@ -186,3 +191,37 @@ def list_requests(root, state=None):
     with locked(root) as c:
         rows = [summary(c, r[0]) for r in c.execute("SELECT correlation_id FROM requests ORDER BY correlation_id")]
         return [r for r in rows if state is None or any(s["status"] == state for s in r["stages"])]
+
+
+def relocate(root):
+    """Update bound root in intake requests after an explicit host-path relocation."""
+    root, home, db = locations(root)
+    if not db.exists():
+        return {"relocated": False, "updated_requests": 0}
+    private(home, True)
+    private(db)
+    lock = home / "writer.lock"
+    safe(lock)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    c = None
+    try:
+        private(lock)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys=ON")
+        c.execute("PRAGMA synchronous=FULL")
+        require(c.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
+                and c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA, "incompatible_store")
+        require(c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                and not c.execute("PRAGMA foreign_key_check").fetchall(), "corrupt_store")
+        require(not c.execute("SELECT 1 FROM stages WHERE status='running'").fetchone(), "active_stage_during_relocation")
+        with c:
+            cursor = c.execute("UPDATE requests SET root=? WHERE root!=?", (str(root), str(root)))
+            updated = cursor.rowcount
+        validate(c, root)
+        return {"relocated": bool(updated), "updated_requests": updated}
+    finally:
+        if c is not None:
+            c.close()
+        os.close(fd)

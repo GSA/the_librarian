@@ -87,13 +87,13 @@ def relative_name(value):
     return value
 
 
-def eligible(path):
-    return isinstance(path, str) and path.endswith(".md") and policy.allowed(path, "markdown_roots")
+def eligible(path, root=None):
+    return isinstance(path, str) and path.endswith(".md") and policy.allowed(path, "markdown_roots", root)
 
 
 def source_path(root, name):
     relative_name(name)
-    if not eligible(name):
+    if not eligible(name, root):
         fail(f"Forbidden source path (not a maintained Markdown home): {name}")
     path = no_symlinks(root / name)
     if not path.is_file():
@@ -101,12 +101,12 @@ def source_path(root, name):
     return path
 
 
-def canonical_locator(value):
+def canonical_locator(value, root=None):
     if not isinstance(value, str):
         fail("A locator must be a string")
     path, separator, fragment = value.partition("#")
     relative_name(path)
-    if not eligible(path) and not renditions.eligible(path):
+    if not eligible(path, root) and not renditions.eligible(path, root):
         fail(f"Forbidden locator path: {path}")
     fragment = unquote(fragment)
     if any(c in fragment for c in ("\\0", "\\n", "\\r")):
@@ -163,17 +163,22 @@ def load_compaction():
     return module
 
 
-def original_allowed(path):
-    return isinstance(path, str) and policy.allowed(path, "original_roots")
+def original_allowed(path, root=None):
+    return isinstance(path, str) and policy.allowed(path, "original_roots", root)
 
 
-def rendition_api():
-    return types.SimpleNamespace(**{
+def rendition_api(root=None):
+    api = {
         name: globals()[name] for name in (
             "fail", "fields", "validate_context", "no_symlinks", "relative_name", "digest",
             "load_catalog", "load_event_reader", "strict_object", "eligible", "canonical_locator", "original_allowed",
         )
-    })
+    }
+    if root is not None:
+        api["eligible"] = lambda p: eligible(p, root)
+        api["canonical_locator"] = lambda v: canonical_locator(v, root)
+        api["original_allowed"] = lambda p: original_allowed(p, root)
+    return types.SimpleNamespace(**api)
 
 
 
@@ -182,49 +187,50 @@ def rendition_api():
 
 
 
-def load_manifest(path):
+def load_manifest(path, root=None):
     path = no_symlinks(path)
     raw = path.read_bytes()
     config = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
     fields(config, ("schema_version", "audience", "documents", "context_rules"),
            "Manifest", optional=("renditions",))
-    renditions.validate(config, rendition_api())
+    renditions.validate(config, rendition_api(root), root=root)
     if type(config["schema_version"]) is not int or config["schema_version"] != SCHEMA:
         fail(f"Unsupported manifest schema_version; expected {SCHEMA}")
-    if config["audience"] != AUDIENCE:
-        fail(f"Manifest audience must be {AUDIENCE!r}")
+    expected_audience = policy.for_root(root)[0]["audience"] if root is not None else AUDIENCE
+    if config["audience"] != expected_audience:
+        fail(f"Manifest audience must be {expected_audience!r}")
     if not isinstance(config["documents"], list):
         fail("Manifest documents must be a list (empty is supported)")
     seen = set()
     for document in config["documents"]:
         fields(document, ("path", "role", "context"), "Document")
         name = relative_name(document["path"])
-        if not eligible(name):
+        if not eligible(name, root):
             fail(f"Forbidden source path: {name}")
         if name in seen:
             fail(f"Duplicate document: {name}")
         seen.add(name)
         if not isinstance(document["role"], str) or not document["role"].strip():
             fail(f"Document role must be a nonempty string: {name}")
-        validate_context(document["context"])
+        validate_context(document["context"], root=root)
     if not isinstance(config["context_rules"], dict):
         fail("context_rules must be an object")
     normalized = {}
     for locator, contexts in config["context_rules"].items():
-        locator = canonical_locator(locator)
+        locator = canonical_locator(locator, root)
         if locator in normalized:
             fail(f"Duplicate normalized context rule: {locator}")
-        validate_context(contexts)
+        validate_context(contexts, root=root)
         normalized[locator] = contexts
     config["context_rules"] = normalized
     return config, digest(raw)
 
 
-def validate_context(context):
+def validate_context(context, root=None):
     if not isinstance(context, list):
         fail("Context must be a list of locators")
     for locator in context:
-        canonical_locator(locator)
+        canonical_locator(locator, root)
 
 
 def github_slug(title):
@@ -394,19 +400,25 @@ def readonly(path):
 
 
 def metadata_expected(root, manifest_hash, config=None, rendition_identity=None, review_snapshot=None):
+    try:
+        corpus_root = policy.logical_corpus_root(root)
+        settings = policy.for_root(root)[0]
+        policy_fp = policy.fingerprint(root)
+    except ValueError as error:
+        fail(str(error))
     if rendition_identity is None:
         _, rendition_identity = renditions.inputs(
-            root, config or {}, rendition_api(), review_snapshot=review_snapshot)
+            root, config or {}, rendition_api(root), review_snapshot=review_snapshot)
     return {
         "schema_version": str(SCHEMA), "engine_fingerprint": engine_fingerprint(),
-        "manifest_hash": manifest_hash, "corpus_root": str(root),
-        "audience": AUDIENCE, "policy_hash": policy.fingerprint(),
+        "manifest_hash": manifest_hash, "corpus_root": corpus_root,
+        "audience": settings["audience"], "policy_hash": policy_fp,
         "rendition_identity": rendition_identity,
     }
 
 
-def get_section(connection, locator):
-    locator = canonical_locator(locator)
+def get_section(connection, locator, root=None):
+    locator = canonical_locator(locator, root)
     row = connection.execute(
         "SELECT s.* FROM aliases a JOIN sections s ON s.id=a.section_id WHERE a.locator=?",
         (locator,),
@@ -416,14 +428,14 @@ def get_section(connection, locator):
     return row
 
 
-def validate_contexts(connection, config):
+def validate_contexts(connection, config, root=None):
     for document in [*config["documents"], *config.get("renditions", [])]:
         for locator in document["context"]:
-            get_section(connection, locator)
+            get_section(connection, locator, root)
     for locator, contexts in config["context_rules"].items():
-        get_section(connection, locator)
+        get_section(connection, locator, root)
         for companion in contexts:
-            get_section(connection, companion)
+            get_section(connection, companion, root)
 
 
 
@@ -479,7 +491,7 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
     selected, rendition_identity = renditions.inputs(
-        root, config, rendition_api(), review_snapshot=review_snapshot)
+        root, config, rendition_api(root), review_snapshot=review_snapshot)
     expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
         existing = readonly(db)
@@ -536,8 +548,8 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
                 (path + ("#" + anchor if anchor else ""), ids[index])
                 for anchor, index in aliases.items()
             ))
-        renditions.store(connection, selected, rendition_api())
-        validate_contexts(connection, config)
+        renditions.store(connection, selected, rendition_api(root))
+        validate_contexts(connection, config, root)
         connection.commit()
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             fail("Index integrity check failed")
@@ -546,7 +558,7 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
         counts = count_index(connection)
         connection.close()
         connection = None
-        if load_manifest(manifest)[1] != manifest_hash:
+        if load_manifest(manifest, root)[1] != manifest_hash:
             fail("Manifest changed during build; prior index preserved, retry build")
         if (snapshot_hashes(root, config) != hashes
                 or metadata_expected(root, manifest_hash, config) != expected):
@@ -560,7 +572,7 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
         if publication_guard is not None:
             publication_guard()
         os.replace(temporary, db)
-        return envelope(command="build", fresh=True, database=str(db), **counts)
+        return envelope(command="build", fresh=True, database=str(db), root=root, **counts)
     finally:
         if connection is not None:
             connection.close()
@@ -598,13 +610,14 @@ def freshness(connection, root, manifest, db, config, manifest_hash):
     if set(stored) != {document["path"] for document in config["documents"]}:
         reasons.append("manifest document set changed")
     reasons.extend(f"source changed: {path}" for path in current if current[path] != stored.get(path))
-    if load_manifest(manifest)[1] != manifest_hash:
+    if load_manifest(manifest, root)[1] != manifest_hash:
         reasons.append("manifest changed during read")
     return reasons
 
 
-def envelope(**values):
-    return {"audience": AUDIENCE, "notice": NOTICE, "handling": policy.SETTINGS["handling"], **values}
+def envelope(*, root=None, **values):
+    settings = policy.for_root(root)[0] if root is not None else policy.SETTINGS
+    return {"audience": settings["audience"], "notice": NOTICE, "handling": settings["handling"], **values}
 
 
 
@@ -749,11 +762,11 @@ def link_record(connection, path, target):
     }
 
 
-def packet(connection, config, locator, max_chars, *, fail_fast=False):
+def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None):
     if max_chars < 1:
         fail("--max-chars must be a positive integer")
-    requested = canonical_locator(locator)
-    selected = get_section(connection, requested)
+    requested = canonical_locator(locator, root)
+    selected = get_section(connection, requested, root)
     docs = {row["path"]: row for row in connection.execute("SELECT * FROM documents")}
     document_context = {doc["path"]: doc["context"]
                         for doc in [*config["documents"], *config.get("renditions", [])]}
@@ -761,7 +774,7 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
     rules = {}
     rule_sections = {}
     for key, values in config["context_rules"].items():
-        section = get_section(connection, key)
+        section = get_section(connection, key, root)
         rules.setdefault(section["id"], []).extend(values)
         rule_sections[section["id"]] = section
     pieces = []
@@ -803,7 +816,7 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
 
     while queue:
         target, reason = queue.pop(0)
-        row = get_section(connection, target)
+        row = get_section(connection, target, root)
         add_piece(row, row["line_start"], row["line_end"], row["text"], reason)
         if row["id"] in seen:
             continue
@@ -822,17 +835,17 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
         if table:
             add_piece(row, table[0] + 1, table[1], table[2], "table-column-headers")
         for companion in document_context[row["path"]]:
-            queue.append((canonical_locator(companion), "configured-document-context"))
+            queue.append((canonical_locator(companion, root), "configured-document-context"))
         # A broad selection must retain corrections attached to its included subsections.
         for rule_id, section in rule_sections.items():
             if (rule_id != row["id"] and section["path"] == row["path"]
                     and row["line_start"] <= section["line_start"]
                     and section["line_end"] <= row["line_end"]):
                 for companion in rules[rule_id]:
-                    queue.append((canonical_locator(companion), "configured-contained-context"))
+                    queue.append((canonical_locator(companion, root), "configured-contained-context"))
         for ancestor in inherited:
             for companion in rules.get(ancestor["id"], []):
-                queue.append((canonical_locator(companion), "configured-locator-context"))
+                queue.append((canonical_locator(companion, root), "configured-locator-context"))
     # Definitions elsewhere in a document are required to interpret reference-style links.
     for piece in list(pieces):
         if piece["path"] in rendition_metadata:
@@ -842,7 +855,7 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
             key = " ".join((match[2] or match[1]).lower().split())
             if key in definitions:
                 definition = definitions[key]
-                row = get_section(connection, piece["path"])
+                row = get_section(connection, piece["path"], root)
                 add_piece(row, definition["line"], definition["line"],
                           definition["text"], "reference-link-definition")
     links = []
@@ -862,7 +875,7 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False):
             "No required context has been truncated."
         )
     result = envelope(
-        command="get", requested_locator=requested, locator=selected["locator"],
+        root=root, command="get", requested_locator=requested, locator=selected["locator"],
         caveat="Exact source text with inherited/configured context, not a synthesized or verified answer.",
         characters=required, pieces=pieces, outbound_links=links,
     )
@@ -921,7 +934,7 @@ def validate_many_limits(locators, max_chars, max_output_chars=None):
         fail("--max-output-chars must be a positive integer")
 
 
-def packet_many(connection, config, locators, max_chars=30000, *, format_="compact"):
+def packet_many(connection, config, locators, max_chars=30000, *, format_="compact", root=None):
     """Pool exact spans without merging the per-request qualification relationships."""
     validate_many_limits(locators, max_chars)
     if format_ not in ("compact", "full"):
@@ -931,7 +944,7 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
     requests = []
     characters = 0
     for locator in locators:
-        original = packet(connection, config, locator, max_chars, fail_fast=True)
+        original = packet(connection, config, locator, max_chars, fail_fast=True, root=root)
         projected = compact_packet(original) if format_ == "compact" else original
         pieces = []
         for piece in original["pieces"]:
@@ -971,7 +984,7 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
             },
         })
     return envelope(
-        command="get-many", format=f"qualified-many-{format_}-v1",
+        root=root, command="get-many", format=f"qualified-many-{format_}-v1",
         characters=characters, document_count=len(documents), span_count=len(spans),
         documents=documents, spans=spans, requests=requests,
         reference_notice="All references are local to this response. Each request's ordered pieces "

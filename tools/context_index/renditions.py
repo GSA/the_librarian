@@ -16,13 +16,15 @@ DOCLING_RENDER_SCALE = 3.0
 DOCLING_MAX_PAGE_PIXELS = 32_000_000
 
 
-def eligible(path):
+def eligible(path, root=None):
+    from tools import policy
+    prefix = re.escape(policy.storage_roots(root)["extractions_home"])
     return isinstance(path, str) and bool(re.fullmatch(
-        r"data/extractions/\.local/D\d+/[a-f0-9]{64}/extraction\.json", path
+        prefix + r"/D\d+/[a-f0-9]{64}/extraction\.json", path
     ))
 
 
-def validate(config, engine):
+def validate(config, engine, root=None):
     selections = config.get("renditions", [])
     if not isinstance(selections, list) or len(selections) > 10:
         engine.fail("renditions must be a list of at most ten explicit selections")
@@ -30,8 +32,8 @@ def validate(config, engine):
     for item in selections:
         engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),
                       "Rendition selection", optional=("review_event_ids",))
-        if (not eligible(item["path"]) or item["path"] in seen
-                or PurePosixPath(item["path"]).parts[3] != item["receipt_id"]
+        if (not eligible(item["path"], root) or item["path"] in seen
+                or PurePosixPath(item["path"]).parts[-3] != item["receipt_id"]
                 or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "odt", "docling"}
                 or not isinstance(item["sha256"], str)
                 or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
@@ -107,7 +109,7 @@ def inputs(root, config, engine, review_snapshot=None):
             engine.fail("Selected rendition receipt exceeds the bounded catalog lookup")
         by_id = {record["id"]: record for record in records["records"]}
         source = value["source"]
-        run = PurePosixPath(item["path"]).parts[4]
+        run = PurePosixPath(item["path"]).parts[-2]
         prefix = "docling" if item["format"] == "docling" else "extract"
         child = by_id.get("A-" + prefix + "-" + run, {})
         relation = by_id.get("R-" + prefix + "-" + run, {})

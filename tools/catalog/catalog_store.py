@@ -15,6 +15,7 @@ import sys
 import unicodedata
 import uuid
 
+from tools import policy
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
     CatalogError, canonical, choice, exact, fingerprint, hash_value, identifier,
@@ -95,7 +96,11 @@ def private_file(path):
 def locations(root):
     root = safe_path(root)
     require(root.is_dir(), "Corpus root must exist")
-    home = safe_path(root / HOME)
+    try:
+        rel_home = policy.validate_instance_roots(root)["catalog_home"]
+    except ValueError as error:
+        raise CatalogError(str(error)) from error
+    home = safe_path(root / rel_home)
     return home, home / DB_NAME, home / "backups"
 
 

@@ -2,8 +2,10 @@
 
 **Audience:** maintainers and operators.
 **Date:** October 21, 2026.
-**Status:** Accepted. Describes the contract an updateable distribution must
-honor; the store-home and path-binding changes it requires are not implemented.
+**Status:** Accepted and implemented. The store-home configuration, logical
+corpus-root binding, per-instance policy evaluation, and explicit migration and
+recovery paths described below are active in `tools/policy.py` and
+`tools/initialize.py`.
 
 ## Context
 
@@ -79,27 +81,33 @@ growth is an operational fact that per-project instances multiply.
    every upgrade. Rebuilding an authority store is never an upgrade or
    recovery action.
 
-### What must change to make instances portable
+### Implemented portability and store-layout contract
 
-- **Store home becomes instance configuration, not a code constant.** An
-  instance declares its data root and the layout beneath it; the code reads
-  that declaration. Until this exists, a data root cannot be moved between
-  installations that disagree on layout, and a container cannot choose its
-  mount point freely.
-- **The derived index must not bind an absolute host path as identity.** It
-  should bind the instance's logical data root, so that mounting the same data
-  at a different host path does not invalidate the index while genuinely
-  changing the corpus still does. Until this exists, a containerized
-  deployment must mount the data root at one fixed path forever.
-- **Policy must be per-instance.** `tools/policy.py` resolves
-  `config/policy.json` and `config/policy.local.json` relative to the toolkit
-  directory and loads them at import time. One toolkit therefore has exactly
-  one policy, and `--root` selects data without selecting a matching policy.
-  Since the policy hash is bound into the index and governs what may be read
-  and served, a policy that cannot follow the data root is the single largest
-  blocker to running one toolkit against several instances. This is the
-  technical reason the topology in [0004](0004-instance-topology.md) clones
-  the toolkit rather than sharing it.
+- **Store home is instance configuration, not a code constant.** An instance
+  may declare canonical relative `storage_roots` (`catalog_home`,
+  `review_events_home`, `context_index_db`, `intake_home`, `extractions_home`,
+  `diagnostics_log`, and `selection_manifest`) in `config/policy.json` or
+  `config/policy.local.json`, and may override the active selection manifest via
+  ignored `config/selection.local.json`. `tools/initialize.py` records the
+  initialized store identities and layout in private `.local/instance.json`
+  (`0600`). Changing `storage_roots` on an initialized instance requires
+  `python3 tools/initialize.py --migrate-storage`, which uses private
+  `.local/migration.json` (`0600`) to move populated stores transactionally and
+  `--recover-migration` to roll back an interrupted move and verify pre-migration
+  authority state tokens.
+- **The derived index binds logical instance identity rather than host path.**
+  `tools/policy.py:logical_corpus_root(root)` binds `instance_id`,
+  `catalog_store_id`, `review_store_id`, and `storage_roots` into the index's
+  `corpus_root` metadata. Moving an entire instance directory to a new host path
+  or mounting it into a container volume preserves index freshness, while
+  substituting `catalog.sqlite3`, `events.sqlite3`, or `index.sqlite3` from
+  another instance is immediately refused. After an approved host-path move,
+  `python3 tools/initialize.py --relocate` rebinds `requests.root` in the intake
+  recovery ledger when no stage is `running`.
+- **Policy is evaluated per instance.** `tools/policy.py` resolves
+  `config/policy.json` and `config/policy.local.json` against the target `--root`
+  instance directory on every operation, fail-closed on symlinks, unknown fields,
+  or overlapping storage roots.
 - **Backup retention needs a stated policy, not automatic deletion.** Report
   backup count, total size and oldest retained revision; let an operator prune
   deliberately with verification. Do not add automatic retention deletion.

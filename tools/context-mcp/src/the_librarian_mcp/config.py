@@ -2,10 +2,21 @@
 
 import argparse
 from dataclasses import dataclass
+import importlib.util
 import json
 import math
 from pathlib import Path
 from typing import ClassVar
+
+
+def _load_policy(toolkit_root: Path):
+    path = toolkit_root / "tools/policy.py"
+    spec = importlib.util.spec_from_file_location("librarian_instance_policy", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Policy module unavailable at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,13 @@ class Config:
                           for end in range(1, len(relative.parts) + 1)]
             if not path.is_file() or any(component.is_symlink() for component in components):
                 raise ValueError("--root must identify a complete trusted toolkit clone")
+        policy_mod = _load_policy(self.toolkit_root)
+        roots = policy_mod.validate_instance_roots(self.root)
+        if self.manifest == Path("config/selection.json"):
+            resolved_manifest = policy_mod.selection_path(self.root).relative_to(self.toolkit_root)
+            object.__setattr__(self, "manifest", resolved_manifest)
+        if self.db == Path("tools/context_index/.local/index.sqlite3"):
+            object.__setattr__(self, "db", Path(roots["context_index_db"]))
         for name in ("manifest", "db"):
             value = getattr(self, name)
             path = value if value.is_absolute() else self.root / value

@@ -155,7 +155,10 @@ def log_lock(path):
 class Log:
     """Append-only JSONL writer. Opt-in; a write failure is reported, never swallowed."""
 
-    def __init__(self, root, value):
+    def __init__(self, root, value=None):
+        if value is None:
+            from tools import policy
+            value = policy.validate_instance_roots(root)["diagnostics_log"]
         self.path = log_path(root, value)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -309,7 +312,7 @@ def prune(path, keep):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--log", default=".local/diagnostics/retrieval.jsonl")
+    parser.add_argument("--log")
     commands = parser.add_subparsers(dest="command", required=True)
     summary = commands.add_parser("report", help="Summarize observed coverage and findability gaps")
     summary.add_argument("--since-days", type=int)
@@ -317,7 +320,9 @@ def main(argv=None):
     removal.add_argument("--keep", type=int, required=True)
     args = parser.parse_args(argv)
     try:
-        path = log_path(args.root, args.log)
+        from tools import policy
+        log_rel = args.log or policy.validate_instance_roots(args.root)["diagnostics_log"]
+        path = log_path(args.root, log_rel)
         if not path.is_file():
             raise DiagnosticsError(f"No diagnostics log at {path}; retrieval diagnostics are opt-in")
         if args.command == "report":

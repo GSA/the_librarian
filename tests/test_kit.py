@@ -1152,6 +1152,135 @@ class WorkspaceTests(WorkspaceCase):
             self.assertEqual(set(archive.namelist()), set(json.loads((kit / "release-files.json").read_text())))
             self.assertNotIn("config/policy.local.json", archive.namelist())
 
+    def test_portable_roots_relocation_substitution_and_migration_recovery(self):
+        from tools.intake import store as intake_store
+
+        kit = self.root / "instance_a"
+        clone_release(kit)
+        custom_roots = {
+            "catalog_home": ".local/stores/catalog",
+            "review_events_home": ".local/stores/review-events",
+            "context_index_db": ".local/stores/index.sqlite3",
+            "intake_home": ".local/stores/intake",
+            "extractions_home": "data/extractions/.local/custom",
+            "diagnostics_log": ".local/stores/diagnostics.jsonl",
+            "selection_manifest": "config/selection.json",
+        }
+        (kit / "config/policy.local.json").write_text(json.dumps({"storage_roots": custom_roots}))
+        (kit / "documents").mkdir(exist_ok=True)
+        (kit / "documents/guide.md").write_text("# Guide\n\nPortable instance content.\n")
+        (kit / "config/selection.local.json").write_text(json.dumps({
+            "schema_version": 1,
+            "audience": "authorized-local",
+            "documents": [{"path": "documents/guide.md", "role": "guide", "context": []}],
+            "context_rules": {},
+        }))
+
+        def run_in(target, *args, check=True):
+            result = subprocess.run([sys.executable, *args], cwd=target, capture_output=True, text=True)
+            if check:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            return result
+
+        init_report = run_in(kit, "tools/initialize.py")
+        self.assertEqual(init_report["storage_roots"]["catalog_home"], ".local/stores/catalog")
+        self.assertTrue((kit / ".local/instance.json").is_file())
+        self.assertTrue((kit / ".local/stores/catalog/catalog.sqlite3").is_file())
+
+        cat_state = catalog.status(kit)["state_token"]
+        catalog.submit(
+            kit,
+            [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}],
+            actor="operator", request_id="req-portable-s1", expected_state=cat_state,
+            reason="Seed portable instance catalog",
+        )
+        intake_store.initialize(kit)
+        request_raw = json.dumps({
+            "version": 1, "correlation_id": "req-relocate-1", "correction_of": None,
+            "policy": {"version": 1, "sha256": policy.for_root(kit)[1]},
+            "retry": {"max_attempts": 2, "backoff_seconds": 5},
+            "stages": [{"id": "delivery", "kind": "return", "operation": "await-ack",
+                        "arguments": {"delivery_correlation": "delivery-one",
+                                      "disposition_path": "disposition.json",
+                                      "disposition_sha256": "b" * 64}}],
+        }).encode()
+        intake_store.stage(kit, request_raw)
+
+        build_report = run_in(kit, "-m", "tools.context_index.context_index", "build")
+        self.assertEqual(build_report["documents"], 1)
+        self.assertTrue((kit / ".local/stores/index.sqlite3").is_file())
+
+        # Move the entire instance to a new host path: index stays fresh without rebuild.
+        relocated = self.root / "relocated_instance"
+        shutil.move(str(kit), str(relocated))
+        status_after_move = run_in(relocated, "-m", "tools.context_index.context_index", "status")
+        self.assertTrue(status_after_move["fresh"])
+        hits = run_in(relocated, "-m", "tools.context_index.context_index", "search", "Portable")
+        self.assertEqual(len(hits["hits"]), 1)
+
+        # Intake ledger refuses the old host path until explicitly relocated.
+        with self.assertRaises(intake_store.IntakeError):
+            intake_store.inspect(relocated, "req-relocate-1")
+        reloc_report = run_in(relocated, "tools/initialize.py", "--relocate")
+        self.assertEqual(reloc_report["intake"]["updated_requests"], 1)
+        self.assertEqual(intake_store.inspect(relocated, "req-relocate-1")["correlation_id"], "req-relocate-1")
+
+        # Substituting another instance's catalog, review-events, or index store must fail closed.
+        other = self.root / "instance_b"
+        clone_release(other)
+        run_in(other, "tools/initialize.py")
+        run_in(other, "-m", "tools.context_index.context_index", "build")
+
+        cat_db = relocated / ".local/stores/catalog/catalog.sqlite3"
+        saved_cat = cat_db.read_bytes()
+        cat_db.write_bytes((other / ".local/catalog/catalog.sqlite3").read_bytes())
+        try:
+            with self.assertRaisesRegex(catalog.CatalogError, "Cross-instance or substituted catalog store"):
+                catalog.status(relocated)
+            stale_index = run_in(relocated, "-m", "tools.context_index.context_index", "status", check=False)
+            self.assertNotEqual(stale_index.returncode, 0)
+        finally:
+            cat_db.write_bytes(saved_cat)
+
+        idx_db = relocated / ".local/stores/index.sqlite3"
+        saved_idx = idx_db.read_bytes()
+        idx_db.write_bytes((other / "tools/context_index/.local/index.sqlite3").read_bytes())
+        try:
+            substituted_idx = run_in(relocated, "-m", "tools.context_index.context_index", "search", "Portable", check=False)
+            self.assertNotEqual(substituted_idx.returncode, 0)
+            self.assertIn("corpus_root", substituted_idx.stderr)
+        finally:
+            idx_db.write_bytes(saved_idx)
+
+        # Changing storage_roots without --migrate-storage refuses operation; interrupted migration rolls back cleanly.
+        migrated_roots = dict(custom_roots, catalog_home=".local/migrated/catalog",
+                              review_events_home=".local/migrated/review-events")
+        (relocated / "config/policy.local.json").write_text(json.dumps({"storage_roots": migrated_roots}))
+        with self.assertRaisesRegex(catalog.CatalogError, "migrate-storage"):
+            catalog.status(relocated)
+
+        pre_cat_token = saved_cat
+        with self.assertRaisesRegex(RuntimeError, "Simulated interruption"):
+            policy.migrate_storage(relocated, interrupt_after=1)
+        self.assertTrue((relocated / ".local/migration.json").is_file())
+        with self.assertRaisesRegex(catalog.CatalogError, "recover-migration"):
+            catalog.status(relocated)
+
+        recovered = run_in(relocated, "tools/initialize.py", "--recover-migration")
+        self.assertTrue(recovered["recovered"])
+        self.assertFalse((relocated / ".local/migration.json").exists())
+        (relocated / "config/policy.local.json").write_text(json.dumps({"storage_roots": custom_roots}))
+        self.assertEqual(cat_db.read_bytes(), pre_cat_token)
+
+        # Complete migration moves stores and preserves state tokens.
+        (relocated / "config/policy.local.json").write_text(json.dumps({"storage_roots": migrated_roots}))
+        before_token = policy.read_instance_binding(relocated)["catalog_store_id"]
+        mig_report = run_in(relocated, "tools/initialize.py", "--migrate-storage")
+        self.assertTrue(mig_report["migrated"])
+        self.assertEqual(catalog.status(relocated)["store_id"], before_token)
+        self.assertTrue((relocated / ".local/migrated/catalog/catalog.sqlite3").is_file())
+
 
 class AbsenceClassificationTests(WorkspaceCase):
     """A zero-result search must explain itself without quoting the corpus."""

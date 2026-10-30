@@ -101,7 +101,8 @@ def text(raw):
     }
 
 
-def gemini(raw):
+def gemini(raw, root=None):
+    settings = policy.for_root(root)[0] if root is not None else policy.SETTINGS
     text = raw.decode("utf-8")
     require("\x00" not in text, "NUL in UTF-8 transcript")
     lines = text.splitlines(keepends=True)
@@ -111,15 +112,15 @@ def gemini(raw):
     for number, line in enumerate(lines, 1):
         label = re.sub(r"^[^\w]+", "", line.strip()).lower()
         item = {"line": number, "text": line}
-        if label in policy.SETTINGS["transcript"]["notes_headings"]:
+        if label in settings["transcript"]["notes_headings"]:
             require(section not in {"transcript", "transcript-footer"},
                     "Ambiguous generated-notes heading after transcript start")
             section = "generated-notes"
-        elif label == policy.SETTINGS["transcript"]["transcript_heading"]:
+        elif label == settings["transcript"]["transcript_heading"]:
             headings += 1
             section = "transcript"
         elif section == "transcript" and re.fullmatch(
-                policy.SETTINGS["transcript"]["end_pattern"], line.strip()):
+                settings["transcript"]["end_pattern"], line.strip()):
             endings += 1
             section = "transcript-footer"
         item["section"] = section
@@ -141,7 +142,7 @@ def gemini(raw):
         warnings.append("Transcript end marker absent; meeting completeness is unknown.")
     return {"format": "gemini-txt", "scope": "all supplied UTF-8 lines, unchanged",
             "lines": result, "warnings": warnings,
-            "precedence": policy.SETTINGS["transcript"]["precedence"]}
+            "precedence": settings["transcript"]["precedence"]}
 
 
 def xml(raw, name):
@@ -278,7 +279,7 @@ def source(root, receipt, format_name):
     require(data["role"] == "original" and data["presence"] == "present"
             and data["coverage"] != "excluded", "Receipt original is absent, excluded or not an original")
     relative = Path(data["path"])
-    require(policy.allowed(relative.as_posix(), "original_roots"),
+    require(policy.allowed(relative.as_posix(), "original_roots", root),
             "Original path is outside configured extraction roots or excluded by policy")
     suffix = {"gemini-txt": ".txt", "text": ".txt", "odt": ".odt"}[format_name]
     require(relative.suffix.lower() == suffix, "Selected format disagrees with source extension")
@@ -298,12 +299,14 @@ def source(root, receipt, format_name):
 
 def bundle(root, receipt, format_name):
     state, original, identity, raw = source(root, receipt, format_name)
-    engine = {"version": VERSION, "sha256": digest(Path(__file__).read_bytes() + policy.fingerprint().encode())}
+    settings = policy.for_root(root)[0]
+    extractions_home = policy.validate_instance_roots(root)["extractions_home"]
+    engine = {"version": VERSION, "sha256": digest(Path(__file__).read_bytes() + policy.fingerprint(root).encode())}
     run = digest(encoded({"source": identity, "extractor": engine, "format": format_name}))
-    payload = {"gemini-txt": gemini, "text": text, "odt": odt}[format_name](raw)
+    payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "odt": odt}[format_name](raw)
     value = {"schema_version": VERSION, "run_id": run, "extractor": engine,
-             "source": identity, "boundary": BOUNDARY + " " + policy.SETTINGS["handling"], "payload": payload}
-    path = root / HOME / receipt / run / "extraction.json"
+             "source": identity, "boundary": BOUNDARY + " " + settings["handling"], "payload": payload}
+    path = root / extractions_home / receipt / run / "extraction.json"
     return state, original, path, value
 
 
@@ -311,7 +314,7 @@ def unchanged(root, value):
     path = catalog.safe_path(root / value["source"]["path"])
     require(digest(read_source(path)) == value["source"]["sha256"],
             "Source changed during extraction/registration")
-    require(digest(Path(__file__).read_bytes() + policy.fingerprint().encode()) == value["extractor"]["sha256"],
+    require(digest(Path(__file__).read_bytes() + policy.fingerprint(root).encode()) == value["extractor"]["sha256"],
             "Extractor changed during operation")
 
 

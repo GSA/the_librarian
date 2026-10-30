@@ -15,7 +15,8 @@ def inventory(root, directory, limit):
     root = root.absolute()
     if any(part.is_symlink() for part in (root, *root.parents)):
         raise ValueError("Root symlinks are not permitted")
-    if directory not in policy.SETTINGS["markdown_roots"] + policy.SETTINGS["original_roots"]:
+    settings = policy.for_root(root)[0]
+    if directory not in settings["markdown_roots"] + settings["original_roots"]:
         raise ValueError("Directory must be an explicitly configured content root")
     start = root / directory
     if not start.is_dir() or any(part.is_symlink() for part in (start, *start.parents)):
@@ -26,7 +27,7 @@ def inventory(root, directory, limit):
         kept = []
         for name in sorted(directories):
             path = Path(base) / name
-            if path.is_symlink() or name in policy.SETTINGS["excluded_directory_names"]:
+            if path.is_symlink() or name in settings["excluded_directory_names"]:
                 skipped += 1
             else:
                 kept.append(name)
@@ -35,7 +36,7 @@ def inventory(root, directory, limit):
             path = Path(base) / name
             relative = path.relative_to(root).as_posix()
             if path.is_symlink() or not path.is_file() or not any(
-                policy.allowed(relative, category) for category in ("markdown_roots", "original_roots")
+                policy.allowed(relative, category, root) for category in ("markdown_roots", "original_roots")
             ):
                 skipped += 1
                 continue
