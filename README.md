@@ -46,6 +46,16 @@ creates an automatic backup.
 
 ## Ingesting files (current manual method)
 
+To stage and register a file in one step, use the upload intake (see
+[context/intake.md](context/intake.md#manual-upload-and-local-drop)):
+
+```sh
+.venv/bin/python -m tools.intake.cli --root . submit-file ~/memo.pdf \
+  --submission-id memo-001 --format pdf --actor "$USER" --reason "Register memo"
+```
+
+It replaces steps 1–3 below and leaves extraction to step 4.
+
 1. **Drop** the original file under `sources/` (for example `sources/memo.pdf`).
 2. **Discover** what has not been registered yet:
    ```sh

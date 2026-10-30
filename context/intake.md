@@ -46,5 +46,35 @@ named stage. The ledger is operational recovery state, never corpus authority.
   corrupt ledgers refuse operation; never rebuild corpus authority from this
   ledger. Protect operational request bodies like other private instance data.
 
+## Manual upload and local drop
+
+`submit-file FILE --submission-id ID --format {text,gemini-txt,odt,pdf,image}
+--actor A --reason R` stages one explicitly supplied file. Optional
+`--name`, `--correction-of`, `--expected-sha256` and declared
+`--origin-system/--origin-locator/--origin-version`.
+
+- The file is read once through a symlink-free, regular-file-only descriptor and
+  refused if it changes during the read, exceeds the existing extractor limit, or
+  fails the extension/signature check for an already supported format.
+- Bytes and a hash-bound `submission.json` provenance sidecar are atomically
+  published (0600 in 0700 directories) under
+  `<first original root>/intake/<submission-id>/`, then registered as source,
+  receipt, original and preserved-metadata records through a durable
+  `catalog-submit` stage with correlation `upload-<submission-id>`.
+- The acknowledgment reports `receipt` (committed, pending, retryable, blocked,
+  dead-letter) separately from `processing`; upload never extracts, reviews,
+  selects or qualifies anything.
+- A filename never supplies a remote identity or version; only declared origin
+  fields do (`identity_basis`). Equal bytes under distinct submissions remain
+  distinct sources and receipts.
+- An exact retry returns the existing acknowledgment and resumes unfinished
+  work. Changed bytes or descriptor under one submission ID are a
+  `submission_conflict`; send a new submission with `--correction-of`, which
+  reuses the parent source and adds a `version-of` relationship.
+- `drop-scan --drop DIR` is discovery only. `drop-submit --drop DIR` submits each
+  `NAME` paired with `NAME.submission.json` (the v1 descriptor fields). The drop
+  must exist and contain `.librarian-drop`; a missing or unmarked mount is
+  `drop_unavailable`, never an empty success. Drop contents are never modified.
+
 No acquisition, connector, scheduler, automatic review/selection, migration,
 model service or return transport is supplied by this interface.
