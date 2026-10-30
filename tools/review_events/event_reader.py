@@ -40,6 +40,7 @@ class Snapshot:
     state: dict
     events: list
     successors: dict
+    root: Path = contract.ROOT
 
     def query(self, *, receipt_id=None, source_id=None, outcome=None, content=None,
               unit=None, scope=None, origin=None, include_history=False, limit=10,
@@ -104,10 +105,11 @@ class Snapshot:
             matches.append((sequence, event))
         remaining = [(sequence, event) for sequence, event in matches if sequence > after]
         selected = remaining[:limit]
+        settings = contract.policy.for_root(self.root)[0]
         packet = {
-            "contract_version": 1, "audience": contract.policy.SETTINGS["audience"],
+            "contract_version": 1, "audience": settings["audience"],
             "authority": store.AUTHORITY, "notice": NOTICE,
-            "handling": contract.policy.SETTINGS["handling"], "generated_at": store.now(),
+            "handling": settings["handling"], "generated_at": store.now(),
             "state": deepcopy(self.state), "filters": filters,
             "records": [{"sequence": sequence, "event": deepcopy(event),
                          "superseded_by": self.successors.get(event["event_id"])}
@@ -126,10 +128,10 @@ def read_snapshot(root):
         contract.require(db.exists(), "Review-event database is missing; no legacy fallback")
         with closing(store.connect(db)) as connection:
             connection.execute("BEGIN")
-            state, events = store.inspect(connection)
+            state, events = store.inspect(connection, root)
             successors = {predecessor: event["event_id"]
                           for event in events for predecessor in event["supersedes"]}
-        return Snapshot(state, events, successors)
+        return Snapshot(state, events, successors, root)
     except contract.ReviewError:
         raise
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, RecursionError) as error:

@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest.mock import patch
@@ -23,7 +24,7 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-from tools import ontology, package, policy
+from tools import package, policy
 from tools.catalog import catalog_store as catalog
 from tools.context_index import compact_records
 from tools.context_index import context_index as index
@@ -669,6 +670,7 @@ class WorkspaceTests(WorkspaceCase):
         rendition = self.root / path
         rendition.parent.mkdir(parents=True)
         rendition.write_bytes(raw)
+        rendition.chmod(0o600)
         registered_value = deepcopy(value)
         registered_value["canonical_bytes"] = raw
         catalog.submit(self.root, docling_bridge.registration_records(
@@ -1150,129 +1152,343 @@ class WorkspaceTests(WorkspaceCase):
             self.assertEqual(set(archive.namelist()), set(json.loads((kit / "release-files.json").read_text())))
             self.assertNotIn("config/policy.local.json", archive.namelist())
 
+    def test_portable_roots_relocation_substitution_and_migration_recovery(self):
+        from tools.intake import store as intake_store
 
-class DeclaredVocabulary(WorkspaceCase):
-    """The relation model is configuration the validator reads, not embedded constants."""
+        kit = self.root / "instance_a"
+        clone_release(kit)
+        custom_roots = {
+            "catalog_home": ".local/stores/catalog",
+            "review_events_home": ".local/stores/review-events",
+            "context_index_db": ".local/stores/index.sqlite3",
+            "intake_home": ".local/stores/intake",
+            "extractions_home": "data/extractions/.local/custom",
+            "diagnostics_log": ".local/stores/diagnostics.jsonl",
+            "selection_manifest": "config/selection.json",
+        }
+        (kit / "config/policy.local.json").write_text(json.dumps({"storage_roots": custom_roots}))
+        (kit / "documents").mkdir(exist_ok=True)
+        (kit / "documents/guide.md").write_text("# Guide\n\nPortable instance content.\n")
+        (kit / "config/selection.local.json").write_text(json.dumps({
+            "schema_version": 1,
+            "audience": "authorized-local",
+            "documents": [{"path": "documents/guide.md", "role": "guide", "context": []}],
+            "context_rules": {},
+        }))
 
-    def relate(self, relation="version-of", basis="reported", extra=()):
-        home = self.root / catalog.HOME
-        if home.exists():
-            shutil.rmtree(home)
-        records = [
-            {"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}},
-            {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}},
-            {"id": "R-link", "kind": "relationship", "data": {
-                "from_id": "S1", "to_id": "S2", "relation": relation,
-                "scope": "Structural contract test; no reported content claim.",
-                "basis": basis, "provenance": []}},
-            *extra,
-        ]
-        state = catalog.initialize(self.root)["state"]
-        return catalog.submit(self.root, records, actor="test-runner", request_id="relate",
-                              expected_state=state["state_token"], reason="Vocabulary contract test")
+        def run_in(target, *args, check=True):
+            result = subprocess.run([sys.executable, *args], cwd=target, capture_output=True, text=True)
+            if check:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            return result
 
-    def test_relation_terms_come_from_the_declared_vocabulary(self):
-        with self.assertRaises(catalog.CatalogError):
-            self.relate(relation="supersedes")
-        declared = dict(ontology.RELATIONS["version-of"], description="Declared only for this test.")
-        with patch.dict(ontology.RELATIONS, {"supersedes": declared}):
-            self.assertEqual(self.relate(relation="supersedes")["records"], 3)
+        init_report = run_in(kit, "tools/initialize.py")
+        self.assertEqual(init_report["storage_roots"]["catalog_home"], ".local/stores/catalog")
+        self.assertTrue((kit / ".local/instance.json").is_file())
+        self.assertTrue((kit / ".local/stores/catalog/catalog.sqlite3").is_file())
 
-    def test_entailed_edges_are_never_authority_records(self):
-        with self.assertRaises(catalog.CatalogError):
-            self.relate(basis="entailed")
+        cat_state = catalog.status(kit)["state_token"]
+        catalog.submit(
+            kit,
+            [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}],
+            actor="operator", request_id="req-portable-s1", expected_state=cat_state,
+            reason="Seed portable instance catalog",
+        )
+        intake_store.initialize(kit)
+        request_raw = json.dumps({
+            "version": 1, "correlation_id": "req-relocate-1", "correction_of": None,
+            "policy": {"version": 1, "sha256": policy.for_root(kit)[1]},
+            "retry": {"max_attempts": 2, "backoff_seconds": 5},
+            "stages": [{"id": "delivery", "kind": "return", "operation": "await-ack",
+                        "arguments": {"delivery_correlation": "delivery-one",
+                                      "disposition_path": "disposition.json",
+                                      "disposition_sha256": "b" * 64}}],
+        }).encode()
+        intake_store.stage(kit, request_raw)
 
-    def test_local_configuration_cannot_admit_an_entailed_basis(self):
-        override = self.root / "ontology.local.json"
-        override.write_text(json.dumps({"bases": list(ontology.RESERVED_BASES)}))
-        with patch.object(ontology, "LOCAL", override):
-            with self.assertRaises(ontology.OntologyError):
-                ontology.load()
-        self.assertEqual(ontology.BASES, ontology.AUTHORITY_BASES)
-        self.assertFalse(ontology.AUTHORITY_BASES & ontology.RESERVED_BASES)
+        build_report = run_in(kit, "-m", "tools.context_index.context_index", "build")
+        self.assertEqual(build_report["documents"], 1)
+        self.assertTrue((kit / ".local/stores/index.sqlite3").is_file())
 
-    def test_a_vocabulary_edited_after_import_refuses_reads_and_writes(self):
-        self.assertEqual(self.relate()["records"], 3)
-        state = catalog.status(self.root)["state_token"]
-        records = [{"id": "S3", "kind": "source",
-                    "data": {"category": "artifact", "provenance": []}}]
-        with patch.object(catalog.ontology, "fingerprint", lambda: "edited-after-import"):
-            with self.assertRaises(catalog.CatalogError) as refusal:
-                catalog.submit(self.root, records, actor="test-runner", request_id="stale",
-                               expected_state=state, reason="Write under a changed vocabulary")
-            self.assertIn("restart", str(refusal.exception))
-        # The refused write left no trace; the store is readable and unchanged.
-        self.assertEqual(catalog.status(self.root)["state_token"], state)
-        self.assertEqual(catalog.status(self.root)["records"], 3)
+        # Move the entire instance to a new host path: index stays fresh without rebuild.
+        relocated = self.root / "relocated_instance"
+        shutil.move(str(kit), str(relocated))
+        status_after_move = run_in(relocated, "-m", "tools.context_index.context_index", "status")
+        self.assertTrue(status_after_move["fresh"])
+        hits = run_in(relocated, "-m", "tools.context_index.context_index", "search", "Portable")
+        self.assertEqual(len(hits["hits"]), 1)
 
-    def test_precommit_vocabulary_changes_roll_back(self):
-        records = [{"id": "S1", "kind": "source",
-                    "data": {"category": "artifact", "provenance": []}}]
-        override = self.root / "ontology.local.json"
-        for contents in ('{"notice": "Changed vocabulary during submission"}', 'invalid json'):
-            with self.subTest(contents=contents):
-                shutil.rmtree(self.root / catalog.HOME, ignore_errors=True)
-                override.unlink(missing_ok=True)
-                state = catalog.initialize(self.root)["state"]
-                with patch.object(ontology, "LOCAL", override):
-                    with patch.object(catalog, "ONTOLOGY_FINGERPRINT", ontology.fingerprint()):
-                        with self.assertRaises(catalog.CatalogError):
-                            catalog.submit(self.root, records, actor="test-runner",
-                                           request_id="precommit-vocabulary", reason="Transaction guard",
-                                           expected_state=state["state_token"],
-                                           precommit_check=lambda: override.write_text(contents))
-                        override.unlink(missing_ok=True)
-                        self.assertEqual(catalog.status(self.root)["state_token"], state["state_token"])
-                        self.assertEqual(catalog.status(self.root)["records"], 0)
+        # Intake ledger refuses the old host path until explicitly relocated.
+        with self.assertRaises(intake_store.IntakeError):
+            intake_store.inspect(relocated, "req-relocate-1")
+        reloc_report = run_in(relocated, "tools/initialize.py", "--relocate")
+        self.assertEqual(reloc_report["intake"]["updated_requests"], 1)
+        self.assertEqual(intake_store.inspect(relocated, "req-relocate-1")["correlation_id"], "req-relocate-1")
 
-    def test_a_relation_over_an_unresolvable_entity_kind_is_refused(self):
-        """Declaring a business entity kind is a code change, not a config edit."""
-        widened = dict(ontology.SETTINGS,
-                       endpoint_kinds=[*ontology.SETTINGS["endpoint_kinds"], "rule"])
-        with patch.object(catalog.ontology, "SETTINGS", widened):
-            with self.assertRaises(catalog.CatalogError) as refusal:
-                self.relate()
-        self.assertIn("cannot resolve", str(refusal.exception))
-        self.assertIn("rule", str(refusal.exception))
+        # Substituting another instance's catalog, review-events, or index store must fail closed.
+        other = self.root / "instance_b"
+        clone_release(other)
+        run_in(other, "tools/initialize.py")
+        run_in(other, "-m", "tools.context_index.context_index", "build")
 
-    def test_endpoint_kinds_are_enforced_per_relation(self):
-        artifact_only = dict(ontology.RELATIONS["version-of"], from_kinds=["artifact"])
-        with patch.dict(ontology.RELATIONS, {"version-of": artifact_only}):
-            with self.assertRaises(catalog.CatalogError):
-                self.relate(relation="version-of")
+        cat_db = relocated / ".local/stores/catalog/catalog.sqlite3"
+        saved_cat = cat_db.read_bytes()
+        cat_db.write_bytes((other / ".local/catalog/catalog.sqlite3").read_bytes())
+        try:
+            with self.assertRaisesRegex(catalog.CatalogError, "Cross-instance or substituted catalog store"):
+                catalog.status(relocated)
+            stale_index = run_in(relocated, "-m", "tools.context_index.context_index", "status", check=False)
+            self.assertNotEqual(stale_index.returncode, 0)
+        finally:
+            cat_db.write_bytes(saved_cat)
 
-    def test_declared_disjointness_refuses_contradictory_edges(self):
-        second = {"id": "R-other", "kind": "relationship", "data": {
-            "from_id": "S1", "to_id": "S2", "relation": "duplicate-of",
-            "scope": "Structural contract test; no reported content claim.",
-            "basis": "reported", "provenance": []}}
-        self.assertEqual(self.relate(extra=[second])["records"], 4)
-        with patch.object(ontology, "DISJOINT",
-                          frozenset([frozenset({"version-of", "duplicate-of"})])):
-            with self.assertRaises(catalog.CatalogError):
-                self.relate(extra=[second])
+        idx_db = relocated / ".local/stores/index.sqlite3"
+        saved_idx = idx_db.read_bytes()
+        idx_db.write_bytes((other / "tools/context_index/.local/index.sqlite3").read_bytes())
+        try:
+            substituted_idx = run_in(relocated, "-m", "tools.context_index.context_index", "search", "Portable", check=False)
+            self.assertNotEqual(substituted_idx.returncode, 0)
+            self.assertIn("corpus_root", substituted_idx.stderr)
+        finally:
+            idx_db.write_bytes(saved_idx)
 
-    def test_store_refuses_a_changed_vocabulary(self):
-        catalog.initialize(self.root)
-        self.assertEqual(catalog.status(self.root, audit=True)["records"], 0)
-        with patch.object(ontology, "HASH", "0" * 64):
-            with self.assertRaises(catalog.CatalogError):
-                catalog.status(self.root, audit=True)
+        # Changing storage_roots without --migrate-storage refuses operation; interrupted migration rolls back cleanly.
+        migrated_roots = dict(custom_roots, catalog_home=".local/migrated/catalog",
+                              review_events_home=".local/migrated/review-events")
+        (relocated / "config/policy.local.json").write_text(json.dumps({"storage_roots": migrated_roots}))
+        with self.assertRaisesRegex(catalog.CatalogError, "migrate-storage"):
+            catalog.status(relocated)
 
-    def test_store_predating_the_binding_requires_the_shipped_vocabulary(self):
-        with closing(sqlite3.connect(":memory:")) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.executescript(catalog.schema_sql())
-            connection.executemany("INSERT INTO metadata VALUES (?,?)", {
-                "store_id": str(uuid.uuid4()),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "authority": catalog.AUTHORITY,
-                "contract_version": str(catalog.VERSION),
-            }.items())
-            self.assertEqual(catalog.inspect(connection)[0]["records"], 0)
-            with patch.object(ontology, "HASH", "0" * 64):
-                with self.assertRaises(catalog.CatalogError):
-                    catalog.inspect(connection)
+        pre_cat_token = saved_cat
+        with self.assertRaisesRegex(RuntimeError, "Simulated interruption"):
+            policy.migrate_storage(relocated, interrupt_after=1)
+        self.assertTrue((relocated / ".local/migration.json").is_file())
+        with self.assertRaisesRegex(catalog.CatalogError, "recover-migration"):
+            catalog.status(relocated)
+
+        recovered = run_in(relocated, "tools/initialize.py", "--recover-migration")
+        self.assertTrue(recovered["recovered"])
+        self.assertFalse((relocated / ".local/migration.json").exists())
+        (relocated / "config/policy.local.json").write_text(json.dumps({"storage_roots": custom_roots}))
+        self.assertEqual(cat_db.read_bytes(), pre_cat_token)
+
+        # Complete migration moves stores and preserves state tokens.
+        (relocated / "config/policy.local.json").write_text(json.dumps({"storage_roots": migrated_roots}))
+        before_token = policy.read_instance_binding(relocated)["catalog_store_id"]
+        mig_report = run_in(relocated, "tools/initialize.py", "--migrate-storage")
+        self.assertTrue(mig_report["migrated"])
+        self.assertEqual(catalog.status(relocated)["store_id"], before_token)
+        self.assertTrue((relocated / ".local/migrated/catalog/catalog.sqlite3").is_file())
+
+    def test_portable_roots_edge_cases_and_instance_policy_propagation(self):
+        from tools.intake import adapters as intake_adapters, store as intake_store
+        from tools.extraction import docling_adapter, docling_bridge
+
+        kit = self.root / "instance_custom"
+        clone_release(kit)
+        custom_roots = {
+            "catalog_home": ".local/custom/catalog",
+            "review_events_home": ".local/custom/review-events",
+            "context_index_db": ".local/custom/index.sqlite3",
+            "intake_home": ".local/queues/recovery/intake",
+            "extractions_home": "data/extractions/.local/custom-runs",
+            "diagnostics_log": ".local/custom/diagnostics.jsonl",
+            "selection_manifest": "config/custom-selection.json",
+        }
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": custom_roots,
+        }))
+        (kit / "custom_docs").mkdir(exist_ok=True)
+        (kit / "custom_docs/AGENTS.md").write_text("# Custom Context\n\nCompanion context rules.\n")
+        (kit / "custom_docs/guide.md").write_text("# Custom Guide\n\nUniqueCustomToken content.\n")
+        (kit / "config/custom-selection.json").write_text(json.dumps({
+            "schema_version": 1,
+            "audience": "custom-instance-audience",
+            "documents": [
+                {
+                    "path": "custom_docs/AGENTS.md",
+                    "role": "rules",
+                    "context": [],
+                },
+                {
+                    "path": "custom_docs/guide.md",
+                    "role": "guide",
+                    "context": ["custom_docs/AGENTS.md"],
+                },
+            ],
+            "context_rules": {},
+        }))
+        # Keep shipped default config/selection.json template alongside custom-selection.json
+        self.assertTrue((kit / "config/selection.json").is_file())
+
+        def run_in(target, *args, check=True):
+            result = subprocess.run([sys.executable, *args], cwd=target, capture_output=True, text=True)
+            if check:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            return result
+
+        # 1. Initialize instance + deeply nested intake_home (.local/queues/recovery/intake)
+        run_in(kit, "tools/initialize.py")
+        intake_init = intake_store.initialize(kit)
+        self.assertTrue((kit / ".local/queues/recovery/intake/intake.sqlite3").is_file())
+        self.assertEqual(stat.S_IMODE((kit / ".local/queues/recovery").stat().st_mode), 0o700)
+
+        # 2. Search envelope (hit and zero-result) reflects custom instance audience and handling
+        stage_spec = {
+            "id": "build-idx",
+            "kind": "publication",
+            "operation": "index-build",
+            "arguments": {
+                "manifest": "config/custom-selection.json",
+                "db": ".local/custom/index.sqlite3",
+            },
+        }
+        intent = intake_adapters.prepare(kit, stage_spec)
+        self.assertTrue(intent["selection_validated"])
+        ev = intake_adapters.execute(kit, stage_spec, intent)
+        self.assertEqual(ev["boundary"], "publication-confirmed")
+        self.assertTrue(intake_adapters.availability(kit, stage_spec, ev)["available"])
+
+        hit_res = run_in(kit, "-m", "tools.context_index.context_index", "search", "UniqueCustomToken")
+        self.assertEqual(hit_res["audience"], "custom-instance-audience")
+        self.assertEqual(hit_res["handling"], "Custom instance handling notice.")
+        empty_res = run_in(kit, "-m", "tools.context_index.context_index", "search", "AbsentTokenXYZ")
+        self.assertEqual(empty_res["audience"], "custom-instance-audience")
+        self.assertEqual(empty_res["handling"], "Custom instance handling notice.")
+        self.assertIn("absence", empty_res)
+
+        # 3. Missing authority DB restore works on an initialized instance and enforces store_id lineage
+        cat_backup = catalog.backup(kit)
+        rev_backup = events.backup(kit)
+        cat_db = kit / ".local/custom/catalog/catalog.sqlite3"
+        rev_db = kit / ".local/custom/review-events/events.sqlite3"
+        cat_db.unlink()
+        rev_db.unlink()
+        restored_cat = catalog.restore(kit, Path(cat_backup["snapshot"]))
+        self.assertEqual(restored_cat["command"], "restore")
+        self.assertTrue(cat_db.is_file())
+        restored_rev = events.restore(kit, Path(rev_backup["snapshot"]))
+        self.assertEqual(restored_rev["command"], "restore")
+        self.assertTrue(rev_db.is_file())
+
+        # 4. rendition_api(kit) binds validate_context to kit (custom_docs/AGENTS.md)
+        api = index.rendition_api(kit)
+        api.validate_context(["custom_docs/AGENTS.md"])
+
+        # 5. Interruption before journal update rolls back planned moves cleanly
+        diagnostics.Log(kit, custom_roots["diagnostics_log"]).record_read(
+            {"command": "get"},
+            started_at="2026-10-22T12:00:00+00:00",
+            completed_at="2026-10-22T12:00:01+00:00",
+            duration_ms=10,
+        )
+        next_roots = dict(
+            custom_roots,
+            catalog_home=".local/moved/catalog",
+            review_events_home=".local/moved/review-events",
+            diagnostics_log=".local/moved/diagnostics.jsonl",
+            selection_manifest="config/moved-selection.json",
+        )
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": next_roots,
+        }))
+        with self.assertRaisesRegex(RuntimeError, "before journal update"):
+            policy.migrate_storage(kit, interrupt_before_journal=1)
+        self.assertFalse(cat_db.exists())
+        self.assertTrue((kit / ".local/moved/catalog/catalog.sqlite3").is_file())
+        recovered = policy.recover_migration(kit)
+        self.assertTrue(recovered["recovered"])
+        self.assertIn("catalog_home", recovered["rolled_back"])
+        self.assertTrue(cat_db.is_file())
+        self.assertFalse((kit / ".local/migration.json").exists())
+
+        # Complete migration moves diagnostics_log and selection_manifest too
+        completed = policy.migrate_storage(kit)
+        self.assertTrue(completed["migrated"])
+        self.assertTrue((kit / ".local/moved/diagnostics.jsonl").is_file())
+        self.assertTrue((kit / "config/moved-selection.json").is_file())
+
+        # 6. Docling prepare/verify/register succeeds on an instance with custom policy and extractions_home
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": next_roots,
+        }))
+        self.assertEqual(docling_bridge.binding(kit)["policy_sha256"], policy.for_root(kit)[1])
+        self.assertEqual(docling_adapter._extractions_home(kit), Path("data/extractions/.local/custom-runs"))
+        raw_pdf = b"%PDF-1.7\ncustom instance docling input"
+        (kit / "custom_sources").mkdir(exist_ok=True)
+        (kit / "custom_sources/input.pdf").write_bytes(raw_pdf)
+        cat_state = catalog.status(kit)["state_token"]
+        catalog.submit(
+            kit,
+            [
+                {"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}},
+                {"id": "D1", "kind": "receipt", "data": {
+                    "source_ids": ["S1"], "artifact_id": "A-pdf", "provenance": []}},
+                {"id": "A-pdf", "kind": "artifact", "data": {
+                    "path": "custom_sources/input.pdf", "parent_id": None, "receipt_id": "D1",
+                    "role": "original", "audience": "source", "coverage": "pending-extraction",
+                    "reason": "Custom instance Docling test.", "presence": "present",
+                    "sha256": hashlib.sha256(raw_pdf).hexdigest(), "hash_basis": "observed",
+                    "bytes": len(raw_pdf), "extraction": "pending", "handling_refs": [],
+                    "provenance": [],
+                }},
+            ],
+            actor="operator", request_id="seed-custom-docling", expected_state=cat_state,
+            reason="Seed custom instance Docling receipt",
+        )
+        stub_report = {
+            "conversion": {"schema": "docling-rendition-v1", "format": "pdf",
+                           "document": {"texts": [], "tables": []}, "pages": [],
+                           "confidence": {}, "warnings": [], "omissions": []},
+            "runtime": {"docling": "test"},
+            "profile": {"version": 2, "limits": {}},
+            "assets": {"schema": "docling-assets-v1", "files": [], "sha256": "a" * 64},
+        }
+        worker_sha = hashlib.sha256(docling_adapter.WORKER.read_bytes()).hexdigest()
+        with patch.object(
+            docling_adapter,
+            "_convert_with_identity",
+            side_effect=lambda *args: (deepcopy(stub_report), worker_sha),
+        ):
+            prep = docling_adapter.run(
+                kit, "prepare", "D1", "pdf", Path("/unused/models"), Path("/unused/python")
+            )
+            self.assertTrue(prep["rendition"].startswith("data/extractions/.local/custom-runs/D1/"))
+            docling_adapter.run(
+                kit, "verify", "D1", "pdf", Path("/unused/models"), Path("/unused/python")
+            )
+            reg = docling_adapter.run(
+                kit, "register", "D1", "pdf", Path("/unused/models"), Path("/unused/python"),
+                actor="operator", expected_state=catalog.status(kit)["state_token"],
+            )
+            self.assertTrue(reg["registered"])
+
+        # 7. Populated extractions_home refuses auto-migration before moving anything
+        bad_roots = dict(next_roots, extractions_home="data/extractions/.local/other-runs")
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": bad_roots,
+        }))
+        with self.assertRaisesRegex(ValueError, "populated extractions_home"):
+            policy.migrate_storage(kit)
+        self.assertFalse((kit / ".local/migration.json").exists())
 
 
 class AbsenceClassificationTests(WorkspaceCase):
@@ -1313,6 +1529,13 @@ class AbsenceClassificationTests(WorkspaceCase):
         self.assertEqual(uncombined["absent_terms"], 0)
         self.assertEqual(uncombined["sections_matching_any"], 2)
         self.assertIn("retrieval or selection limit", uncombined["caveat"])
+
+    def test_sections_matching_any_counts_distinct_sections_when_terms_overlap(self):
+        self.corpus({"a.md": "# Alpha\n\nalphaonly betaonly material.\n"})
+        partial = self.absence("alphaonly betaonly zzgapone")
+        self.assertEqual(partial["classification"], "absent-partial")
+        self.assertEqual((partial["terms"], partial["absent_terms"]), (3, 1))
+        self.assertEqual(partial["sections_matching_any"], 1)
 
     def test_classification_respects_the_requested_path_scope(self):
         self.corpus({"a.md": "# Alpha\n\nalphaonly material.\n",
@@ -1429,6 +1652,36 @@ class RetrievalDiagnostics(unittest.TestCase):
         result = diagnostics.prune(self.log.path, 1)
         self.assertEqual((result["before"], result["after"], result["removed"]), (3, 1, 2))
         self.assertEqual(len(diagnostics.read_records(self.log.path)), 1)
+
+    def test_prune_and_write_serialize_across_shared_lock_file(self):
+        for minute in range(3):
+            self.log.record_search(self.search_payload(1), **self.stamps(minute))
+        entered_read = threading.Event()
+        release_read = threading.Event()
+        original_read_records = diagnostics.read_records
+
+        def paused_read_records(path):
+            records = original_read_records(path)
+            entered_read.set()
+            release_read.wait(timeout=5)
+            return records
+
+        writer_result = {}
+
+        def concurrent_writer():
+            entered_read.wait(timeout=5)
+            writer_result["record"] = self.log.record_search(self.search_payload(2), **self.stamps(10))
+
+        writer = threading.Thread(target=concurrent_writer)
+        writer.start()
+        with patch.object(diagnostics, "read_records", side_effect=paused_read_records):
+            threading.Timer(0.05, release_read.set).start()
+            result = diagnostics.prune(self.log.path, 1)
+        writer.join(timeout=5)
+        self.assertEqual((result["before"], result["after"], result["removed"]), (3, 1, 2))
+        records = diagnostics.read_records(self.log.path)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[-1]["run_id"], writer_result["record"]["run_id"])
 
     def test_reads_are_counted_but_never_attributed(self):
         """A read is counted as a bare event, carrying no locator, excerpt or count."""

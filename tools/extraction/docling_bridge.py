@@ -43,19 +43,19 @@ def _allowed(name, settings):
     return any(name.startswith(prefix + "/") for prefix in settings["original_roots"])
 
 
-def _policy_binding():
+def _policy_binding(root=None):
     require(digest(Path(policy.__file__).read_bytes()) == POLICY_CODE_SHA256,
             "Loaded policy code changed; start a fresh process")
-    settings, policy_hash = policy.load()
+    settings, policy_hash = policy.for_root(root)
     return settings, {
         "policy_sha256": policy_hash,
         "policy_code_sha256": POLICY_CODE_SHA256,
     }
 
 
-def binding():
+def binding(root=None):
     """Fresh policy and installation-code binding; never use cached eligibility."""
-    _, result = _policy_binding()
+    _, result = _policy_binding(root)
     here = Path(__file__)
     adapter = here.with_name("docling_adapter.py")
     coordinator = sys.modules.get(f"{__package__}.docling_adapter")
@@ -98,7 +98,7 @@ def _read_source(path):
 def source(root: Path, receipt: str, format_name: str):
     """Return catalog state, original record, source identity and one byte snapshot."""
     require(format_name in ("pdf", "image"), "Unsupported Docling format")
-    settings, initial_policy = _policy_binding()
+    settings, initial_policy = _policy_binding(root)
     snapshot = catalog.receipt_metadata(root, [receipt])
     registration = snapshot["registrations"][receipt]
     original = registration["artifact"]
@@ -118,7 +118,7 @@ def source(root: Path, receipt: str, format_name: str):
             "Source differs from catalog hash; reconcile its identity/version")
     require(data["bytes"] is None or data["bytes"] == len(raw),
             "Source differs from catalog byte count; reconcile its identity/version")
-    require(_policy_binding()[1] == initial_policy,
+    require(_policy_binding(root)[1] == initial_policy,
             "Policy changed during source validation; retry")
     identity = {
         "receipt_id": receipt, "artifact_id": original["id"],

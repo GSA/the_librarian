@@ -11,6 +11,7 @@ are never evidence about the subject matter of a corpus.
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
 import json
@@ -135,10 +136,29 @@ def private_descriptor(path, flags):
     return descriptor
 
 
+@contextmanager
+def log_lock(path):
+    """Serialize append and prune across a stable lock file so replace cannot orphan writes."""
+    target = Path(path)
+    lock_file = target.with_name(target.name + ".lock")
+    require(not lock_file.is_symlink(), f"Diagnostics lock cannot be a symlink: {lock_file}")
+    require(not lock_file.parent.is_symlink(), f"Diagnostics directory cannot be a symlink: {lock_file.parent}")
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = private_descriptor(lock_file, os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 class Log:
     """Append-only JSONL writer. Opt-in; a write failure is reported, never swallowed."""
 
-    def __init__(self, root, value):
+    def __init__(self, root, value=None):
+        if value is None:
+            from tools import policy
+            value = policy.validate_instance_roots(root)["diagnostics_log"]
         self.path = log_path(root, value)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -147,16 +167,16 @@ class Log:
         raw = (json.dumps(record, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
                + "\n").encode()
         require(len(raw) <= MAX_RECORD_BYTES, "Diagnostic exceeds its record budget")
-        descriptor = private_descriptor(self.path, os.O_WRONLY | os.O_APPEND)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            size = os.fstat(descriptor).st_size
-            require(size + len(raw) <= MAX_LOG_BYTES,
-                    f"Diagnostics log is full at {size} bytes; prune it explicitly")
-            require(os.write(descriptor, raw) == len(raw), "Short diagnostics write")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        with log_lock(self.path):
+            descriptor = private_descriptor(self.path, os.O_WRONLY | os.O_APPEND)
+            try:
+                size = os.fstat(descriptor).st_size
+                require(size + len(raw) <= MAX_LOG_BYTES,
+                        f"Diagnostics log is full at {size} bytes; prune it explicitly")
+                require(os.write(descriptor, raw) == len(raw), "Short diagnostics write")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         return record
 
     def record_search(self, payload, *, started_at, completed_at, duration_ms, run_id=None):
@@ -268,20 +288,21 @@ def report(path, *, since=None):
 def prune(path, keep):
     """Explicitly drop all but the newest records. Never automatic; reports both counts."""
     require(type(keep) is int and 0 <= keep <= MAX_RECORDS, "--keep must be a bounded nonnegative integer")
-    records = read_records(path)
-    retained = records[len(records) - keep:] if keep else []
-    descriptor, temporary = tempfile.mkstemp(dir=str(Path(path).parent), suffix=".jsonl")
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            for record in retained:
-                stream.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except Exception:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+    with log_lock(path):
+        records = read_records(path)
+        retained = records[len(records) - keep:] if keep else []
+        descriptor, temporary = tempfile.mkstemp(dir=str(Path(path).parent), suffix=".jsonl")
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                for record in retained:
+                    stream.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            Path(temporary).unlink(missing_ok=True)
+            raise
     return {"schema": SCHEMA, "log": str(path), "notice": NOTICE,
             "before": len(records), "after": len(retained),
             "removed": len(records) - len(retained),
@@ -291,7 +312,7 @@ def prune(path, keep):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--log", default=".local/diagnostics/retrieval.jsonl")
+    parser.add_argument("--log")
     commands = parser.add_subparsers(dest="command", required=True)
     summary = commands.add_parser("report", help="Summarize observed coverage and findability gaps")
     summary.add_argument("--since-days", type=int)
@@ -299,7 +320,9 @@ def main(argv=None):
     removal.add_argument("--keep", type=int, required=True)
     args = parser.parse_args(argv)
     try:
-        path = log_path(args.root, args.log)
+        from tools import policy
+        log_rel = args.log or policy.validate_instance_roots(args.root)["diagnostics_log"]
+        path = log_path(args.root, log_rel)
         if not path.is_file():
             raise DiagnosticsError(f"No diagnostics log at {path}; retrieval diagnostics are opt-in")
         if args.command == "report":

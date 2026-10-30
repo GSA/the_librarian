@@ -1,7 +1,5 @@
 # Engineer context contract
 
-Use the [business-context contract](../docs/contracts/business-context.md) for entity identity, directional claims, and qualified answer metadata. Keep reported attribution separate from extracted, candidate, or confirmed qualification; confidence and structurally valid review tokens do not establish truth. Knowitall owns code identity, and external code references are navigation, not support. The pure APIs validate supplied contracts, not authority or runtime freshness.
-
 Start from the original task, repository instructions, and authorized context. Verify MCP connectivity and retrieve exact qualified evidence after search discovery.
 
 Before implementation, identify:

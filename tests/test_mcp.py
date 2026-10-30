@@ -232,6 +232,46 @@ class MCP(unittest.IsolatedAsyncioTestCase):
                     await session.call_tool("search", {"query": "documentation"})
             self.assertFalse((root / ".local/diagnostics").exists())
 
+    async def test_mcp_uses_instance_local_selection_and_storage_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "kit"
+            clone_release(root)
+            (root / "config/policy.local.json").write_text(json.dumps({
+                "storage_roots": {
+                    "catalog_home": ".local/custom/catalog",
+                    "review_events_home": ".local/custom/review-events",
+                    "context_index_db": ".local/custom/index.sqlite3",
+                }
+            }))
+            (root / "documents").mkdir(exist_ok=True)
+            (root / "documents/custom.md").write_text("# Custom\n\nLocal selection override token.\n")
+            (root / "config/selection.local.json").write_text(json.dumps({
+                "schema_version": 1,
+                "audience": "authorized-local",
+                "documents": [{"path": "documents/custom.md", "role": "guide", "context": []}],
+                "context_rules": {},
+            }))
+            subprocess.run([sys.executable, str(root / "tools/initialize.py")],
+                           capture_output=True, text=True, check=True)
+            subprocess.run([sys.executable, "-m", "tools.context_index.context_index",
+                            "--root", str(root), "build"],
+                           cwd=root, capture_output=True, text=True, check=True)
+            cfg = Config(root=root)
+            self.assertEqual(cfg.manifest, Path("config/selection.local.json"))
+            self.assertEqual(cfg.db, Path(".local/custom/index.sqlite3"))
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "the_librarian_mcp.server", "--root", str(root)],
+                env=dict(os.environ, PYTHONPATH=str(root / "tools/context-mcp/src")),
+            )
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    res = await session.call_tool("search", {"query": "override"})
+                    payload = json.loads(res.content[0].text)
+                    self.assertEqual(len(payload["hits"]), 1)
+                    self.assertEqual(payload["hits"][0]["path"], "documents/custom.md")
+
 
 if __name__ == "__main__":
     unittest.main()

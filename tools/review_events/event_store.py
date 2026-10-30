@@ -71,22 +71,24 @@ def require(condition, message):
     contract.require(condition, message)
 
 
-def store_schema():
+def store_schema(root=None):
     schema, _ = contract.read_json(contract.SCHEMA)
-    schema["properties"]["audience"] = {"const": contract.policy.SETTINGS["audience"]}
+    audience = contract.policy.for_root(root)[0]["audience"]
+    schema["properties"]["audience"] = {"const": audience}
     return schema
 
 
-def bundle(events):
+def bundle(events, root=None):
+    audience = contract.policy.for_root(root)[0]["audience"]
     return {"schema_version": VERSION, "authority": AUTHORITY,
-            "audience": contract.policy.SETTINGS["audience"], "events": events}
+            "audience": audience, "events": events}
 
 
-def validate_history(events):
+def validate_history(events, root=None):
     if events:
-        schema = store_schema()
+        schema = store_schema(root)
         schema["properties"]["events"]["maxItems"] = max(256, len(events))
-        contract.validate(bundle(events), schema=schema, stored=True)
+        contract.validate(bundle(events, root), root if root is not None else contract.ROOT, schema=schema, stored=True)
 
 
 def origin_key(event):
@@ -116,10 +118,16 @@ def private_file(path):
     return path
 
 
-def locations(root):
+def locations(root, *, allow_missing=False):
     root = contract.safe_path(root)
     require(root.is_dir(), "Corpus root must exist")
-    home = contract.safe_path(root / HOME)
+    try:
+        rel_home = contract.policy.validate_instance_roots(
+            root, allow_missing=("catalog", "review-event") if allow_missing else ()
+        )["review_events_home"]
+    except ValueError as error:
+        raise contract.ReviewError(str(error)) from error
+    home = contract.safe_path(root / rel_home)
     return home, home / DB_NAME, home / BACKUPS
 
 
@@ -168,7 +176,7 @@ def seal(path):
     fsync_directory(path.parent)
 
 
-def inspect(connection):
+def inspect(connection, root=None):
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     require(application_id != SUPERSEDED_APPLICATION_ID,
             "Superseded FREV review-event identity; explicit migration or re-initialization is required")
@@ -181,7 +189,7 @@ def inspect(connection):
     base_keys = {"store_id", "created_at", "contract_hash", "authority"}
     require(set(metadata) == base_keys, "Invalid store metadata")
     require(metadata["authority"] == AUTHORITY and
-            metadata["contract_hash"] == fingerprint(store_schema()),
+            metadata["contract_hash"] == fingerprint(store_schema(root)),
             "Stored contract differs from installed contract; explicit migration required")
     require(str(uuid.UUID(metadata["store_id"])) == metadata["store_id"], "Invalid store identity")
     contract.timestamp(metadata["created_at"])
@@ -225,7 +233,7 @@ def inspect(connection):
                 require(event["reviewer"] == row["actor"], "Native reviewer differs from batch attribution")
         previous_batch = row["batch_hash"]
     require(all(1 <= r["revision"] <= len(batches) for r in rows), "Event references invalid batch")
-    validate_history(events)
+    validate_history(events, root)
     expected_corrections = {(target, event["event_id"]) for event in events for target in event["supersedes"]}
     actual_corrections = {tuple(r) for r in connection.execute("SELECT predecessor,successor FROM corrections")}
     require(actual_corrections == expected_corrections, "Correction index differs from preserved history")
@@ -254,8 +262,8 @@ def schema_sql():
     return f"PRAGMA application_id={APPLICATION_ID};\nPRAGMA user_version={VERSION};\n{SQL}\n{triggers}\n"
 
 
-def snapshot(connection, backups, reason):
-    state, _ = inspect(connection)
+def snapshot(connection, backups, reason, root=None):
+    state, _ = inspect(connection, root)
     private_directory(backups)
     name = f"{state['store_id']}-r{state['revision']:08d}-{reason}-{uuid.uuid4().hex}"
     final = backups / (name + ".sqlite3")
@@ -266,7 +274,7 @@ def snapshot(connection, backups, reason):
         with closing(sqlite3.connect(temporary)) as target:
             connection.backup(target)
         with closing(connect(temporary)) as target:
-            copied, _ = inspect(target)
+            copied, _ = inspect(target, root)
         require(copied == state, "Backup does not match committed store")
         seal(temporary)
         digest = file_hash(temporary)
@@ -298,11 +306,11 @@ def initialize(root):
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.executescript(schema_sql())
                 metadata = {"store_id": str(uuid.uuid4()), "created_at": now(),
-                            "contract_hash": fingerprint(store_schema()), "authority": AUTHORITY}
+                            "contract_hash": fingerprint(store_schema(root)), "authority": AUTHORITY}
                 connection.executemany("INSERT INTO metadata VALUES (?,?)", metadata.items())
                 connection.row_factory = sqlite3.Row
-                state, _ = inspect(connection)
-                initial = snapshot(connection, backups, "init")
+                state, _ = inspect(connection, root)
+                initial = snapshot(connection, backups, "init", root)
             seal(temporary)
             os.replace(temporary, db)
             fsync_directory(home)
@@ -323,8 +331,8 @@ def validate_request(value):
 
 
 def prepare_submission(value, root):
-    schema = store_schema()
-    contract.schema_validate(value, schema)
+    schema = store_schema(root)
+    contract.schema_validate(value, schema, root=root)
     require(all(e["provenance"]["origin"] == "agent_review" for e in value["events"]),
             "Only native review submissions are supported")
     return value["events"]
@@ -339,13 +347,13 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
     input_hash = fingerprint(incoming)
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db, write=True)) as connection:
-        state, existing = inspect(connection)
+        state, existing = inspect(connection, root)
         prior = connection.execute("SELECT * FROM batches WHERE request_id=?", (request_id,)).fetchone()
         if prior is not None:
             require(prior["actor"] == actor and prior["input_hash"] == input_hash,
                     "Request ID reused with a different actor or payload")
             return {"command": "append", "idempotent": True, **state, "committed_revision": prior["revision"],
-                    "backup": snapshot(connection, backups, "retry")}
+                    "backup": snapshot(connection, backups, "retry", root)}
         require(state["revision"] == expected_revision and state["state_token"] == expected_state,
                 "Stale revision or state token; re-read state before writing")
         ids = {e["event_id"] for e in existing}
@@ -357,8 +365,8 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
             require(key is None or key not in origins, "Historical review already imported")
             if key is not None:
                 origins.add(key)
-        validate_history(existing + incoming)
-        pre = snapshot(connection, backups, "pre-write")
+        validate_history(existing + incoming, root)
+        pre = snapshot(connection, backups, "pre-write", root)
         committed = False
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -383,7 +391,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
             connection.execute("COMMIT")
             committed = True
             seal(db)
-            post = snapshot(connection, backups, "post-write")
+            post = snapshot(connection, backups, "post-write", root)
         except (OSError, sqlite3.Error, contract.ReviewError) as error:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -393,17 +401,17 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
                     "Do not resubmit as a new request; retry the same request or run backup."
                 ) from error
             raise
-        return {"command": "append", "idempotent": False, **inspect(connection)[0],
+        return {"command": "append", "idempotent": False, **inspect(connection, root)[0],
                 "pre_backup": pre, "backup": post}
 
 
 def backup(root):
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db)) as connection:
-        return {"command": "backup", **snapshot(connection, backups, "manual")}
+        return {"command": "backup", **snapshot(connection, backups, "manual", root)}
 
 
-def verified_snapshot(path):
+def verified_snapshot(path, root=None):
     path = private_file(path)
     require(path.suffix == ".sqlite3", "Snapshot must be a SQLite file")
     receipt_path = private_file(path.with_suffix(".json"))
@@ -417,38 +425,42 @@ def verified_snapshot(path):
     require(path.stat().st_size == record["bytes"] and file_hash(path) == record["sha256"],
             "Snapshot bytes differ from backup receipt")
     with closing(connect(path)) as connection:
-        state, _ = inspect(connection)
+        state, _ = inspect(connection, root)
     require(state == record["state"], "Snapshot state differs from receipt")
     return state
 
 
 def restore(root, source, expected_state=None):
     source = private_file(source)
-    source_state = verified_snapshot(source)
-    home, db, backups = locations(root)
+    source_state = verified_snapshot(source, root)
+    home, db, backups = locations(root, allow_missing=True)
     require(source != db, "Restore source cannot be the live store")
     with writer_lock(home):
         safety = None
         if db.exists():
             with closing(connect(db)) as connection:
-                state, _ = inspect(connection)
+                state, _ = inspect(connection, root)
                 require(expected_state == state["state_token"],
                         "Replacing a store requires its current --expected-state")
                 require(source_state["store_id"] == state["store_id"], "Cannot replace a different store lineage")
-                safety = snapshot(connection, backups, "pre-restore")
+                safety = snapshot(connection, backups, "pre-restore", root)
         else:
             require(expected_state is None,
                     "Absent store must not have replacement expectations")
+            instance = contract.policy.read_instance_binding(root)
+            if instance is not None and instance.get("review_store_id") is not None:
+                require(source_state["store_id"] == instance["review_store_id"],
+                        "Cannot replace a different store lineage")
         temporary = home / ("restore-" + uuid.uuid4().hex + ".partial")
         reserve(temporary)
         try:
             with closing(connect(source)) as original, closing(sqlite3.connect(temporary)) as target:
                 original.backup(target)
             with closing(connect(temporary)) as restored:
-                require(inspect(restored)[0] == source_state,
+                require(inspect(restored, root)[0] == source_state,
                         "Restored state differs from snapshot")
-                require(verified_snapshot(source) == source_state, "Snapshot changed during restore")
-                recovery = snapshot(restored, backups, "restored")
+                require(verified_snapshot(source, root) == source_state, "Snapshot changed during restore")
+                recovery = snapshot(restored, backups, "restored", root)
             seal(temporary)
             # DELETE journaling ensures no WAL from an old lineage survives replacement.
             for suffix in ("-wal", "-shm", "-journal"):
@@ -470,7 +482,7 @@ def status(root, event_id=None):
     _, db, _ = locations(root)
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
-        state, events = inspect(connection)
+        state, events = inspect(connection, root)
         if event_id is None:
             return {"command": "status", **state}
         matches = [e for e in events if e["event_id"] == event_id]

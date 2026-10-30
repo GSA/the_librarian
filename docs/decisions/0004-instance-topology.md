@@ -2,8 +2,10 @@
 
 **Audience:** maintainers and operators.
 **Date:** October 21, 2026.
-**Status:** Accepted. Describes the intended deployment shape; the
-configuration work it depends on is not implemented.
+**Status:** Accepted and implemented. Per-instance policy and selection
+overrides (`config/policy.local.json`, `config/selection.local.json`),
+configurable relative `storage_roots`, `.local/instance.json` lineage binding,
+and host-path-independent index freshness are implemented.
 
 ## Context
 

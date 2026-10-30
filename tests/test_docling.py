@@ -243,7 +243,7 @@ class DoclingLifecycle(unittest.TestCase):
                         if target == "source":
                             self.path.write_bytes(self.raw + b"changed")
                     return result
-                def current_binding():
+                def current_binding(*_args, **_kwargs):
                     return {**binding, "policy_sha256": "changed"} if mutated[0] and target == "policy" else binding
                 with patch.object(catalog, "_snapshot", side_effect=mutate), \
                      patch.object(bridge, "binding", side_effect=current_binding):
