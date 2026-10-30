@@ -102,7 +102,7 @@ def text(raw):
 
 
 def gemini(raw, root=None):
-    settings = policy.for_root(root)[0] if root is not None else policy.SETTINGS
+    settings = policy.for_root(root)[0]
     text = raw.decode("utf-8")
     require("\x00" not in text, "NUL in UTF-8 transcript")
     lines = text.splitlines(keepends=True)

@@ -1,6 +1,7 @@
 """Deployment policy is data, not organization-specific code."""
 
 from contextlib import closing
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -172,15 +173,14 @@ def load(root=None):
     return value, hashlib.sha256(b"\0".join(binding)).hexdigest()
 
 
-SETTINGS, HASH = load()
+_IMPORT_SETTINGS, _IMPORT_HASH = load()
+SETTINGS, HASH = deepcopy(_IMPORT_SETTINGS), _IMPORT_HASH
 
 
 def _has_instance_policy(root):
     if root is None:
         return False
     instance_root = _no_symlinks(root)
-    if instance_root == ROOT:
-        return False
     return any(
         (instance_root / rel).exists() or (instance_root / rel).is_symlink()
         for rel in ("config/policy.json", "config/policy.local.json")
@@ -190,16 +190,24 @@ def _has_instance_policy(root):
 def for_root(root=None):
     if _has_instance_policy(root):
         return load(root)
-    return SETTINGS, load()[1]
+    disk_settings, disk_hash = load()
+    if disk_hash == _IMPORT_HASH and SETTINGS != _IMPORT_SETTINGS:
+        return (
+            SETTINGS,
+            hashlib.sha256(
+                json.dumps(SETTINGS, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        )
+    return disk_settings, disk_hash
 
 
 def fingerprint(root=None):
-    policy_hash = load(root)[1] if _has_instance_policy(root) else load()[1]
+    policy_hash = for_root(root)[1]
     return hashlib.sha256(Path(__file__).read_bytes() + policy_hash.encode()).hexdigest()
 
 
 def allowed(name, category, root=None):
-    settings = for_root(root)[0] if root is not None else SETTINGS
+    settings = for_root(root)[0]
     path = PurePosixPath(name)
     if path.is_absolute() or "\\" in name or any(p in ("", ".", "..") for p in name.split("/")):
         return False
@@ -211,7 +219,7 @@ def allowed(name, category, root=None):
 
 
 def storage_roots(root=None):
-    settings = for_root(root)[0] if root is not None else SETTINGS
+    settings = for_root(root)[0]
     return _validate_storage_roots(
         settings.get("storage_roots", {}),
         settings["markdown_roots"],
@@ -240,6 +248,14 @@ def _read_private_json(path, label):
     return value
 
 
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _write_private_json(path, payload):
     path = _no_symlinks(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -253,6 +269,7 @@ def _write_private_json(path, payload):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_dir(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -297,10 +314,10 @@ def read_instance_binding(root):
     return value
 
 
-def validate_instance_roots(root):
+def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=False):
     instance_root = _no_symlinks(root)
     migration = instance_root / MIGRATION_FILE
-    if migration.exists() or migration.is_symlink():
+    if not ignore_migration_lock and (migration.exists() or migration.is_symlink()):
         raise ValueError("Interrupted store migration detected; run initialize --recover-migration")
     roots = storage_roots(instance_root)
     for key, rel in roots.items():
@@ -310,6 +327,8 @@ def validate_instance_roots(root):
         ("review_events_home", "events.sqlite3"),
         ("intake_home", "intake.sqlite3"),
         ("context_index_db", None),
+        ("diagnostics_log", None),
+        ("selection_manifest", None),
     )
     for key, filename in store_artifacts:
         configured_rel = roots[key]
@@ -339,6 +358,8 @@ def validate_instance_roots(root):
         ):
             if recorded_id is not None:
                 if not db_path.exists():
+                    if label in allow_missing:
+                        continue
                     raise ValueError(f"Initialized instance is missing its {label} authority store")
                 app_id, actual_id = _probe_store_id(db_path, expected_app)
                 if app_id == expected_app and actual_id != recorded_id:
@@ -389,7 +410,7 @@ def logical_corpus_root(root):
     }, sort_keys=True, separators=(",", ":"))
 
 
-def migrate_storage(root, *, interrupt_after=None):
+def migrate_storage(root, *, interrupt_after=None, interrupt_before_journal=None):
     """Transactionally relocate configured storage roots within an instance."""
     from tools.catalog import catalog_store as catalog
     from tools.review_events import event_store as events
@@ -405,16 +426,27 @@ def migrate_storage(root, *, interrupt_after=None):
     to_roots = storage_roots(instance_root)
     if from_roots == to_roots:
         return {"migrated": False, "instance_id": instance["instance_id"], "storage_roots": to_roots}
+    if from_roots["extractions_home"] != to_roots["extractions_home"]:
+        ext_src = _no_symlinks(instance_root / from_roots["extractions_home"])
+        if ext_src.exists() and any(ext_src.rglob("extraction.json")):
+            raise ValueError(
+                "Cannot migrate a populated extractions_home automatically because registered "
+                "catalog provenance and rendition locators bind the extraction path; reconcile "
+                "rendition registrations explicitly"
+            )
     cat_db = instance_root / from_roots["catalog_home"] / "catalog.sqlite3"
     rev_db = instance_root / from_roots["review_events_home"] / "events.sqlite3"
     with closing(catalog.connect(cat_db)) as conn:
         cat_state = catalog.inspect(conn)[0]
     with closing(events.connect(rev_db)) as conn:
-        rev_state = events.inspect(conn)[0]
+        rev_state = events.inspect(conn, instance_root)[0]
     if (cat_state["store_id"] != instance["catalog_store_id"]
             or rev_state["store_id"] != instance["review_store_id"]):
         raise ValueError("Cross-instance or substituted authority store detected before migration")
-    move_keys = ("catalog_home", "review_events_home", "intake_home", "extractions_home", "context_index_db")
+    move_keys = (
+        "catalog_home", "review_events_home", "intake_home", "extractions_home",
+        "context_index_db", "diagnostics_log", "selection_manifest",
+    )
     planned = []
     for key in move_keys:
         if from_roots[key] != to_roots[key]:
@@ -423,7 +455,7 @@ def migrate_storage(root, *, interrupt_after=None):
             if dst.exists():
                 raise ValueError(f"Target storage root already exists for {key}: {to_roots[key]}")
             if src.exists():
-                planned.append((key, from_roots[key], to_roots[key]))
+                planned.append({"key": key, "from": from_roots[key], "to": to_roots[key]})
     journal = {
         "schema_version": 1,
         "instance_id": instance["instance_id"],
@@ -431,20 +463,26 @@ def migrate_storage(root, *, interrupt_after=None):
         "to_roots": to_roots,
         "catalog_state_token": cat_state["state_token"],
         "review_state_token": rev_state["state_token"],
+        "planned_moves": planned,
         "completed_moves": [],
     }
     _write_private_json(migration_path, journal)
-    for count, (key, src_rel, dst_rel) in enumerate(planned, 1):
+    for count, item in enumerate(planned, 1):
+        key, src_rel, dst_rel = item["key"], item["from"], item["to"]
         src = instance_root / src_rel
         dst = instance_root / dst_rel
         dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
-        if key == "context_index_db":
+        if key in ("context_index_db", "diagnostics_log"):
             src_lock = src.with_name(src.name + ".lock")
             dst_lock = dst.with_name(dst.name + ".lock")
             if src_lock.exists():
                 shutil.move(str(src_lock), str(dst_lock))
-        journal["completed_moves"].append({"key": key, "from": src_rel, "to": dst_rel})
+        _fsync_dir(src.parent)
+        _fsync_dir(dst.parent)
+        if interrupt_before_journal is not None and count >= interrupt_before_journal:
+            raise RuntimeError("Simulated interruption before journal update during storage migration")
+        journal["completed_moves"].append(item)
         _write_private_json(migration_path, journal)
         if interrupt_after is not None and count >= interrupt_after:
             raise RuntimeError("Simulated interruption during storage migration")
@@ -452,6 +490,7 @@ def migrate_storage(root, *, interrupt_after=None):
     updated_instance["storage_roots"] = to_roots
     _write_private_json(instance_root / INSTANCE_FILE, updated_instance)
     migration_path.unlink()
+    _fsync_dir(migration_path.parent)
     if catalog.status(instance_root)["state_token"] != cat_state["state_token"]:
         raise ValueError("Catalog state token changed unexpectedly across storage migration")
     if events.status(instance_root)["state_token"] != rev_state["state_token"]:
@@ -474,34 +513,42 @@ def recover_migration(root):
     if not migration_path.exists() and not migration_path.is_symlink():
         raise ValueError("No interrupted store migration to recover")
     journal = _read_private_json(migration_path, "Migration journal")
-    for move in reversed(journal.get("completed_moves", [])):
+    moves = journal.get("planned_moves") or journal.get("completed_moves", [])
+    rolled_back = []
+    for move in reversed(moves):
         src = _no_symlinks(instance_root / move["from"])
         dst = _no_symlinks(instance_root / move["to"])
+        if dst.exists() and src.exists():
+            raise ValueError(f"Ambiguous rollback state for {move['key']}: both source and destination exist")
         if dst.exists():
             src.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             shutil.move(str(dst), str(src))
-            if move["key"] == "context_index_db":
+            if move["key"] in ("context_index_db", "diagnostics_log"):
                 src_lock = src.with_name(src.name + ".lock")
                 dst_lock = dst.with_name(dst.name + ".lock")
                 if dst_lock.exists():
                     shutil.move(str(dst_lock), str(src_lock))
+            _fsync_dir(src.parent)
+            _fsync_dir(dst.parent)
+            rolled_back.append(move["key"])
     instance = read_instance_binding(instance_root)
     if instance is not None:
         instance["storage_roots"] = journal["from_roots"]
         _write_private_json(instance_root / INSTANCE_FILE, instance)
-    migration_path.unlink()
     cat_db = instance_root / journal["from_roots"]["catalog_home"] / "catalog.sqlite3"
     rev_db = instance_root / journal["from_roots"]["review_events_home"] / "events.sqlite3"
     with closing(catalog.connect(cat_db)) as conn:
         cat_state = catalog.inspect(conn)[0]
     with closing(events.connect(rev_db)) as conn:
-        rev_state = events.inspect(conn)[0]
+        rev_state = events.inspect(conn, instance_root)[0]
     if (cat_state["state_token"] != journal["catalog_state_token"]
             or rev_state["state_token"] != journal["review_state_token"]):
         raise ValueError("Recovered store state does not match pre-migration journal")
+    migration_path.unlink()
+    _fsync_dir(migration_path.parent)
     return {
         "recovered": True,
         "instance_id": journal["instance_id"],
         "restored_roots": journal["from_roots"],
-        "rolled_back": [item["key"] for item in reversed(journal.get("completed_moves", []))],
+        "rolled_back": rolled_back,
     }

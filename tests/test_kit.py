@@ -1281,6 +1281,170 @@ class WorkspaceTests(WorkspaceCase):
         self.assertEqual(catalog.status(relocated)["store_id"], before_token)
         self.assertTrue((relocated / ".local/migrated/catalog/catalog.sqlite3").is_file())
 
+    def test_portable_roots_edge_cases_and_instance_policy_propagation(self):
+        from tools.intake import adapters as intake_adapters, store as intake_store
+        from tools.extraction import docling_adapter, docling_bridge
+
+        kit = self.root / "instance_custom"
+        clone_release(kit)
+        custom_roots = {
+            "catalog_home": ".local/custom/catalog",
+            "review_events_home": ".local/custom/review-events",
+            "context_index_db": ".local/custom/index.sqlite3",
+            "intake_home": ".local/queues/recovery/intake",
+            "extractions_home": "data/extractions/.local/custom-runs",
+            "diagnostics_log": ".local/custom/diagnostics.jsonl",
+            "selection_manifest": "config/custom-selection.json",
+        }
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": custom_roots,
+        }))
+        (kit / "custom_docs").mkdir(exist_ok=True)
+        (kit / "custom_docs/AGENTS.md").write_text("# Custom Context\n\nCompanion context rules.\n")
+        (kit / "custom_docs/guide.md").write_text("# Custom Guide\n\nUniqueCustomToken content.\n")
+        (kit / "config/custom-selection.json").write_text(json.dumps({
+            "schema_version": 1,
+            "audience": "custom-instance-audience",
+            "documents": [
+                {
+                    "path": "custom_docs/AGENTS.md",
+                    "role": "rules",
+                    "context": [],
+                },
+                {
+                    "path": "custom_docs/guide.md",
+                    "role": "guide",
+                    "context": ["custom_docs/AGENTS.md"],
+                },
+            ],
+            "context_rules": {},
+        }))
+        # Remove default selection.json so selection_manifest comes from custom-selection.json
+        (kit / "config/selection.json").unlink()
+
+        def run_in(target, *args, check=True):
+            result = subprocess.run([sys.executable, *args], cwd=target, capture_output=True, text=True)
+            if check:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            return result
+
+        # 1. Initialize instance + deeply nested intake_home (.local/queues/recovery/intake)
+        run_in(kit, "tools/initialize.py")
+        intake_init = intake_store.initialize(kit)
+        self.assertTrue((kit / ".local/queues/recovery/intake/intake.sqlite3").is_file())
+        self.assertEqual(stat.S_IMODE((kit / ".local/queues/recovery").stat().st_mode), 0o700)
+
+        # 2. Search envelope (hit and zero-result) reflects custom instance audience and handling
+        stage_spec = {
+            "id": "build-idx",
+            "kind": "publication",
+            "operation": "index-build",
+            "arguments": {
+                "manifest": "config/custom-selection.json",
+                "db": ".local/custom/index.sqlite3",
+            },
+        }
+        intent = intake_adapters.prepare(kit, stage_spec)
+        self.assertTrue(intent["selection_validated"])
+        ev = intake_adapters.execute(kit, stage_spec, intent)
+        self.assertEqual(ev["boundary"], "publication-confirmed")
+        self.assertTrue(intake_adapters.availability(kit, stage_spec, ev)["available"])
+
+        hit_res = run_in(kit, "-m", "tools.context_index.context_index", "search", "UniqueCustomToken")
+        self.assertEqual(hit_res["audience"], "custom-instance-audience")
+        self.assertEqual(hit_res["handling"], "Custom instance handling notice.")
+        empty_res = run_in(kit, "-m", "tools.context_index.context_index", "search", "AbsentTokenXYZ")
+        self.assertEqual(empty_res["audience"], "custom-instance-audience")
+        self.assertEqual(empty_res["handling"], "Custom instance handling notice.")
+        self.assertIn("absence", empty_res)
+
+        # 3. Missing authority DB restore works on an initialized instance and enforces store_id lineage
+        cat_backup = catalog.backup(kit)
+        rev_backup = events.backup(kit)
+        cat_db = kit / ".local/custom/catalog/catalog.sqlite3"
+        rev_db = kit / ".local/custom/review-events/events.sqlite3"
+        cat_db.unlink()
+        rev_db.unlink()
+        restored_cat = catalog.restore(kit, Path(cat_backup["snapshot"]))
+        self.assertEqual(restored_cat["command"], "restore")
+        self.assertTrue(cat_db.is_file())
+        restored_rev = events.restore(kit, Path(rev_backup["snapshot"]))
+        self.assertEqual(restored_rev["command"], "restore")
+        self.assertTrue(rev_db.is_file())
+
+        # 4. rendition_api(kit) binds validate_context to kit (custom_docs/AGENTS.md)
+        api = index.rendition_api(kit)
+        api.validate_context(["custom_docs/AGENTS.md"])
+
+        # 5. Interruption before journal update rolls back planned moves cleanly
+        diagnostics.Log(kit, custom_roots["diagnostics_log"]).record_read(
+            {"command": "get"},
+            started_at="2026-10-22T12:00:00+00:00",
+            completed_at="2026-10-22T12:00:01+00:00",
+            duration_ms=10,
+        )
+        next_roots = dict(
+            custom_roots,
+            catalog_home=".local/moved/catalog",
+            review_events_home=".local/moved/review-events",
+            diagnostics_log=".local/moved/diagnostics.jsonl",
+            selection_manifest="config/moved-selection.json",
+        )
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": next_roots,
+        }))
+        with self.assertRaisesRegex(RuntimeError, "before journal update"):
+            policy.migrate_storage(kit, interrupt_before_journal=1)
+        self.assertFalse(cat_db.exists())
+        self.assertTrue((kit / ".local/moved/catalog/catalog.sqlite3").is_file())
+        recovered = policy.recover_migration(kit)
+        self.assertTrue(recovered["recovered"])
+        self.assertIn("catalog_home", recovered["rolled_back"])
+        self.assertTrue(cat_db.is_file())
+        self.assertFalse((kit / ".local/migration.json").exists())
+
+        # Complete migration moves diagnostics_log and selection_manifest too
+        completed = policy.migrate_storage(kit)
+        self.assertTrue(completed["migrated"])
+        self.assertTrue((kit / ".local/moved/diagnostics.jsonl").is_file())
+        self.assertTrue((kit / "config/moved-selection.json").is_file())
+
+        # 6. Populated extractions_home refuses auto-migration before moving anything
+        ext_file = kit / "data/extractions/.local/custom-runs/D1" / ("a" * 64) / "extraction.json"
+        ext_file.parent.mkdir(parents=True, exist_ok=True)
+        ext_file.write_text("{}\n")
+        bad_roots = dict(next_roots, extractions_home="data/extractions/.local/other-runs")
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": bad_roots,
+        }))
+        with self.assertRaisesRegex(ValueError, "populated extractions_home"):
+            policy.migrate_storage(kit)
+        self.assertFalse((kit / ".local/migration.json").exists())
+
+        # 7. Docling bridge and adapter bind to instance root policy and extractions_home
+        (kit / "config/policy.local.json").write_text(json.dumps({
+            "audience": "custom-instance-audience",
+            "handling": "Custom instance handling notice.",
+            "markdown_roots": ["documents", "custom_docs"],
+            "original_roots": ["sources", "custom_sources"],
+            "storage_roots": next_roots,
+        }))
+        self.assertEqual(docling_bridge.binding(kit)["policy_sha256"], policy.for_root(kit)[1])
+        self.assertEqual(docling_adapter._extractions_home(kit), Path("data/extractions/.local/custom-runs"))
+
 
 class AbsenceClassificationTests(WorkspaceCase):
     """A zero-result search must explain itself without quoting the corpus."""

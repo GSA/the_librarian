@@ -95,7 +95,7 @@ def main(argv=None):
             if args.command == "status":
                 result = envelope(root=root, command="status", fresh=True, database=str(db), **count_index(connection))
             elif args.command == "search":
-                result = search(connection, args.query, args.limit, args.path)
+                result = search(connection, args.query, args.limit, args.path, root=root)
             elif args.command == "get":
                 result = packet(connection, config, args.locator, args.max_chars, root=root)
                 if args.format == "compact":

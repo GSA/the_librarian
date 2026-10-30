@@ -49,7 +49,7 @@ def prepare(root, stage):
             return {"operation": operation, "delivery_correlation": args["delivery_correlation"], "disposition_sha256": args["disposition_sha256"]}
         if operation == "index-build":
             manifest = index.no_symlinks(root / args["manifest"])
-            config, manifest_hash = index.load_manifest(manifest)
+            config, manifest_hash = index.load_manifest(manifest, root)
             index.validate_db_path(root, root / args["db"])
             return {"operation": operation, "manifest_sha256": manifest_hash,
                     "manifest_bytes_sha256": index.digest(manifest.read_bytes()),
@@ -85,7 +85,7 @@ def execute(root, stage, intent, previous=None):
             require(prepare(root, stage) == intent, "changed_publication_inputs")
             manifest = root / args["manifest"]
             db = index.validate_db_path(root, root / args["db"])
-            config, checksum = index.load_manifest(manifest)
+            config, checksum = index.load_manifest(manifest, root)
             with index.publication_lock(db):
                 fresh = False
                 if db.exists():
@@ -109,7 +109,7 @@ def execute(root, stage, intent, previous=None):
             result = events.append(root, **args)
             # The current store revision is not the original request revision.
             with events.writer_lock(events.locations(root)[0]), closing(events.connect(events.locations(root)[1])) as c:
-                events.inspect(c)
+                events.inspect(c, root)
                 batch = c.execute("SELECT revision FROM batches WHERE request_id=?", (args["request_id"],)).fetchone()
                 revision = batch[0]
             return {"boundary": "review-committed", "committed_revision": revision,
@@ -143,7 +143,7 @@ def availability(root, stage, evidence):
         return {"available": False, "reason": "not-publication"}
     try:
         manifest = index.no_symlinks(root / stage["arguments"]["manifest"])
-        config, checksum = index.load_manifest(manifest)
+        config, checksum = index.load_manifest(manifest, root)
         db = index.validate_db_path(root, root / stage["arguments"]["db"])
         with closing(index.readonly(db)) as connection:
             fresh = not index.freshness(connection, root, manifest, db, config, checksum)

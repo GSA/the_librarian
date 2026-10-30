@@ -178,6 +178,7 @@ def rendition_api(root=None):
         api["eligible"] = lambda p: eligible(p, root)
         api["canonical_locator"] = lambda v: canonical_locator(v, root)
         api["original_allowed"] = lambda p: original_allowed(p, root)
+        api["validate_context"] = lambda c: validate_context(c, root)
     return types.SimpleNamespace(**api)
 
 
@@ -196,7 +197,7 @@ def load_manifest(path, root=None):
     renditions.validate(config, rendition_api(root), root=root)
     if type(config["schema_version"]) is not int or config["schema_version"] != SCHEMA:
         fail(f"Unsupported manifest schema_version; expected {SCHEMA}")
-    expected_audience = policy.for_root(root)[0]["audience"] if root is not None else AUDIENCE
+    expected_audience = policy.for_root(root)[0]["audience"]
     if config["audience"] != expected_audience:
         fail(f"Manifest audience must be {expected_audience!r}")
     if not isinstance(config["documents"], list):
@@ -616,7 +617,7 @@ def freshness(connection, root, manifest, db, config, manifest_hash):
 
 
 def envelope(*, root=None, **values):
-    settings = policy.for_root(root)[0] if root is not None else policy.SETTINGS
+    settings = policy.for_root(root)[0]
     return {"audience": settings["audience"], "notice": NOTICE, "handling": settings["handling"], **values}
 
 
@@ -679,7 +680,7 @@ def classify_absence(connection, query, path):
     }
 
 
-def search(connection, query, limit, path):
+def search(connection, query, limit, path, *, root=None):
     if not 1 <= limit <= 50:
         fail("--limit must be between 1 and 50")
     parameters = [literal_query(query)]
@@ -715,7 +716,7 @@ def search(connection, query, limit, path):
                 hit["line_basis"] = "retained-extraction-byte-range-and-json-pointer"
             else:
                 hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
-    result = envelope(command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
+    result = envelope(root=root, command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
     if not hits:
         result["absence"] = classify_absence(connection, query, path)
     return result

@@ -73,13 +73,13 @@ def require(condition, message):
 
 def store_schema(root=None):
     schema, _ = contract.read_json(contract.SCHEMA)
-    audience = contract.policy.for_root(root)[0]["audience"] if root is not None else contract.policy.SETTINGS["audience"]
+    audience = contract.policy.for_root(root)[0]["audience"]
     schema["properties"]["audience"] = {"const": audience}
     return schema
 
 
 def bundle(events, root=None):
-    audience = contract.policy.for_root(root)[0]["audience"] if root is not None else contract.policy.SETTINGS["audience"]
+    audience = contract.policy.for_root(root)[0]["audience"]
     return {"schema_version": VERSION, "authority": AUTHORITY,
             "audience": audience, "events": events}
 
@@ -118,11 +118,13 @@ def private_file(path):
     return path
 
 
-def locations(root):
+def locations(root, *, allow_missing=False):
     root = contract.safe_path(root)
     require(root.is_dir(), "Corpus root must exist")
     try:
-        rel_home = contract.policy.validate_instance_roots(root)["review_events_home"]
+        rel_home = contract.policy.validate_instance_roots(
+            root, allow_missing=("catalog", "review-event") if allow_missing else ()
+        )["review_events_home"]
     except ValueError as error:
         raise contract.ReviewError(str(error)) from error
     home = contract.safe_path(root / rel_home)
@@ -431,7 +433,7 @@ def verified_snapshot(path, root=None):
 def restore(root, source, expected_state=None):
     source = private_file(source)
     source_state = verified_snapshot(source, root)
-    home, db, backups = locations(root)
+    home, db, backups = locations(root, allow_missing=True)
     require(source != db, "Restore source cannot be the live store")
     with writer_lock(home):
         safety = None
@@ -445,6 +447,10 @@ def restore(root, source, expected_state=None):
         else:
             require(expected_state is None,
                     "Absent store must not have replacement expectations")
+            instance = contract.policy.read_instance_binding(root)
+            if instance is not None and instance.get("review_store_id") is not None:
+                require(source_state["store_id"] == instance["review_store_id"],
+                        "Cannot replace a different store lineage")
         temporary = home / ("restore-" + uuid.uuid4().hex + ".partial")
         reserve(temporary)
         try:

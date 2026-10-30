@@ -77,7 +77,15 @@ def initialize(root):
     root, home, db = locations(root)
     require(not home.exists(), "already_initialized")
     safe(home.parent)
-    home.parent.mkdir(mode=0o700, exist_ok=True)
+    missing = []
+    cursor = home.parent
+    while cursor != root and not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    home.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for created in reversed(missing):
+        created.chmod(0o700)
+        sync_directory(created.parent)
     home.mkdir(mode=0o700)
     fd = os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     os.close(fd)

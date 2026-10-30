@@ -93,11 +93,13 @@ def private_file(path):
     return path
 
 
-def locations(root):
+def locations(root, *, allow_missing=False):
     root = safe_path(root)
     require(root.is_dir(), "Corpus root must exist")
     try:
-        rel_home = policy.validate_instance_roots(root)["catalog_home"]
+        rel_home = policy.validate_instance_roots(
+            root, allow_missing=("catalog", "review-event") if allow_missing else ()
+        )["catalog_home"]
     except ValueError as error:
         raise CatalogError(str(error)) from error
     home = safe_path(root / rel_home)
@@ -656,7 +658,7 @@ def verify_backup(path):
 def restore(root, snapshot, expected_state=None):
     source = private_file(snapshot)
     source_state = verify_backup(source)
-    home, db, backups = locations(root)
+    home, db, backups = locations(root, allow_missing=True)
     require(source != db, "Restore source cannot be the live database")
     with writer_lock(home):
         safety = None
@@ -669,6 +671,10 @@ def restore(root, snapshot, expected_state=None):
                 safety = _snapshot(connection, backups, "pre-restore")
         else:
             require(expected_state is None, "Missing store cannot have replacement expectations")
+            instance = policy.read_instance_binding(root)
+            if instance is not None and instance.get("catalog_store_id") is not None:
+                require(source_state["store_id"] == instance["catalog_store_id"],
+                        "Cannot replace a different store lineage")
         partial = home / ("restore-" + uuid.uuid4().hex + ".partial")
         reserve(partial)
         published = False

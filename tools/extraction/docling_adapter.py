@@ -310,12 +310,25 @@ def convert(source: bytes, name: str, format_name: str,
     return _convert_with_identity(source, name, format_name, artifacts_path, python)[0]
 
 
+def _extractions_home(root: Path) -> Path:
+    try:
+        return Path(bridge.policy.validate_instance_roots(root)["extractions_home"])
+    except ValueError as error:
+        raise AdapterError(str(error), "invalid_policy") from error
+
+
+def _bridge_binding(root: Path):
+    if bridge.policy._has_instance_policy(root):
+        return bridge.binding(root)
+    return bridge.binding()
+
+
 def _bundle(root, receipt, format_name, artifacts_path, python):
-    installation = bridge.binding()
+    installation = _bridge_binding(root)
     state, original, source_identity, raw = bridge.source(root, receipt, format_name)
     report, worker_sha = _convert_with_identity(
         raw, Path(source_identity["path"]).name, format_name, artifacts_path, python)
-    require(bridge.binding() == installation,
+    require(_bridge_binding(root) == installation,
             "Policy or extraction code changed during conversion", "mutation")
     _require_worker(worker_sha)
     extractor = {"schema_version": VERSION, "label": "docling-" + format_name,
@@ -329,7 +342,7 @@ def _bundle(root, receipt, format_name, artifacts_path, python):
              "boundary": BOUNDARY, "conversion": report["conversion"]}
     raw_value = canonical_bytes(value)
     require(len(raw_value) <= MAX_RESULT, "Complete rendition exceeds 64 MiB", "output_limit")
-    path = root / HOME / receipt / run_id / "extraction.json"
+    path = root / _extractions_home(root) / receipt / run_id / "extraction.json"
     return state, original, path, value, raw_value
 
 
@@ -365,7 +378,7 @@ def _unchanged(root, receipt, format_name, expected_source, expected_binding,
                expected_worker):
     state, _, identity, _ = bridge.source(root, receipt, format_name)
     require(identity == expected_source, "Source changed during Docling operation")
-    require(bridge.binding() == expected_binding, "Policy or extraction code changed during operation")
+    require(_bridge_binding(root) == expected_binding, "Policy or extraction code changed during operation")
     _require_worker(expected_worker)
     return state
 
@@ -387,7 +400,7 @@ def run(root: Path, command: str, receipt: str, format_name: str,
                 "Computed identity differs from the expected identity", "mutation")
     binding = value["extractor"]["installation"]
     worker_sha = value["extractor"]["worker_sha256"]
-    home = root / HOME
+    home = root / _extractions_home(root)
     with bridge.catalog.writer_lock(home):
         if command == "prepare":
             bridge.catalog.private_directory(path.parent.parent)

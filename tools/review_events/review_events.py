@@ -72,7 +72,7 @@ def schema_validate(bundle, schema=None, *, root=None):
         raise ReviewError("Install tools/review_events/requirements.txt in a local environment") from error
     if schema is None:
         schema, _ = read_json(SCHEMA)
-        audience = policy.for_root(root)[0]["audience"] if root is not None else policy.SETTINGS["audience"]
+        audience = policy.for_root(root)[0]["audience"]
         schema["properties"]["audience"] = {"const": audience}
     def offline(uri):
         raise NoSuchResource(ref=uri)
