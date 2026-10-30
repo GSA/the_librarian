@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest.mock import patch
@@ -1191,6 +1192,13 @@ class AbsenceClassificationTests(WorkspaceCase):
         self.assertEqual(uncombined["sections_matching_any"], 2)
         self.assertIn("retrieval or selection limit", uncombined["caveat"])
 
+    def test_sections_matching_any_counts_distinct_sections_when_terms_overlap(self):
+        self.corpus({"a.md": "# Alpha\n\nalphaonly betaonly material.\n"})
+        partial = self.absence("alphaonly betaonly zzgapone")
+        self.assertEqual(partial["classification"], "absent-partial")
+        self.assertEqual((partial["terms"], partial["absent_terms"]), (3, 1))
+        self.assertEqual(partial["sections_matching_any"], 1)
+
     def test_classification_respects_the_requested_path_scope(self):
         self.corpus({"a.md": "# Alpha\n\nalphaonly material.\n",
                      "b.md": "# Beta\n\nbetaonly material.\n"})
@@ -1306,6 +1314,36 @@ class RetrievalDiagnostics(unittest.TestCase):
         result = diagnostics.prune(self.log.path, 1)
         self.assertEqual((result["before"], result["after"], result["removed"]), (3, 1, 2))
         self.assertEqual(len(diagnostics.read_records(self.log.path)), 1)
+
+    def test_prune_and_write_serialize_across_shared_lock_file(self):
+        for minute in range(3):
+            self.log.record_search(self.search_payload(1), **self.stamps(minute))
+        entered_read = threading.Event()
+        release_read = threading.Event()
+        original_read_records = diagnostics.read_records
+
+        def paused_read_records(path):
+            records = original_read_records(path)
+            entered_read.set()
+            release_read.wait(timeout=5)
+            return records
+
+        writer_result = {}
+
+        def concurrent_writer():
+            entered_read.wait(timeout=5)
+            writer_result["record"] = self.log.record_search(self.search_payload(2), **self.stamps(10))
+
+        writer = threading.Thread(target=concurrent_writer)
+        writer.start()
+        with patch.object(diagnostics, "read_records", side_effect=paused_read_records):
+            threading.Timer(0.05, release_read.set).start()
+            result = diagnostics.prune(self.log.path, 1)
+        writer.join(timeout=5)
+        self.assertEqual((result["before"], result["after"], result["removed"]), (3, 1, 2))
+        records = diagnostics.read_records(self.log.path)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[-1]["run_id"], writer_result["record"]["run_id"])
 
     def test_reads_are_counted_but_never_attributed(self):
         """A read is counted as a bare event, carrying no locator, excerpt or count."""

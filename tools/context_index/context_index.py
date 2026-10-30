@@ -649,9 +649,18 @@ def classify_absence(connection, query, path):
     absent = [term for term, count in counts.items() if not count]
     classification = ("absent-corpus" if len(absent) == len(counts)
                       else "absent-partial" if absent else "present-uncombined")
+    if len(absent) == len(counts):
+        matching_any = 0
+    else:
+        restriction = " AND s.path=?" if path is not None else ""
+        parameters = [" OR ".join(fts_term(term) for term in counts)] + ([path] if path is not None else [])
+        matching_any = connection.execute(
+            "SELECT count(DISTINCT s.id) FROM search_fts JOIN sections s ON s.id=search_fts.rowid "
+            "WHERE search_fts MATCH ?" + restriction, parameters,
+        ).fetchone()[0]
     return {
         "classification": classification, "terms": len(counts), "absent_terms": len(absent),
-        "sections_matching_any": sum(counts.values()),
+        "sections_matching_any": matching_any,
         "scope": "selection" if path is None else "path",
         "caveat": ABSENCE[classification],
     }

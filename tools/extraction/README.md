@@ -3,13 +3,13 @@
 ## Ordinary strict UTF-8 text
 
 A registered `.txt` original can use the stdlib extraction lifecycle without
-Docling or model assets:
+Docling or model assets (substitute your registered `D<N>` receipt ID for `D1`):
 
 ```sh
 PY=.venv/bin/python
-$PY tools/extraction/extract.py prepare D-receipt --format text
-$PY tools/extraction/extract.py verify D-receipt --format text
-$PY tools/extraction/extract.py register D-receipt --format text \
+$PY -m tools.extraction.extract prepare D1 --format text
+$PY -m tools.extraction.extract verify D1 --format text
+$PY -m tools.extraction.extract register D1 --format text \
   --actor operator --expected-state CATALOG_STATE_TOKEN
 ```
 
@@ -145,11 +145,11 @@ MODELS=$PWD/tools/extraction/.local/models
 
 $PY -m tools.extraction.docling_extract inspect \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY -m tools.extraction.docling_extract prepare D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract prepare D1 --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY -m tools.extraction.docling_extract verify D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract verify D1 --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY"
-$PY -m tools.extraction.docling_extract register D-receipt --format pdf \
+$PY -m tools.extraction.docling_extract register D1 --format pdf \
   --artifacts-path "$MODELS" --python "$DOCLING_PY" \
   --actor operator --expected-state CATALOG_STATE_TOKEN
 ```
