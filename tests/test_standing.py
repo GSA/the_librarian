@@ -315,6 +315,39 @@ class StandingEvaluationTests(StandingCase):
                 self.write_private("config/standing-findings.json", {**self.findings, **update})
                 self.assert_outcome("exception", "findings-mismatch")
 
+    def test_eleven_or_more_warnings_qualify_when_each_is_inspected(self):
+        self.value["conversion"]["warnings"] = [
+            {"code": "low_confidence", "message": f"Field {i}"} for i in range(12)]
+        refs = [f"#/warnings/{i}" for i in range(12)]
+        with patch.object(standing, "_registered", return_value=({"id": "x"}, {})):
+            self.raw = self.write_rendition(self.value)
+            self.findings["rendition_sha256"] = sha(self.raw)
+            self.findings["inspected"]["warnings"] = refs
+            self.write_private("config/standing-findings.json", self.findings)
+            self.assert_outcome("qualified", "complete-inspected-scope")
+            self.findings["inspected"]["warnings"] = refs[:2] + refs[3:]
+            self.write_private("config/standing-findings.json", self.findings)
+            self.assert_outcome("pending-review", "insufficient-inspected-scope")
+
+    def test_catalog_identity_change_after_extraction_is_not_qualified(self):
+        records = catalog.read_records(self.root, receipt="D1")["records"]
+        for field, value in (("audience", "human"), ("handling_refs", ["H-changed"])):
+            with self.subTest(field=field):
+                original = deepcopy(next(r for r in records if r["id"] == "A-input"))
+                original["data"][field] = value
+                with patch.object(standing.catalog, "receipt_metadata",
+                                  side_effect=self.metadata_with(original)):
+                    self.assert_outcome("exception", "unregistered-rendition")
+
+    def metadata_with(self, original):
+        real = catalog.receipt_metadata
+
+        def metadata(root, receipts):
+            value = real(root, receipts)
+            value["registrations"]["D1"]["artifact"] = original
+            return value
+        return metadata
+
 
 class StandingIntakeTests(StandingCase):
     def test_qualified_rendition_is_reviewed_selected_and_published(self):
@@ -435,6 +468,41 @@ class StandingIntakeTests(StandingCase):
     def has_hit(self):
         with closing(index.readonly(self.root / DB)) as db:
             return bool(index.search(db, "Standing phrase", 10, None)["hits"])
+
+    def test_publication_under_unrelated_policy_after_revocation_is_refused(self):
+        self.stage_all()
+        self.run_stage("review")
+        self.run_stage("select")
+        self.policy["status"] = "revoked"
+        self.write_private("config/standing-policy.json", self.policy)
+        other = {**self.policy, "policy_id": "other-routine", "status": "active",
+                 "scope": {"receipts": ["D2"], "audiences": ["source"]}}
+        other_sha = self.write_private("config/other-policy.json", other)
+        stage_request(self.root, [stage("publication", "standing-publish",
+                                        {"policy_path": "config/other-policy.json",
+                                         "policy_sha256": other_sha,
+                                         "manifest": "config/selection.json", "db": DB},
+                                        "publish")], "req-other")
+        result = self.run_stage("publish", "req-other")
+        self.assertEqual((result["status"], result["attempts"][-1]["code"]),
+                         ("blocked", "standing-selection-unauthorized"))
+        self.assertFalse(self.has_hit())
+
+    def test_availability_requires_selections_authorized_by_publish_policy(self):
+        self.stage_all()
+        for name in ("review", "select", "publish"):
+            self.assertEqual(self.run_stage(name)["status"], "succeeded")
+        evidence = self.evidence("publish")
+        narrowed = deepcopy(self.policy)
+        narrowed["scope"]["receipts"] = ["D2"]
+        stage_ = deepcopy(self.publish_stage())
+        stage_["arguments"]["policy_sha256"] = self.write_private(
+            "config/standing-policy.json", narrowed)
+        evidence = {**evidence, "standing_policy": {**evidence["standing_policy"],
+                                                    "sha256": stage_["arguments"]["policy_sha256"]}}
+        stale = adapters.availability(self.root, stage_, evidence)
+        self.assertEqual((stale["available"], stale["reason"]),
+                         (False, "standing-policy-stale-or-revoked"))
 
     def test_changed_inputs_between_review_and_select_block(self):
         self.stage_all()
