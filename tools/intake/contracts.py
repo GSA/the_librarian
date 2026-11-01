@@ -63,6 +63,8 @@ def relative(value):
             and all(p not in {"", ".", ".."} for p in value.split("/")))
 
 
+STANDING = {"policy_path", "policy_sha256", "rendition", "rendition_sha256",
+            "findings_path", "findings_sha256", "event_id"}
 KINDS = ("receipt", "extraction", "review", "publication", "return")
 OPERATIONS = {
     "catalog-submit": ("receipt", {"records", "actor", "request_id", "expected_state", "reason"}),
@@ -71,6 +73,9 @@ OPERATIONS = {
     "docling-register": ("extraction", {"receipt", "format_name", "artifacts_path", "python", "actor", "expected_state"}),
     "review-append": ("review", {"value", "actor", "request_id", "expected_revision", "expected_state"}),
     "index-build": ("publication", {"manifest", "db"}),
+    "standing-review": ("review", STANDING | {"request_id"}),
+    "standing-select": ("publication", STANDING | {"request_id", "manifest"}),
+    "standing-publish": ("publication", {"policy_path", "policy_sha256", "manifest", "db"}),
     "await-ack": ("return", {"delivery_correlation", "disposition_path", "disposition_sha256"}),
 }
 
@@ -106,13 +111,17 @@ def decode_request(raw):
         fields(stage["arguments"], names)
         args = stage["arguments"]
         for key in names - {"records", "value", "expected_revision"}:
-            text(args[key], 4096 if key in {"artifacts_path", "python", "manifest", "db", "disposition_path"} else 500)
+            text(args[key], 4096 if key in {"artifacts_path", "python", "manifest", "db", "disposition_path", "policy_path", "rendition", "findings_path"} else 500)
         if "expected_revision" in args:
             require(type(args["expected_revision"]) is int and args["expected_revision"] >= 0)
         if "format_name" in args:
             require(args["format_name"] in {"pdf", "image"})
-        for key in {"manifest", "db", "disposition_path"} & names:
+        for key in {"manifest", "db", "disposition_path", "policy_path", "rendition", "findings_path"} & names:
             relative(args[key])
-        if "disposition_sha256" in args:
-            sha(args["disposition_sha256"])
+        for key in {"disposition_sha256", "policy_sha256", "rendition_sha256", "findings_sha256"} & names:
+            sha(args[key])
+        if stage["operation"].startswith("standing-") and "request_id" in args:
+            require(re.fullmatch(r"req-[a-z0-9-]{1,100}", args["request_id"]) is not None)
+        if "event_id" in args:
+            require(re.fullmatch(r"rev-[a-z0-9-]{1,100}", args["event_id"]) is not None)
     return value

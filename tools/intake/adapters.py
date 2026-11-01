@@ -10,6 +10,7 @@ from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
 from tools.extraction import docling_adapter as docling
 from tools.context_index import context_index as index
+from . import standing
 from .contracts import IntakeError, identifier, require
 
 
@@ -38,10 +39,49 @@ def native_failure(error):
     return StageFailure("blocked", "native-input")
 
 
+STANDING_REVIEW = ("policy_path", "policy_sha256", "rendition", "rendition_sha256",
+                   "findings_path", "findings_sha256", "event_id")
+
+
+def standing_intent(root, stage):
+    """Evaluate a standing-policy stage; the outcome is pinned before any write."""
+    args = {key: stage["arguments"][key] for key in STANDING_REVIEW}
+    result = standing.evaluate(root, args)
+    result.pop("child", None)
+    return {"operation": stage["operation"], **result}
+
+
+def standing_publish_guard(root, args):
+    policy = standing.load_policy(root, args["policy_path"], args["policy_sha256"])
+    if policy["status"] != "active":
+        raise standing.Refusal("blocked", "standing-exception-policy-revoked")
+    return {"policy_id": policy["policy_id"], "version": policy["version"],
+            "sha256": args["policy_sha256"]}
+
+
 def prepare(root, stage):
+    try:
+        return _prepare(root, stage)
+    except standing.Refusal as error:
+        raise StageFailure(error.category, error.code) from error
+
+
+def _prepare(root, stage):
     try:
         args = stage["arguments"]
         operation = stage["operation"]
+        if operation in {"standing-review", "standing-select"}:
+            intent = standing_intent(root, stage)
+            if operation == "standing-review" and intent["outcome"] == "qualified":
+                # Fixed once in the saved intent so a crash-after-commit retry
+                # resubmits the identical event under the same request ID.
+                intent["recorded_at"] = standing.datetime.now(
+                    standing.timezone.utc).replace(microsecond=0).isoformat()
+            return intent
+        if operation == "standing-publish":
+            pinned = standing_publish_guard(root, args)
+            return {**_prepare(root, {**stage, "operation": "index-build"}),
+                    "operation": operation, "standing_policy": pinned}
         if operation == "await-ack":
             path = catalog.safe_path(root / args["disposition_path"])
             raw = docling.bridge._read_source(path)
@@ -76,8 +116,66 @@ def prepare(root, stage):
 
 def execute(root, stage, intent, previous=None):
     try:
+        return _execute(root, stage, intent, previous)
+    except standing.Refusal as error:
+        raise StageFailure(error.category, error.code) from error
+
+
+def _standing_result(root, stage, intent):
+    """Re-evaluate against current inputs; stale policy, source or findings refuse."""
+    args = {key: stage["arguments"][key] for key in STANDING_REVIEW}
+    result = standing.evaluate(root, args)
+    current = {"operation": stage["operation"], **{k: v for k, v in result.items() if k != "child"}}
+    expected = {k: v for k, v in intent.items() if k != "recorded_at"}
+    if current != expected:
+        raise StageFailure("blocked", "changed-standing-inputs")
+    standing.refusal(result)
+    return args, result
+
+
+def _execute(root, stage, intent, previous=None, extra_guard=None):
+    try:
         args = stage["arguments"]
         operation = stage["operation"]
+        if operation == "standing-review":
+            review_args, result = _standing_result(root, stage, intent)
+            event = standing.review_event(result, review_args,
+                                          standing.datetime.fromisoformat(intent["recorded_at"]))
+            state = events.status(root)
+            committed = events.append(root, events.bundle([event]), result["reviewer"], args["request_id"],
+                                      state["revision"], state["state_token"])
+            if standing.bound_event(root, result, review_args) is None:
+                raise StageFailure("blocked", "review-event-mismatch")
+            return {"boundary": "review-committed", "outcome": "qualified",
+                    "event_ids": [args["event_id"]], "request_id": args["request_id"],
+                    "policy": result["policy"], "idempotent": committed["idempotent"]}
+        if operation == "standing-select":
+            review_args, result = _standing_result(root, stage, intent)
+            if standing.bound_event(root, result, review_args) is None:
+                raise StageFailure("blocked", "review-event-missing")
+            child = standing.selected_child(result, review_args)
+            submitted = catalog.submit(
+                root, [child], actor=result["reviewer"], request_id=args["request_id"],
+                expected_state=catalog.status(root)["state_token"],
+                reason=child["data"]["reason"])
+            entry = standing.selection_entry(result, review_args)
+            manifest_sha = standing.write_manifest(root, args["manifest"], entry)
+            return {"boundary": "selection-committed", "outcome": "qualified",
+                    "catalog_revision": submitted["committed_revision"],
+                    "request_id": args["request_id"], "selection": entry,
+                    "manifest_bytes_sha256": manifest_sha, "policy": result["policy"]}
+        if operation == "standing-publish":
+            publish = {**stage, "operation": "index-build"}
+            index_intent = {**{k: v for k, v in intent.items() if k != "standing_policy"},
+                            "operation": "index-build"}
+
+            def guard():
+                require(standing_publish_guard(root, args) == intent["standing_policy"],
+                        "changed_publication_inputs")
+            guard()
+            evidence = _execute(root, publish, index_intent, previous, guard)
+            guard()
+            return {**evidence, "standing_policy": intent["standing_policy"]}
         if operation == "await-ack":
             require(prepare(root, stage) == intent, "changed_disposition")
             return {"boundary": "return-pending", **intent}
@@ -91,9 +189,13 @@ def execute(root, stage, intent, previous=None):
                 if db.exists():
                     with closing(index.readonly(db)) as connection:
                         fresh = not index.freshness(connection, root, manifest, db, config, checksum)
+
+                def guard():
+                    require(prepare(root, stage) == intent, "changed_publication_inputs")
+                    if extra_guard is not None:
+                        extra_guard()
                 if not fresh:
-                    index.build(root, manifest, db, config, checksum,
-                                publication_guard=lambda: require(prepare(root, stage) == intent, "changed_publication_inputs"))
+                    index.build(root, manifest, db, config, checksum, publication_guard=guard)
                 require(prepare(root, stage) == intent, "changed_publication_inputs")
                 with closing(index.readonly(db)) as connection:
                     require(not index.freshness(connection, root, manifest, db, config, checksum), "stale_publication")
@@ -139,9 +241,18 @@ def execute(root, stage, intent, previous=None):
 
 
 def availability(root, stage, evidence):
-    if stage["operation"] != "index-build":
+    if stage["operation"] not in {"index-build", "standing-publish"}:
         return {"available": False, "reason": "not-publication"}
     try:
+        if stage["operation"] == "standing-publish":
+            try:
+                pinned = standing_publish_guard(root, stage["arguments"])
+            except standing.Refusal:
+                return {"available": False, "reason": "standing-policy-stale-or-revoked",
+                        "scope": "selected-index"}
+            if pinned != evidence.get("standing_policy"):
+                return {"available": False, "reason": "standing-policy-stale-or-revoked",
+                        "scope": "selected-index"}
         manifest = index.no_symlinks(root / stage["arguments"]["manifest"])
         config, checksum = index.load_manifest(manifest, root)
         db = index.validate_db_path(root, root / stage["arguments"]["db"])
