@@ -85,7 +85,7 @@ The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extractio
 - Prepare twice with independent offline conversions, verify identical rendition bytes, and register deferred renditions in the catalog with idempotent retry.
 - Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries (`docs/decisions/0008-proof-of-concept-closure.md`).
 - Qualified retrieval can explicitly select exact-rendition, substantively reviewed Docling text and table records, with retained-byte, JSON-pointer, and page provenance. Unsupported content collections fail closed.
-- Automatic review, qualification, intake advancement, selection, and indexing are not added. Real-document OCR accuracy remains unmeasured.
+- The later standing-policy intake stages implement authorized evidence-based review, qualification, selection, and publication through the existing atomic index (see [the intake contract](context/intake.md)). Parser success alone never qualifies content. Real-document OCR accuracy remains unmeasured.
 
 
 ## Reuse gaps identified on October 19
