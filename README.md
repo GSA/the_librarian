@@ -57,6 +57,20 @@ To stage and register a file in one step, use the upload intake (see
 
 It replaces steps 1–3 below and leaves extraction to step 4.
 
+To take in a whole read-only folder, classify it and then ingest the admitted
+files through upload and extraction (see
+[context/intake.md](context/intake.md#read-only-cohort-intake)):
+
+```sh
+.venv/bin/python -m tools.intake.cohort classify --root . --inbox /path/to/inbox
+.venv/bin/python -m tools.intake.cohort ingest --root . --inbox /path/to/inbox \
+  --system my-inbox --actor "$USER" --report .local/cohort-report.json
+```
+
+Every file gets a counted disposition; nothing in the inbox is changed, and
+extracted renditions stay unselected until a standing-policy review qualifies
+them.
+
 1. **Drop** the original file under `sources/` (for example `sources/memo.pdf`).
 2. **Discover** what has not been registered yet:
    ```sh
@@ -72,7 +86,7 @@ It replaces steps 1–3 below and leaves extraction to step 4.
      --request-id intake-001 --expected-state "$TOKEN" --reason "Register memo"
    ```
 4. **Extract** text (optional):
-   - For Gemini transcripts or ODT:
+   - For UTF-8 text, Gemini transcripts or ODT:
      `.venv/bin/python -m tools.extraction.extract {prepare,verify,register} D1 --format odt ...`
    - For PDF or images: use Docling. See
      [tools/extraction/README.md](tools/extraction/README.md). Docling needs its

@@ -19,6 +19,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0006](0006-relationship-traversal.md) | Relationship traversal and graph storage options | Open; precondition 1 reported unsatisfied, embedded candidates checked October 22, upstream edge extraction separated October 23 |
 | [0007](0007-execution-traces.md) | Agent execution traces: diagnostics, not memory | Accepted as a boundary; agent memory declined, coverage-gap diagnostics implemented with bare read counts, dead-weight requirement withdrawn, no retrieval-quality figure derived |
 | [0008](0008-proof-of-concept-closure.md) | Concluded proof of concept and adopted reusable lessons | Accepted |
+| [0009](0009-read-only-cohort-intake.md) | Read-only cohort intake and model-assisted standing review | Implemented; bulk review gated per instance |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in

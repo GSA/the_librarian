@@ -83,5 +83,6 @@
   "tests/test_worker_contracts.py",
   "tests/test_docling.py",
   "tools/extraction/README.md",
-  "docs/decisions/0008-proof-of-concept-closure.md"
+  "docs/decisions/0008-proof-of-concept-closure.md",
+  "docs/decisions/0009-read-only-cohort-intake.md"
 ]
