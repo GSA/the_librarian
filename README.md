@@ -62,6 +62,15 @@ To stage and register a file in one step, use the upload intake (see
 
 It replaces steps 1–3 below and leaves extraction to step 4.
 
+To watch a run, use the read-only, body-free progress view (CLI or a
+loopback-only page that refreshes itself; see
+[context/intake.md](context/intake.md#progress-view)):
+
+```sh
+.venv/bin/python -m tools.intake.cli --root . progress --format text
+.venv/bin/python -m tools.intake.cli --root . progress-serve   # http://127.0.0.1:8765/
+```
+
 1. **Drop** the original file under `sources/` (for example `sources/memo.pdf`).
 2. **Discover** what has not been registered yet:
    ```sh
