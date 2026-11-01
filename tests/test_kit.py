@@ -932,10 +932,14 @@ class WorkspaceTests(WorkspaceCase):
             invalid["review_event_ids"] = review_ids
             with self.subTest(review_ids=review_ids), self.assertRaises(index.IndexError_):
                 index.renditions.validate({"renditions": [invalid]}, api)
-        invalid = deepcopy(base)
-        invalid["format"] = "text"
-        with self.assertRaises(index.IndexError_):
-            index.renditions.validate({"renditions": [invalid]}, api)
+        reviewed_text = deepcopy(base)
+        reviewed_text["format"] = "text"
+        index.renditions.validate({"renditions": [reviewed_text]}, api)
+        for review_ids in ([], ["rev-exact", "rev-exact"], [1]):
+            invalid = deepcopy(reviewed_text)
+            invalid["review_event_ids"] = review_ids
+            with self.subTest(text_review_ids=review_ids), self.assertRaises(index.IndexError_):
+                index.renditions.validate({"renditions": [invalid]}, api)
 
     def test_selected_empty_text_is_refused_without_replacing_index(self):
         self.docs()

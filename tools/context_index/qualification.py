@@ -2,6 +2,8 @@
 
 POLICY_VERSION = "docling-exact-rendition-review-v1"
 COMPLETE_SCOPE = "Complete exact Docling rendition review."
+EXTRACT_POLICY_VERSION = "extract-exact-rendition-review-v1"
+EXTRACT_COMPLETE_SCOPE = "Complete exact text extraction rendition review."
 
 
 def docling(selection, value, identity, snapshot, engine):
@@ -16,6 +18,21 @@ def docling(selection, value, identity, snapshot, engine):
             or not source["source_ids"] or not isinstance(source.get("path"), str)):
         engine.fail("Invalid Docling qualification identity")
 
+    reviewed_content, reviewed_scope = _bound(selection, source, snapshot, engine,
+                                              COMPLETE_SCOPE, "Docling")
+    if "text" not in reviewed_content:
+        engine.fail("Docling text content lacks exact substantive review")
+    if tables and "tables" not in reviewed_content:
+        engine.fail("Docling table content lacks exact substantive review")
+    return {"policy_version": POLICY_VERSION,
+            "review_event_ids": list(selection["review_event_ids"]),
+            "review_state": snapshot.state["state_token"],
+            "reviewed_content": sorted(reviewed_content),
+            "reviewed_scope": reviewed_scope}
+
+
+def _bound(selection, source, snapshot, engine, complete_scope, label):
+    """Return reviewed content for configured active events binding the exact rendition."""
     by_id = {event.get("event_id"): event for event in snapshot.events
              if isinstance(event, dict)}
     reviewed_content = set()
@@ -23,7 +40,7 @@ def docling(selection, value, identity, snapshot, engine):
     for event_id in selection["review_event_ids"]:
         event = by_id.get(event_id)
         if event is None or event_id in snapshot.successors:
-            engine.fail("Configured Docling review event is missing or superseded")
+            engine.fail(f"Configured {label} review event is missing or superseded")
         event_source = event.get("source", {})
         scope = event.get("scope", {})
         checksum = event_source.get("checksum", {})
@@ -36,20 +53,30 @@ def docling(selection, value, identity, snapshot, engine):
                 or event.get("outcome") != "reviewed"
                 or scope.get("unit") != "file" or scope.get("extent") != "defined_scope"
                 or scope.get("coordinates") != "not_applicable" or scope.get("ranges") != []
-                or scope.get("description") != COMPLETE_SCOPE
+                or scope.get("description") != complete_scope
                 or not isinstance(content, list) or not content
                 or not event.get("reviewer") or not event.get("reviewed_on")
                 or not isinstance(event.get("evidence"), list) or not event["evidence"]
                 or event.get("uncertainties") != []):
-            engine.fail("Docling review does not bind the exact complete rendition")
+            engine.fail(f"{label} review does not bind the exact complete rendition")
         reviewed_content.update(content)
         reviewed_scope.append({"event_id": event_id, "content": sorted(content),
                                "unit": "file", "extent": "defined_scope"})
+    return reviewed_content, reviewed_scope
+
+
+def extract(selection, value, identity, snapshot, engine):
+    """Qualify one exact strict-text, transcript or ODT rendition against review events."""
+    source = value.get("source", {})
+    if (value.get("schema_version") != 1 or source.get("receipt_id") != selection["receipt_id"]
+            or not isinstance(source.get("source_ids"), list)
+            or not source["source_ids"] or not isinstance(source.get("path"), str)):
+        engine.fail("Invalid extraction qualification identity")
+    reviewed_content, reviewed_scope = _bound(selection, source, snapshot, engine,
+                                              EXTRACT_COMPLETE_SCOPE, "Extraction")
     if "text" not in reviewed_content:
-        engine.fail("Docling text content lacks exact substantive review")
-    if tables and "tables" not in reviewed_content:
-        engine.fail("Docling table content lacks exact substantive review")
-    return {"policy_version": POLICY_VERSION,
+        engine.fail("Extraction text content lacks exact substantive review")
+    return {"policy_version": EXTRACT_POLICY_VERSION,
             "review_event_ids": list(selection["review_event_ids"]),
             "review_state": snapshot.state["state_token"],
             "reviewed_content": sorted(reviewed_content),

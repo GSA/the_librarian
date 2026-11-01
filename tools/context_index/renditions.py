@@ -48,8 +48,9 @@ def validate(config, engine, root=None):
         if (item["format"] == "docling" and
                 (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
             engine.fail("Docling selection requires unique review_event_ids")
-        if item["format"] != "docling" and review_ids is not None:
-            engine.fail("review_event_ids are supported only for Docling selections")
+        if (item["format"] != "docling" and review_ids is not None
+                and (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
+            engine.fail("Reviewed extraction selection requires unique review_event_ids")
         if not item["context"]:
             engine.fail("Rendition selection requires maintained source context")
         engine.validate_context(item["context"])
@@ -65,7 +66,8 @@ def inputs(root, config, engine, review_snapshot=None):
     if not selections:
         return [], ""
     catalog = engine.load_catalog()
-    if any(item["format"] == "docling" for item in selections) and review_snapshot is None:
+    if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
+            and review_snapshot is None):
         review_snapshot = engine.load_event_reader().read_snapshot(root)
     snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
     state = snapshot["state"]["state_token"]
@@ -160,6 +162,9 @@ def inputs(root, config, engine, review_snapshot=None):
             docling_qualification = qualification.docling(
                 item, value, identity, review_snapshot, engine)
             validate_docling_conversion(value, engine)
+        elif "review_event_ids" in item:
+            docling_qualification = qualification.extract(
+                item, value, identity, review_snapshot, engine)
         metadata = {
             "source": source, "rendition_path": item["path"], "rendition_sha256": item["sha256"],
             "extractor": value["extractor"], "run_id": run,
@@ -188,9 +193,10 @@ def inputs(root, config, engine, review_snapshot=None):
                 metadata[key] = payload[key]
         if docling_qualification is not None:
             metadata["qualification"] = docling_qualification
+            identity["qualification"] = docling_qualification
+        if item["format"] == "docling":
             metadata["confidence"] = value["conversion"]["confidence"]
             metadata["omissions"] = value["conversion"]["omissions"]
-            identity["qualification"] = docling_qualification
         result.append((item, raw, value, metadata))
         identities.append(identity)
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
