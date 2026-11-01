@@ -10,7 +10,8 @@ named stage. The ledger is operational recovery state, never corpus authority.
   key refusal, 1 MiB request limit, 16 stages, 1–10 attempts, 0–86400s backoff.
 - Fixed adapters: receipt/catalog-submit; extraction/docling-prepare,
   docling-verify, docling-register; review/review-append;
-  publication/index-build; return/await-ack. See `tools/intake/contracts.py` for
+  publication/index-build; review/standing-review, publication/standing-select,
+  publication/standing-publish; return/await-ack. See `tools/intake/contracts.py` for
   argument fields. Preserve native attribution and original concurrency tokens.
 - Intake stores exact requests before effects. Prepared intent commits before
   an execution attempt. Restart reconciles unfinished attempts without charging
@@ -29,6 +30,21 @@ named stage. The ledger is operational recovery state, never corpus authority.
   atomically replacing the destination; a raising guard preserves the prior
   index. Inspection reports current availability separately from historical
   completion, including when a published index later becomes unreadable.
+- Standing-policy stages (`tools/intake/standing.py`) pin a private (0600)
+  `standing-policy-v1` file by SHA-256 (id, version, active/revoked status,
+  reviewer, receipt/audience scope, page/record/findings budgets, selection
+  context) and an attributed `standing-findings-v1` record for one exact
+  registered Docling rendition. Only findings that inspected every page, text
+  record, table and warning, with no contradictions or missing evidence, are
+  `qualified`; parser success and confidence never qualify. Other outcomes
+  (`pending-review`, `rejected`, `deferred`, `exception`) block visibly with a
+  reason code and write nothing. Missing findings are a retryable
+  `review-route-unavailable`. Corrections, new mappings or existing independent
+  reviews of the rendition require independent review. A qualified review
+  appends one deterministic event under its request ID (idempotent after a lost
+  acknowledgment); selection re-evaluates, marks the catalog child indexed and
+  atomically adds the manifest entry; publication pins the policy, and current
+  availability is false once the policy is revoked/changed or sources drift.
 - Undecodable or invalid native inputs block durably with a recorded attempt
   outcome instead of surfacing a traceback, and ledger write failures after
   validation report an unavailable ledger rather than claiming corruption.
@@ -46,5 +62,5 @@ named stage. The ledger is operational recovery state, never corpus authority.
   corrupt ledgers refuse operation; never rebuild corpus authority from this
   ledger. Protect operational request bodies like other private instance data.
 
-No acquisition, connector, scheduler, automatic review/selection, migration,
+No acquisition, connector, scheduler, unauthorized review/selection, migration,
 model service or return transport is supplied by this interface.
