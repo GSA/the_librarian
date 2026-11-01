@@ -159,6 +159,18 @@ class RefusalTests(UploadCase):
             self.assertCode("invalid_name", value, name=name)
         self.assertNothingStaged()
 
+    def test_text_format_admits_shared_text_like_suffixes(self):
+        from tools.extraction import extract
+        self.assertEqual(upload.FORMATS["text"][0], extract.TEXT_SUFFIXES)
+        for index, suffix in enumerate(sorted(extract.TEXT_SUFFIXES)):
+            name = "page" + suffix
+            ack = upload.submit(self.root, self.file(name), value(f"sub-t{index}", name=name))
+            self.assertEqual(ack["receipt"]["state"], "committed")
+        self.assertCode("type_mismatch", upload.submit, self.root,
+                        self.file("binary.doc", b"\xd0\xcf\x11\xe0\x00"), value("sub-bin", name="binary.doc"))
+        self.assertCode("unsupported_type", value, name="app.js")
+        self.assertEqual(upload.FORMATS["gemini-txt"][0], {".txt"})
+
     def test_unsupported_and_mismatched_types_are_refused(self):
         self.assertCode("unsupported_type", value, name="memo.docx", fmt="docx")
         self.assertCode("unsupported_type", value, name="memo.pdf", fmt="text")

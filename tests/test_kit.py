@@ -1089,6 +1089,15 @@ class WorkspaceTests(WorkspaceCase):
         self.assertEqual(events.status(self.root)["state_token"], review_before)
         self.assertEqual(self.manifest.read_bytes(), manifest_before)
 
+    def test_text_extraction_accepts_shared_text_like_suffixes(self):
+        self.registration("sources/page.md", b"# Title\nbody\n")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        self.assertTrue(prepared["created"])
+        with self.assertRaisesRegex(extract.ExtractionError, "disagrees with source extension"):
+            extract.run(self.root, "prepare", "D1", "odt")
+        with self.assertRaisesRegex(extract.ExtractionError, "disagrees with source extension"):
+            extract.run(self.root, "prepare", "D1", "gemini-txt")
+
     def test_text_lifecycle_refuses_changed_source_and_conflicting_publication(self):
         self.registration("sources/notes.txt", b"stable\n")
         prepared = extract.run(self.root, "prepare", "D1", "text")

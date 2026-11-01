@@ -22,6 +22,7 @@ import zipfile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store
 from .contracts import IntakeError, canonical, decode, digest, fields, identifier, require, sha, text
 
@@ -36,7 +37,7 @@ FORMATS = {
     "pdf": ({".pdf"}, 64 * MIB),
     "image": ({".png", ".jpg", ".jpeg"}, 64 * MIB),
     "odt": ({".odt"}, 16 * MIB),
-    "text": ({".txt"}, 16 * MIB),
+    "text": (set(TEXT_SUFFIXES), 16 * MIB),
     "gemini-txt": ({".txt"}, 16 * MIB),
 }
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
