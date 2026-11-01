@@ -99,6 +99,15 @@ class SubmitTests(UploadCase):
         self.assertNotEqual(first["records"]["receipt_id"], second["records"]["receipt_id"])
         self.assertNotEqual(first["original"]["path"], second["original"]["path"])
 
+    def test_suffix_related_submission_ids_never_collide(self):
+        first = upload.submit(self.root, self.file(), value("memo"))
+        second = upload.submit(self.root, self.file(), value("memo-submission"))
+        third = upload.submit(self.root, self.file(), value("m-memo"))
+        ids = [set(a["records"].values()) - {None} for a in (first, second, third)]
+        self.assertFalse(ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2])
+        self.assertEqual(second["receipt"]["state"], "committed")
+        self.assertEqual(third["receipt"]["state"], "committed")
+
     def test_exact_retry_returns_existing_acknowledgment(self):
         first = upload.submit(self.root, self.file(), value())
         revision = catalog.status(self.root)["revision"]
@@ -228,6 +237,24 @@ class RecoveryTests(UploadCase):
         self.assertEqual(self.records(), {})
         ack = upload.submit(self.root, self.file(), value())
         self.assertEqual(ack["receipt"]["state"], "committed")
+
+    def test_stranded_uncommitted_upload_has_linked_replacement(self):
+        with patch.object(runner, "run", side_effect=SystemExit("crash before run")), self.assertRaises(SystemExit):
+            upload.submit(self.root, self.file(), value("sub-a"))
+        self.assertCode("correction_parent_pending", upload.submit, self.root,
+                        self.file(), value("sub-a-fix", correction_of="sub-a"))
+        upload.submit(self.root, self.file(name="other.txt"), value("sub-b", name="other.txt"))
+        stranded = upload.submit(self.root, self.file(), value("sub-a"))
+        self.assertEqual(stranded["receipt"]["state"], "blocked")
+        fixed = upload.submit(self.root, self.file(), value("sub-a-fix", correction_of="sub-a"))
+        self.assertEqual(fixed["receipt"]["state"], "committed")
+        self.assertEqual(fixed["correction_of"], "sub-a")
+        self.assertIsNone(fixed["records"]["relationship_id"])
+        self.assertEqual(store.inspect(self.root, "upload-sub-a-fix")["correction_of"], "upload-sub-a")
+        records = self.records()
+        self.assertNotIn(stranded["records"]["receipt_id"], records)
+        self.assertNotEqual(fixed["records"]["source_id"], stranded["records"]["source_id"])
+        self.assertEqual(upload.submit(self.root, self.file(), value("sub-a"))["receipt"]["state"], "blocked")
 
     def test_duplicate_concurrent_submissions_produce_one_receipt(self):
         path = self.file()

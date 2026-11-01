@@ -86,7 +86,12 @@ named stage. The ledger is operational recovery state, never corpus authority.
 - An exact retry returns the existing acknowledgment and resumes unfinished
   work. Changed bytes or descriptor under one submission ID are a
   `submission_conflict`; send a new submission with `--correction-of`, which
-  reuses the parent source and adds a `version-of` relationship.
+  reuses the parent source and adds a `version-of` relationship. A parent whose
+  receipt durably blocked or dead-lettered without committing (for example a
+  stale catalog state after an interruption) may also be replaced this way: the
+  replacement plans fresh records against the current catalog, links the
+  ledger requests, and leaves the stranded request visible. A parent that can
+  still commit is `correction_parent_pending`; retry it exactly instead.
 - `drop-scan --drop DIR` is discovery only. `drop-submit --drop DIR` submits each
   `NAME` paired with `NAME.submission.json` (the v1 descriptor fields). The drop
   must exist and contain `.librarian-drop`; a missing or unmarked mount is
