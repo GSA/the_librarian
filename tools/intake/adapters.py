@@ -55,8 +55,10 @@ def standing_publish_guard(root, args):
     policy = standing.load_policy(root, args["policy_path"], args["policy_sha256"])
     if policy["status"] != "active":
         raise standing.Refusal("blocked", "standing-exception-policy-revoked")
-    return {"policy_id": policy["policy_id"], "version": policy["version"],
-            "sha256": args["policy_sha256"]}
+    pinned = {"policy_id": policy["policy_id"], "version": policy["version"],
+              "sha256": args["policy_sha256"]}
+    standing.authorize_publication(root, args["manifest"], policy, pinned)
+    return pinned
 
 
 def prepare(root, stage):

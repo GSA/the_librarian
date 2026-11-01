@@ -180,7 +180,14 @@ def _registered(root, value, args):
     child = by_id.get("A-docling-" + value["run_id"])
     relation = by_id.get("R-docling-" + value["run_id"], {}).get("data", {})
     data = original["data"]
-    if (child is None or child["data"].get("path") != args["rendition"]
+    receipt = metadata["registrations"][source["receipt_id"]]["receipt"]["data"]
+    current = {"receipt_id": source["receipt_id"], "artifact_id": original["id"],
+               "source_ids": receipt["source_ids"],
+               **{key: data.get(key) for key in ("path", "sha256", "bytes", "audience",
+                                                 "handling_refs")}}
+    if (child is None or source != current
+            or child["data"].get("audience") != source["audience"]
+            or child["data"].get("handling_refs") != source["handling_refs"] or child["data"].get("path") != args["rendition"]
             or child["data"].get("sha256") != args["rendition_sha256"]
             or child["data"].get("parent_id") != original["id"]
             or child["data"].get("role") != "generated-rendition"
@@ -252,7 +259,7 @@ def evaluate(root, args):
                 "texts": sorted(item["self_ref"] for item in document["texts"]),
                 "tables": sorted(item["self_ref"] for item in document["tables"]),
                 # Each warning instance is inspected individually, not per code.
-                "warnings": [f"#/warnings/{i}" for i in range(len(conversion["warnings"]))]}
+                "warnings": sorted(f"#/warnings/{i}" for i in range(len(conversion["warnings"])))}
     result["inspected"] = {key: len(items) for key, items in expected.items()}
     if (len(expected["pages"]) > standing["budget"]["max_pages"]
             or len(records) > standing["budget"]["max_records"]):
@@ -349,6 +356,48 @@ def _matches(event, result, args):
         return event == review_event(result, args, recorded)
     except (TypeError, ValueError, KeyError):
         return False
+
+
+STANDING_STATEMENT = re.compile(
+    r"Standing policy ([a-z0-9][a-z0-9-]{0,99}) v([1-9][0-9]*) \(sha256 ([a-f0-9]{64})\) "
+    r"authorized this exact rendition review\.")
+
+
+def authorize_publication(root, manifest_name, standing, pinned):
+    """Refuse a manifest whose standing-authorized selections this policy did not authorize.
+
+    Selections backed only by independent reviews are outside standing authority
+    and are left to the native qualification rules.
+    """
+    try:
+        path = index.no_symlinks(Path(root) / manifest_name)
+        index.load_manifest(path, root)
+        raw = json.loads(path.read_bytes().decode("utf-8"),
+                         object_pairs_hook=index.strict_object)
+        snapshot = event_reader.read_snapshot(root)
+    except (OSError, UnicodeError, ValueError, index.IndexError_,
+            events.contract.ReviewError) as error:
+        raise Refusal("blocked", "standing-selection-unauthorized") from error
+    by_id = {event["event_id"]: event for event in snapshot.events}
+    expected = (pinned["policy_id"], str(pinned["version"]), pinned["sha256"])
+    for item in raw.get("renditions", []):
+        for event_id in item.get("review_event_ids") or []:
+            event = by_id.get(event_id)
+            quotes = [e.get("quote") or "" for e in (event or {}).get("evidence", [])]
+            claims = [m.groups() for q in quotes for m in [STANDING_STATEMENT.fullmatch(q)] if m]
+            if not claims:
+                continue
+            if (claims != [expected] or item["receipt_id"] not in standing["scope"]["receipts"]
+                    or _audience(root, item["path"]) not in standing["scope"]["audiences"]):
+                raise Refusal("blocked", "standing-selection-unauthorized")
+
+
+def _audience(root, name):
+    try:
+        _, raw = _read(root, name, 64 * 1024 * 1024)
+        return json.loads(raw.decode("utf-8"))["source"]["audience"]
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, Refusal):
+        return None
 
 
 def selection_entry(result, args):

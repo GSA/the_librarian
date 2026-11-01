@@ -45,6 +45,12 @@ named stage. The ledger is operational recovery state, never corpus authority.
   acknowledgment); selection re-evaluates, marks the catalog child indexed and
   atomically adds the manifest entry; publication pins the policy, and current
   availability is false once the policy is revoked/changed or sources drift.
+  Qualification compares the rendition's full source identity (artifact,
+  source IDs, path, hash, bytes, audience, handling refs) with the current
+  catalog registration. Publication and availability refuse a manifest whose
+  standing-reviewed selections were authorized by a different policy or fall
+  outside the publishing policy's receipt/audience scope
+  (`standing-selection-unauthorized`).
 - Undecodable or invalid native inputs block durably with a recorded attempt
   outcome instead of surfacing a traceback, and ledger write failures after
   validation report an unavailable ledger rather than claiming corruption.
