@@ -293,19 +293,26 @@ def records_for(root, value, raw, original_path, sidecar_path, sidecar):
     state, taken = catalog_view(root)
     taken |= reserved_ids(root)
     sid = value["submission_id"]
-    artifact_id, meta_id = f"A-upload-{sid}", f"A-upload-{sid}-submission"
+    # Distinct role suffixes keep every submission's IDs disjoint from every other's.
+    artifact_id, meta_id = f"A-upload-{sid}-original", f"A-upload-{sid}-submission"
     relation_id = f"R-upload-{sid}-version-of"
     require(not {artifact_id, meta_id, relation_id} & taken, "identifier_conflict")
     parent_artifact = None
     if value["correction_of"]:
         parent = ledger_request(root, correlation(value["correction_of"]))
         require(parent is not None, "unknown_correction_parent")
-        require(status_of(root, correlation(value["correction_of"])) == "succeeded",
-                "correction_parent_uncommitted")
+        parent_status = status_of(root, correlation(value["correction_of"]))
         parent_receipt = next(r for r in submit_records(parent) if r["kind"] == "receipt")
-        source_id = parent_receipt["data"]["source_ids"][0]
-        parent_artifact = parent_receipt["data"]["artifact_id"]
-    else:
+        if parent_status == "succeeded":
+            source_id = parent_receipt["data"]["source_ids"][0]
+            parent_artifact = parent_receipt["data"]["artifact_id"]
+        else:
+            # Only a durably refused, never-committed parent may be replaced; work that
+            # can still commit is finished by retrying the exact original submission.
+            require(parent_status in {"blocked", "dead-letter"}, "correction_parent_pending")
+            committed = catalog_view(root)[1]
+            require(not {r["id"] for r in submit_records(parent)} & committed, "correction_parent_pending")
+    if parent_artifact is None:
         source_id = next_id("S", taken)
     receipt_id = next_id("D", taken)
     provenance = [{"path": sidecar_path, "sha256": digest(sidecar), "line_start": None, "line_end": None}]
