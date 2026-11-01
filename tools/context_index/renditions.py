@@ -10,6 +10,8 @@ from pathlib import PurePosixPath
 from tools.context_index import qualification
 
 
+# One instance publishes a reviewed cohort (thousands of files), not a hand-picked handful.
+MAX_SELECTIONS = 5000
 DOCLING_MAX_PAGES = 100
 DOCLING_MAX_RECORDS = 10000
 DOCLING_RENDER_SCALE = 3.0
@@ -26,8 +28,8 @@ def eligible(path, root=None):
 
 def validate(config, engine, root=None):
     selections = config.get("renditions", [])
-    if not isinstance(selections, list) or len(selections) > 10:
-        engine.fail("renditions must be a list of at most ten explicit selections")
+    if not isinstance(selections, list) or len(selections) > MAX_SELECTIONS:
+        engine.fail(f"renditions must be a list of at most {MAX_SELECTIONS} explicit selections")
     seen = set()
     for item in selections:
         engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),

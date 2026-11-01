@@ -589,6 +589,21 @@ class WorkspaceTests(WorkspaceCase):
         event["counts"].update(reviewed=1, pending=0)
         return selection, value, event
 
+    def test_rendition_selection_limit_is_shared_and_above_ten(self):
+        api = index.rendition_api()
+        api.validate_context = lambda context: None
+        api.eligible = lambda path: True
+        api.canonical_locator = lambda value: value
+        def selections(count):
+            return [{"path": f"data/extractions/.local/D{n + 1}/{'a' * 64}/extraction.json",
+                     "sha256": "b" * 64, "receipt_id": f"D{n + 1}", "format": "text",
+                     "context": ["documents/context.md"]} for n in range(count)]
+        self.assertGreater(index.renditions.MAX_SELECTIONS, 10)
+        index.renditions.validate({"renditions": selections(11)}, api)
+        with self.assertRaises(index.IndexError_):
+            index.renditions.validate(
+                {"renditions": selections(index.renditions.MAX_SELECTIONS + 1)}, api)
+
     def test_strict_docling_qualification_accepts_only_active_exact_file_review(self):
         api = index.rendition_api()
         selection, value, event = self.docling_qualification_fixture(tables=True)

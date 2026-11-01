@@ -92,7 +92,7 @@ def load_policy(root, name, expected_sha):
     if valid:
         scope, budget, selection = value["scope"], value["budget"], value["selection"]
         valid = (isinstance(scope, dict) and set(scope) == {"receipts", "audiences"}
-                 and isinstance(scope["receipts"], list) and 0 < len(scope["receipts"]) <= 100
+                 and isinstance(scope["receipts"], list) and 0 < len(scope["receipts"]) <= renditions.MAX_SELECTIONS
                  and all(_identifier(r, r"D0*[1-9][0-9]*") for r in scope["receipts"])
                  and _texts(scope["audiences"]) and scope["audiences"]
                  and isinstance(budget, dict)
@@ -425,7 +425,7 @@ def write_manifest(root, name, entry):
     current = [item for item in selected if item["path"] == entry["path"]]
     if current == [entry]:
         return index.digest(path.read_bytes())
-    if current or len(selected) >= 10:
+    if current or len(selected) >= renditions.MAX_SELECTIONS:
         raise Refusal("blocked", "selection-conflict")
     selected.append(entry)
     data = (json.dumps(raw, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
