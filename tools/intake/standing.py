@@ -370,7 +370,9 @@ def authorize_publication(root, manifest_name, standing, pinned):
     and are left to the native qualification rules.
     """
     try:
-        raw = json.loads((Path(root) / manifest_name).read_bytes().decode("utf-8"),
+        path = index.no_symlinks(Path(root) / manifest_name)
+        index.load_manifest(path, root)
+        raw = json.loads(path.read_bytes().decode("utf-8"),
                          object_pairs_hook=index.strict_object)
         snapshot = event_reader.read_snapshot(root)
     except (OSError, UnicodeError, ValueError, index.IndexError_,
@@ -378,7 +380,7 @@ def authorize_publication(root, manifest_name, standing, pinned):
         raise Refusal("blocked", "standing-selection-unauthorized") from error
     by_id = {event["event_id"]: event for event in snapshot.events}
     expected = (pinned["policy_id"], str(pinned["version"]), pinned["sha256"])
-    for item in raw.get("renditions", []) if isinstance(raw, dict) else []:
+    for item in raw.get("renditions", []):
         for event_id in item.get("review_event_ids") or []:
             event = by_id.get(event_id)
             quotes = [e.get("quote") or "" for e in (event or {}).get("evidence", [])]

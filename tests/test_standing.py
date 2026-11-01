@@ -488,6 +488,17 @@ class StandingIntakeTests(StandingCase):
                          ("blocked", "standing-selection-unauthorized"))
         self.assertFalse(self.has_hit())
 
+    def test_malformed_publication_manifest_blocks_durably(self):
+        for renditions in ([None], None):
+            with self.subTest(renditions=renditions):
+                manifest = self.root / "config/selection.json"
+                config = json.loads(manifest.read_bytes())
+                manifest.write_text(json.dumps({**config, "renditions": renditions}))
+                with self.assertRaises(standing.Refusal) as caught:
+                    adapters.standing_publish_guard(self.root, {
+                        **self.review_args(), "manifest": "config/selection.json", "db": DB})
+                self.assertEqual(caught.exception.code, "standing-selection-unauthorized")
+
     def test_availability_requires_selections_authorized_by_publish_policy(self):
         self.stage_all()
         for name in ("review", "select", "publish"):
