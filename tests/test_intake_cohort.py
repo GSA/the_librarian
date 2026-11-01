@@ -97,6 +97,19 @@ class ClassifyTests(CohortCase):
         self.assertEqual({k: (v["disposition"], v["format"]) for k, v in entries.items()}, expected)
         self.assertEqual(tree(self.inbox), self.before)
 
+    def test_missing_or_unlistable_inbox_fails_instead_of_counting_nothing(self):
+        from tools.intake.contracts import IntakeError
+        with self.assertRaises(IntakeError) as caught:
+            cohort.classify(self.root, Path(self.temp.name) / "absent")
+        self.assertEqual(caught.exception.code, "inbox_unavailable")
+        (self.inbox / "a").chmod(0o000)
+        self.addCleanup((self.inbox / "a").chmod, 0o555)
+        if os.access(self.inbox / "a", os.R_OK):
+            self.skipTest("running with permission override")
+        with self.assertRaises(IntakeError) as caught:
+            cohort.classify(self.root, self.inbox)
+        self.assertEqual(caught.exception.code, "inbox_unavailable")
+
     def test_over_limit_is_counted_not_dropped(self):
         original = cohort.upload.FORMATS["text"]
         cohort.upload.FORMATS["text"] = (original[0], 4)

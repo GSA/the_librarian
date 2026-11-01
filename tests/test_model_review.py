@@ -1,5 +1,6 @@
 """Model-assisted standing review: prompts, findings, sample evaluation and cost estimate."""
 import json
+import os
 from pathlib import Path
 import stat
 from unittest.mock import patch
@@ -61,6 +62,32 @@ class PromptTests(ReviewCase):
         self.assertIn("untrusted", task["messages"][0]["content"].lower())
 
 
+class OdtPromptTests(test_kit.WorkspaceCase):
+    def test_odt_prompt_carries_every_node_field(self):
+        import io
+        from zipfile import ZipFile
+        office, text = extract.NS["office"], extract.NS["text"]
+        buffer = io.BytesIO()
+        with ZipFile(buffer, "w") as z:
+            z.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+            z.writestr("content.xml", f'<office:document-content xmlns:office="{office}" '
+                       f'xmlns:text="{text}" xmlns:xlink="http://www.w3.org/1999/xlink">'
+                       '<office:body><office:text><text:p>See <text:a xlink:href='
+                       '"https://example.invalid/target">label</text:a> after</text:p>'
+                       '</office:text></office:body></office:document-content>')
+            z.writestr("meta.xml", f'<office:document-meta xmlns:office="{office}">'
+                       '<office:meta/></office:document-meta>')
+            z.writestr("META-INF/manifest.xml", "<manifest/>")
+        store.initialize(self.root)
+        self.registration("sources/plan.odt", buffer.getvalue())
+        prepared = extract.run(self.root, "prepare", "D1", "odt")
+        body = model_review.task(self.root, prepared["rendition"])["messages"][-1]["content"]
+        self.assertIn("https://example.invalid/target", body)
+        records = json.loads(body)["records"]
+        self.assertTrue(all({"member", "locator", "tag", "attributes", "text", "tail"} <= set(r)
+                            for r in records))
+
+
 class FindingsTests(ReviewCase):
     def review(self, transport):
         return model_review.review(self.root, self.rendition, self.policy, "model-a", transport)
@@ -100,7 +127,8 @@ class FindingsTests(ReviewCase):
         for value in ({"content": "not json", "usage": {}},
                       reply(records=[0, 7]),
                       reply(decision="maybe"),
-                      reply(warnings=["#/payload/warnings/9"])):
+                      reply(warnings=["#/payload/warnings/9"]),
+                      reply(decision=["accept"]), reply(decision={"a": 1})):
             with self.subTest(value=value["content"][:20]):
                 result = self.review(Transport(value))
                 self.assertEqual(result["status"], "invalid-reply")
@@ -119,6 +147,20 @@ class FindingsTests(ReviewCase):
                                      transport, max_prompt_chars=10)
         self.assertEqual(result["status"], "too-large")
         self.assertEqual(transport.calls, [])
+
+    def test_findings_over_policy_budget_are_not_written(self):
+        self.policy["budget"]["max_findings_bytes"] = 1024
+        result = self.review(Transport(reply(missing_evidence=["x" * 900, "y" * 900])))
+        self.assertEqual(result["status"], "over-budget")
+        self.assertNotIn("findings_path", result)
+
+    def test_relative_root_writes_findings(self):
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        result = model_review.review(Path("."), self.rendition, self.policy, "model-a",
+                                     Transport(reply()))
+        self.assertTrue((self.root / result["findings_path"]).is_file())
 
     def test_reviewer_must_name_the_model(self):
         self.policy["reviewer"] = "usai:other"

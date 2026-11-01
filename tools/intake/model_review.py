@@ -62,12 +62,11 @@ class TransportError(Exception):
         super().__init__(code)
 
 
-def _record_text(item):
-    if "paragraph_text" in item:
-        return item["paragraph_text"]
+def _record(index, item):
     if "tag" in item:
-        return (item.get("text") or "") + (item.get("tail") or "")
-    return item["text"]
+        # ODT nodes: every preserved field reaches the reviewer, not only readable text.
+        return {"i": index, **item}
+    return {"i": index, "text": item["text"]}
 
 
 def _rendition(root, rendition):
@@ -82,7 +81,7 @@ def task(root, rendition):
     payload = value["payload"]
     records = payload[standing.EXTRACT_FORMATS[payload["format"]]]
     body = {"format": payload["format"],
-            "records": [{"i": i, "text": _record_text(r)} for i, r in enumerate(records)],
+            "records": [_record(i, r) for i, r in enumerate(records)],
             "warnings": [{"ref": f"#/payload/warnings/{i}", "text": w}
                          for i, w in enumerate(payload["warnings"])]}
     return _task(body, value)
@@ -103,7 +102,8 @@ def _parse(content, expected):
         value = json.loads(fenced[1] if fenced else text)
     except ValueError:
         return None
-    if not isinstance(value, dict) or value.get("decision") not in DECISIONS:
+    if not isinstance(value, dict) or not isinstance(value.get("decision"), str) \
+            or value["decision"] not in DECISIONS:
         return None
     records, warnings = value.get("inspected_records"), value.get("inspected_warnings")
     lists = [value.get("contradictions", []), value.get("missing_evidence", [])]
@@ -144,10 +144,10 @@ def assess(prepared, model, transport, max_prompt_chars=MAX_PROMPT_CHARS):
 
 
 def _write_private(root, name, raw):
-    path = catalog.safe_path(Path(root) / name)
-    for parent in reversed(path.relative_to(Path(root)).parents[:-1]):
-        directory = Path(root) / parent
-        directory.mkdir(mode=0o700, exist_ok=True)
+    root = catalog.safe_path(root)
+    path = catalog.safe_path(root / name)
+    for parent in reversed(path.relative_to(root).parents[:-1]):
+        (root / parent).mkdir(mode=0o700, exist_ok=True)
     if path.exists():
         if path.read_bytes() != raw:
             raise ValueError("Findings path already holds different findings")
@@ -182,6 +182,8 @@ def review(root, rendition, standing_policy, model, transport,
                 "missing_evidence": parsed["missing_evidence"],
                 "correction_of": None, "new_mapping": False, "exception_resolution": None}
     encoded = json.dumps(findings, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    if len(encoded) > standing_policy["budget"]["max_findings_bytes"]:
+        return {**result, "status": "over-budget"}
     digest = hashlib.sha256(encoded).hexdigest()
     home = policy.validate_instance_roots(root)["intake_home"]
     name = (f"{home}/findings/{value['source']['receipt_id']}/{value['run_id']}/"

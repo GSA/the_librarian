@@ -106,8 +106,13 @@ def classify(root, inbox):
     root, inbox = Path(root).resolve(), Path(inbox).resolve()
     if root == inbox or inbox in root.parents:
         raise IntakeError("instance_inside_inbox")
+    if not inbox.is_dir():
+        raise IntakeError("inbox_unavailable")
+
+    def unavailable(error):
+        raise IntakeError("inbox_unavailable") from error
     entries = []
-    for directory, names, files in os.walk(inbox, followlinks=False):
+    for directory, names, files in os.walk(inbox, onerror=unavailable, followlinks=False):
         here = Path(directory)
         for name in [*files, *(n for n in names if (here / n).is_symlink())]:
             path = here / name
