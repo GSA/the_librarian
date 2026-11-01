@@ -24,7 +24,7 @@ from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store
-from .contracts import IntakeError, canonical, decode, digest, fields, identifier, require, sha, text
+from .contracts import IntakeError, canonical, decode, digest, fields, identifier, relative, require, sha, text
 
 VERSION = 1
 DROP_MARKER = ".librarian-drop"
@@ -40,6 +40,8 @@ FORMATS = {
     "text": (set(TEXT_SUFFIXES), 16 * MIB),
     "gemini-txt": ({".txt"}, 16 * MIB),
 }
+IDENTITY_BASIS = {"declared-remote": "declared-origin", "operator-supplied": "operator-supplied-bytes",
+                  "local-path": "local-path-copy"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 RECEIPT_STATES = {"succeeded": "committed", "staged": "pending", "running": "pending",
                   "retryable": "retryable", "blocked": "blocked", "dead-letter": "dead-letter"}
@@ -69,6 +71,15 @@ def validate_descriptor(value):
         # Without a declaration there is no remote identity to record.
         require(origin["system"] is None and origin["locator"] is None
                 and origin["version"] is None, "invalid_origin")
+    elif origin["kind"] == "local-path":
+        # A local copy names its read-only source tree and relative path; it never
+        # asserts a remote identity or version.
+        require(origin["version"] is None and isinstance(origin["locator"], str), "invalid_origin")
+        try:
+            text(origin["system"], 200)
+            relative(origin["locator"])
+        except IntakeError as error:
+            raise IntakeError("invalid_origin") from error
     else:
         require(origin["kind"] == "declared-remote", "invalid_origin")
         text(origin["system"], 200)
@@ -81,12 +92,14 @@ def validate_descriptor(value):
 
 
 def descriptor(*, submission_id, format_name, name, actor, reason, correction_of=None,
-               origin_system=None, origin_locator=None, origin_version=None, expected_sha256=None):
+               origin_system=None, origin_locator=None, origin_version=None, expected_sha256=None,
+               origin_kind=None):
     declared = any(v is not None for v in (origin_system, origin_locator, origin_version))
+    kind = origin_kind or ("declared-remote" if declared else "operator-supplied")
     return validate_descriptor({
         "version": VERSION, "submission_id": submission_id, "correction_of": correction_of,
         "format": format_name, "name": name, "actor": actor, "reason": reason,
-        "origin": {"kind": "declared-remote" if declared else "operator-supplied",
+        "origin": {"kind": kind,
                    "system": origin_system, "locator": origin_locator, "version": origin_version},
         "expected_sha256": expected_sha256})
 
@@ -285,7 +298,7 @@ def plan(root, value, raw):
         "format": value["format"], "name": value["name"], "actor": value["actor"],
         "reason": value["reason"], "origin": value["origin"],
         "original": {"path": original_path, "sha256": digest(raw), "bytes": len(raw)},
-        "identity_basis": "declared-origin" if value["origin"]["kind"] == "declared-remote" else "operator-supplied-bytes",
+        "identity_basis": IDENTITY_BASIS[value["origin"]["kind"]],
     }) + "\n").encode()
     return directory, original_path, sidecar_path, sidecar
 
