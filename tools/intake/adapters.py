@@ -5,10 +5,13 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+import xml.etree.ElementTree as ET
+from zipfile import BadZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
 from tools.extraction import docling_adapter as docling
+from tools.extraction import extract
 from tools.context_index import context_index as index
 from . import standing
 from .contracts import IntakeError, identifier, require
@@ -104,12 +107,17 @@ def _prepare(root, stage):
             else:
                 events.prepare_submission(args["value"], root)
             return {"operation": operation}
+        if operation.startswith("extract-"):
+            _, _, path, value = extract.bundle(root, args["receipt"], args["format_name"])
+            return {"operation": operation, "run_id": value["run_id"], "source": value["source"],
+                    "rendition": path.relative_to(root).as_posix(), "extractor": value["extractor"]}
         if operation.startswith("docling-"):
             _, _, path, value, _ = docling._bundle(root, args["receipt"], args["format_name"], Path(args["artifacts_path"]), Path(args["python"]))
             return {"operation": operation, "run_id": value["run_id"], "source": value["source"],
                     "rendition": path.relative_to(root).as_posix(), "extractor": value["extractor"]}
         raise StageFailure("blocked", "unsupported-stage")
-    except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError, index.IndexError_) as error:
+    except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError,
+            index.IndexError_, extract.ExtractionError, BadZipFile, ET.ParseError) as error:
         raise native_failure(error) from error
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         # Undecodable native inputs block durably rather than escaping as a crash.
@@ -219,6 +227,20 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             return {"boundary": "review-committed", "committed_revision": revision,
                     "event_ids": [e["event_id"] for e in args["value"]["events"]],
                     "request_id": args["request_id"], "backup": result["backup"]}
+        if operation.startswith("extract-"):
+            # Refuse a changed source/extractor before any publication or registration.
+            require(prepare(root, stage) == intent, "changed_extraction_identity")
+            command = operation.removeprefix("extract-")
+            result = extract.run(root, command, args["receipt"], args["format_name"],
+                                 args.get("actor"), args.get("expected_state"))
+            require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"],
+                    "changed_extraction_identity")
+            evidence = {"boundary": "extraction-" + command, "run_id": result["run_id"],
+                        "rendition": result["rendition"], "rendition_sha256": result["rendition_sha256"],
+                        "source_sha256": result["source_sha256"]}
+            if command == "register":
+                evidence["request_id"] = result["request_id"]
+            return evidence
         if operation.startswith("docling-"):
             # The native lifecycle validates the pinned identity against its own
             # snapshot, so one conversion per attempt decides the effect.
@@ -235,7 +257,8 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                 evidence.update(committed_revision=result["catalog"]["committed_revision"], backup=result["catalog"]["backup"])
             return evidence
         raise StageFailure("blocked", "unsupported-stage")
-    except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError, index.IndexError_) as error:
+    except (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError,
+            index.IndexError_, extract.ExtractionError, BadZipFile, ET.ParseError) as error:
         raise native_failure(error) from error
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         # Undecodable native inputs block durably rather than escaping as a crash.
