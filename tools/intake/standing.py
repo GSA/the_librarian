@@ -86,7 +86,7 @@ def load_policy(root, name, expected_sha):
         "schema", "policy_id", "version", "status", "reviewer", "scope", "budget", "selection"}
         and value["schema"] == POLICY_SCHEMA and _identifier(value["policy_id"])
         and type(value["version"]) is int and value["version"] > 0
-        and value["status"] in {"active", "revoked"}
+        and isinstance(value["status"], str) and value["status"] in {"active", "revoked"}
         and isinstance(value["reviewer"], str)
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}", value["reviewer"]) is not None)
     if valid:
@@ -121,7 +121,7 @@ def _findings_valid(value):
     inspected = value["inspected"]
     return (value["schema"] == FINDINGS_SCHEMA
             and isinstance(value["policy"], dict) and set(value["policy"]) == {"policy_id", "version"}
-            and value["decision"] in {"accept", "reject", "defer"}
+            and isinstance(value["decision"], str) and value["decision"] in {"accept", "reject", "defer"}
             and isinstance(inspected, dict) and set(inspected) == {"pages", "texts", "tables", "warnings"}
             and all(isinstance(inspected[k], list) and len(inspected[k]) <= renditions.DOCLING_MAX_RECORDS
                     for k in inspected)
@@ -158,6 +158,8 @@ def _rendition(root, args, engine):
             engine.fail("Docling identity mismatch")
     except (UnicodeError, ValueError, index.IndexError_):
         return raw, None, "rendition-fidelity"
+    if not engine.original_allowed(source["path"]):
+        raise Refusal("blocked", "prohibited-source")
     original = catalog.safe_path(Path(root) / index.relative_name(source["path"]))
     if not original.is_file() or hashlib.sha256(original.read_bytes()).hexdigest() != source["sha256"]:
         raise Refusal("blocked", "stale-source")
@@ -249,7 +251,8 @@ def evaluate(root, args):
     expected = {"pages": sorted(page["page_no"] for page in conversion["pages"]),
                 "texts": sorted(item["self_ref"] for item in document["texts"]),
                 "tables": sorted(item["self_ref"] for item in document["tables"]),
-                "warnings": sorted({str(w.get("code", "")) for w in conversion["warnings"]})}
+                # Each warning instance is inspected individually, not per code.
+                "warnings": [f"#/warnings/{i}" for i in range(len(conversion["warnings"]))]}
     result["inspected"] = {key: len(items) for key, items in expected.items()}
     if (len(expected["pages"]) > standing["budget"]["max_pages"]
             or len(records) > standing["budget"]["max_records"]):
@@ -260,8 +263,13 @@ def evaluate(root, args):
         snapshot = event_reader.read_snapshot(root)
     except events.contract.ReviewError as error:
         raise Refusal("blocked", "review-store-unavailable") from error
+    qualified = {"source": source, "content": ["tables", "text"] if expected["tables"] else ["text"],
+                 "reviewer": standing["reviewer"], "context": standing["selection"]["context"]}
+    candidate = {**result, **qualified}
+    # Only this exact standing event (a crash-after-commit retry) is exempt.
     others = [e for e in snapshot.events if e["source"]["locator"] == args["rendition"]
-              and e["event_id"] != args["event_id"] and e["event_id"] not in snapshot.successors]
+              and e["event_id"] not in snapshot.successors
+              and not _matches(e, candidate, args)]
     if others:
         return outcome("pending-review", "conflicting-review")
     if findings["decision"] == "reject":
@@ -273,9 +281,7 @@ def evaluate(root, args):
     inspected = {key: sorted(findings["inspected"][key]) for key in expected}
     if inspected != expected:
         return outcome("pending-review", "insufficient-inspected-scope")
-    result.update(source=source, content=["tables", "text"] if expected["tables"] else ["text"],
-                  reviewer=standing["reviewer"], context=standing["selection"]["context"],
-                  child=child)
+    result.update(qualified, child=child)
     return outcome("qualified", "complete-inspected-scope")
 
 
@@ -329,13 +335,20 @@ def bound_event(root, result, args):
     except events.contract.ReviewError:
         return None
     event = found["event"]
-    if (found["superseded_by"] is not None or event["outcome"] != "reviewed"
-            or event["reviewer"] != result["reviewer"]
-            or event["source"]["locator"] != args["rendition"]
-            or event["source"]["checksum"] != {"sha256": args["rendition_sha256"], "basis": "reported"}
-            or event["scope"]["content"] != result["content"]):
+    if found["superseded_by"] is not None or not _matches(event, result, args):
         return None
     return event
+
+
+def _matches(event, result, args):
+    """True only for the exact deterministic standing event of this qualification."""
+    if event["event_id"] != args["event_id"]:
+        return False
+    try:
+        recorded = datetime.fromisoformat(event["recorded_at"])
+        return event == review_event(result, args, recorded)
+    except (TypeError, ValueError, KeyError):
+        return False
 
 
 def selection_entry(result, args):

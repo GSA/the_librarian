@@ -35,7 +35,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
   reviewer, receipt/audience scope, page/record/findings budgets, selection
   context) and an attributed `standing-findings-v1` record for one exact
   registered Docling rendition. Only findings that inspected every page, text
-  record, table and warning, with no contradictions or missing evidence, are
+  record, table and individual warning (`#/warnings/N`), with no contradictions or missing evidence, are
   `qualified`; parser success and confidence never qualify. Other outcomes
   (`pending-review`, `rejected`, `deferred`, `exception`) block visibly with a
   reason code and write nothing. Missing findings are a retryable

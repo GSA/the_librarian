@@ -71,7 +71,7 @@ class StandingCase(test_kit.WorkspaceCase):
                          "rendition": RENDITION, "rendition_sha256": sha(self.raw),
                          "reviewer": "standing-reviewer", "decision": "accept",
                          "inspected": {"pages": [1, 2], "texts": ["#/texts/0"],
-                                       "tables": ["#/tables/0"], "warnings": ["low_confidence"]},
+                                       "tables": ["#/tables/0"], "warnings": ["#/warnings/0"]},
                          "explanation": "Compared every page, text, table and warning to the original.",
                          "contradictions": [], "missing_evidence": [], "correction_of": None,
                          "new_mapping": False, "exception_resolution": None}
@@ -204,6 +204,54 @@ class StandingEvaluationTests(StandingCase):
         self.policy.update(version=1, status="revoked")
         self.write_private("config/standing-policy.json", self.policy)
         self.assert_outcome("exception", "policy-revoked")
+
+    def test_each_warning_instance_must_be_inspected(self):
+        self.value["conversion"]["warnings"].append(
+            {"code": "low_confidence", "message": "Second field"})
+        self.assertEqual(len(self.value["conversion"]["warnings"]), 2)
+        with patch.object(standing, "_registered", return_value=({"id": "x"}, {})):
+            self.raw = self.write_rendition(self.value)
+            self.findings["rendition_sha256"] = sha(self.raw)
+            self.write_private("config/standing-findings.json", self.findings)
+            self.assert_outcome("pending-review", "insufficient-inspected-scope")
+            self.findings["inspected"]["warnings"] = ["#/warnings/0", "#/warnings/1"]
+            self.write_private("config/standing-findings.json", self.findings)
+            self.assert_outcome("qualified", "complete-inspected-scope")
+
+    def test_malformed_enum_values_refuse_durably(self):
+        self.write_private("config/standing-findings.json", {**self.findings, "decision": []})
+        self.assert_outcome("exception", "invalid-findings")
+        self.policy["status"] = []
+        self.write_private("config/standing-policy.json", self.policy)
+        self.stage_all()
+        result = self.run_stage("review")
+        self.assertEqual((result["status"], result["attempts"][-1]["code"]),
+                         ("blocked", "standing-policy-invalid"))
+
+    def test_excluded_original_refuses_before_review(self):
+        with patch.object(standing.index, "original_allowed", return_value=False):
+            with self.assertRaises(standing.Refusal) as caught:
+                self.evaluate()
+        self.assertEqual(caught.exception.code, "prohibited-source")
+
+    def assert_not_reusable(self, mutate):
+        result = self.evaluate()
+        event = standing.review_event(result, self.review_args())
+        mutate(event)
+        event["evidence"] = [{"kind": "agent_statement", "pointer": None,
+                              "quote": "Independent review outside the standing policy."}]
+        state = events.status(self.root)
+        events.append(self.root, events.bundle([event]), "standing-reviewer", "req-other",
+                      state["revision"], state["state_token"])
+        self.assertIsNone(standing.bound_event(self.root, result, self.review_args()))
+        self.assert_outcome("pending-review", "conflicting-review")
+
+    def test_select_cannot_reuse_partial_review_event(self):
+        self.assert_not_reusable(lambda e: (e.update(outcome="partial"), e["counts"].update(
+            total=2, reviewed=1, pending=1)))
+
+    def test_select_cannot_reuse_independent_complete_review_event(self):
+        self.assert_not_reusable(lambda e: None)
 
     def test_policy_must_be_private(self):
         (self.root / "config/standing-policy.json").chmod(0o644)
