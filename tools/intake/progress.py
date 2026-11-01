@@ -174,7 +174,8 @@ def read_catalog(root):
                         "Catalog home missing or not private")
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
-            state = catalog.validated_state(connection, home)
+            # Full inspection, not validated_state(): its cache would write files.
+            state = catalog.inspect(connection)[0]
             catalog.current_view(connection)
             kinds = dict(connection.execute("SELECT kind,count(*) FROM catalog_current GROUP BY kind"))
             coverage = dict(connection.execute(
@@ -215,6 +216,9 @@ def read_index(root):
         selected = {"documents": len(config["documents"]),
                     "renditions": len(config.get("renditions", []))}
         db = index.validate_db_path(root, root / policy.validate_instance_roots(root)["context_index_db"])
+        if db.is_file() and (db.stat().st_mode & 0o777 != 0o600
+                             or db.parent.stat().st_mode & 0o777 != 0o700):
+            return {"available": False, "error": "not_private", "fresh": False}
         with closing(index.readonly(db)) as connection:
             reasons = index.freshness(connection, root, manifest, db, config, checksum)
             counts = index.count_index(connection)

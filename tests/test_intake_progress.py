@@ -136,7 +136,6 @@ class MixedStateTests(ProgressCase):
                                      "select": None, "publish": None})
 
     def test_funnel_counts_and_stage_matrix(self):
-        progress.snapshot(self.root)  # warm the catalog's existing read-validation cache
         before = self.files()
         result = progress.snapshot(self.root, limit=100)
         self.assertEqual(self.files(), before, "progress must not write the stores")
@@ -206,6 +205,25 @@ class CatalogAndIndexTests(ProgressCase):
         self.assertFalse(result["index"]["available"])
         self.assertIn("error", result["index"])
         self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_index_freshness_counts_and_public_index(self):
+        from tools.context_index import cli as index_cli
+        manifest = self.root / "config/selection.json"
+        manifest.parent.mkdir()
+        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.SETTINGS["audience"],
+                                        "documents": [], "context_rules": {}, "renditions": []}))
+        with patch("sys.stdout"):
+            self.assertEqual(index_cli.main(["--root", str(self.root), "build"]), 0)
+        before = self.files()
+        result = progress.snapshot(self.root)["index"]
+        self.assertEqual(self.files(), before)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["indexed"], {"documents": 0, "sections": 0})
+        self.assertEqual(result["selected"], {"documents": 0, "renditions": 0})
+        db = self.root / "tools/context_index/.local/index.sqlite3"
+        db.chmod(0o644)
+        self.assertEqual(progress.snapshot(self.root)["index"]["error"], "not_private")
 
 
 class CorruptLedgerTests(ProgressCase):
