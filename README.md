@@ -32,6 +32,21 @@ python3 -m venv .venv
 If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 `python3 -m pip --python .venv/bin/python install ./tools/context-mcp`.
 
+### Development and agent worktrees
+
+Every clone or Git worktree needs its own `.venv`; the main checkout's
+environment is not copied. Create the environment and install
+`./tools/context-mcp` as above before running tests. Reinstall when dependency
+declarations change. Tests use temporary workspaces, so development-only
+checkouts do not need store initialization or preflight.
+
+`ModuleNotFoundError: No module named 'mcp'` means the selected interpreter
+lacks the MCP SDK declared in `tools/context-mcp/pyproject.toml`. Install the
+adapter into that worktree's environment and run tests with
+`.venv/bin/python`, not bare `python3`. If `.venv` exists but lacks `pip`, use
+the host-pip fallback above without recreating the environment. Do not skip
+MCP tests or install packages globally to hide the setup failure.
+
 ## Configuration
 
 | File | Purpose |
