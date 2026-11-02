@@ -91,14 +91,15 @@ def _html_parts(message):
         require(depth <= MAX_DEPTH and part.defects == [], "mime-malformed")
         if part.get_content_maintype() == "message":
             continue  # forwarded or embedded messages are not the exported page
+        if str(part.get("Content-Disposition", "")).split(";")[0].strip().lower() == "attachment":
+            continue  # an attachment, and everything inside it, is not the exported page
         if part.is_multipart():
             stack.extend((child, depth + 1) for child in reversed(part.get_payload()))
             continue
         require(part.get_content_maintype() != "multipart", "mime-malformed")
         leaves += 1
         require(leaves <= MAX_PARTS, "mime-malformed")
-        disposition = str(part.get("Content-Disposition", "")).split(";")[0].strip().lower()
-        if part.get_content_type() == "text/html" and disposition != "attachment":
+        if part.get_content_type() == "text/html":
             found.append((leaves, part))
     return found
 

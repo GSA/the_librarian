@@ -103,6 +103,14 @@ class ConvertTests(unittest.TestCase):
         self.assertNotIn("ATTACHED", joined)
         self.assertNotIn("FORWARDED", joined)
 
+    def test_html_inside_an_attached_multipart_container_is_ignored(self):
+        inner = "--%s\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>NESTEDATTACHED</p>\r\n" % "inner"
+        container = ("--%s\r\nContent-Type: multipart/mixed; boundary=inner\r\n"
+                     "Content-Disposition: attachment\r\n\r\n%s--inner--\r\n" % (B, inner))
+        joined = "".join(self.lines(message(html_part(), container)))
+        self.assertNotIn("NESTEDATTACHED", joined)
+        self.assertIn("Fund Code Maintenance", joined)
+
     def test_multiple_html_parts_are_all_included_in_order(self):
         second = html_part("<p>Second part text</p>")
         lines = self.lines(message(html_part("<p>First part text</p>"), second))
