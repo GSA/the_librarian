@@ -11,6 +11,7 @@ any checkout with ``--tree`` to compare revisions on identical fixtures.
     python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200,400 --resume
 """
 import argparse
+import contextlib
 from collections import Counter
 import hashlib
 import json
@@ -43,8 +44,11 @@ def fixture(inbox, count, seed="bench"):
         path.write_text(body, encoding="utf-8")
 
 
+@contextlib.contextmanager
 def instrument(timers):
+    """Time the STAGES functions into ``timers``; always restore the originals on exit."""
     import importlib
+    saved = []
 
     def wrap(module, name):
         original = getattr(module, name)
@@ -58,11 +62,17 @@ def instrument(timers):
                 entry[0] += 1
                 entry[1] += time.perf_counter() - start
                 entry[2] += time.process_time() - cpu
+        saved.append((module, name, original))
         setattr(module, name, timed)
-    for module_name, name in STAGES:
-        module = importlib.import_module(module_name)
-        if hasattr(module, name):
-            wrap(module, name)
+    try:
+        for module_name, name in STAGES:
+            module = importlib.import_module(module_name)
+            if hasattr(module, name):
+                wrap(module, name)
+        yield timers
+    finally:
+        for module, name, original in reversed(saved):
+            setattr(module, name, original)
 
 
 def percentile(values, fraction):
@@ -137,14 +147,14 @@ def run_size(size, resume, work):
     catalog.initialize(root)
     fixture(inbox, size)
     timers = {}
-    instrument(timers)
     result = {"files": size}
-    if resume:
-        half = size // 2
-        result["first_half"] = phase(cohort, root, inbox, half, timers)
-        result["resumed"] = phase(cohort, root, inbox, None, timers)
-    else:
-        result["ingest"] = phase(cohort, root, inbox, None, timers)
+    with instrument(timers):
+        if resume:
+            half = size // 2
+            result["first_half"] = phase(cohort, root, inbox, half, timers)
+            result["resumed"] = phase(cohort, root, inbox, None, timers)
+        else:
+            result["ingest"] = phase(cohort, root, inbox, None, timers)
     result["backups"] = backups(root)
     result["final"] = totals(root)
     start = time.perf_counter()

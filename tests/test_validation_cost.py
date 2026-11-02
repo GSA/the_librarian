@@ -107,5 +107,22 @@ class IncrementalGraphTests(unittest.TestCase):
         self.assertLessEqual(max(costs), 12)
 
 
+class BenchmarkInstrumentationTests(unittest.TestCase):
+    def test_instrumentation_is_removed_between_measured_runs(self):
+        from tools.catalog import catalog_store
+        from tools.diagnostics import ingest_benchmark as bench
+        original = catalog_store.inspect
+        first, second = {}, {}
+        with bench.instrument(first):
+            self.assertIsNot(catalog_store.inspect, original)
+        self.assertIs(catalog_store.inspect, original)
+        with bench.instrument(second):
+            with self.assertRaises(Exception):
+                catalog_store.inspect(None)
+        self.assertIs(catalog_store.inspect, original)
+        self.assertEqual(first, {})
+        self.assertEqual(second["catalog_store.inspect"][0], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,9 @@ by reverse-applying that change), `main` (0010 plus cohort intake) and `fix`
 (this decision). Each size ingests half the files, then resumes over all of
 them (already-ingested files take the idempotent path). Runs shared a 14-core
 host and the 400-file runs overlapped other work, so compare shapes rather
-than third-digit values.
+than third-digit values. The tables were recorded before the harness restored its
+timing wrappers between sizes, so later sizes carry a small, equal-per-tree
+wrapper overhead; the harness now restores them.
 
 | Tree | Files | Ingest wall (s) | CPU (s) | Ingest p50 / p95 (ms) | Resume wall (s) | Resume p50 / p95 (ms) | Resume first→last decile (ms) | Backups |
 |---|---|---|---|---|---|---|---|---|
