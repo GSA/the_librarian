@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from tools.extraction import extract
+from tools.extraction import extract, mhtml
 from . import runner, store, upload
 from .contracts import IntakeError
 
@@ -30,9 +30,14 @@ REASON = "Read-only local cohort intake; copy only, not extraction review or qua
 OUTCOMES = ("received", "extracted", "failed", "changed-since-intake", "not-processed")
 
 
-def submission(relative, system):
-    """Stable ASCII-safe submission identity, name and locator for one inbox path."""
-    key = hashlib.sha256((system + "\0" + relative).encode("utf-8")).hexdigest()[:24]
+def submission(relative, system, fmt=None):
+    """Stable ASCII-safe submission identity, name and locator for one inbox path.
+
+    Files read as MIME HTML get a distinct identity from the plain-text identity an
+    earlier toolkit version may have used, so they are received and extracted again.
+    """
+    salt = "\0" + fmt if fmt == "mhtml" else ""
+    key = hashlib.sha256((system + "\0" + relative + salt).encode("utf-8")).hexdigest()[:24]
     base = unicodedata.normalize("NFKD", relative.rsplit("/", 1)[-1])
     base = base.encode("ascii", "ignore").decode("ascii")
     stem, dot, suffix = base.rpartition(".") if "." in base else (base, "", "")
@@ -46,18 +51,25 @@ def submission(relative, system):
 
 
 def _format(path, relative, raw, root):
+    """Return (format, refusal code); MIME content wins over any text suffix."""
     suffix = path.suffix.lower()
     if suffix == ".odt":
-        return "odt"
+        return "odt", None
+    if suffix in extract.TEXT_SUFFIXES and mhtml.recognised(raw):
+        try:
+            mhtml.payload(raw)
+        except mhtml.MhtmlError as error:
+            return None, error.code
+        return "mhtml", None
     if suffix == ".txt":
         try:
             extract.gemini(raw, root)
-            return "gemini-txt"
+            return "gemini-txt", None
         except (extract.ExtractionError, UnicodeDecodeError):
-            return "text"
+            return "text", None
     if suffix in extract.TEXT_SUFFIXES:
-        return "text"
-    return None
+        return "text", None
+    return None, None
 
 
 def _disposition(root, inbox, path, relative):
@@ -83,15 +95,18 @@ def _disposition(root, inbox, path, relative):
         return {**entry, "format": fmt, "disposition": "over-limit" if over else "needs-runtime"}
     if suffix not in extract.TEXT_SUFFIXES | {".odt"}:
         return {**entry, "disposition": "needs-reader"}
-    limit = max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "odt"))
+    limit = max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "mhtml", "odt"))
     if size > limit:
         return {**entry, "disposition": "over-limit"}
     try:
         raw = upload.read_file(path, limit)
     except IntakeError as error:
         return {**entry, "disposition": "unsafe-path", "code": error.code}
-    fmt = _format(path, relative, raw, root)
+    fmt, refusal = _format(path, relative, raw, root)
     entry.update(format=fmt, sha256=hashlib.sha256(raw).hexdigest())
+    if refusal:
+        # MIME that cannot be read strictly is never admitted as raw encoded text.
+        return {**entry, "disposition": "needs-reader", "code": refusal}
     if size > upload.FORMATS[fmt][1]:
         return {**entry, "disposition": "over-limit"}
     try:
@@ -142,11 +157,13 @@ def _request(root, correlation_id, stage_id, operation, arguments):
 
 def _extract(root, entry, actor):
     base = {"receipt": entry["receipt_id"], "format_name": entry["format"]}
-    stage = _request(root, "extract-" + entry["submission_id"], "prepare", "extract-prepare", base)
+    # The reader version is part of the request identity: a new MIME reader version extracts again.
+    version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
+    stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare", "extract-prepare", base)
     if stage["status"] == "succeeded":
         # Registration pins the catalog state when staged, immediately before it runs;
         # a repeated registration is idempotent by its saved request.
-        stage = _request(root, "register-" + entry["submission_id"], "register",
+        stage = _request(root, "register-" + entry["submission_id"] + version, "register",
                          "extract-register", {**base, "actor": actor,
                                               "expected_state": catalog.status(root)["state_token"]})
     if stage["status"] != "succeeded":
@@ -158,11 +175,18 @@ def _extract(root, entry, actor):
 
 
 def _process(root, inbox, entry, system, actor):
-    identity = submission(entry["relative"], system)
+    identity = submission(entry["relative"], system, entry["format"])
     entry.update(identity)
+    superseded = None
+    if entry["format"] == "mhtml":
+        # An entry ingested before MIME recognition (as plain text) is corrected, not kept.
+        earlier = submission(entry["relative"], system)["submission_id"]
+        if upload.ledger_request(root, upload.correlation(earlier)) is not None:
+            superseded = earlier
     try:
         ack = upload.submit(root, Path(inbox) / entry["relative"], upload.descriptor(
             submission_id=identity["submission_id"], format_name=entry["format"],
+            correction_of=superseded,
             name=identity["name"], actor=actor, reason=REASON, origin_kind="local-path",
             origin_system=system, origin_locator=identity["locator"],
             expected_sha256=entry["sha256"]))
