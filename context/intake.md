@@ -15,8 +15,8 @@ named stage. The ledger is operational recovery state, never corpus authority.
   argument fields. Preserve native attribution and original concurrency tokens.
 - Intake stores exact requests before effects. Prepared intent commits before
   an execution attempt. Restart reconciles unfinished attempts without charging
-  another attempt. Catalog/review retries use original request IDs and verified
-  native backups; evidence records original committed revisions, not current
+  another attempt. Catalog/review retries use original request IDs and daily
+  verified native snapshots (a retry or same-day write reports `backup: null`); evidence records original committed revisions, not current
   unrelated revisions. Docling reruns the offline native lifecycle, binding
   source/runtime/rendition identity; no auto-review or selection. Intake passes
   the pinned identity to the native lifecycle as `expected_identity`, so a

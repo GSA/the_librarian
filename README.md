@@ -36,7 +36,7 @@ If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 
 | File | Purpose |
 | --- | --- |
-| `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` |
+| `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` and `backup_retention_days` |
 | `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git |
 | `config/selection.local.json` | Instance selection override, ignored by Git (same schema as `config/selection.json`; auto-selected when `--manifest` is omitted) |
 
@@ -46,8 +46,13 @@ Default stores (configurable via `storage_roots` and bound in `.local/instance.j
 `data/extractions/.local` (extracted renditions), `.local/intake` (optional intake
 recovery ledger), and `.local/diagnostics/retrieval.jsonl` (default path for the
 diagnostics CLI; MCP retrieval logging is opt-in via `--diagnostics-log`). Each
-catalog `submit` and review-event `append` creates verified pre-write and
-post-write backups.
+catalog `submit` and review-event `append` takes a verified snapshot before the
+write only when the store has none for the current UTC day, then deletes
+snapshots older than seven days (set `backup_retention_days` in
+`config/policy.local.json` to change). `python3 -m tools.backups status` reports
+backup count and size; `python3 -m tools.backups prune` is a dry run and
+`--apply` keeps the newest verified snapshot per day. See
+[decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
 
 ## Ingesting files (current manual method)
 

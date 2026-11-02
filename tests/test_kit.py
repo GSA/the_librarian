@@ -410,7 +410,10 @@ class WorkspaceTests(WorkspaceCase):
                            expected_state="outdated", reason="Structural contract test")
         packet = catalog.read_records(self.root, receipt="D1")
         self.assertEqual(compact_records.expand_catalog(compact_records.compact_catalog(packet)), packet)
-        snapshot = Path(result["backup"]["snapshot"])
+        # Initialisation already took today's snapshot, so the write and its retry take none.
+        self.assertIsNone(result["backup"])
+        self.assertIsNone(retry["backup"])
+        snapshot = Path(catalog.backup(self.root)["snapshot"])
         self.assertEqual(catalog.verify_backup(snapshot), result["state"])
         restored = self.root / "restored"
         restored.mkdir()
@@ -447,7 +450,8 @@ class WorkspaceTests(WorkspaceCase):
                 db.execute("DELETE FROM events")
         destination = self.root / "recovered"
         destination.mkdir()
-        events.restore(destination, Path(result["backup"]["snapshot"]))
+        self.assertIsNone(result["backup"])
+        events.restore(destination, Path(events.backup(self.root)["snapshot"]))
         self.assertEqual(events.status(destination)["state_token"], result["state_token"])
 
     def test_invalid_native_event_rejected(self):
