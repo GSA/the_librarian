@@ -81,6 +81,13 @@ class DailySnapshots(unittest.TestCase):
         os.chmod(self.files()[0], 0o600)
         self.assertIsNotNone(self.write("S1")["backup"])
 
+    def test_same_length_corruption_does_not_satisfy_the_daily_gate(self):
+        path = self.files()[0]
+        raw = bytearray(path.read_bytes())
+        raw[-1] ^= 0xFF
+        path.write_bytes(bytes(raw))
+        self.assertIsNotNone(self.write("S1")["backup"])
+
     def test_snapshots_older_than_the_window_are_pruned_after_the_new_one(self):
         self.write("S1")
         for _ in range(9):

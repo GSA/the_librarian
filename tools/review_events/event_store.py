@@ -424,9 +424,10 @@ def prune(root, *, apply=False):
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db)) as connection:
         store_id = inspect(connection, root)[0]["store_id"]
-    return snapshots.prune(backups, store_id=store_id, verify=lambda path: verified_snapshot(path, root),
-                           errors=(contract.ReviewError,), days=contract.policy.backup_retention_days(root),
-                           apply=apply, thin=True)
+        # Hold the writer lock so prune cannot overlap a write's retention or a restore.
+        return snapshots.prune(backups, store_id=store_id, verify=lambda path: verified_snapshot(path, root),
+                               errors=(contract.ReviewError,), days=contract.policy.backup_retention_days(root),
+                               apply=apply, thin=True)
 
 
 def verified_snapshot(path, root=None):

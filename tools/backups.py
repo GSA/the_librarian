@@ -8,6 +8,7 @@ so both stores follow one rule. Source document text is never read here.
 """
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -55,6 +56,14 @@ def _fsync_directory(path):
         os.close(descriptor)
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class Entry:
     """One backup stem: a snapshot, its receipt and any partial leftovers."""
 
@@ -85,17 +94,17 @@ class Entry:
         return state.get("store_id") if isinstance(state, dict) else None
 
     def intact(self, store_id):
-        """Per-write gate: receipt names this store and matches the snapshot's size.
+        """Per-write gate: receipt names this store and the snapshot bytes match its hash.
 
-        Content verification happened when the snapshot was taken and happens again
-        before anything is pruned; hashing the whole file on every write would make
-        write cost grow with store size.
+        Only today's snapshot is hashed (one sequential read, stopping at the first
+        intact one), so write cost grows with store size, not with write count.
         """
         record = self.record
         if record is None or self.snapshot is None or self.store_id != store_id:
             return False
         try:
-            return record["database"] == self.snapshot.name and os.lstat(self.snapshot).st_size == record["bytes"]
+            return (record["database"] == self.snapshot.name and os.lstat(self.snapshot).st_size == record["bytes"]
+                    and _sha256(self.snapshot) == record["sha256"])
         except OSError:
             return False
 

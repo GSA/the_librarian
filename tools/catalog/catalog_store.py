@@ -312,8 +312,9 @@ def prune(root, *, apply=False):
     with writer_lock(home), closing(connect(db)) as connection:
         connection.execute("BEGIN")
         store_id = inspect(connection)[0]["store_id"]
-    return snapshots.prune(backups, store_id=store_id, verify=verify_backup, errors=(CatalogError,),
-                           days=policy.backup_retention_days(root), apply=apply, thin=True)
+        # Hold the writer lock so prune cannot overlap a write's retention or a restore.
+        return snapshots.prune(backups, store_id=store_id, verify=verify_backup, errors=(CatalogError,),
+                               days=policy.backup_retention_days(root), apply=apply, thin=True)
 
 
 def _snapshot(connection, backups, reason):
