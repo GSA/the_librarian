@@ -15,7 +15,7 @@ import sys
 import unicodedata
 import uuid
 
-from tools import policy
+from tools import backups as snapshots, policy
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
     CatalogError, canonical, choice, exact, fingerprint, hash_value, identifier,
@@ -293,6 +293,30 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def _daily_snapshot(root, connection, backups, state):
+    """Verified snapshot before the write, only when the UTC day has none; then bounded retention."""
+    return snapshots.daily_snapshot(
+        backups, store_id=state["store_id"],
+        take=lambda: _snapshot_in_transaction(connection, backups, "daily"),
+        verify=verify_backup, errors=(CatalogError,), days=policy.backup_retention_days(root))
+
+
+def backup_inventory(root):
+    return snapshots.inventory(locations(root)[2])
+
+
+def prune(root, *, apply=False):
+    """Operator prune: newest verified snapshot per UTC day inside the window; dry run by default."""
+    home, db, backups = locations(root)
+    private_file(db)
+    with writer_lock(home), closing(connect(db)) as connection:
+        connection.execute("BEGIN")
+        store_id = inspect(connection)[0]["store_id"]
+        # Hold the writer lock so prune cannot overlap a write's retention or a restore.
+        return snapshots.prune(backups, store_id=store_id, verify=verify_backup, errors=(CatalogError,),
+                               days=policy.backup_retention_days(root), apply=apply, thin=True)
+
+
 def _snapshot(connection, backups, reason):
     owned_transaction = not connection.in_transaction
     if owned_transaction:
@@ -316,7 +340,7 @@ def _snapshot_in_transaction(connection, backups, reason):
         with closing(connect(partial)) as target:
             require(inspect(target)[0] == state, "Backup state mismatch")
         seal(partial)
-        record = {"backup_version": VERSION, "created_at": now(), "reason": reason, "database": final.name,
+        record = {"backup_version": VERSION, "created_at": snapshots.utcnow().isoformat(), "reason": reason, "database": final.name,
                   "sha256": file_hash(partial), "bytes": partial.stat().st_size, "state": state}
         os.link(partial, final, follow_symlinks=False)
         partial.unlink()
@@ -453,21 +477,17 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
         prior = next((batch for batch in batches if batch["request_id"] == request_id), None)
         if prior is not None:
             require(prior["input_hash"] == input_hash, "Request ID reused with different actor, reason, or records")
-            try:
-                recovery = _snapshot(connection, backups, "retry")
-            except (OSError, sqlite3.Error, CatalogError) as error:
-                raise CatalogError("Request already committed; retry the same request: backup failed") from error
             if precommit_check is not None:
                 precommit_check()
             return {"command": "submit", "idempotent": True, **state, "state": state,
                     "request_id": request_id, "committed_revision": prior["revision"],
                     "committed_at": prior["committed_at"], "committed_state": committed_states[prior["revision"]],
-                    "backup": recovery}
+                    "backup": None, "retention": None}
         require(expected_state == state["state_token"], "Stale expected state; re-read before writing")
         resulting = dict(current)
         resulting.update((record["id"], record) for record in incoming)
         validate_graph(resulting)
-        pre = _snapshot(connection, backups, "pre-write")
+        taken, retention = _daily_snapshot(root, connection, backups, state)
         connection.execute("COMMIT")
         committed = False
         revision = state["revision"] + 1
@@ -490,8 +510,7 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             connection.execute("COMMIT")
             committed = True
             seal(db)
-            post = _snapshot(connection, backups, "post-write")
-            written = post["state"]
+            written = make_state(state, revision, batch["revision_hash"], len(resulting))
         except (OSError, sqlite3.Error, CatalogError) as error:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -502,7 +521,7 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             raise
         return {"command": "submit", "idempotent": False, **written, "state": written,
                 "request_id": request_id, "committed_revision": revision, "committed_at": batch["committed_at"],
-                "committed_state": written, "pre_backup": pre, "backup": post}
+                "committed_state": written, "backup": taken, "retention": retention}
 
 
 def read_records(root, *, kind=None, receipt=None, source=None, path=None, coverage=None,

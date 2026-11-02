@@ -10,6 +10,8 @@ from pathlib import PurePosixPath
 from tools.context_index import qualification
 
 
+# One instance publishes a reviewed cohort (thousands of files), not a hand-picked handful.
+MAX_SELECTIONS = 5000
 DOCLING_MAX_PAGES = 100
 DOCLING_MAX_RECORDS = 10000
 DOCLING_RENDER_SCALE = 3.0
@@ -26,15 +28,15 @@ def eligible(path, root=None):
 
 def validate(config, engine, root=None):
     selections = config.get("renditions", [])
-    if not isinstance(selections, list) or len(selections) > 10:
-        engine.fail("renditions must be a list of at most ten explicit selections")
+    if not isinstance(selections, list) or len(selections) > MAX_SELECTIONS:
+        engine.fail(f"renditions must be a list of at most {MAX_SELECTIONS} explicit selections")
     seen = set()
     for item in selections:
         engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),
                       "Rendition selection", optional=("review_event_ids",))
         if (not eligible(item["path"], root) or item["path"] in seen
                 or PurePosixPath(item["path"]).parts[-3] != item["receipt_id"]
-                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "odt", "docling"}
+                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "mhtml", "odt", "docling"}
                 or not isinstance(item["sha256"], str)
                 or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
             engine.fail("Invalid or duplicate rendition selection")
@@ -46,8 +48,9 @@ def validate(config, engine, root=None):
         if (item["format"] == "docling" and
                 (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
             engine.fail("Docling selection requires unique review_event_ids")
-        if item["format"] != "docling" and review_ids is not None:
-            engine.fail("review_event_ids are supported only for Docling selections")
+        if (item["format"] != "docling" and review_ids is not None
+                and (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
+            engine.fail("Reviewed extraction selection requires unique review_event_ids")
         if not item["context"]:
             engine.fail("Rendition selection requires maintained source context")
         engine.validate_context(item["context"])
@@ -63,7 +66,8 @@ def inputs(root, config, engine, review_snapshot=None):
     if not selections:
         return [], ""
     catalog = engine.load_catalog()
-    if any(item["format"] == "docling" for item in selections) and review_snapshot is None:
+    if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
+            and review_snapshot is None):
         review_snapshot = engine.load_event_reader().read_snapshot(root)
     snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
     state = snapshot["state"]["state_token"]
@@ -93,6 +97,8 @@ def inputs(root, config, engine, review_snapshot=None):
                     if item["format"] == "gemini-txt" else
                     ("format", "scope", "warnings", "lines", "bom_bytes", "ends_with_terminator")
                     if item["format"] == "text" else
+                    ("format", "scope", "warnings", "lines", "method", "parts")
+                    if item["format"] == "mhtml" else
                     ("format", "scope", "warnings", "nodes", "xml_sha256", "members", "unrendered_features"))
         if item["format"] != "docling":
             engine.fields(payload, required, "Extraction payload")
@@ -151,6 +157,8 @@ def inputs(root, config, engine, review_snapshot=None):
         payload = value.get("payload")
         if item["format"] == "text":
             validate_text_mapping(payload, original_raw, engine)
+        elif item["format"] == "mhtml":
+            validate_mhtml(payload, original_raw, engine)
         identity = {"original": original, "rendition": child, "relationship": relation,
                     "source": source, "rendition_sha256": item["sha256"]}
         docling_qualification = None
@@ -158,6 +166,9 @@ def inputs(root, config, engine, review_snapshot=None):
             docling_qualification = qualification.docling(
                 item, value, identity, review_snapshot, engine)
             validate_docling_conversion(value, engine)
+        elif "review_event_ids" in item:
+            docling_qualification = qualification.extract(
+                item, value, identity, review_snapshot, engine)
         metadata = {
             "source": source, "rendition_path": item["path"], "rendition_sha256": item["sha256"],
             "extractor": value["extractor"], "run_id": run,
@@ -170,6 +181,9 @@ def inputs(root, config, engine, review_snapshot=None):
                           if item["format"] == "gemini-txt" else
                           "All byte-mapped physical text lines explicitly selected; decoding is not review."
                           if item["format"] == "text" else
+                          "All converted plain-text lines of the decoded MIME HTML parts explicitly selected; "
+                          "conversion is not review."
+                          if item["format"] == "mhtml" else
                           "Strictly qualified selected Docling structural records."
                           if item["format"] == "docling" else
                           "Located XML records only; text rendition, not a rendered or approved view."),
@@ -181,17 +195,28 @@ def inputs(root, config, engine, review_snapshot=None):
                 "Resolve source_location for the original line, byte range or XML member/element. "
                 "Extraction and retrieval are not new review, corroboration or acceptance."),
         }
-        for key in ("precedence", "xml_sha256", "unrendered_features", "bom_bytes", "ends_with_terminator"):
+        for key in ("precedence", "xml_sha256", "unrendered_features", "bom_bytes", "ends_with_terminator",
+                    "method", "parts"):
             if payload is not None and key in payload:
                 metadata[key] = payload[key]
         if docling_qualification is not None:
             metadata["qualification"] = docling_qualification
+            identity["qualification"] = docling_qualification
+        if item["format"] == "docling":
             metadata["confidence"] = value["conversion"]["confidence"]
             metadata["omissions"] = value["conversion"]["omissions"]
-            identity["qualification"] = docling_qualification
         result.append((item, raw, value, metadata))
         identities.append(identity)
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
+
+
+def validate_mhtml(payload, source_raw, engine):
+    """The stored conversion must equal a fresh strict conversion of the exact original bytes."""
+    from tools.extraction import mhtml
+    try:
+        mhtml.verify(payload, source_raw)
+    except mhtml.MhtmlError:
+        engine.fail("MIME HTML rendition does not match a fresh conversion of the original")
 
 
 def validate_text_mapping(payload, source_raw, engine):
@@ -419,7 +444,7 @@ def records(raw, value, engine):
     payload = value["payload"]
     # Full text/source-byte comparison was performed by inputs() before this
     # record generator receives a selected rendition.
-    key = "lines" if payload["format"] in {"gemini-txt", "text"} else "nodes"
+    key = "lines" if payload["format"] in {"gemini-txt", "text", "mhtml"} else "nodes"
     if not payload[key]:
         return
     match = re.search(r'^\s*"' + key + r'": \[\s*$', text, re.M)
@@ -437,6 +462,8 @@ def records(raw, value, engine):
                     or record["section"] not in {
                         "unclassified", "generated-notes", "transcript", "transcript-footer"}):
                 engine.fail("Invalid transcript line numbering/classification")
+        elif payload["format"] == "mhtml":
+            engine.fields(record, ("line", "text", "part"), "MIME HTML line")
         elif payload["format"] != "text":
             engine.fields(record, ("member", "locator", "tag", "attributes", "text", "tail"),
                           "ODT node", optional=("paragraph_text",))
@@ -460,6 +487,12 @@ def records(raw, value, engine):
             elif timestamp:
                 parent = timestamp
             title = record.get("speaker_label_as_written", record.get("timestamp_label", "Transcript"))
+            search_text = record["text"]
+        elif payload["format"] == "mhtml":
+            anchor = "line-" + str(record["line"])
+            location = {"json_pointer": f"/payload/lines/{index}",
+                        "converted_line": record["line"], "html_part": record["part"]}
+            title = "Line " + str(record["line"])
             search_text = record["text"]
         elif payload["format"] == "text":
             anchor = "line-" + str(record["line"])

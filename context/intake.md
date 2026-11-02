@@ -9,14 +9,15 @@ named stage. The ledger is operational recovery state, never corpus authority.
   Each stage has `id`, `kind`, `operation`, `arguments`. Closed fields, duplicate
   key refusal, 1 MiB request limit, 16 stages, 1–10 attempts, 0–86400s backoff.
 - Fixed adapters: receipt/catalog-submit; extraction/docling-prepare,
-  docling-verify, docling-register; review/review-append;
+  docling-verify, docling-register; extraction/extract-prepare, extract-register
+  (strict UTF-8 `text`, `gemini-txt`, `mhtml`, `odt`); review/review-append;
   publication/index-build; review/standing-review, publication/standing-select,
   publication/standing-publish; return/await-ack. See `tools/intake/contracts.py` for
   argument fields. Preserve native attribution and original concurrency tokens.
 - Intake stores exact requests before effects. Prepared intent commits before
   an execution attempt. Restart reconciles unfinished attempts without charging
-  another attempt. Catalog/review retries use original request IDs and verified
-  native backups; evidence records original committed revisions, not current
+  another attempt. Catalog/review retries use original request IDs and daily
+  verified native snapshots (a retry or same-day write reports `backup: null`); evidence records original committed revisions, not current
   unrelated revisions. Docling reruns the offline native lifecycle, binding
   source/runtime/rendition identity; no auto-review or selection. Intake passes
   the pinned identity to the native lifecycle as `expected_identity`, so a
@@ -34,8 +35,11 @@ named stage. The ledger is operational recovery state, never corpus authority.
   `standing-policy-v1` file by SHA-256 (id, version, active/revoked status,
   reviewer, receipt/audience scope, page/record/findings budgets, selection
   context) and an attributed `standing-findings-v1` record for one exact
-  registered Docling rendition. Only findings that inspected every page, text
-  record, table and individual warning (`#/warnings/N`), with no contradictions or missing evidence, are
+  registered Docling or extraction rendition. Only findings that inspected every
+  page, text record, table and individual warning (`#/warnings/N`) of a Docling
+  rendition, or every payload record (`records: [index]`) and warning
+  (`#/payload/warnings/N`) of a text, transcript or ODT rendition, with no
+  contradictions or missing evidence, are
   `qualified`; parser success and confidence never qualify. Other outcomes
   (`pending-review`, `rejected`, `deferred`, `exception`) block visibly with a
   reason code and write nothing. Missing findings are a retryable
@@ -70,7 +74,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
 
 ## Manual upload and local drop
 
-`submit-file FILE --submission-id ID --format {text,gemini-txt,odt,pdf,image}
+`submit-file FILE --submission-id ID --format {text,gemini-txt,mhtml,odt,pdf,image}
 --actor A --reason R` stages one explicitly supplied file. Optional
 `--name`, `--correction-of`, `--expected-sha256` and declared
 `--origin-system/--origin-locator/--origin-version`.
@@ -98,10 +102,104 @@ named stage. The ledger is operational recovery state, never corpus authority.
   replacement plans fresh records against the current catalog, links the
   ledger requests, and leaves the stranded request visible. A parent that can
   still commit is `correction_parent_pending`; retry it exactly instead.
+- `--origin-kind local-path` records a copy of a local file: a system label and
+  a relative locator (`identity_basis: local-path-copy`), never a remote
+  identity or version.
 - `drop-scan --drop DIR` is discovery only. `drop-submit --drop DIR` submits each
   `NAME` paired with `NAME.submission.json` (the v1 descriptor fields). The drop
   must exist and contain `.librarian-drop`; a missing or unmarked mount is
   `drop_unavailable`, never an empty success. Drop contents are never modified.
 
+## Progress view
+
+`progress` and `progress-serve` are read-only, body-free observation of a run;
+they never stage, run, replay, repair or initialize anything, and a missing,
+locked, public or corrupt ledger, catalog, review-event store or index is
+reported as that source being unavailable with its error class, never a crash.
+
+```sh
+.venv/bin/python -m tools.intake.cli --root . progress [--format text] [--run bulk=upload-bulk-]
+.venv/bin/python -m tools.intake.cli --root . progress-serve [--port 8765] [--refresh 5]
+```
+
+- The ledger is opened `mode=ro` without the writer lock and fully validated in
+  one read transaction; the catalog and review events use their validated
+  read paths, and the index reports freshness, stale reasons, indexed
+  documents/sections and selected documents/renditions.
+- Each request maps to one funnel state from its ordered stage statuses and
+  last attempt: `staged`, `received` (receipt committed), `extracting`,
+  `extracted`, `pending-review`, `reviewed`, `qualified`, `selected`,
+  `published`, or the exceptions `rejected`, `deferred`, `exception`
+  (blocked `standing-<outcome>-*` codes), `skipped-by-format`
+  (`unsupported-type`, `type-mismatch`, `unsupported-format`,
+  `skipped-by-format`), `needs-reader` (`needs-reader*`), `blocked` and
+  `dead-letter`. Per kind, stage counts by ledger status are also shown.
+- Recent and needs-attention items carry correlation ID, current stage,
+  operation, status, funnel state and last attempt outcome/category/code and
+  times only; request arguments, intents, evidence and document text are never
+  read into the report. `--run NAME=PREFIX` groups correlation IDs by prefix.
+- `progress-serve` serves `/` (HTML, `meta refresh`, no scripts or external
+  assets) and `/progress.json`, GET/HEAD only, with `Cache-Control: no-store`
+  and a deny-all CSP. It binds `127.0.0.1` by default, rejects non-loopback
+  `Host` headers, and refuses any non-loopback `--host` with
+  `non_loopback_bind` unless `--allow-non-loopback` records explicit approval.
+
 No acquisition, connector, scheduler, unauthorized review/selection, migration,
 model service or return transport is supplied by this interface.
+
+## Read-only cohort intake
+
+`python -m tools.intake.cohort classify --root ROOT --inbox DIR [--report FILE]`
+gives every file below a read-only inbox exactly one disposition and prints
+body-free counts: `admit` (with format `text`, `gemini-txt`, `mhtml` or `odt`; a `.txt`
+that parses as a Gemini transcript is `gemini-txt`; a text-suffix file whose
+content starts with MIME headers, such as a Confluence "Exported From Confluence"
+`.doc`, is `mhtml`), `needs-runtime` (PDF and
+images awaiting a verified Docling runtime), `needs-reader` (no existing
+reader, for example Office formats, or MIME that cannot be read strictly; the
+report carries a `code` such as `mime-malformed`, `mime-no-html`, `mime-encoding`,
+`mime-charset` or `mime-empty`, and raw encoded text is never admitted instead), `archive-expanded` (a zip whose sibling
+`_extracted/<name>/` is classified instead), `skipped-asset` (web site assets),
+`skipped-artifact` (alternate-data-stream sidecars such as `:Zone.Identifier`),
+`unreadable` (fails strict UTF-8 or signature checks), `empty`, `over-limit` and
+`unsafe-path` (symlinks and non-regular files). Suffix is never format proof.
+
+`mhtml` extraction (`tools/extraction/mhtml.py`, stdlib `email` + `html.parser`)
+recognises MIME by content, reads only non-attachment `text/html` parts with
+strict transfer-encoding and charset decoding, converts them to plain-text lines
+and never follows links, scripts or images. The payload records
+`method {name: "mhtml-html-text", version}` and the parts read; the extractor
+identity covers the reader code, and a stored rendition must equal a fresh
+conversion of the original bytes. A file earlier ingested as plain `text` gets a
+new `mhtml` submission that is recorded as a correction of the old one
+(`correction_of`), so it is extracted again rather than kept. Bump
+`mhtml.METHOD_VERSION` when conversion output changes.
+
+`ingest ... --system LABEL --actor A [--limit N]` submits each admitted file as
+a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,
+percent-encoded inbox-relative locator, pinned SHA-256) and runs
+`extract-prepare` then `extract-register` through the ledger. Outcomes are
+counted as `received`, `extracted`, `failed`, `changed-since-intake` and
+`not-processed`; reruns are idempotent. The inbox is never written. The
+optional `--report` (0600) lists per-file paths, hashes and outcomes and is
+private instance data. Extraction never reviews, selects or qualifies.
+
+## Model-assisted standing review
+
+`tools/intake/model_review.py` turns one model's review of one exact extraction
+rendition into a private `standing-findings-v1` record under
+`<intake_home>/findings/`, exactly as the model reported it: partial inspection
+is never filled in, and replies that do not parse, name an unknown record or
+warning, or exceed the prompt or record budget write no findings. The standing
+policy's `reviewer` must be `usai:<model>`. Prompts mark document text as
+untrusted. The transport is restricted to models configured for the `usai`
+provider in a Pi `models.json`.
+
+`python -m tools.intake.model_review evaluate --root ROOT --models-config FILE
+--model M ... --rendition PATH ... [--controls]` scores candidate models on a
+sample (complete inspections, failed replies, decisions, token usage, time, and
+whether a synthetic garbled/injection control was rejected) and prints a
+body-free report with the selected model and rule. `estimate()` extrapolates
+sample token usage to the admitted count and bytes for a budget ceiling. Record
+the chosen model, rationale, estimate and approved ceiling privately before any
+bulk review, and actual usage after it.

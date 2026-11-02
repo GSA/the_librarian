@@ -410,7 +410,10 @@ class WorkspaceTests(WorkspaceCase):
                            expected_state="outdated", reason="Structural contract test")
         packet = catalog.read_records(self.root, receipt="D1")
         self.assertEqual(compact_records.expand_catalog(compact_records.compact_catalog(packet)), packet)
-        snapshot = Path(result["backup"]["snapshot"])
+        # Initialisation already took today's snapshot, so the write and its retry take none.
+        self.assertIsNone(result["backup"])
+        self.assertIsNone(retry["backup"])
+        snapshot = Path(catalog.backup(self.root)["snapshot"])
         self.assertEqual(catalog.verify_backup(snapshot), result["state"])
         restored = self.root / "restored"
         restored.mkdir()
@@ -447,7 +450,8 @@ class WorkspaceTests(WorkspaceCase):
                 db.execute("DELETE FROM events")
         destination = self.root / "recovered"
         destination.mkdir()
-        events.restore(destination, Path(result["backup"]["snapshot"]))
+        self.assertIsNone(result["backup"])
+        events.restore(destination, Path(events.backup(self.root)["snapshot"]))
         self.assertEqual(events.status(destination)["state_token"], result["state_token"])
 
     def test_invalid_native_event_rejected(self):
@@ -461,11 +465,11 @@ class WorkspaceTests(WorkspaceCase):
         with self.assertRaises(contract.ReviewError):
             events.prepare_submission(events.bundle([event]), self.root)
 
-    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast"):
-        self.registration("sources/notes.txt", raw)
-        prepared = extract.run(self.root, "prepare", "D1", "text")
-        extract.run(self.root, "verify", "D1", "text")
-        extract.run(self.root, "register", "D1", "text", "test-runner",
+    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast", name="sources/notes.txt", fmt="text"):
+        self.registration(name, raw)
+        prepared = extract.run(self.root, "prepare", "D1", fmt)
+        extract.run(self.root, "verify", "D1", fmt)
+        extract.run(self.root, "register", "D1", fmt, "test-runner",
                     catalog.status(self.root)["state_token"])
         child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
                      if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
@@ -475,10 +479,34 @@ class WorkspaceTests(WorkspaceCase):
                        reason="Explicit synthetic text selection")
         self.docs()
         self.config["renditions"] = [{"path": prepared["rendition"],
-            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": fmt,
             "context": ["documents/AGENTS.md"]}]
         self.build()
         return prepared
+
+    def test_selected_mime_html_is_searchable_as_decoded_text_not_raw_markup(self):
+        raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
+               b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+               b"<html><body><h1>Fund Codes</h1><p class=3D\"rule\">A fund code must be exactly "
+               b"four=\r\n characters.</p></body></html>\r\n")
+        prepared = self.selected_text(raw, "sources/page.doc", "mhtml")
+        with closing(index.readonly(self.db)) as db:
+            found = index.search(db, "exactly four characters", 10, None)
+            self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
+            self.assertEqual(index.search(db, "class", 10, None)["hits"], [])
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            self.assertEqual(packet["renditions"][prepared["rendition"]]["method"]["name"],
+                             "mhtml-html-text")
+
+    def test_mime_html_rendition_refuses_a_payload_that_differs_from_a_fresh_conversion(self):
+        from tools.extraction import mhtml
+        raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+               b"<p>one</p>\r\n")
+        api = index.rendition_api()
+        payload = mhtml.payload(raw)
+        payload["lines"][0]["text"] = "two\n"
+        with self.assertRaises(index.IndexError_):
+            index.renditions.validate_mhtml(payload, raw, api)
 
     def test_selected_text_round_trips_exact_lines_and_byte_locations(self):
         prepared = self.selected_text()
@@ -588,6 +616,21 @@ class WorkspaceTests(WorkspaceCase):
         event["uncertainties"] = []
         event["counts"].update(reviewed=1, pending=0)
         return selection, value, event
+
+    def test_rendition_selection_limit_is_shared_and_above_ten(self):
+        api = index.rendition_api()
+        api.validate_context = lambda context: None
+        api.eligible = lambda path: True
+        api.canonical_locator = lambda value: value
+        def selections(count):
+            return [{"path": f"data/extractions/.local/D{n + 1}/{'a' * 64}/extraction.json",
+                     "sha256": "b" * 64, "receipt_id": f"D{n + 1}", "format": "text",
+                     "context": ["documents/context.md"]} for n in range(count)]
+        self.assertGreater(index.renditions.MAX_SELECTIONS, 10)
+        index.renditions.validate({"renditions": selections(11)}, api)
+        with self.assertRaises(index.IndexError_):
+            index.renditions.validate(
+                {"renditions": selections(index.renditions.MAX_SELECTIONS + 1)}, api)
 
     def test_strict_docling_qualification_accepts_only_active_exact_file_review(self):
         api = index.rendition_api()
@@ -917,10 +960,14 @@ class WorkspaceTests(WorkspaceCase):
             invalid["review_event_ids"] = review_ids
             with self.subTest(review_ids=review_ids), self.assertRaises(index.IndexError_):
                 index.renditions.validate({"renditions": [invalid]}, api)
-        invalid = deepcopy(base)
-        invalid["format"] = "text"
-        with self.assertRaises(index.IndexError_):
-            index.renditions.validate({"renditions": [invalid]}, api)
+        reviewed_text = deepcopy(base)
+        reviewed_text["format"] = "text"
+        index.renditions.validate({"renditions": [reviewed_text]}, api)
+        for review_ids in ([], ["rev-exact", "rev-exact"], [1]):
+            invalid = deepcopy(reviewed_text)
+            invalid["review_event_ids"] = review_ids
+            with self.subTest(text_review_ids=review_ids), self.assertRaises(index.IndexError_):
+                index.renditions.validate({"renditions": [invalid]}, api)
 
     def test_selected_empty_text_is_refused_without_replacing_index(self):
         self.docs()
@@ -1088,6 +1135,15 @@ class WorkspaceTests(WorkspaceCase):
         self.assertEqual((self.root / "sources/notes.txt").read_bytes(), source_before)
         self.assertEqual(events.status(self.root)["state_token"], review_before)
         self.assertEqual(self.manifest.read_bytes(), manifest_before)
+
+    def test_text_extraction_accepts_shared_text_like_suffixes(self):
+        self.registration("sources/page.md", b"# Title\nbody\n")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        self.assertTrue(prepared["created"])
+        with self.assertRaisesRegex(extract.ExtractionError, "disagrees with source extension"):
+            extract.run(self.root, "prepare", "D1", "odt")
+        with self.assertRaisesRegex(extract.ExtractionError, "disagrees with source extension"):
+            extract.run(self.root, "prepare", "D1", "gemini-txt")
 
     def test_text_lifecycle_refuses_changed_source_and_conflicting_publication(self):
         self.registration("sources/notes.txt", b"stable\n")

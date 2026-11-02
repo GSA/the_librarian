@@ -51,7 +51,7 @@ MCP tests or install packages globally to hide the setup failure.
 
 | File | Purpose |
 | --- | --- |
-| `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` |
+| `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` and `backup_retention_days` |
 | `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git |
 | `config/selection.local.json` | Instance selection override, ignored by Git (same schema as `config/selection.json`; auto-selected when `--manifest` is omitted) |
 
@@ -61,8 +61,13 @@ Default stores (configurable via `storage_roots` and bound in `.local/instance.j
 `data/extractions/.local` (extracted renditions), `.local/intake` (optional intake
 recovery ledger), and `.local/diagnostics/retrieval.jsonl` (default path for the
 diagnostics CLI; MCP retrieval logging is opt-in via `--diagnostics-log`). Each
-catalog `submit` and review-event `append` creates verified pre-write and
-post-write backups.
+catalog `submit` and review-event `append` takes a verified snapshot before the
+write only when the store has none for the current UTC day, then deletes
+snapshots older than seven days (set `backup_retention_days` in
+`config/policy.local.json` to change). `python3 -m tools.backups status` reports
+backup count and size; `python3 -m tools.backups prune` is a dry run and
+`--apply` keeps the newest verified snapshot per day. See
+[decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
 
 ## Ingesting files (current manual method)
 
@@ -76,6 +81,29 @@ To stage and register a file in one step, use the upload intake (see
 ```
 
 It replaces steps 1–3 below and leaves extraction to step 4.
+
+To take in a whole read-only folder, classify it and then ingest the admitted
+files through upload and extraction (see
+[context/intake.md](context/intake.md#read-only-cohort-intake)):
+
+```sh
+.venv/bin/python -m tools.intake.cohort classify --root . --inbox /path/to/inbox
+.venv/bin/python -m tools.intake.cohort ingest --root . --inbox /path/to/inbox \
+  --system my-inbox --actor "$USER" --report .local/cohort-report.json
+```
+
+Every file gets a counted disposition; nothing in the inbox is changed, and
+extracted renditions stay unselected until a standing-policy review qualifies
+them.
+
+To watch a run, use the read-only, body-free progress view (CLI or a
+loopback-only page that refreshes itself; see
+[context/intake.md](context/intake.md#progress-view)):
+
+```sh
+.venv/bin/python -m tools.intake.cli --root . progress --format text
+.venv/bin/python -m tools.intake.cli --root . progress-serve   # http://127.0.0.1:8765/
+```
 
 1. **Drop** the original file under `sources/` (for example `sources/memo.pdf`).
 2. **Discover** what has not been registered yet:

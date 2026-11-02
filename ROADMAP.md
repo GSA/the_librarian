@@ -246,8 +246,8 @@ eligible work. Expose backlog age, blocked/error counts, last successful
 reconciliation and source-coverage limitations. Body-free metrics are useful
 diagnostics, not the durable recovery ledger or evidence of review.
 
-Preserve verified pre/post-write backups and retained originals. Never add
-automatic retention deletion or rebuild authoritative stores as job recovery.
+Preserve the verified daily store snapshots (decision 0010) and retained
+originals. Never rebuild authoritative stores as job recovery.
 Define pause, clean shutdown and explicit resume before enabling scheduling.
 
 ## Retrieval diagnostics from agent execution

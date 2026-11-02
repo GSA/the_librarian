@@ -71,6 +71,8 @@ OPERATIONS = {
     "docling-prepare": ("extraction", {"receipt", "format_name", "artifacts_path", "python"}),
     "docling-verify": ("extraction", {"receipt", "format_name", "artifacts_path", "python"}),
     "docling-register": ("extraction", {"receipt", "format_name", "artifacts_path", "python", "actor", "expected_state"}),
+    "extract-prepare": ("extraction", {"receipt", "format_name"}),
+    "extract-register": ("extraction", {"receipt", "format_name", "actor", "expected_state"}),
     "review-append": ("review", {"value", "actor", "request_id", "expected_revision", "expected_state"}),
     "index-build": ("publication", {"manifest", "db"}),
     "standing-review": ("review", STANDING | {"request_id"}),
@@ -115,7 +117,9 @@ def decode_request(raw):
         if "expected_revision" in args:
             require(type(args["expected_revision"]) is int and args["expected_revision"] >= 0)
         if "format_name" in args:
-            require(args["format_name"] in {"pdf", "image"})
+            allowed = ({"text", "gemini-txt", "mhtml", "odt"} if stage["operation"].startswith("extract-")
+                       else {"pdf", "image"})
+            require(args["format_name"] in allowed)
         for key in {"manifest", "db", "disposition_path", "policy_path", "rendition", "findings_path"} & names:
             relative(args[key])
         for key in {"disposition_sha256", "policy_sha256", "rendition_sha256", "findings_sha256"} & names:

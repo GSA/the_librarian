@@ -108,9 +108,10 @@ growth is an operational fact that per-project instances multiply.
   `config/policy.json` and `config/policy.local.json` against the target `--root`
   instance directory on every operation, fail-closed on symlinks, unknown fields,
   or overlapping storage roots.
-- **Backup retention needs a stated policy, not automatic deletion.** Report
-  backup count, total size and oldest retained revision; let an operator prune
-  deliberately with verification. Do not add automatic retention deletion.
+- **Backup retention is bounded.** Superseded by
+  [0010](0010-daily-snapshots-and-retention.md): one verified snapshot per UTC
+  day, seven days retained, with a dry-run-by-default prune command and a
+  body-free backup inventory.
 
 ### Backwards compatibility statement to publish per release
 
