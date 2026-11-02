@@ -178,11 +178,24 @@ new `mhtml` submission that is recorded as a correction of the old one
 `ingest ... --system LABEL --actor A [--limit N]` submits each admitted file as
 a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,
 percent-encoded inbox-relative locator, pinned SHA-256) and runs
-`extract-prepare` then `extract-register` through the ledger. Outcomes are
+`extract-prepare` then `extract-register` through the ledger. When an inbox
+file's bytes change after intake, a content-salted submission ID is derived and
+submitted as a correction of the prior submission (`correction_of`). Outcomes are
 counted as `received`, `extracted`, `failed`, `changed-since-intake` and
 `not-processed`; reruns are idempotent. The inbox is never written. The
 optional `--report` (0600) lists per-file paths, hashes and outcomes and is
 private instance data. Extraction never reviews, selects or qualifies.
+
+`qualify ... --system LABEL --actor A --policy PATH --manifest PATH
+--models-config FILE --model M [--context LOCATOR ...] [--index DB] [--limit N]`
+runs `ingest`, ensures the private standing policy and selection manifest exist,
+runs `model_review.review` and stages `standing-review` + `standing-select`
+(`standing-<submission-id>`) for each unreviewed extracted rendition, reconciles
+the selection manifest to active qualified renditions when `--limit` is omitted,
+and runs `standing-publish` to build the context index. Incomplete or failing
+reviews remain visibly `pending-review`, `rejected`, `deferred` or `exception`
+without indexing; reruns reuse existing ledger stages without extra model calls.
+Stdout prints body-free `counts` and token `usage`.
 
 ## Model-assisted standing review
 

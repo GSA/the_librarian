@@ -224,6 +224,163 @@ class IngestTests(CohortCase):
         failed = [e for e in report["entries"] if e.get("outcome") == "failed"]
         self.assertEqual([e["code"] for e in failed], ["native-input"])
 
+    def test_malformed_odt_space_count_is_counted_as_failed_not_raised(self):
+        self.writable()
+        bad_odt = self.inbox / "bad-space.odt"
+        bad_odt.write_bytes(odt(space_count="abc"))
+        bad_odt.chmod(0o444)
+        self.inbox.chmod(0o555)
+        report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        entry = next(e for e in report["entries"] if e["relative"] == "bad-space.odt")
+        self.assertEqual(entry["outcome"], "failed")
+        self.assertEqual(entry["stage"], "prepare")
+        self.assertEqual(entry["code"], "native-input")
+        self.assertEqual(report["counts"]["outcome"]["failed"], 1)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 6)
+
+class QualifyTests(CohortCase):
+    def setUp(self):
+        super().setUp()
+        from tools.review_events import event_store as events
+        events.initialize(self.root)
+        (self.root / "config").mkdir(parents=True, exist_ok=True)
+        (self.root / "config/policy.local.json").write_text(
+            json.dumps({"audience": "authorized-local"}))
+        (self.root / "documents").mkdir(parents=True, exist_ok=True)
+        (self.root / "documents/context.md").write_text(
+            "# Cohort Context\nQualified Falcon cohort context.\n")
+
+    def _transport(self, incomplete_text=None):
+        calls = []
+
+        def fake(model, messages):
+            calls.append((model, messages))
+            payload = json.loads(messages[-1]["content"])
+            records = [r["i"] for r in payload["records"]]
+            if incomplete_text and incomplete_text in messages[-1]["content"]:
+                records = []
+            reply = {
+                "decision": "accept",
+                "inspected_records": records,
+                "inspected_warnings": [w["ref"] for w in payload["warnings"]],
+                "contradictions": [], "missing_evidence": [],
+                "explanation": "Inspected all rendition records against standing policy.",
+            }
+            return {"content": json.dumps(reply),
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+
+        return fake, calls
+
+    def test_qualify_reviews_selects_and_publishes_cohort_and_leaves_incomplete_visibly_pending(self):
+        from tools.context_index import context_index as index
+        transport, calls = self._transport(incomplete_text="Just text")
+        report = cohort.qualify(
+            self.root, self.inbox, system="falcon-docs-inbox", actor="cohort-runner",
+            policy_path="config/standing-policy.local.json",
+            manifest="config/selection.local.json",
+            model="gpt-5.6-terra", transport=transport,
+            context=["documents/context.md"])
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(report["counts"]["qualification"],
+                         {"qualified": 5, "pending-review": 1})
+        self.assertEqual(report["counts"]["published"], 1)
+        self.assertEqual(report["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
+        plain = next(e for e in report["entries"] if e["relative"] == "m/plain.txt")
+        self.assertEqual(plain["qualification"], "pending-review")
+        stage = store.inspect(self.root, "standing-" + plain["submission_id"])["stages"][0]
+        self.assertEqual(stage["status"], "blocked")
+        self.assertEqual(stage["attempts"][-1]["code"],
+                         "standing-pending-review-insufficient-inspected-scope")
+
+        manifest = self.root / "config/selection.local.json"
+        config, _ = index.load_manifest(manifest, self.root)
+        self.assertEqual(len(config["renditions"]), 5)
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            hits = index.search(db, "Fund codes", 10, None, root=self.root)["hits"]
+            self.assertEqual(len(hits), 1)
+            got = index.packet(db, config, hits[0]["locator"], 60000, root=self.root)
+            rendition = got["renditions"][hits[0]["path"]]
+            self.assertEqual(rendition["source"]["sha256"],
+                             hashlib.sha256(CONFLUENCE).hexdigest())
+            self.assertTrue(rendition["rendition_sha256"])
+            self.assertTrue(got["pieces"][0]["source_hash"])
+            self.assertEqual(got["pieces"][0]["locator"], hits[0]["locator"])
+            many = index.packet_many(db, config, [hits[0]["locator"]], 60000, root=self.root)
+            self.assertEqual(len(many["requests"]), 1)
+            self.assertEqual(index.search(db, "Just text", 10, None, root=self.root)["hits"], [])
+
+    def test_qualify_rerun_is_idempotent_without_extra_model_calls_or_revisions(self):
+        from tools.review_events import event_store as events
+        transport, calls = self._transport()
+        first = cohort.qualify(
+            self.root, self.inbox, system="inbox", actor="cohort-runner",
+            policy_path="config/standing-policy.local.json",
+            manifest="config/selection.local.json",
+            model="gpt-5.6-terra", transport=transport,
+            context=["documents/context.md"])
+        self.assertEqual(first["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(calls), 6)
+        cat_state = catalog.status(self.root)["state_token"]
+        rev_state = events.status(self.root)["state_token"]
+        second = cohort.qualify(
+            self.root, self.inbox, system="inbox", actor="cohort-runner",
+            policy_path="config/standing-policy.local.json",
+            manifest="config/selection.local.json",
+            model="gpt-5.6-terra", transport=transport,
+            context=["documents/context.md"])
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(second["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(second["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+        self.assertEqual(catalog.status(self.root)["state_token"], cat_state)
+        self.assertEqual(events.status(self.root)["state_token"], rev_state)
+
+    def test_modifying_or_adding_one_file_updates_only_affected_item_and_republishes(self):
+        from tools.context_index import context_index as index
+        transport, calls = self._transport()
+        first = cohort.qualify(
+            self.root, self.inbox, system="inbox", actor="cohort-runner",
+            policy_path="config/standing-policy.local.json",
+            manifest="config/selection.local.json",
+            model="gpt-5.6-terra", transport=transport,
+            context=["documents/context.md"])
+        old_notes = next(e for e in first["entries"] if e["relative"] == "a/notes.md")
+        calls.clear()
+
+        self.writable()
+        (self.inbox / "a/notes.md").write_bytes(b"# Notes\nUpdated cohort line\n")
+        (self.inbox / "a/added.md").write_bytes(b"# Added\nFresh cohort item\n")
+        for path in [self.inbox, *self.inbox.rglob("*")]:
+            if not path.is_symlink():
+                path.chmod(0o555 if path.is_dir() else 0o444)
+
+        second = cohort.qualify(
+            self.root, self.inbox, system="inbox", actor="cohort-runner",
+            policy_path="config/standing-policy.local.json",
+            manifest="config/selection.local.json",
+            model="gpt-5.6-terra", transport=transport,
+            context=["documents/context.md"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(second["counts"]["qualification"], {"qualified": 7})
+        new_notes = next(e for e in second["entries"] if e["relative"] == "a/notes.md")
+        self.assertNotEqual(new_notes["submission_id"], old_notes["submission_id"])
+        self.assertNotEqual(new_notes["receipt_id"], old_notes["receipt_id"])
+        sidecar = json.loads(
+            (self.root / Path(new_notes["original"]).parent / "submission.json").read_text())
+        self.assertEqual(sidecar["correction_of"], old_notes["submission_id"])
+        selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
+        selected_receipts = {r["receipt_id"] for r in selected}
+        self.assertIn(new_notes["receipt_id"], selected_receipts)
+        self.assertNotIn(old_notes["receipt_id"], selected_receipts)
+        self.assertEqual(len(selected), 7)
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            self.assertEqual(
+                len(index.search(db, "Updated cohort line", 10, None, root=self.root)["hits"]), 1)
+            self.assertEqual(
+                len(index.search(db, "Fresh cohort item", 10, None, root=self.root)["hits"]), 1)
+            notes_hits = index.search(db, "Notes", 10, None, root=self.root)["hits"]
+            self.assertEqual([h["path"] for h in notes_hits], [new_notes["rendition"]])
+
+
 class CliTests(CohortCase):
     def test_cli_prints_body_free_counts_and_writes_private_report(self):
         import contextlib
@@ -240,6 +397,53 @@ class CliTests(CohortCase):
         self.assertEqual(printed["counts"]["outcome"]["extracted"], 6)
         self.assertEqual(report.stat().st_mode & 0o777, 0o600)
         self.assertEqual(len(json.loads(report.read_text())["entries"]), 15)
+
+    def test_cli_qualify_prints_body_free_counts_and_usage(self):
+        import contextlib
+        from unittest.mock import patch
+        from tools.intake import cohort as module, model_review
+        from tools.review_events import event_store as events
+        events.initialize(self.root)
+        (self.root / "config").mkdir(parents=True, exist_ok=True)
+        (self.root / "config/policy.local.json").write_text(
+            json.dumps({"audience": "authorized-local"}))
+        (self.root / "documents").mkdir(parents=True, exist_ok=True)
+        (self.root / "documents/context.md").write_text("# Context\nBody.\n")
+
+        def fake(model, messages):
+            payload = json.loads(messages[-1]["content"])
+            return {"content": json.dumps({
+                "decision": "accept",
+                "inspected_records": [r["i"] for r in payload["records"]],
+                "inspected_warnings": [w["ref"] for w in payload["warnings"]],
+                "contradictions": [], "missing_evidence": [], "explanation": "Clean.",
+            }), "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+
+        out = io.StringIO()
+        report = Path(self.temp.name) / "qualify-report.json"
+        models_cfg = Path(self.temp.name) / "models.json"
+        models_cfg.write_text("{}")
+        with patch.object(model_review, "usai_transport", return_value=fake), \
+                contextlib.redirect_stdout(out):
+            code = module.main([
+                "qualify", "--root", str(self.root), "--inbox", str(self.inbox),
+                "--system", "inbox", "--actor", "cohort-runner",
+                "--policy", "config/standing-policy.local.json",
+                "--manifest", "config/selection.local.json",
+                "--models-config", str(models_cfg),
+                "--model", "gpt-5.6-terra",
+                "--context", "documents/context.md",
+                "--report", str(report),
+            ])
+        self.assertEqual(code, 0)
+        raw = out.getvalue()
+        for body in ("Fund codes", "Line", "Decided", "hello there", "Just text", "Plan", "inside"):
+            self.assertNotIn(body, raw)
+        printed = json.loads(raw)
+        self.assertEqual(set(printed), {"counts", "usage"})
+        self.assertEqual(printed["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(printed["usage"], {"prompt_tokens": 30, "completion_tokens": 12})
+        self.assertEqual(report.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

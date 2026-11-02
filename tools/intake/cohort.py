@@ -19,24 +19,28 @@ from urllib.parse import quote
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import runner, store, upload
+from . import model_review, runner, standing, store, upload
 from .contracts import IntakeError
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
 RUNTIME_FORMATS = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
 EXPANDED_DIRECTORY = "_extracted"
+DEFAULT_INDEX = "tools/context_index/.local/index.sqlite3"
 REASON = "Read-only local cohort intake; copy only, not extraction review or qualification."
 OUTCOMES = ("received", "extracted", "failed", "changed-since-intake", "not-processed")
 
 
-def submission(relative, system, fmt=None):
+def submission(relative, system, fmt=None, content_sha256=None):
     """Stable ASCII-safe submission identity, name and locator for one inbox path.
 
     Files read as MIME HTML get a distinct identity from the plain-text identity an
     earlier toolkit version may have used, so they are received and extracted again.
+    When an inbox file's bytes change after intake, ``content_sha256`` derives a new
+    submission identity that supersedes the prior one via ``correction_of``.
     """
-    salt = "\0" + fmt if fmt == "mhtml" else ""
+    salt = ("\0" + fmt if fmt == "mhtml" else "") + ("\0" + content_sha256 if content_sha256 else "")
     key = hashlib.sha256((system + "\0" + relative + salt).encode("utf-8")).hexdigest()[:24]
     base = unicodedata.normalize("NFKD", relative.rsplit("/", 1)[-1])
     base = base.encode("ascii", "ignore").decode("ascii")
@@ -176,13 +180,20 @@ def _extract(root, entry, actor):
 
 def _process(root, inbox, entry, system, actor):
     identity = submission(entry["relative"], system, entry["format"])
-    entry.update(identity)
     superseded = None
-    if entry["format"] == "mhtml":
+    prior = upload.ledger_request(root, upload.correlation(identity["submission_id"]))
+    if prior is not None:
+        orig = next((r for r in upload.submit_records(prior)
+                     if r["kind"] == "artifact" and r["data"].get("role") == "original"), None)
+        if orig is not None and orig["data"]["sha256"] != entry["sha256"]:
+            superseded = identity["submission_id"]
+            identity = submission(entry["relative"], system, entry["format"], entry["sha256"])
+    elif entry["format"] == "mhtml":
         # An entry ingested before MIME recognition (as plain text) is corrected, not kept.
         earlier = submission(entry["relative"], system)["submission_id"]
         if upload.ledger_request(root, upload.correlation(earlier)) is not None:
             superseded = earlier
+    entry.update(identity)
     try:
         ack = upload.submit(root, Path(inbox) / entry["relative"], upload.descriptor(
             submission_id=identity["submission_id"], format_name=entry["format"],
@@ -221,30 +232,190 @@ def ingest(root, inbox, *, system, actor, limit=None):
     return {"counts": counts, "entries": entries}
 
 
-def _write_private(path, value):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    os.fchmod(descriptor, 0o600)
+def _write_json(path, value, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    os.fchmod(descriptor, mode)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
         stream.write("\n")
 
 
+def _write_private(path, value):
+    _write_json(path, value, 0o600)
+
+
+def _ensure_standing_inputs(root, policy_path, manifest, model, context):
+    policy_file = root / policy_path
+    if not policy_file.is_file():
+        _write_private(policy_file, {
+            "schema": standing.POLICY_SCHEMA,
+            "policy_id": "cohort-standing",
+            "version": 1,
+            "status": "active",
+            "reviewer": f"{model_review.PROVIDER}:{model}",
+            "scope": {
+                "receipts": [f"D{i}" for i in range(1, 2501)],
+                "audiences": ["source"],
+            },
+            "budget": {
+                "max_pages": renditions.DOCLING_MAX_PAGES,
+                "max_records": renditions.DOCLING_MAX_RECORDS,
+                "max_findings_bytes": standing.LIMIT,
+            },
+            "selection": {"context": list(context or ["context/intake.md"])},
+        })
+    policy_sha = hashlib.sha256(policy_file.read_bytes()).hexdigest()
+    standing_policy = standing.load_policy(root, policy_path, policy_sha)
+    manifest_file = root / manifest
+    raw = (json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.is_file() else {
+        "schema_version": 1,
+        "audience": policy.for_root(root)[0]["audience"],
+        "documents": [],
+        "context_rules": {},
+        "renditions": [],
+    })
+    docs = {d["path"] for d in raw.setdefault("documents", [])}
+    changed = not manifest_file.is_file()
+    for locator in standing_policy["selection"]["context"]:
+        doc = locator.split("#", 1)[0]
+        if doc not in docs:
+            raw["documents"].append({"path": doc, "role": "context", "context": []})
+            docs.add(doc)
+            changed = True
+    if changed:
+        _write_json(manifest_file, raw)
+    return standing_policy, policy_sha
+
+
+def _standing_outcome(stage):
+    code = stage["attempts"][-1]["code"] if stage["attempts"] else stage["status"]
+    for name in ("pending-review", "rejected", "deferred", "exception"):
+        if code.startswith("standing-" + name + "-"):
+            return name, code
+    return "pending-review", code
+
+
+def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
+            context=None, index_path=DEFAULT_INDEX, limit=None):
+    """Ingest, model-review, select and publish the cohort; return body-free counts and usage."""
+    root = Path(root).resolve()
+    report = ingest(root, inbox, system=system, actor=actor, limit=limit)
+    standing_policy, policy_sha = _ensure_standing_inputs(
+        root, policy_path, manifest, model, context)
+    usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
+    for entry in report["entries"]:
+        if entry.get("outcome") != "extracted":
+            continue
+        corr = "standing-" + entry["submission_id"]
+        event_id = "rev-" + entry["submission_id"]
+        try:
+            current = store.inspect(root, corr)
+        except IntakeError as error:
+            if error.code != "unknown_request":
+                raise
+            current = None
+        if current is None:
+            reviewed = model_review.review(
+                root, entry["rendition"], standing_policy, model, transport)
+            usage.update(reviewed["usage"])
+            if reviewed["status"] != "reviewed":
+                entry.update(qualification="pending-review", review_status=reviewed["status"])
+                continue
+            review_args = {
+                "policy_path": policy_path, "policy_sha256": policy_sha,
+                "rendition": entry["rendition"], "rendition_sha256": entry["rendition_sha256"],
+                "findings_path": reviewed["findings_path"],
+                "findings_sha256": reviewed["findings_sha256"], "event_id": event_id,
+            }
+            store.stage(root, json.dumps({
+                "version": 1, "correlation_id": corr, "correction_of": None,
+                "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+                "retry": {"max_attempts": 3, "backoff_seconds": 0},
+                "stages": [
+                    {"id": "review", "kind": "review", "operation": "standing-review",
+                     "arguments": {**review_args, "request_id": "req-" + corr + "-review"}},
+                    {"id": "select", "kind": "publication", "operation": "standing-select",
+                     "arguments": {**review_args, "request_id": "req-" + corr + "-select",
+                                   "manifest": manifest}},
+                ],
+            }).encode())
+            current = store.inspect(root, corr)
+        if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
+            current = runner.run(root, corr, "review")
+        if (current["stages"][0]["status"] == "succeeded"
+                and current["stages"][1]["status"] in {"staged", "running", "retryable"}):
+            current = runner.run(root, corr, "select")
+        if all(s["status"] == "succeeded" for s in current["stages"]):
+            entry.update(qualification="qualified", review_event_id=event_id)
+        else:
+            failed = next(s for s in current["stages"] if s["status"] != "succeeded")
+            outcome_name, code = _standing_outcome(failed)
+            entry.update(qualification=outcome_name, review_code=code)
+    if limit is None:
+        qualified_paths = {e["rendition"] for e in report["entries"]
+                           if e.get("qualification") == "qualified"}
+        manifest_file = root / manifest
+        raw = json.loads(manifest_file.read_text(encoding="utf-8"))
+        kept = [r for r in raw.get("renditions", []) if r["path"] in qualified_paths]
+        if kept != raw.get("renditions", []):
+            raw["renditions"] = kept
+            _write_json(manifest_file, raw)
+    manifest_sha = hashlib.sha256((root / manifest).read_bytes()).hexdigest()[:16]
+    pub_corr = f"publish-{policy_sha[:12]}-{manifest_sha}"
+    try:
+        pub = store.inspect(root, pub_corr)["stages"][0]
+    except IntakeError as error:
+        if error.code != "unknown_request":
+            raise
+        store.stage(root, json.dumps({
+            "version": 1, "correlation_id": pub_corr, "correction_of": None,
+            "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+            "retry": {"max_attempts": 3, "backoff_seconds": 0},
+            "stages": [{"id": "publish", "kind": "publication", "operation": "standing-publish",
+                        "arguments": {"policy_path": policy_path, "policy_sha256": policy_sha,
+                                      "manifest": manifest, "db": str(index_path)}}],
+        }).encode())
+        pub = store.inspect(root, pub_corr)["stages"][0]
+    if pub["status"] in {"staged", "running", "retryable"}:
+        pub = runner.run(root, pub_corr, "publish")["stages"][0]
+    report["counts"]["qualification"] = dict(
+        Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
+    report["counts"]["published"] = int(pub["status"] == "succeeded")
+    report["usage"] = {"prompt_tokens": usage["prompt_tokens"],
+                       "completion_tokens": usage["completion_tokens"]}
+    return report
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("classify", "ingest"):
+    for name in ("classify", "ingest", "qualify"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--root", required=True, type=Path)
         command.add_argument("--inbox", required=True, type=Path)
         command.add_argument("--report", type=Path,
                              help="private (0600) per-file report with paths and hashes")
-        if name == "ingest":
+        if name in {"ingest", "qualify"}:
             command.add_argument("--system", required=True)
             command.add_argument("--actor", required=True)
             command.add_argument("--limit", type=int)
+        if name == "qualify":
+            command.add_argument("--policy", required=True, dest="policy_path")
+            command.add_argument("--manifest", required=True)
+            command.add_argument("--models-config", required=True, type=Path)
+            command.add_argument("--model", required=True)
+            command.add_argument("--context", action="append", dest="context")
+            command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
     args = parser.parse_args(argv)
     try:
-        if args.command == "ingest":
+        if args.command == "qualify":
+            report = qualify(
+                args.root, args.inbox, system=args.system, actor=args.actor,
+                policy_path=args.policy_path, manifest=args.manifest, model=args.model,
+                transport=model_review.usai_transport(args.models_config),
+                context=args.context, index_path=args.index_path, limit=args.limit)
+        elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                             limit=args.limit)
         else:
@@ -257,7 +428,10 @@ def main(argv=None):
         return 2
     if args.report:
         _write_private(args.report, report)
-    print(json.dumps({"counts": report["counts"]}, sort_keys=True))
+    summary = {"counts": report["counts"]}
+    if "usage" in report:
+        summary["usage"] = report["usage"]
+    print(json.dumps(summary, sort_keys=True))
     return 0
 
 
