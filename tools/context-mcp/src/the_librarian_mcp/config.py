@@ -8,6 +8,10 @@ import math
 from pathlib import Path
 from typing import ClassVar
 
+from . import audit
+
+AUDIT_DEFAULT = "derive-from-agent-label"
+
 
 def _load_policy(toolkit_root: Path):
     path = toolkit_root / "tools/policy.py"
@@ -29,6 +33,8 @@ class Config:
     max_results: int = 25
     timeout_seconds: float = 30
     diagnostics_log: Path | None = None
+    audit_log: Path | str | None = None
+    agent_label: str | None = None
 
     context_module: ClassVar[str] = "tools.context_index.context_index"
     event_module: ClassVar[str] = "tools.review_events.event_reader"
@@ -103,6 +109,20 @@ class Config:
                 raise ValueError("--diagnostics-log must stay within --root")
             if path.suffix != ".jsonl":
                 raise ValueError("--diagnostics-log must be a .jsonl file")
+        if self.audit_log is None:
+            if self.agent_label is not None:
+                raise ValueError("--agent-label only labels an enabled --audit-log")
+        else:
+            if self.agent_label is None:
+                raise ValueError("--audit-log requires --agent-label")
+            audit.label(self.agent_label)
+            if str(self.audit_log) == AUDIT_DEFAULT:
+                object.__setattr__(self, "audit_log", audit.default_path(self.agent_label))
+            path = audit.log_path(self.root, Path(self.audit_log))
+            if self.diagnostics_log is not None and path == (
+                    self.diagnostics_log if self.diagnostics_log.is_absolute()
+                    else self.root / self.diagnostics_log):
+                raise ValueError("--audit-log must not be the body-free --diagnostics-log")
         for name in ("max_source_chars", "max_output_chars", "max_results"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -124,4 +144,10 @@ def parser(description: str) -> argparse.ArgumentParser:
     result.add_argument("--timeout-seconds", type=float, default=30)
     result.add_argument("--diagnostics-log", type=Path, default=None,
                         help="Opt in to body-free retrieval diagnostics at this .jsonl path")
+    result.add_argument("--audit-log", type=Path, nargs="?", const=AUDIT_DEFAULT, default=None,
+                        help="Opt in to a FULL-TEXT audit of every tool call (queries and returned "
+                             "corpus text) at this .jsonl path below <root>/.local; without a value, "
+                             ".local/audit/<agent-label>-mcp-access.jsonl")
+    result.add_argument("--agent-label", default=None,
+                        help="Agent name recorded in each audit record, [a-z0-9._-]{1,64}")
     return result

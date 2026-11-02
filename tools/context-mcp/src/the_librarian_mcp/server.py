@@ -14,6 +14,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, Implementation, TextContent, ToolAnnotations
 from pydantic import Field
 
+from . import audit
 from .config import Config, parser
 
 Format = Literal["full", "compact"]
@@ -157,9 +158,47 @@ class Reader:
         return content
 
 
+class AuditedServer(MCPServer):
+    """Record each call's arguments and the exact text the client receives."""
+
+    def __init__(self, *arguments, audit_log: audit.Log, **options):
+        super().__init__(*arguments, **options)
+        self.audit_log = audit_log
+
+    async def _handle_call_tool(self, ctx, params):
+        started = datetime.now(timezone.utc)
+        counter = time.monotonic()
+        result = await super()._handle_call_tool(ctx, params)
+        if not isinstance(result, CallToolResult):
+            return result
+        failed = bool(result.is_error)
+        try:
+            self.audit_log.write(
+                tool=params.name, arguments=dict(params.arguments or {}),
+                outcome="error" if failed else "ok",
+                error_type="ToolError" if failed else None,
+                text="".join(block.text for block in result.content
+                             if isinstance(block, TextContent)),
+                started_at=started.isoformat(),
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                duration_ms=(time.monotonic() - counter) * 1000,
+            )
+        except Exception as failure:
+            return CallToolResult(content=[TextContent(
+                type="text", text="Audit log could not be recorded; no result returned: "
+                f"{type(failure).__name__}")], is_error=True)
+        return result
+
+
 def create_server(config: Config) -> MCPServer:
     reader = Reader(config)
-    server = MCPServer(
+    if config.audit_log is None:
+        factory = MCPServer
+    else:
+        log = audit.Log(config.root, config.audit_log, config.agent_label)
+        factory = lambda *arguments, **options: AuditedServer(
+            *arguments, audit_log=log, **options)
+    server = factory(
         SERVER_INFO.name, version=SERVER_INFO.version, instructions=INSTRUCTIONS + (
             f" Configured ceilings: {config.max_source_chars} source characters, "
             f"{config.max_output_chars} serialized tool-result characters, "

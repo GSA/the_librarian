@@ -1,4 +1,4 @@
-# 0011 - Bounded validation cost after daily snapshots
+# 0012 - Bounded validation cost after daily snapshots
 
 **Audience:** maintainers and operators.
 **Status:** Accepted. Follows [0010](0010-daily-snapshots-and-retention.md).

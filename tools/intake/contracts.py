@@ -118,7 +118,7 @@ def decode_request(raw):
         if "expected_revision" in args:
             require(type(args["expected_revision"]) is int and args["expected_revision"] >= 0)
         if "format_name" in args:
-            allowed = ({"text", "gemini-txt", "odt"} if stage["operation"].startswith("extract-")
+            allowed = ({"text", "gemini-txt", "mhtml", "odt"} if stage["operation"].startswith("extract-")
                        else {"pdf", "image"})
             require(args["format_name"] in allowed)
         for key in {"manifest", "db", "disposition_path", "policy_path", "rendition", "findings_path"} & names:

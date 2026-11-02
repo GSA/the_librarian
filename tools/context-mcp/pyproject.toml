@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 librarian-mcp = "the_librarian_mcp.server:main"
 librarian-preflight = "the_librarian_mcp.preflight:main"
+librarian-audit = "the_librarian_mcp.audit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

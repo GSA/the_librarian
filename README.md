@@ -32,6 +32,21 @@ python3 -m venv .venv
 If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 `python3 -m pip --python .venv/bin/python install ./tools/context-mcp`.
 
+### Development and agent worktrees
+
+Every clone or Git worktree needs its own `.venv`; the main checkout's
+environment is not copied. Create the environment and install
+`./tools/context-mcp` as above before running tests. Reinstall when dependency
+declarations change. Tests use temporary workspaces, so development-only
+checkouts do not need store initialization or preflight.
+
+`ModuleNotFoundError: No module named 'mcp'` means the selected interpreter
+lacks the MCP SDK declared in `tools/context-mcp/pyproject.toml`. Install the
+adapter into that worktree's environment and run tests with
+`.venv/bin/python`, not bare `python3`. If `.venv` exists but lacks `pip`, use
+the host-pip fallback above without recreating the environment. Do not skip
+MCP tests or install packages globally to hide the setup failure.
+
 ## Configuration
 
 | File | Purpose |
@@ -55,7 +70,7 @@ backup count and size; `python3 -m tools.backups prune` is a dry run and
 [decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
 Ingest cost still grows with history; measure it on synthetic cohorts with
 `python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see
-[decision 0011](docs/decisions/0011-bounded-validation-cost.md).
+[decision 0012](docs/decisions/0012-bounded-validation-cost.md).
 
 ## Ingesting files (current manual method)
 
@@ -158,6 +173,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
 | `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index |
 | `librarian-mcp` | Read-only stdio MCP server |
+| `librarian-audit` | Body-free `report` of the opt-in MCP audit log |
 
 ## MCP for consumer agents
 
@@ -190,6 +206,15 @@ Pi (`.local/environment/pi/mcp.json` in The Engineer) or any MCP client:
            "--manifest", "/abs/instance/config/selection.local.json"],
   "timeout": 60}}}
 ```
+
+Add `--audit-log --agent-label <agent>` to a binding to keep a private,
+full-text record of every call: the arguments and the exact text returned, in
+`.local/audit/<agent>-mcp-access.jsonl` (rotated at 64 MiB, never deleted by the
+toolkit). It contains corpus text and agent queries, so treat it at the
+instance's audience. If a record cannot be written the call fails instead of
+returning unrecorded text. `.venv/bin/librarian-audit --root "$PWD"
+report` summarizes it without bodies. See
+[decision 0012](docs/decisions/0011-full-text-mcp-audit-log.md).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
 the cited text. A search with no hits returns an `absence` reason: the indexed
