@@ -11,7 +11,7 @@ from collections import Counter
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import sys
@@ -20,10 +20,12 @@ import unicodedata
 from urllib.parse import quote
 
 from tools import policy
+from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
 from . import cli, model_review, runner, standing, store, upload
+from . import contracts
 from .contracts import IntakeError
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
@@ -280,6 +282,18 @@ def _replace_json(path, value, mode=0o644):
         os.close(directory)
 
 
+def _origin_locator(root, rendition, system):
+    """The inbox locator a selected rendition came from, or None when it is not this cohort's."""
+    try:
+        value = json.loads((root / rendition).read_text(encoding="utf-8"))
+        sidecar = json.loads((root / PurePosixPath(value["source"]["path"]).parent
+                              / upload.SIDECAR).read_text(encoding="utf-8"))
+        origin = sidecar["origin"]
+        return origin["locator"] if origin.get("system") == system else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _instance_file(root, name):
     """An instance-relative path with no symlink component, checked before any read or write."""
     try:
@@ -295,10 +309,23 @@ def _instance_file(root, name):
     return path
 
 
-def _validate_inputs(root, policy_path, manifest, context):
+def _validate_inputs(root, policy_path, manifest, context, index_path, model):
     """Refuse bad paths and a missing maintained context before ingesting or writing anything."""
     _instance_file(root, policy_path)
     _instance_file(root, manifest)
+    try:
+        contracts.relative(index_path)
+        index.validate_db_path(root, root / index_path)
+        if (root / manifest).is_file():
+            index.load_manifest(index.no_symlinks(root / manifest), root)
+        if (root / policy_path).is_file():
+            raw = standing._read(root, policy_path, standing.LIMIT)[1]
+            loaded = standing.load_policy(root, policy_path, hashlib.sha256(raw).hexdigest())
+            if loaded["reviewer"] != f"{model_review.PROVIDER}:{model}":
+                raise IntakeError("policy_reviewer_mismatch")
+    except (index.IndexError_, standing.Refusal, IntakeError, OSError) as error:
+        raise IntakeError(getattr(error, "code", None) if isinstance(error, IntakeError)
+                          else "preflight_invalid") from error
     locators = context
     policy_file = root / policy_path
     if policy_file.is_file():
@@ -400,7 +427,7 @@ def _set_manifest_renditions(root, manifest, renditions_):
 
 
 def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                       model, transport, usage):
+                       model, transport, usage, snapshot=None):
     """Review and select one extracted rendition; identity is bound to the exact rendition."""
     token = "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
     corr, event_id = "standing-" + token, "rev-" + token
@@ -425,6 +452,14 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
              "arguments": {**review_args, "request_id": "req-" + corr + "-select",
                            "manifest": manifest}}])
         current = store.inspect(root, corr)
+    settled = all(st["status"] == "succeeded" for st in current["stages"])
+    if settled and snapshot is not None:
+        live = {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
+        if event_id not in live:
+            # An operator superseded this review; never resurrect its selection.
+            entry.update(qualification="pending-review", review_code="review-superseded",
+                         superseded_event=event_id)
+            return
     if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
         current = runner.run(root, corr, "review")
     if (current["stages"][0]["status"] == "succeeded"
@@ -483,7 +518,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
         raise IntakeError("context_required")
-    _validate_inputs(root, policy_path, manifest, context)
+    _validate_inputs(root, policy_path, manifest, context, index_path, model)
     report = ingest(root, inbox, system=system, actor=actor, limit=limit)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
@@ -495,23 +530,30 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         _set_manifest_renditions(root, manifest, [
             r for r in _manifest_renditions(root, manifest) if r["path"] in current])
     usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
+    snapshot = event_reader.read_snapshot(root)
     for entry in extracted:
         _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                           model, transport, usage)
+                           model, transport, usage, snapshot)
     selected = _manifest_renditions(root, manifest)
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
     # Reconcile from validated review evidence: add missing and, for a full run, drop the rest.
     desired = [e["selection"] for e in qualified]
+    # Keep an operator's explicit selection for a rendition whose saved review was superseded.
+    stale = {e["superseded_event"] for e in extracted if "superseded_event" in e}
+    kept = {e["rendition"] for e in extracted if e.get("review_code") == "review-superseded"}
+    selected = [r for r in selected if not stale & set(r.get("review_event_ids") or [])]
     if limit is None:
-        _set_manifest_renditions(root, manifest, desired)
+        _set_manifest_renditions(root, manifest, [
+            r for r in selected if r["path"] in kept] + desired)
     else:
         # A partial run replaces only what it processed: drop the superseded and the
         # re-reviewed selections of processed items and keep everything else.
-        superseded = {e["superseded_receipt"] for e in extracted if "superseded_receipt" in e}
+        locators = {e["locator"] for e in extracted}
         replaced = {e["rendition"] for e in extracted}
         _set_manifest_renditions(root, manifest, [
             r for r in selected
-            if r["receipt_id"] not in superseded and r["path"] not in replaced] + desired)
+            if r["path"] not in kept | replaced
+            and _origin_locator(root, r["path"], system) not in locators] + desired)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     report["counts"]["qualification"] = dict(
         Counter(e["qualification"] for e in report["entries"] if "qualification" in e))

@@ -421,6 +421,61 @@ class QualifyTests(CohortCase):
             paths = {h["path"] for h in index.search(db, "Notes", 10, None, root=self.root)["hits"]}
             self.assertEqual(paths, {notes["rendition"]})
 
+    def test_limited_run_drops_every_earlier_version_and_older_extraction(self):
+        from tools.context_index import context_index as index
+        transport, _ = self._transport()
+        self._qualify(transport)
+        for text in (b"# Notes\nSecond version\n", b"# Notes\nThird version\n"):
+            self.writable()
+            (self.inbox / "a/notes.md").write_bytes(text)
+            self._qualify(transport, limit=15)
+        selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
+        self.assertEqual(len(selected), 6)
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            hits = index.search(db, "version", 10, None, root=self.root)["hits"]
+            self.assertEqual(len(hits), 1)
+
+    def test_qualify_preflights_policy_permissions_and_index_before_ingesting(self):
+        transport, calls = self._transport()
+        policy_file = self.root / "config/standing-policy.local.json"
+        self._qualify(transport)
+        calls.clear()
+        before = catalog.status(self.root)["state_token"]
+        policy_file.chmod(0o644)
+        with self.assertRaises(IntakeError):
+            self._qualify(transport)
+        policy_file.chmod(0o600)
+        with self.assertRaises(IntakeError):
+            self._qualify(transport, index_path="/tmp/escape.sqlite3")
+        with self.assertRaises(IntakeError):
+            self._qualify(transport, model="other-model")
+        self.assertEqual(calls, [])
+        self.assertEqual(catalog.status(self.root)["state_token"], before)
+
+    def test_superseded_review_is_not_resurrected_by_a_later_qualify(self):
+        from copy import deepcopy
+        from tools.review_events import event_reader, event_store as events
+        transport, calls = self._transport()
+        report = self._qualify(transport)
+        notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
+        snap = event_reader.read_snapshot(self.root)
+        old = next(e for e in snap.events if e["event_id"] == notes["review_event_id"])
+        newer = deepcopy(old)
+        newer.update(event_id="rev-operator-correction", supersedes=[old["event_id"]],
+                     correction_reason="Operator corrected this standing review.",
+                     recorded_at="2099-01-01T00:00:00+00:00")
+        state = events.status(self.root)
+        events.append(self.root, events.bundle([newer]), old["reviewer"], "req-operator-fix",
+                      state["revision"], state["state_token"])
+        calls.clear()
+        again = self._qualify(transport)
+        self.assertEqual(calls, [])
+        entry = next(e for e in again["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual(entry["qualification"], "pending-review")
+        self.assertEqual(entry["review_code"], "review-superseded")
+        selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
+        self.assertNotIn(notes["review_event_id"], [e for r in selected for e in r["review_event_ids"]])
+
     def test_changed_standing_policy_does_not_report_old_evidence_as_qualified(self):
         transport, _ = self._transport()
         self._qualify(transport)

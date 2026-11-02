@@ -203,7 +203,8 @@ the processed items' selections. Changing an active policy's content does not
 requalify old evidence: renditions already reviewed under another policy stay
 `pending-review` until an explicit policy-change review correction is made. `standing-publish` builds the context index;
 a saved publication is reused only while the index is present and fresh,
-otherwise a new revision is staged. Incomplete or failing reviews remain visibly
+otherwise a new revision is staged. A review an operator later superseded is reported `pending-review` (`review-superseded`) and its saved selection is not restored; the operator's corrected selection is kept.
+The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
 `pending-review`, `rejected`, `deferred` or `exception` without indexing.
 Stdout prints body-free `counts` and token `usage`.
 
