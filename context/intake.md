@@ -10,7 +10,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
   key refusal, 1 MiB request limit, 16 stages, 1–10 attempts, 0–86400s backoff.
 - Fixed adapters: receipt/catalog-submit; extraction/docling-prepare,
   docling-verify, docling-register; extraction/extract-prepare, extract-register
-  (strict UTF-8 `text`, `gemini-txt`, `odt`); review/review-append;
+  (strict UTF-8 `text`, `gemini-txt`, `mhtml`, `odt`); review/review-append;
   publication/index-build; review/standing-review, publication/standing-select,
   publication/standing-publish; return/await-ack. See `tools/intake/contracts.py` for
   argument fields. Preserve native attribution and original concurrency tokens.
@@ -74,7 +74,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
 
 ## Manual upload and local drop
 
-`submit-file FILE --submission-id ID --format {text,gemini-txt,odt,pdf,image}
+`submit-file FILE --submission-id ID --format {text,gemini-txt,mhtml,odt,pdf,image}
 --actor A --reason R` stages one explicitly supplied file. Optional
 `--name`, `--correction-of`, `--expected-sha256` and declared
 `--origin-system/--origin-locator/--origin-version`.
@@ -117,14 +117,29 @@ model service or return transport is supplied by this interface.
 
 `python -m tools.intake.cohort classify --root ROOT --inbox DIR [--report FILE]`
 gives every file below a read-only inbox exactly one disposition and prints
-body-free counts: `admit` (with format `text`, `gemini-txt` or `odt`; a `.txt`
-that parses as a Gemini transcript is `gemini-txt`), `needs-runtime` (PDF and
+body-free counts: `admit` (with format `text`, `gemini-txt`, `mhtml` or `odt`; a `.txt`
+that parses as a Gemini transcript is `gemini-txt`; a text-suffix file whose
+content starts with MIME headers, such as a Confluence "Exported From Confluence"
+`.doc`, is `mhtml`), `needs-runtime` (PDF and
 images awaiting a verified Docling runtime), `needs-reader` (no existing
-reader, for example Office formats), `archive-expanded` (a zip whose sibling
+reader, for example Office formats, or MIME that cannot be read strictly; the
+report carries a `code` such as `mime-malformed`, `mime-no-html`, `mime-encoding`,
+`mime-charset` or `mime-empty`, and raw encoded text is never admitted instead), `archive-expanded` (a zip whose sibling
 `_extracted/<name>/` is classified instead), `skipped-asset` (web site assets),
 `skipped-artifact` (alternate-data-stream sidecars such as `:Zone.Identifier`),
 `unreadable` (fails strict UTF-8 or signature checks), `empty`, `over-limit` and
 `unsafe-path` (symlinks and non-regular files). Suffix is never format proof.
+
+`mhtml` extraction (`tools/extraction/mhtml.py`, stdlib `email` + `html.parser`)
+recognises MIME by content, reads only non-attachment `text/html` parts with
+strict transfer-encoding and charset decoding, converts them to plain-text lines
+and never follows links, scripts or images. The payload records
+`method {name: "mhtml-html-text", version}` and the parts read; the extractor
+identity covers the reader code, and a stored rendition must equal a fresh
+conversion of the original bytes. A file earlier ingested as plain `text` gets a
+new `mhtml` submission that is recorded as a correction of the old one
+(`correction_of`), so it is extracted again rather than kept. Bump
+`mhtml.METHOD_VERSION` when conversion output changes.
 
 `ingest ... --system LABEL --actor A [--limit N]` submits each admitted file as
 a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,

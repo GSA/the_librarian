@@ -461,11 +461,11 @@ class WorkspaceTests(WorkspaceCase):
         with self.assertRaises(contract.ReviewError):
             events.prepare_submission(events.bundle([event]), self.root)
 
-    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast"):
-        self.registration("sources/notes.txt", raw)
-        prepared = extract.run(self.root, "prepare", "D1", "text")
-        extract.run(self.root, "verify", "D1", "text")
-        extract.run(self.root, "register", "D1", "text", "test-runner",
+    def selected_text(self, raw=b"first\r\n\xce\xb2\nlast", name="sources/notes.txt", fmt="text"):
+        self.registration(name, raw)
+        prepared = extract.run(self.root, "prepare", "D1", fmt)
+        extract.run(self.root, "verify", "D1", fmt)
+        extract.run(self.root, "register", "D1", fmt, "test-runner",
                     catalog.status(self.root)["state_token"])
         child = next(record for record in catalog.read_records(self.root, receipt="D1")["records"]
                      if record["kind"] == "artifact" and record["data"]["role"] == "generated-rendition")
@@ -475,10 +475,34 @@ class WorkspaceTests(WorkspaceCase):
                        reason="Explicit synthetic text selection")
         self.docs()
         self.config["renditions"] = [{"path": prepared["rendition"],
-            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": "text",
+            "sha256": prepared["rendition_sha256"], "receipt_id": "D1", "format": fmt,
             "context": ["documents/AGENTS.md"]}]
         self.build()
         return prepared
+
+    def test_selected_mime_html_is_searchable_as_decoded_text_not_raw_markup(self):
+        raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
+               b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+               b"<html><body><h1>Fund Codes</h1><p class=3D\"rule\">A fund code must be exactly "
+               b"four=\r\n characters.</p></body></html>\r\n")
+        prepared = self.selected_text(raw, "sources/page.doc", "mhtml")
+        with closing(index.readonly(self.db)) as db:
+            found = index.search(db, "exactly four characters", 10, None)
+            self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
+            self.assertEqual(index.search(db, "class", 10, None)["hits"], [])
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            self.assertEqual(packet["renditions"][prepared["rendition"]]["method"]["name"],
+                             "mhtml-html-text")
+
+    def test_mime_html_rendition_refuses_a_payload_that_differs_from_a_fresh_conversion(self):
+        from tools.extraction import mhtml
+        raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+               b"<p>one</p>\r\n")
+        api = index.rendition_api()
+        payload = mhtml.payload(raw)
+        payload["lines"][0]["text"] = "two\n"
+        with self.assertRaises(index.IndexError_):
+            index.renditions.validate_mhtml(payload, raw, api)
 
     def test_selected_text_round_trips_exact_lines_and_byte_locations(self):
         prepared = self.selected_text()

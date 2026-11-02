@@ -181,12 +181,14 @@ def _rendition(root, args, engine):
         try:
             if value["payload"]["format"] == "text":
                 renditions.validate_text_mapping(value["payload"], original.read_bytes(), engine)
+            elif value["payload"]["format"] == "mhtml":
+                renditions.validate_mhtml(value["payload"], original.read_bytes(), engine)
         except (index.IndexError_, TypeError, KeyError):
             return raw, None, "rendition-fidelity"
     return raw, value, None
 
 
-EXTRACT_FORMATS = {"text": "lines", "gemini-txt": "lines", "odt": "nodes"}
+EXTRACT_FORMATS = {"text": "lines", "gemini-txt": "lines", "mhtml": "lines", "odt": "nodes"}
 
 
 def _kind(value):
