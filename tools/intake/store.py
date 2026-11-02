@@ -7,7 +7,7 @@ import sqlite3
 import stat
 
 from tools import policy
-from .contracts import IntakeError, canonical, decode, decode_request, digest, require
+from .contracts import IntakeError, canonical, decode, decode_request, digest, request_shape, require
 
 APPLICATION_ID = 0x4C494E54
 SCHEMA = 1
@@ -103,14 +103,14 @@ def validate(c, root):
     require(c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             and not c.execute("PRAGMA foreign_key_check").fetchall(), "corrupt_store")
     for row in c.execute("SELECT * FROM requests"):
-        request = decode_request(row["raw"])
+        correlation_id, correction_of, stage_ids = request_shape(row["raw"])
         require(digest(row["raw"]) == row["request_sha256"] and row["root"] == str(root)
-                and request["correlation_id"] == row["correlation_id"]
-                and request["correction_of"] == row["correction_of"], "corrupt_request")
+                and correlation_id == row["correlation_id"]
+                and correction_of == row["correction_of"], "corrupt_request")
         stages = c.execute("SELECT * FROM stages WHERE correlation_id=? ORDER BY ordinal", (row["correlation_id"],)).fetchall()
-        require(len(stages) == len(request["stages"]), "corrupt_stage")
-        for ordinal, (stage, saved) in enumerate(zip(request["stages"], stages)):
-            require(saved["ordinal"] == ordinal and saved["stage_id"] == stage["id"]
+        require(len(stages) == len(stage_ids), "corrupt_stage")
+        for ordinal, (stage_id, saved) in enumerate(zip(stage_ids, stages)):
+            require(saved["ordinal"] == ordinal and saved["stage_id"] == stage_id
                     and saved["status"] in {"staged", "running", "retryable", "blocked", "dead-letter", "succeeded", "return-pending"}
                     and type(saved["cycle"]) is int and saved["cycle"] >= 0, "corrupt_stage")
             for key in ("intent", "evidence"):
@@ -120,12 +120,12 @@ def validate(c, root):
                     require(digest(raw.encode()) == saved[key + "_sha256"] and isinstance(decode(raw.encode()), dict), "corrupt_artifact")
             require(saved["status"] not in {"succeeded", "return-pending"}
                     or (saved["intent"] is not None and saved["evidence"] is not None), "corrupt_stage")
-            attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? ORDER BY cycle,ordinal", (row["correlation_id"], stage["id"])).fetchall()
+            attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? ORDER BY cycle,ordinal", (row["correlation_id"], stage_id)).fetchall()
             for attempt in attempts:
                 require(0 <= attempt["cycle"] <= saved["cycle"] and attempt["ordinal"] >= 1
                         and (attempt["outcome"] in {None, "succeeded", "failed", "return-pending"})
                         and ((attempt["ended"] is None) == (attempt["outcome"] is None)), "corrupt_attempt")
-            replays = c.execute("SELECT cycle FROM replays WHERE correlation_id=? AND stage_id=? ORDER BY cycle", (row["correlation_id"], stage["id"])).fetchall()
+            replays = c.execute("SELECT cycle FROM replays WHERE correlation_id=? AND stage_id=? ORDER BY cycle", (row["correlation_id"], stage_id)).fetchall()
             require([r[0] for r in replays] == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
 
 
