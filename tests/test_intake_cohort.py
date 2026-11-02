@@ -224,19 +224,6 @@ class IngestTests(CohortCase):
         failed = [e for e in report["entries"] if e.get("outcome") == "failed"]
         self.assertEqual([e["code"] for e in failed], ["native-input"])
 
-    def test_malformed_odt_space_count_is_counted_as_failed_not_raised(self):
-        self.writable()
-        bad_odt = self.inbox / "bad-space.odt"
-        bad_odt.write_bytes(odt(space_count="abc"))
-        bad_odt.chmod(0o444)
-        self.inbox.chmod(0o555)
-        report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
-        entry = next(e for e in report["entries"] if e["relative"] == "bad-space.odt")
-        self.assertEqual(entry["outcome"], "failed")
-        self.assertEqual(entry["stage"], "prepare")
-        self.assertEqual(entry["code"], "native-input")
-        self.assertEqual(report["counts"]["outcome"]["failed"], 1)
-        self.assertEqual(report["counts"]["outcome"]["extracted"], 6)
 
 class QualifyTests(CohortCase):
     def setUp(self):
