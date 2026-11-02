@@ -362,3 +362,64 @@ class NativeTests(unittest.TestCase):
         self.assertFalse((root / ".local/review-events").exists())
         child = next(r for r in catalog.read_records(root, receipt="D1", limit=20)["records"] if r["id"].startswith("A-docling-"))
         self.assertEqual(child["data"]["coverage"], "deferred")
+
+
+class ExtractStageTests(unittest.TestCase):
+    """Strict text/Gemini/ODT extraction through the durable ledger, like Docling."""
+
+    def setUp(self):
+        from tools.intake import upload
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "instance"
+        self.root.mkdir()
+        store.initialize(self.root)
+        catalog.initialize(self.root)
+        source = Path(self.temp.name) / "notes.md"
+        source.write_bytes(b"# Notes\nLine two\n")
+        self.ack = upload.submit(self.root, source, upload.descriptor(
+            submission_id="sub-1", format_name="text", name="notes.md",
+            actor="test-runner", reason="Extraction stage test"))
+
+    def stages(self):
+        receipt = self.ack["records"]["receipt_id"]
+        base = {"receipt": receipt, "format_name": "text"}
+        return [stage("extraction", "extract-prepare", base, "prepare"),
+                stage("extraction", "extract-register",
+                      {**base, "actor": "operator",
+                       "expected_state": catalog.status(self.root)["state_token"]}, "register")]
+
+    def test_extract_stages_prepare_and_register_with_restart(self):
+        stage_request(self.root, self.stages())
+        real = adapters.execute
+        def crash(*args):
+            real(*args)
+            raise SystemExit()
+        for name in ("prepare", "register"):
+            with patch.object(adapters, "execute", side_effect=crash), self.assertRaises(SystemExit):
+                runner.run(self.root, "req-native", name)
+            result = runner.run(self.root, "req-native", name)
+        self.assertTrue(result["complete"])
+        evidence = result["stages"][1]["evidence"]
+        self.assertEqual(evidence["boundary"], "extraction-register")
+        records = catalog.read_records(self.root, receipt="D1", limit=20)["records"]
+        child = next(r for r in records if r["id"] == "A-extract-" + evidence["run_id"])
+        self.assertEqual(child["data"]["coverage"], "deferred")
+        self.assertEqual(child["data"]["path"], evidence["rendition"])
+        self.assertEqual(child["data"]["sha256"], evidence["rendition_sha256"])
+
+    def test_extract_format_mismatch_blocks_durably(self):
+        stages = self.stages()
+        stages[0]["arguments"]["format_name"] = "odt"
+        stage_request(self.root, stages[:1])
+        result = runner.run(self.root, "req-native", "prepare")
+        self.assertEqual(result["stages"][0]["status"], "blocked")
+        self.assertEqual(result["stages"][0]["attempts"][-1]["code"], "native-input")
+
+    def test_extract_and_docling_formats_are_not_interchangeable(self):
+        from tools.intake.contracts import IntakeError
+        for operation, fmt in (("extract-prepare", "pdf"), ("docling-prepare", "text")):
+            args = ({"receipt": "D1", "format_name": fmt} if operation.startswith("extract")
+                    else {"receipt": "D1", "format_name": fmt, "artifacts_path": "/a", "python": "/p"})
+            with self.subTest(operation=operation), self.assertRaises(IntakeError):
+                stage_request(self.root, [stage("extraction", operation, args)], "req-" + fmt)

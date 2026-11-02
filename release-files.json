@@ -25,6 +25,8 @@
   "tests/test_intake_adapters.py",
   "tests/test_standing.py",
   "tests/test_intake_upload.py",
+  "tests/test_intake_cohort.py",
+  "tests/test_model_review.py",
   "tests/test_intake_progress.py",
   "tools/intake/__init__.py",
   "tools/intake/contracts.py",
@@ -34,6 +36,8 @@
   "tools/intake/standing.py",
   "tools/intake/cli.py",
   "tools/intake/upload.py",
+  "tools/intake/cohort.py",
+  "tools/intake/model_review.py",
   "tools/intake/progress.py",
   "tools/schemas/intake.sql",
   "tests/support.py",
@@ -84,5 +88,6 @@
   "tests/test_docling.py",
   "tools/extraction/README.md",
   "docs/decisions/0008-proof-of-concept-closure.md",
+  "docs/decisions/0009-read-only-cohort-intake.md",
   "docs/decisions/0010-daily-snapshots-and-retention.md"
 ]

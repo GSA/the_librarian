@@ -67,6 +67,20 @@ To stage and register a file in one step, use the upload intake (see
 
 It replaces steps 1–3 below and leaves extraction to step 4.
 
+To take in a whole read-only folder, classify it and then ingest the admitted
+files through upload and extraction (see
+[context/intake.md](context/intake.md#read-only-cohort-intake)):
+
+```sh
+.venv/bin/python -m tools.intake.cohort classify --root . --inbox /path/to/inbox
+.venv/bin/python -m tools.intake.cohort ingest --root . --inbox /path/to/inbox \
+  --system my-inbox --actor "$USER" --report .local/cohort-report.json
+```
+
+Every file gets a counted disposition; nothing in the inbox is changed, and
+extracted renditions stay unselected until a standing-policy review qualifies
+them.
+
 To watch a run, use the read-only, body-free progress view (CLI or a
 loopback-only page that refreshes itself; see
 [context/intake.md](context/intake.md#progress-view)):

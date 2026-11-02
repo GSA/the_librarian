@@ -538,5 +538,114 @@ class StandingIntakeTests(StandingCase):
                          ["rev-standing"])
 
 
+class StandingExtractTests(test_kit.WorkspaceCase):
+    """Standing review of strict text renditions inspects every record and warning."""
+
+    def setUp(self):
+        super().setUp()
+        store.initialize(self.root)
+        from tools.extraction import extract
+        self.registration("sources/notes.md", b"# Extract phrase\nSecond line\n")
+        prepared = extract.run(self.root, "prepare", "D1", "text")
+        extract.run(self.root, "register", "D1", "text", "test-runner",
+                    catalog.status(self.root)["state_token"])
+        self.rendition, self.rendition_sha = prepared["rendition"], prepared["rendition_sha256"]
+        events.initialize(self.root)
+        self.docs()
+        self.policy = {"schema": standing.POLICY_SCHEMA, "policy_id": "routine-text",
+                       "version": 1, "status": "active", "reviewer": "standing-reviewer",
+                       "scope": {"receipts": ["D1"], "audiences": ["source"]},
+                       "budget": {"max_pages": 1, "max_records": 10,
+                                  "max_findings_bytes": 64 * 1024},
+                       "selection": {"context": ["documents/AGENTS.md"]}}
+        self.findings = {"schema": standing.FINDINGS_SCHEMA,
+                         "policy": {"policy_id": "routine-text", "version": 1},
+                         "rendition": self.rendition, "rendition_sha256": self.rendition_sha,
+                         "reviewer": "standing-reviewer", "decision": "accept",
+                         "inspected": {"records": [0, 1], "warnings": ["#/payload/warnings/0"]},
+                         "explanation": "Compared both lines and the warning to the original.",
+                         "contradictions": [], "missing_evidence": [], "correction_of": None,
+                         "new_mapping": False, "exception_resolution": None}
+        self.save("config/standing-policy.json", self.policy)
+        self.save("config/standing-findings.json", self.findings)
+
+    def save(self, name, value):
+        path = self.root / name
+        raw = json.dumps(value).encode()
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        return sha(raw)
+
+    def args(self):
+        return {"policy_path": "config/standing-policy.json",
+                "policy_sha256": sha((self.root / "config/standing-policy.json").read_bytes()),
+                "rendition": self.rendition, "rendition_sha256": self.rendition_sha,
+                "findings_path": "config/standing-findings.json",
+                "findings_sha256": sha((self.root / "config/standing-findings.json").read_bytes()),
+                "event_id": "rev-standing-text"}
+
+    def outcome(self):
+        result = standing.evaluate(self.root, self.args())
+        return result["outcome"], result["reasons"]
+
+    def test_complete_record_and_warning_inspection_qualifies(self):
+        result = standing.evaluate(self.root, self.args())
+        self.assertEqual((result["outcome"], result["content"]), ("qualified", ["text"]))
+        self.assertEqual(result["inspected"], {"records": 2, "warnings": 1})
+
+    def test_partial_or_docling_shaped_inspection_does_not_qualify(self):
+        for inspected, expected in (
+                ({"records": [0], "warnings": ["#/payload/warnings/0"]},
+                 ("pending-review", ["insufficient-inspected-scope"])),
+                ({"records": [0, 1], "warnings": []},
+                 ("pending-review", ["insufficient-inspected-scope"])),
+                ({"pages": [], "texts": [], "tables": [], "warnings": []},
+                 ("exception", ["findings-mismatch"]))):
+            with self.subTest(inspected=inspected):
+                self.save("config/standing-findings.json", {**self.findings, "inspected": inspected})
+                self.assertEqual(self.outcome(), expected)
+
+    def test_record_budget_applies(self):
+        self.policy["budget"]["max_records"] = 1
+        self.save("config/standing-policy.json", self.policy)
+        self.assertEqual(self.outcome(), ("exception", ["budget-exceeded"]))
+
+    def test_review_select_publish_records_qualification(self):
+        review = self.args()
+        stage_request(self.root, [
+            stage("review", "standing-review", {**review, "request_id": "req-text-review"}, "review"),
+            stage("publication", "standing-select", {**review, "request_id": "req-text-select",
+                                                     "manifest": "config/selection.json"}, "select"),
+            stage("publication", "standing-publish",
+                  {"policy_path": review["policy_path"], "policy_sha256": review["policy_sha256"],
+                   "manifest": "config/selection.json", "db": DB}, "publish")], "req-text")
+        for name in ("review", "select", "publish"):
+            result = runner.run(self.root, "req-text", name)
+            self.assertEqual(next(s for s in result["stages"] if s["id"] == name)["status"],
+                             "succeeded", name)
+        manifest = json.loads((self.root / "config/selection.json").read_text())
+        self.assertEqual(manifest["renditions"][0]["format"], "text")
+        self.assertEqual(manifest["renditions"][0]["review_event_ids"], ["rev-standing-text"])
+        with closing(index.readonly(self.root / DB)) as db:
+            hit = index.search(db, "Extract phrase", 10, None)["hits"][0]
+            packet = index.packet(db, manifest, hit["locator"], 60000)
+        qualified = packet["renditions"][self.rendition]["qualification"]
+        self.assertEqual(qualified["review_event_ids"], ["rev-standing-text"])
+        self.assertEqual(qualified["reviewed_content"], ["text"])
+
+    def test_text_selection_with_unknown_review_event_is_refused(self):
+        self.config["renditions"] = [{"path": self.rendition, "sha256": self.rendition_sha,
+                                      "receipt_id": "D1", "format": "text",
+                                      "context": ["documents/AGENTS.md"],
+                                      "review_event_ids": ["rev-missing"]}]
+        child = next(r for r in catalog.read_records(self.root, receipt="D1")["records"]
+                     if r["id"].startswith("A-extract-"))
+        child["data"]["coverage"] = "indexed"
+        catalog.submit(self.root, [child], actor="test-runner", request_id="index-text",
+                       expected_state=catalog.status(self.root)["state_token"], reason="Synthetic")
+        with self.assertRaisesRegex(index.IndexError_, "missing or superseded"):
+            self.build()
+
+
 if __name__ == "__main__":
     unittest.main()

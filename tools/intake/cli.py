@@ -45,6 +45,7 @@ def arguments(argv):
     submit.add_argument("--actor", required=True)
     submit.add_argument("--reason", required=True)
     submit.add_argument("--correction-of")
+    submit.add_argument("--origin-kind", choices=("declared-remote", "local-path"))
     submit.add_argument("--origin-system")
     submit.add_argument("--origin-locator")
     submit.add_argument("--origin-version")
@@ -113,6 +114,7 @@ def main(argv=None):
                 name=args.name or args.file.name, actor=args.actor, reason=args.reason,
                 correction_of=args.correction_of, origin_system=args.origin_system,
                 origin_locator=args.origin_locator, origin_version=args.origin_version,
+                origin_kind=args.origin_kind,
                 expected_sha256=args.expected_sha256)
             result = upload.submit(args.root, args.file, value)
         elif args.command == "drop-scan":

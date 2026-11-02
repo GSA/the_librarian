@@ -27,6 +27,11 @@ MAX_SOURCE = 16 * 1024 * 1024
 MAX_XML = 8 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 MAX_ELEMENTS = 100000
+# UTF-8 text-like document suffixes the strict text reader admits. Each file must
+# still decode as strict UTF-8 without NUL; the suffix is never a format proof.
+# Legacy ".doc"/".eml" exports are admitted only when they are such text (MHTML).
+TEXT_SUFFIXES = frozenset({".txt", ".md", ".html", ".htm", ".json",
+                           ".yaml", ".yml", ".csv", ".doc", ".eml"})
 NS = {
     "office": "urn:oasis:names:tc:opendocument:xmlns:office:1.0",
     "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
@@ -281,8 +286,8 @@ def source(root, receipt, format_name):
     relative = Path(data["path"])
     require(policy.allowed(relative.as_posix(), "original_roots", root),
             "Original path is outside configured extraction roots or excluded by policy")
-    suffix = {"gemini-txt": ".txt", "text": ".txt", "odt": ".odt"}[format_name]
-    require(relative.suffix.lower() == suffix, "Selected format disagrees with source extension")
+    suffixes = {"gemini-txt": {".txt"}, "text": TEXT_SUFFIXES, "odt": {".odt"}}[format_name]
+    require(relative.suffix.lower() in suffixes, "Selected format disagrees with source extension")
     path = catalog.safe_path(root / relative)
     raw = read_source(path)
     observed = digest(raw)

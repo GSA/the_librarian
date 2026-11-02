@@ -91,6 +91,26 @@ class SubmitTests(UploadCase):
             **value(), "origin": {"kind": "operator-supplied", "system": "drive",
                                   "locator": None, "version": None}})
 
+    def test_local_path_origin_records_relative_locator_without_remote_identity(self):
+        ack = upload.submit(self.root, self.file("Report_v2.md"), value(
+            name="Report_v2.md", origin_kind="local-path", origin_system="falcon-docs-inbox",
+            origin_locator="03-CONSUMED/2026 notes/Report v2.md"))
+        self.assertEqual(ack["origin"], {"kind": "local-path", "system": "falcon-docs-inbox",
+                                         "locator": "03-CONSUMED/2026 notes/Report v2.md",
+                                         "version": None})
+        self.assertEqual(ack["identity_basis"], "local-path-copy")
+        sidecar = json.loads((self.root / ack["original"]["path"]).with_name("submission.json").read_bytes())
+        self.assertEqual(sidecar["original"]["sha256"], hashlib.sha256(TEXT).hexdigest())
+        for locator in ("/abs/path.md", "../up.md", "a/./b.md", "a//b.md", "a\\b.md", None):
+            with self.subTest(locator=locator):
+                self.assertCode("invalid_origin", value, origin_kind="local-path",
+                                origin_system="falcon-docs-inbox", origin_locator=locator)
+        self.assertCode("invalid_origin", value, origin_kind="local-path",
+                        origin_system="falcon-docs-inbox", origin_locator="a.md", origin_version="1")
+        self.assertCode("invalid_origin", value, origin_kind="local-path", origin_locator="a.md")
+        self.assertCode("invalid_origin", value, origin_kind="remote-guess",
+                        origin_system="x", origin_locator="a.md")
+
     def test_equal_bytes_from_distinct_origins_remain_distinct(self):
         first = upload.submit(self.root, self.file(), value("sub-a", origin_system="drive", origin_locator="a"))
         second = upload.submit(self.root, self.file(), value("sub-b", origin_system="mail", origin_locator="b"))
@@ -158,6 +178,18 @@ class RefusalTests(UploadCase):
         for name in ("../escape.txt", "sub/notes.txt", ".hidden.txt", "submission.json"):
             self.assertCode("invalid_name", value, name=name)
         self.assertNothingStaged()
+
+    def test_text_format_admits_shared_text_like_suffixes(self):
+        from tools.extraction import extract
+        self.assertEqual(upload.FORMATS["text"][0], extract.TEXT_SUFFIXES)
+        for index, suffix in enumerate(sorted(extract.TEXT_SUFFIXES)):
+            name = "page" + suffix
+            ack = upload.submit(self.root, self.file(name), value(f"sub-t{index}", name=name))
+            self.assertEqual(ack["receipt"]["state"], "committed")
+        self.assertCode("type_mismatch", upload.submit, self.root,
+                        self.file("binary.doc", b"\xd0\xcf\x11\xe0\x00"), value("sub-bin", name="binary.doc"))
+        self.assertCode("unsupported_type", value, name="app.js")
+        self.assertEqual(upload.FORMATS["gemini-txt"][0], {".txt"})
 
     def test_unsupported_and_mismatched_types_are_refused(self):
         self.assertCode("unsupported_type", value, name="memo.docx", fmt="docx")
