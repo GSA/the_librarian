@@ -42,6 +42,7 @@
   "tools/schemas/intake.sql",
   "tests/support.py",
   "tests/test_mcp.py",
+  "tests/test_mcp_audit.py",
   "tools/__init__.py",
   "tools/backups.py",
   "tools/policy.py",
@@ -60,6 +61,7 @@
   "tools/context-mcp/README.md",
   "tools/context-mcp/pyproject.toml",
   "tools/context-mcp/src/the_librarian_mcp/__init__.py",
+  "tools/context-mcp/src/the_librarian_mcp/audit.py",
   "tools/context-mcp/src/the_librarian_mcp/config.py",
   "tools/context-mcp/src/the_librarian_mcp/preflight.py",
   "tools/context-mcp/src/the_librarian_mcp/server.py",
@@ -89,5 +91,6 @@
   "tools/extraction/README.md",
   "docs/decisions/0008-proof-of-concept-closure.md",
   "docs/decisions/0009-read-only-cohort-intake.md",
-  "docs/decisions/0010-daily-snapshots-and-retention.md"
+  "docs/decisions/0010-daily-snapshots-and-retention.md",
+  "docs/decisions/0011-full-text-mcp-audit-log.md"
 ]
