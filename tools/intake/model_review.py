@@ -245,6 +245,27 @@ def estimate(sample, *, admitted, sample_bytes=None, admitted_bytes=None):
     return result
 
 
+def api_key(value):
+    """Resolve a Pi ``models.json`` apiKey: ``$NAME``/``${NAME}`` from the environment,
+    ``$$`` as a literal ``$``, otherwise literal. Command keys are not executed."""
+    if value.startswith("!"):
+        raise TransportError("credential-command-unsupported")
+    missing = []
+
+    def name(match):
+        if match[0] == "$$":
+            return "$"
+        key = match[1] or match[2]
+        if key not in os.environ:
+            missing.append(key)
+            return ""
+        return os.environ[key]
+    resolved = re.sub(r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", name, value)
+    if missing or not resolved:
+        raise TransportError("credential-unavailable")
+    return resolved
+
+
 def usai_transport(models_path, provider=PROVIDER, timeout=300):
     """OpenAI-compatible chat transport restricted to one configured provider's models."""
     config = json.loads(Path(models_path).read_text())["providers"][provider]
@@ -256,7 +277,7 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300):
             raise TransportError("model-not-configured")
         request = urllib.request.Request(
             url, data=json.dumps({"model": model, "messages": messages}).encode(),
-            headers={"Authorization": "Bearer " + config["apiKey"],
+            headers={"Authorization": "Bearer " + api_key(config["apiKey"]),
                      "Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:

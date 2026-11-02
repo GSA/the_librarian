@@ -1,6 +1,7 @@
 """Model-assisted standing review: prompts, findings, sample evaluation and cost estimate."""
 import json
 import os
+import unittest
 from pathlib import Path
 import stat
 from unittest.mock import patch
@@ -217,6 +218,22 @@ class EstimateTests(ReviewCase):
         self.assertEqual(estimate["by_bytes"]["prompt_tokens"], 2_000_000)
 
 
+class CredentialTests(unittest.TestCase):
+    def test_api_key_follows_pi_interpolation(self):
+        with patch.dict(os.environ, {"SECRET_KEY": "s3"}):
+            self.assertEqual(model_review.api_key("${SECRET_KEY}"), "s3")
+            self.assertEqual(model_review.api_key("$SECRET_KEY"), "s3")
+            self.assertEqual(model_review.api_key("lit$$eral"), "lit$eral")
+            self.assertEqual(model_review.api_key("plain"), "plain")
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(model_review.TransportError) as caught:
+                model_review.api_key("${SECRET_KEY}")
+            self.assertEqual(caught.exception.code, "credential-unavailable")
+        with self.assertRaises(model_review.TransportError) as caught:
+            model_review.api_key("!secret-tool lookup usai")
+        self.assertEqual(caught.exception.code, "credential-command-unsupported")
+
+
 class TransportTests(ReviewCase):
     def test_usai_transport_refuses_unconfigured_models_and_providers(self):
         models = Path(self.directory.name) / "models.json"
@@ -254,5 +271,4 @@ class TransportTests(ReviewCase):
 
 
 if __name__ == "__main__":
-    import unittest
     unittest.main()
