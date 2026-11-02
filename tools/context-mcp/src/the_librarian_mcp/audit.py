@@ -114,6 +114,30 @@ def log_files(path):
     return [candidate for _, candidate in rotated] + ([path] if path.exists() else [])
 
 
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def create_directories(path):
+    """Create missing ancestors 0700, fsyncing each new entry in its parent."""
+    path = Path(path)
+    missing = []
+    for candidate in [path, *path.parents]:
+        if candidate.exists() or candidate.is_symlink():
+            break
+        missing.append(candidate)
+    for candidate in reversed(missing):
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:  # a concurrent binding created it first
+            pass
+        fsync_directory(candidate.parent)
+
+
 def private_directory(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -137,6 +161,21 @@ def private_file(path, flags):
     return descriptor
 
 
+def same_file(path, status):
+    other = Path(path).lstat()
+    return (other.st_dev, other.st_ino) == (status.st_dev, status.st_ino)
+
+
+@contextmanager
+def locked(path):
+    descriptor = private_file(Path(path).with_name(Path(path).name + ".lock"), os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 class Log:
     """Append-only, rotated, private full-text audit writer."""
 
@@ -148,22 +187,28 @@ class Log:
         self.path = log_path(root, value)
         self.run_id = str(uuid.uuid4())
         # A concurrent binding may create the directory first; validate, never repair.
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create_directories(self.path.parent)
         private_directory(self.path.parent)
 
-    @contextmanager
     def locked(self):
-        descriptor = private_file(self.path.with_name(self.path.name + ".lock"), os.O_RDWR)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            os.close(descriptor)
+        return locked(self.path)
 
     def sync_directory(self):
-        descriptor = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fsync_directory(self.path.parent)
+
+    def recover(self):
+        """Finish an interrupted rotation: the active name still links a rotated file."""
+        if not self.path.exists():
+            return
+        status = self.path.lstat()
+        if any(name != self.path and same_file(name, status) for name in log_files(self.path)):
+            os.unlink(self.path)
+            self.sync_directory()
+
+    def ends_record(self):
+        descriptor = private_file(self.path, os.O_RDONLY)
         try:
-            os.fsync(descriptor)
+            return os.pread(descriptor, 1, max(os.fstat(descriptor).st_size - 1, 0)) == b"\n"
         finally:
             os.close(descriptor)
 
@@ -193,22 +238,41 @@ class Log:
                + "\n").encode()
         private_directory(self.path.parent)
         with self.locked():
+            self.recover()
             if self.path.exists():
                 status = self.path.lstat()
-                if status.st_size and status.st_size + len(raw) > self.max_bytes:
+                if status.st_size and not self.ends_record():
+                    self.rotate()  # preserve a record left unterminated by a failed write
+                elif status.st_size and status.st_size + len(raw) > self.max_bytes:
                     descriptor = private_file(self.path, os.O_RDONLY)
                     os.close(descriptor)
                     self.rotate()
             created = not self.path.exists()
             descriptor = private_file(self.path, os.O_WRONLY | os.O_APPEND)
             try:
-                require(os.write(descriptor, raw) == len(raw), "Short audit write")
+                view = memoryview(raw)
+                while view:
+                    view = view[os.write(descriptor, view):]
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
             if created:
                 self.sync_directory()
         return record
+
+
+def read_lines(path):
+    require(not path.is_symlink(), f"Audit log cannot be a symlink: {path}")
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def dedupe(files, active):
+    """Drop the active name when an interrupted rotation left it linked to a rotated file."""
+    if active in files and active.exists():
+        status = active.lstat()
+        if any(name != active and same_file(name, status) for name in files):
+            return [name for name in files if name != active]
+    return files
 
 
 def report(root, log=None):
@@ -222,28 +286,41 @@ def report(root, log=None):
     tools, agents, outcomes = Counter(), Counter(), Counter()
     if log is None:
         folder = Path(root).resolve() / DIRECTORY
-        paths = sorted(folder.glob("*.jsonl")) if folder.is_dir() else []
+        # Every log with a writer lock is one active log plus its rotated files.
+        actives = sorted(lock.with_name(lock.name[:-len(".lock")])
+                         for lock in folder.glob("*.jsonl.lock")) if folder.is_dir() else []
     else:
-        paths = log_files(log_path(root, log))
-    for path in paths:
-        require(not path.is_symlink(), f"Audit log cannot be a symlink: {path}")
-        summary["files"] += 1
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                record = json.loads(line)
-                assert record["schema"] == SCHEMA
-                text = record["returned_text"]
-            except (ValueError, KeyError, TypeError, AssertionError):
-                summary["invalid_lines"] += 1
-                continue
-            summary["records"] += 1
-            tools[str(record.get("tool"))] += 1
-            agents[str(record.get("agent_label"))] += 1
-            outcomes[str(record.get("outcome"))] += 1
-            summary["returned_chars"] += len(text)
-            summary["returned_bytes"] += len(text.encode("utf-8"))
-            if hashlib.sha256(text.encode("utf-8")).hexdigest() != record.get("returned_sha256"):
-                summary["hash_mismatches"] += 1
+        actives = [log_path(root, log)]
+    groups, covered = [], set()
+    for active in actives:
+        if not active.parent.is_dir():
+            continue
+        with locked(active):  # writers rotate under this lock; read a stable view
+            files = log_files(active)
+            groups.append([(path, read_lines(path)) for path in dedupe(files, active)])
+        covered.update(files)
+    if log is None and folder.is_dir():
+        groups.append([(path, read_lines(path)) for path in sorted(folder.glob("*.jsonl"))
+                       if path not in covered])
+    for lines in groups:
+        for path, content in lines:
+            summary["files"] += 1
+            for line in content:
+                try:
+                    record = json.loads(line)
+                    assert record["schema"] == SCHEMA
+                    text = record["returned_text"]
+                except (ValueError, KeyError, TypeError, AssertionError):
+                    summary["invalid_lines"] += 1
+                    continue
+                summary["records"] += 1
+                tools[str(record.get("tool"))] += 1
+                agents[str(record.get("agent_label"))] += 1
+                outcomes[str(record.get("outcome"))] += 1
+                summary["returned_chars"] += len(text)
+                summary["returned_bytes"] += len(text.encode("utf-8"))
+                if hashlib.sha256(text.encode("utf-8")).hexdigest() != record.get("returned_sha256"):
+                    summary["hash_mismatches"] += 1
     return {**summary, "by_tool": dict(sorted(tools.items())),
             "by_agent": dict(sorted(agents.items())),
             "by_outcome": dict(sorted(outcomes.items())),

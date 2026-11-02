@@ -8,7 +8,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/context-mcp/src"))
@@ -138,6 +140,62 @@ class AuditLog(unittest.TestCase):
         for path in files:
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertLessEqual(path.stat().st_size, audit.MIN_FILE_BYTES)
+
+    def test_new_directories_are_fsynced_in_their_parents_before_the_first_write(self):
+        synced = []
+        real = audit.fsync_directory
+        with unittest.mock.patch.object(audit, "fsync_directory",
+                                        side_effect=lambda path: (synced.append(Path(path)), real(path))):
+            audit.Log(self.root, Path(".local/deep/er/pi.jsonl"), "pi")
+        self.assertEqual(synced, [self.root, self.root / ".local", self.root / ".local/deep"])
+
+    def test_short_writes_are_completed(self):
+        real = os.write
+        calls = []
+
+        def short(descriptor, data):
+            calls.append(len(data))
+            return real(descriptor, bytes(data)[:7])
+
+        with unittest.mock.patch.object(audit.os, "write", short):
+            self.log().write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(audit.report(self.root)["records"], 1)
+
+    def test_a_fragment_from_a_failed_write_is_rotated_not_appended_to(self):
+        log = self.log()
+        log.write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
+        with log.path.open("ab") as handle:
+            handle.write(b'{"schema": "partial')
+        log.write(tool="search", arguments={}, outcome="ok", text="two", **stamps())
+        summary = audit.report(self.root)
+        self.assertEqual((summary["records"], summary["invalid_lines"], summary["files"]), (2, 1, 2))
+
+    def test_interrupted_rotation_is_recovered_without_duplicates(self):
+        log = self.log(max_bytes=audit.MIN_FILE_BYTES)
+        body = "x" * (audit.MIN_FILE_BYTES // 3)
+        for index in range(2):
+            log.write(tool="search", arguments={"query": str(index)}, outcome="ok",
+                      text=body, **stamps())
+        # Crash after the link, before the unlink: the active name still holds a rotated inode.
+        os.link(log.path, audit.numbered(log.path, 9))
+        self.assertEqual(audit.report(self.root)["records"], 2)
+        log.write(tool="search", arguments={"query": "2"}, outcome="ok", text=body, **stamps())
+        queries = sorted(json.loads(line)["arguments"]["query"]
+                         for path in audit.log_files(log.path) for line in path.read_text().splitlines())
+        self.assertEqual(queries, ["0", "1", "2"])
+        self.assertEqual(audit.report(self.root)["records"], 3)
+
+    def test_report_waits_for_a_rotation_in_progress(self):
+        log = self.log()
+        log.write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
+        done = threading.Event()
+        with log.locked():
+            thread = threading.Thread(target=lambda: (audit.report(self.root), done.set()))
+            thread.start()
+            self.assertFalse(done.wait(0.3))
+        thread.join(5)
+        self.assertTrue(done.is_set())
 
     def test_report_is_body_free_and_verifies_hashes(self):
         log = self.log()
