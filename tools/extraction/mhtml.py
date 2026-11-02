@@ -19,7 +19,7 @@ import re
 
 METHOD = "mhtml-html-text"
 # Bump when conversion output can change so ingested entries are extracted again.
-METHOD_VERSION = 1
+METHOD_VERSION = 2
 MAX_HEADER = 64 * 1024
 MAX_PARTS = 5000
 MAX_DEPTH = 16
@@ -71,8 +71,7 @@ def _decode(part):
         except (binascii.Error, ValueError) as error:
             raise MhtmlError("mime-encoding") from error
     elif encoding == "quoted-printable":
-        require(re.search(rb"=(?![0-9A-Fa-f]{2}|[ \t]*\r?\n)", data) is None
-                and not data.rstrip(b" \t\r\n").endswith(b"="), "mime-encoding")
+        require(re.search(rb"=(?![0-9A-Fa-f]{2}|[ \t]*\r?\n)", data) is None, "mime-encoding")
         data = quopri.decodestring(data)
     charset = (part.get_content_charset() or "us-ascii").strip()
     try:
@@ -114,6 +113,13 @@ class Converter(HTMLParser):
         self.cells = 0
         self.preformatted = 0
         self.row = 0
+        self.open = []  # per open table: whether a cell is currently open at that level
+
+    def close_cell(self):
+        """Close the open cell of the innermost table (HTML allows omitting </td> and </th>)."""
+        if self.open and self.open[-1]:
+            self.open[-1] = False
+            self.cells = max(0, self.cells - 1)
 
     def flush(self):
         line = re.sub(r"\s+", " ", "".join(self.current)).strip()
@@ -135,14 +141,21 @@ class Converter(HTMLParser):
             return
         if self.skip:
             return
-        if tag in {"td", "th"}:
+        if tag == "table":
+            self.break_line()
+            self.open.append(False)
+        elif tag in {"td", "th"}:
+            if not self.open:
+                self.open.append(False)
+            self.close_cell()
             if self.cells == 0 and self.row:
                 self.current.append(" | ")
             elif self.cells:
                 self.current.append(" ")
             self.cells += 1
+            self.open[-1] = True
             self.row += self.cells == 1
-        elif tag == "tr" and not self.cells:
+        elif tag == "tr" and (self.close_cell() or not self.cells):
             self.flush()
             self.row = 0
         elif tag in BLOCKS:
@@ -163,10 +176,15 @@ class Converter(HTMLParser):
                 self.skip.pop()
             return
         if tag in {"td", "th"}:
-            self.cells = max(0, self.cells - 1)
-        elif tag == "tr" and not self.cells:
+            self.close_cell()
+        elif tag == "tr" and (self.close_cell() or not self.cells):
             self.flush()
             self.row = 0
+        elif tag == "table":
+            self.close_cell()
+            if self.open:
+                self.open.pop()
+            self.break_line()
         elif tag in BLOCKS:
             self.break_line()
             if tag == "pre":

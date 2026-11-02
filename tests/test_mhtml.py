@@ -156,5 +156,30 @@ class ConvertTests(unittest.TestCase):
                          ["Encoded \u2014 text\n"])
 
 
+class ConvertRegressionTests(unittest.TestCase):
+    def lines(self, html, encoding="7bit"):
+        raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
+               b"Content-Transfer-Encoding: " + encoding.encode() + b"\r\n\r\n" + html)
+        return [line["text"] for line in mhtml.payload(raw)["lines"]]
+
+    def test_omitted_cell_and_row_end_tags_keep_rows_separate(self):
+        lines = self.lines(b"<table><tr><td>Code<td>Required</tr><tr><td>Other<td>Optional</tr></table>\r\n")
+        self.assertEqual(lines, ["Code | Required\n", "Other | Optional\n"])
+        lines = self.lines(b"<table><tr><th>A<th>B<tr><td>1<td>2</table><p>After</p>\r\n")
+        self.assertEqual(lines, ["A | B\n", "1 | 2\n", "After\n"])
+
+    def test_nested_table_does_not_end_the_outer_cell(self):
+        lines = self.lines(b"<table><tr><td>Outer<table><tr><td>In1<td>In2</table><td>Next</tr></table>\r\n")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Outer", lines[0])
+        self.assertIn("Next", lines[0])
+
+    def test_final_quoted_printable_soft_break_is_valid(self):
+        self.assertEqual(self.lines(b"<p>Rule</p>=\r\n", "quoted-printable"), ["Rule\n"])
+        with self.assertRaises(mhtml.MhtmlError):
+            mhtml.payload(b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
+                          b"Content-Transfer-Encoding: quoted-printable\r\n\r\n<p>Rule</p>=")
+
+
 if __name__ == "__main__":
     unittest.main()
