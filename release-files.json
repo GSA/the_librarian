@@ -56,6 +56,7 @@
   "tools/context-mcp/README.md",
   "tools/context-mcp/pyproject.toml",
   "tools/context-mcp/src/the_librarian_mcp/__init__.py",
+  "tools/context-mcp/src/the_librarian_mcp/audit.py",
   "tools/context-mcp/src/the_librarian_mcp/config.py",
   "tools/context-mcp/src/the_librarian_mcp/preflight.py",
   "tools/context-mcp/src/the_librarian_mcp/server.py",
