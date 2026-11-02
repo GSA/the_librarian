@@ -11,6 +11,11 @@ from zipfile import ZipFile
 from tools.catalog import catalog_store as catalog
 from tools.intake import cohort, store
 
+CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
+              b"------=_Part_1\r\nContent-Type: text/html; charset=utf-8\r\n"
+              b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+              b"<html><body><p class=3D\"x\">Fund codes are four=\r\n characters</p></body></html>\r\n"
+              b"------=_Part_1--\r\n")
 GEMINI = b"Summary\nDecided things.\nTranscript\nAlex: hello there\n"
 
 
@@ -45,7 +50,8 @@ class CohortCase(unittest.TestCase):
         self.inbox = Path(self.temp.name) / "inbox"
         files = {
             "a/notes.md": b"# Notes\nLine\n",
-            "a/FALCON+\u2014+ORR Checklist.doc": b"MIME-Version: 1.0\r\nbody\r\n",
+            "a/FALCON+\u2014+ORR Checklist.doc": CONFLUENCE,
+            "a/broken.doc": b"MIME-Version: 1.0\r\nbody\r\n",
             "a/FALCON+\u2014+ORR Checklist.doc:Zone.Identifier": b"[ZoneTransfer]\n",
             "m/Sync - Notes by Gemini.txt": GEMINI,
             "m/plain.txt": b"Just text\n",
@@ -80,7 +86,8 @@ class ClassifyTests(CohortCase):
         entries = {e["relative"]: e for e in cohort.classify(self.root, self.inbox)}
         expected = {
             "a/notes.md": ("admit", "text"),
-            "a/FALCON+\u2014+ORR Checklist.doc": ("admit", "text"),
+            "a/FALCON+\u2014+ORR Checklist.doc": ("admit", "mhtml"),
+            "a/broken.doc": ("needs-reader", None),
             "a/FALCON+\u2014+ORR Checklist.doc:Zone.Identifier": ("skipped-artifact", None),
             "m/Sync - Notes by Gemini.txt": ("admit", "gemini-txt"),
             "m/plain.txt": ("admit", "text"),
@@ -133,16 +140,18 @@ class IngestTests(CohortCase):
         report = cohort.ingest(self.root, self.inbox, system="falcon-docs-inbox",
                                actor="cohort-runner")
         self.assertEqual(tree(self.inbox), self.before)
-        self.assertEqual(report["counts"]["files"], 14)
+        self.assertEqual(report["counts"]["files"], 15)
         self.assertEqual(report["counts"]["disposition"], {
-            "admit": 6, "skipped-artifact": 1, "needs-runtime": 1, "needs-reader": 1,
+            "admit": 6, "skipped-artifact": 1, "needs-runtime": 1, "needs-reader": 2,
             "unreadable": 1, "empty": 1, "skipped-asset": 1, "archive-expanded": 1,
             "unsafe-path": 1})
         self.assertEqual(report["counts"]["outcome"], {
             "received": 6, "extracted": 6, "failed": 0, "changed-since-intake": 0,
             "not-processed": 0})
-        self.assertEqual(report["counts"]["format"], {"text": 4, "gemini-txt": 1, "odt": 1})
+        self.assertEqual(report["counts"]["format"], {"text": 3, "mhtml": 1, "gemini-txt": 1, "odt": 1})
         raw = json.dumps(report)
+        for body in ("Fund codes", "=3D", "<p"):
+            self.assertNotIn(body, raw)
         for body in ("Line", "Decided", "hello there", "Just text", "Plan", "inside"):
             self.assertNotIn(body, raw)
         records = catalog.read_records(self.root, limit=200)["records"]
@@ -157,6 +166,31 @@ class IngestTests(CohortCase):
                                              "locator": entry["locator"], "version": None})
         self.assertEqual(sidecar["original"]["sha256"],
                          hashlib.sha256((self.inbox / entry["relative"]).read_bytes()).hexdigest())
+
+    def test_mime_doc_is_extracted_as_converted_text_and_malformed_mime_is_not_ingested(self):
+        report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        broken = next(e for e in report["entries"] if e["relative"] == "a/broken.doc")
+        self.assertEqual((broken["disposition"], broken["code"]), ("needs-reader", "mime-malformed"))
+        self.assertNotIn("outcome", broken)
+        entry = next(e for e in report["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        payload = json.loads((self.root / entry["rendition"]).read_text())["payload"]
+        self.assertEqual(payload["format"], "mhtml")
+        self.assertEqual(payload["method"]["name"], "mhtml-html-text")
+        self.assertEqual([r["text"] for r in payload["lines"]], ["Fund codes are four characters\n"])
+
+    def test_text_entry_from_before_mime_recognition_is_corrected_not_kept(self):
+        from tools.intake import upload
+        old = cohort.submission("a/FALCON+\u2014+ORR Checklist.doc", "inbox")
+        upload.submit(self.root, self.inbox / "a/FALCON+\u2014+ORR Checklist.doc", upload.descriptor(
+            submission_id=old["submission_id"], format_name="text", name=old["name"],
+            actor="cohort-runner", reason="earlier toolkit", origin_kind="local-path",
+            origin_system="inbox", origin_locator=old["locator"]))
+        report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        entry = next(e for e in report["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        self.assertEqual(entry["outcome"], "extracted")
+        self.assertNotEqual(entry["submission_id"], old["submission_id"])
+        sidecar = json.loads((self.root / Path(entry["original"]).parent / "submission.json").read_text())
+        self.assertEqual(sidecar["correction_of"], old["submission_id"])
 
     def test_rerun_is_idempotent(self):
         first = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
@@ -205,7 +239,7 @@ class CliTests(CohortCase):
         self.assertEqual(set(printed), {"counts"})
         self.assertEqual(printed["counts"]["outcome"]["extracted"], 6)
         self.assertEqual(report.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(len(json.loads(report.read_text())["entries"]), 14)
+        self.assertEqual(len(json.loads(report.read_text())["entries"]), 15)
 
 
 if __name__ == "__main__":
