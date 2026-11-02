@@ -42,7 +42,7 @@ clients to the git-clone instance dropped that record.
    queries at the instance's audience. It is never retrieval context, never
    indexed, searched or returned by a tool, and is not evidence of review. The
    body-free `--diagnostics-log` is unchanged. Operators summarize the audit
-   with `librarian-audit --root <root> report`, which prints
+   with `librarian-audit --root <root> report [--log PATH]`, which prints
    counts by tool, agent and outcome, returned sizes and hash mismatches, and no
    text or queries.
 

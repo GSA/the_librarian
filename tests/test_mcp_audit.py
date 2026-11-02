@@ -94,6 +94,28 @@ class AuditLog(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "private"):
             log.write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
 
+    def test_report_reads_a_custom_log_and_its_rotations(self):
+        log = audit.Log(self.root, Path(".local/private/pi.jsonl"), "pi",
+                        max_bytes=audit.MIN_FILE_BYTES)
+        for _ in range(4):
+            log.write(tool="search", arguments={}, outcome="ok",
+                      text="x" * (audit.MIN_FILE_BYTES // 3), **stamps())
+        self.assertEqual(audit.report(self.root)["records"], 0)
+        summary = audit.report(self.root, Path(".local/private/pi.jsonl"))
+        self.assertEqual((summary["records"], summary["files"]), (4, 2))
+        with self.assertRaises(audit.AuditError):
+            audit.report(self.root, Path("documents/pi.jsonl"))
+
+    def test_concurrent_bindings_share_an_existing_private_directory(self):
+        first = audit.Log(self.root, Path(".local/audit/pi-mcp-access.jsonl"), "pi")
+        second = audit.Log(self.root, Path(".local/audit/copilot-mcp-access.jsonl"), "copilot")
+        self.assertEqual(first.path.parent, second.path.parent)
+        (self.root / ".local/shared").mkdir(mode=0o755, parents=True)
+        (self.root / ".local/shared").chmod(0o755)
+        with self.assertRaisesRegex(audit.AuditError, "private"):
+            audit.Log(self.root, Path(".local/shared/pi.jsonl"), "pi")
+        self.assertEqual(stat.S_IMODE((self.root / ".local/shared").stat().st_mode), 0o755)
+
     def test_labels_and_outcomes_are_closed(self):
         for label in ("", "Pi", "a b", "x" * 65, "../pi"):
             with self.subTest(label=label), self.assertRaises(audit.AuditError):

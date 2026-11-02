@@ -147,9 +147,8 @@ class Log:
         self.max_bytes = max_bytes
         self.path = log_path(root, value)
         self.run_id = str(uuid.uuid4())
-        if not self.path.parent.exists():
-            self.path.parent.mkdir(mode=0o700, parents=True)
-            os.chmod(self.path.parent, 0o700)
+        # A concurrent binding may create the directory first; validate, never repair.
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         private_directory(self.path.parent)
 
     @contextmanager
@@ -161,10 +160,18 @@ class Log:
         finally:
             os.close(descriptor)
 
+    def sync_directory(self):
+        descriptor = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def rotate(self):
         index = max([int(name.stem.rsplit(".", 1)[1]) for name in log_files(self.path)
                      if name != self.path] or [0]) + 1
         os.link(self.path, numbered(self.path, index), follow_symlinks=False)
+        self.sync_directory()
         os.unlink(self.path)
 
     def write(self, *, tool, arguments, outcome, text, started_at, completed_at,
@@ -192,22 +199,32 @@ class Log:
                     descriptor = private_file(self.path, os.O_RDONLY)
                     os.close(descriptor)
                     self.rotate()
+            created = not self.path.exists()
             descriptor = private_file(self.path, os.O_WRONLY | os.O_APPEND)
             try:
                 require(os.write(descriptor, raw) == len(raw), "Short audit write")
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            if created:
+                self.sync_directory()
         return record
 
 
-def report(root, directory=DIRECTORY):
-    """Body-free summary: counts by tool, agent and outcome, sizes and hash checks."""
-    folder = Path(root).resolve() / directory
+def report(root, log=None):
+    """Body-free summary: counts by tool, agent and outcome, sizes and hash checks.
+
+    Without ``log`` every ``*.jsonl`` in ``.local/audit`` is read; with it, that
+    log (validated like the writer's path) and its rotated files.
+    """
     summary = {"files": 0, "records": 0, "invalid_lines": 0, "hash_mismatches": 0,
                "returned_chars": 0, "returned_bytes": 0}
     tools, agents, outcomes = Counter(), Counter(), Counter()
-    paths = sorted(path for path in folder.glob("*.jsonl")) if folder.is_dir() else []
+    if log is None:
+        folder = Path(root).resolve() / DIRECTORY
+        paths = sorted(folder.glob("*.jsonl")) if folder.is_dir() else []
+    else:
+        paths = log_files(log_path(root, log))
     for path in paths:
         require(not path.is_symlink(), f"Audit log cannot be a symlink: {path}")
         summary["files"] += 1
@@ -237,10 +254,13 @@ def main(argv=None):
     arguments = argparse.ArgumentParser(description="Summarize the MCP audit log without bodies")
     arguments.add_argument("--root", required=True, type=Path)
     commands = arguments.add_subparsers(dest="command", required=True)
-    commands.add_parser("report", help="Counts by tool, agent and outcome; no text or queries")
+    summary = commands.add_parser("report", help="Counts by tool, agent and outcome; no text or queries")
+    summary.add_argument("--log", type=Path, default=None,
+                         help="One audit log below <root>/.local, with its rotated files; "
+                              "default: every log in .local/audit")
     options = arguments.parse_args(argv)
     try:
-        print(json.dumps(report(options.root), sort_keys=True))
+        print(json.dumps(report(options.root, options.log), sort_keys=True))
     except (AuditError, OSError, UnicodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

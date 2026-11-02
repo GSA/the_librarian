@@ -30,7 +30,7 @@ error instead of the result. The log contains corpus text and agent queries;
 it is never retrieval context and no tool reads it. Summarize it without bodies:
 
 ```
-librarian-audit --root <root> report
+librarian-audit --root <root> report [--log PATH]
 ```
 
 See [decision 0011](../../docs/decisions/0011-full-text-mcp-audit-log.md).
