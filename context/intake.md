@@ -188,18 +188,18 @@ private instance data. Extraction never reviews, selects or qualifies.
 
 `qualify ... --system LABEL --actor A --policy PATH --manifest PATH
 --models-config FILE --model M --context LOCATOR [--context LOCATOR ...]
-[--index DB] [--limit N]` runs `ingest`, ensures the private standing policy and
+[--index DB]` runs `ingest`, ensures the private standing policy and
 selection manifest exist (`--context` names maintained documents under the
 policy's `markdown_roots` and is required; nothing is written without it), and
 runs `model_review.review` then stages `standing-review` + `standing-select`
 (`standing-<submission-id>-<rendition-hash>-<policy-hash>`) for each extracted rendition that
 has no saved review. A changed rendition gets a new review; an unchanged one
-reuses its ledger stages with no model call. When `--limit` is omitted the
+reuses its ledger stages with no model call. The
 manifest is first pruned to the cohort's current renditions, then reconciled
 to exactly the qualified ones, adding any that are missing. Policy, manifest and context paths are validated (instance-relative, no
 symlinks, existing maintained sections) before anything is ingested or written;
-manifest and policy files are replaced atomically. A `--limit` run replaces only
-the processed items' selections. Changing an active policy's content does not
+manifest and policy files are replaced atomically.  `qualify` always processes the whole inbox
+(`--limit` exists only on `ingest`). Changing an active policy's content does not
 requalify old evidence: renditions already reviewed under another policy stay
 `pending-review` until an explicit policy-change review correction is made. `standing-publish` builds the context index;
 a saved publication is reused only while the index is present and fresh,

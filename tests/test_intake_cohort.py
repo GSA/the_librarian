@@ -405,36 +405,6 @@ class QualifyTests(CohortCase):
         self.assertFalse((self.root / "config/standing-policy.local.json").exists())
         self.assertFalse((self.root.parent / "escape.local.json").exists())
 
-    def test_limited_run_replaces_only_the_processed_items_prior_selection(self):
-        from tools.context_index import context_index as index
-        transport, _ = self._transport()
-        self._qualify(transport)
-        self.writable()
-        (self.inbox / "a/notes.md").write_bytes(b"# Notes\nCorrected cohort line\n")
-        report = self._qualify(transport, limit=15)
-        notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
-        selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
-        self.assertEqual(len(selected), 6)
-        self.assertIn(notes["rendition"], [r["path"] for r in selected])
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
-            self.assertEqual(len(index.search(db, "Corrected cohort", 10, None, root=self.root)["hits"]), 1)
-            paths = {h["path"] for h in index.search(db, "Notes", 10, None, root=self.root)["hits"]}
-            self.assertEqual(paths, {notes["rendition"]})
-
-    def test_limited_run_drops_every_earlier_version_and_older_extraction(self):
-        from tools.context_index import context_index as index
-        transport, _ = self._transport()
-        self._qualify(transport)
-        for text in (b"# Notes\nSecond version\n", b"# Notes\nThird version\n"):
-            self.writable()
-            (self.inbox / "a/notes.md").write_bytes(text)
-            self._qualify(transport, limit=15)
-        selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
-        self.assertEqual(len(selected), 6)
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
-            hits = index.search(db, "version", 10, None, root=self.root)["hits"]
-            self.assertEqual(len(hits), 1)
-
     def test_qualify_preflights_policy_permissions_and_index_before_ingesting(self):
         transport, calls = self._transport()
         policy_file = self.root / "config/standing-policy.local.json"

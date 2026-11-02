@@ -11,7 +11,7 @@ from collections import Counter
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import stat
 import sys
@@ -201,11 +201,6 @@ def _process(root, inbox, entry, system, actor):
         if upload.ledger_request(root, upload.correlation(earlier)) is not None:
             superseded = earlier
     entry.update(identity)
-    if superseded:
-        old = upload.ledger_request(root, upload.correlation(superseded))
-        if old is not None:
-            entry["superseded_receipt"] = next(
-                r["id"] for r in upload.submit_records(old) if r["kind"] == "receipt")
     try:
         ack = upload.submit(root, Path(inbox) / entry["relative"], upload.descriptor(
             submission_id=identity["submission_id"], format_name=entry["format"],
@@ -280,18 +275,6 @@ def _replace_json(path, value, mode=0o644):
         os.fsync(directory)
     finally:
         os.close(directory)
-
-
-def _origin_locator(root, rendition, system):
-    """The inbox locator a selected rendition came from, or None when it is not this cohort's."""
-    try:
-        value = json.loads((root / rendition).read_text(encoding="utf-8"))
-        sidecar = json.loads((root / PurePosixPath(value["source"]["path"]).parent
-                              / upload.SIDECAR).read_text(encoding="utf-8"))
-        origin = sidecar["origin"]
-        return origin["locator"] if origin.get("system") == system else None
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
 
 
 def _instance_file(root, name):
@@ -512,23 +495,22 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
 
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
-            context=None, index_path=DEFAULT_INDEX, limit=None):
+            context=None, index_path=DEFAULT_INDEX):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage."""
     root = Path(root).resolve()
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
         raise IntakeError("context_required")
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
-    report = ingest(root, inbox, system=system, actor=actor, limit=limit)
+    report = ingest(root, inbox, system=system, actor=actor)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
     extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
-    if limit is None:
-        # Drop selections for renditions the cohort no longer has before selecting replacements,
-        # so replacing a rendition never needs spare manifest capacity.
-        current = {e["rendition"] for e in extracted}
-        _set_manifest_renditions(root, manifest, [
-            r for r in _manifest_renditions(root, manifest) if r["path"] in current])
+    # Drop selections for renditions the cohort no longer has before selecting replacements,
+    # so replacing a rendition never needs spare manifest capacity.
+    current = {e["rendition"] for e in extracted}
+    _set_manifest_renditions(root, manifest, [
+        r for r in _manifest_renditions(root, manifest) if r["path"] in current])
     usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
     snapshot = event_reader.read_snapshot(root)
     for entry in extracted:
@@ -536,24 +518,13 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
                            model, transport, usage, snapshot)
     selected = _manifest_renditions(root, manifest)
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
-    # Reconcile from validated review evidence: add missing and, for a full run, drop the rest.
-    desired = [e["selection"] for e in qualified]
-    # Keep an operator's explicit selection for a rendition whose saved review was superseded.
+    # Reconcile the manifest to exactly the qualified renditions from validated review
+    # evidence, keeping an operator's explicit selection whose saved review was superseded.
     stale = {e["superseded_event"] for e in extracted if "superseded_event" in e}
     kept = {e["rendition"] for e in extracted if e.get("review_code") == "review-superseded"}
     selected = [r for r in selected if not stale & set(r.get("review_event_ids") or [])]
-    if limit is None:
-        _set_manifest_renditions(root, manifest, [
-            r for r in selected if r["path"] in kept] + desired)
-    else:
-        # A partial run replaces only what it processed: drop the superseded and the
-        # re-reviewed selections of processed items and keep everything else.
-        locators = {e["locator"] for e in extracted}
-        replaced = {e["rendition"] for e in extracted}
-        _set_manifest_renditions(root, manifest, [
-            r for r in selected
-            if r["path"] not in kept | replaced
-            and _origin_locator(root, r["path"], system) not in locators] + desired)
+    _set_manifest_renditions(root, manifest, [r for r in selected if r["path"] in kept]
+                             + [e["selection"] for e in qualified])
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     report["counts"]["qualification"] = dict(
         Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
@@ -577,6 +548,7 @@ def main(argv=None):
         if name in {"ingest", "qualify"}:
             command.add_argument("--system", required=True)
             command.add_argument("--actor", required=True)
+        if name == "ingest":
             command.add_argument("--limit", type=int)
         if name == "qualify":
             command.add_argument("--policy", required=True, dest="policy_path")
@@ -592,7 +564,7 @@ def main(argv=None):
                 args.root, args.inbox, system=args.system, actor=args.actor,
                 policy_path=args.policy_path, manifest=args.manifest, model=args.model,
                 transport=model_review.usai_transport(args.models_config),
-                context=args.context, index_path=args.index_path, limit=args.limit)
+                context=args.context, index_path=args.index_path)
         elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                             limit=args.limit)
