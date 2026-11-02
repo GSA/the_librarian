@@ -243,7 +243,7 @@ class NativeTests(unittest.TestCase):
         evidence = result["stages"][0]["evidence"]
         self.assertEqual(evidence["committed_revision"], 1)
         self.assertEqual(catalog.status(self.root)["revision"], 2)
-        catalog.verify_backup(Path(evidence["backup"]["snapshot"]))
+        self.assertIsNone(evidence["backup"])  # initialisation already covered today
 
     def test_review_commit_lost_ack_reconciles_original_revision(self):
         import test_kit

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 
-from . import adapters, runner, store, upload
+from . import adapters, progress, runner, store, upload
 from .contracts import IntakeError, decode, decode_request, require
 
 
@@ -52,6 +52,20 @@ def arguments(argv):
     submit.add_argument("--expected-sha256")
     for name in ("drop-scan", "drop-submit"):
         commands.add_parser(name).add_argument("--drop", type=Path, required=True)
+    for name in ("progress", "progress-serve"):
+        view = commands.add_parser(name, help="Read-only, body-free intake progress" + (
+            " over loopback HTTP" if name == "progress-serve" else ""))
+        view.add_argument("--limit", type=int, default=50, help="Recent and attention items to list")
+        view.add_argument("--run", action="append", default=[], metavar="NAME=PREFIX",
+                          help="Group correlation IDs starting with PREFIX as a named run")
+        if name == "progress":
+            view.add_argument("--format", choices=("json", "text"), default="json")
+        else:
+            view.add_argument("--host", default="127.0.0.1")
+            view.add_argument("--port", type=int, default=8765)
+            view.add_argument("--refresh", type=int, default=5, help="Page refresh seconds")
+            view.add_argument("--allow-non-loopback", action="store_true",
+                              help="Explicit approval to expose the view beyond this machine")
     inspect = commands.add_parser("inspect")
     inspect.add_argument("correlation")
     for name in ("run", "resume", "replay", "acknowledge"):
@@ -63,10 +77,32 @@ def arguments(argv):
     return parser.parse_args(argv)
 
 
+def runs(values):
+    result = {}
+    for value in values:
+        name, separator, prefix = value.partition("=")
+        require(separator and name and prefix and name not in result, "invalid_run")
+        result[name] = prefix
+    return result
+
+
 def main(argv=None):
     args = arguments(argv)
     try:
-        if args.command == "initialize":
+        if args.command == "progress":
+            require(1 <= args.limit <= 1000, "invalid_limit")
+            report = progress.snapshot(args.root, limit=args.limit, runs=runs(args.run))
+            sys.stdout.write(progress.render_text(report) if args.format == "text"
+                             else json.dumps(report, sort_keys=True) + "\n")
+            return 0
+        if args.command == "progress-serve":
+            require(1 <= args.limit <= 1000 and 1 <= args.refresh <= 3600
+                    and 0 <= args.port <= 65535, "invalid_option")
+            progress.check_bind(args.host, args.allow_non_loopback)
+            result = progress.serve(args.root, host=args.host, port=args.port, refresh=args.refresh,
+                                    limit=args.limit, runs=runs(args.run),
+                                    allow_non_loopback=args.allow_non_loopback)
+        elif args.command == "initialize":
             result = store.initialize(args.root)
         elif args.command == "stage":
             result = store.stage(args.root, read_input(args.request))

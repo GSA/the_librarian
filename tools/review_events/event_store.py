@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import uuid
 
+from tools import backups as snapshots
 from tools.review_events import review_events as contract
 
 
@@ -278,7 +279,8 @@ def snapshot(connection, backups, reason, root=None):
         require(copied == state, "Backup does not match committed store")
         seal(temporary)
         digest = file_hash(temporary)
-        record = {"backup_version": 1, "created_at": now(), "reason": reason, "database": final.name,
+        record = {"backup_version": 1, "created_at": snapshots.utcnow().isoformat(), "reason": reason,
+                  "database": final.name,
                   "sha256": digest, "bytes": temporary.stat().st_size, "state": state}
         os.replace(temporary, final)
         fsync_directory(backups)
@@ -353,7 +355,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
             require(prior["actor"] == actor and prior["input_hash"] == input_hash,
                     "Request ID reused with a different actor or payload")
             return {"command": "append", "idempotent": True, **state, "committed_revision": prior["revision"],
-                    "backup": snapshot(connection, backups, "retry", root)}
+                    "backup": None, "retention": None}
         require(state["revision"] == expected_revision and state["state_token"] == expected_state,
                 "Stale revision or state token; re-read state before writing")
         ids = {e["event_id"] for e in existing}
@@ -366,7 +368,10 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
             if key is not None:
                 origins.add(key)
         validate_history(existing + incoming, root)
-        pre = snapshot(connection, backups, "pre-write", root)
+        taken, retention = snapshots.daily_snapshot(
+            backups, store_id=state["store_id"], take=lambda: snapshot(connection, backups, "daily", root),
+            verify=lambda path: verified_snapshot(path, root), errors=(contract.ReviewError,),
+            days=contract.policy.backup_retention_days(root))
         committed = False
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -391,7 +396,6 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
             connection.execute("COMMIT")
             committed = True
             seal(db)
-            post = snapshot(connection, backups, "post-write", root)
         except (OSError, sqlite3.Error, contract.ReviewError) as error:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -402,13 +406,28 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
                 ) from error
             raise
         return {"command": "append", "idempotent": False, **inspect(connection, root)[0],
-                "pre_backup": pre, "backup": post}
+                "backup": taken, "retention": retention}
 
 
 def backup(root):
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db)) as connection:
         return {"command": "backup", **snapshot(connection, backups, "manual", root)}
+
+
+def backup_inventory(root):
+    return snapshots.inventory(locations(root)[2])
+
+
+def prune(root, *, apply=False):
+    """Operator prune: newest verified snapshot per UTC day inside the window; dry run by default."""
+    home, db, backups = locations(root)
+    with writer_lock(home), closing(connect(db)) as connection:
+        store_id = inspect(connection, root)[0]["store_id"]
+        # Hold the writer lock so prune cannot overlap a write's retention or a restore.
+        return snapshots.prune(backups, store_id=store_id, verify=lambda path: verified_snapshot(path, root),
+                               errors=(contract.ReviewError,), days=contract.policy.backup_retention_days(root),
+                               apply=apply, thin=True)
 
 
 def verified_snapshot(path, root=None):

@@ -231,21 +231,20 @@ class DoclingLifecycle(unittest.TestCase):
     def test_source_or_policy_changed_during_backup_aborts_registration(self):
         self.call("prepare")
         state = catalog.status(self.root)["state_token"]
-        snapshot = catalog._snapshot
+        snapshot = catalog._daily_snapshot
         binding = bridge.binding()
         for target in ("source", "policy"):
             with self.subTest(target=target):
                 mutated = [False]
-                def mutate(connection, backups, label):
-                    result = snapshot(connection, backups, label)
-                    if label == "pre-write":
-                        mutated[0] = True
-                        if target == "source":
-                            self.path.write_bytes(self.raw + b"changed")
+                def mutate(*args):
+                    result = snapshot(*args)
+                    mutated[0] = True
+                    if target == "source":
+                        self.path.write_bytes(self.raw + b"changed")
                     return result
                 def current_binding(*_args, **_kwargs):
                     return {**binding, "policy_sha256": "changed"} if mutated[0] and target == "policy" else binding
-                with patch.object(catalog, "_snapshot", side_effect=mutate), \
+                with patch.object(catalog, "_daily_snapshot", side_effect=mutate), \
                      patch.object(bridge, "binding", side_effect=current_binding):
                     with self.assertRaisesRegex(catalog.CatalogError, "changed before catalog commit"):
                         self.call("register", actor="operator", expected_state=state)
@@ -256,13 +255,12 @@ class DoclingLifecycle(unittest.TestCase):
         prepared = self.call("prepare")
         path = self.root / prepared["rendition"]
         state = catalog.status(self.root)["state_token"]
-        snapshot = catalog._snapshot
-        def mutate(connection, backups, label):
-            result = snapshot(connection, backups, label)
-            if label == "pre-write":
-                path.write_bytes(b"tampered during backup")
+        snapshot = catalog._daily_snapshot
+        def mutate(*args):
+            result = snapshot(*args)
+            path.write_bytes(b"tampered during backup")
             return result
-        with patch.object(catalog, "_snapshot", side_effect=mutate):
+        with patch.object(catalog, "_daily_snapshot", side_effect=mutate):
             with self.assertRaisesRegex(catalog.CatalogError, "rendition changed"):
                 self.call("register", actor="operator", expected_state=state)
         self.assertEqual(catalog.status(self.root)["state_token"], state)

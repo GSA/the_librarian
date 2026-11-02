@@ -36,13 +36,23 @@ If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 
 | File | Purpose |
 | --- | --- |
-| `config/policy.json` | Defaults: `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, and handling text |
-| `config/policy.local.json` | Instance overrides, ignored by Git |
-| `config/selection.local.json` | List of documents agents can retrieve, ignored by Git. It uses the same format as `config/selection.json`. |
+| `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` and `backup_retention_days` |
+| `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git |
+| `config/selection.local.json` | Instance selection override, ignored by Git (same schema as `config/selection.json`; auto-selected when `--manifest` is omitted) |
 
-Stores: `.local/catalog` (metadata), `.local/review-events` (reviews), and
-`tools/context_index/.local` (search index, which can be rebuilt). Every write
-creates an automatic backup.
+Default stores (configurable via `storage_roots` and bound in `.local/instance.json`):
+`.local/catalog` (catalog metadata), `.local/review-events` (append-only reviews),
+`tools/context_index/.local/index.sqlite3` (rebuildable FTS5 search index),
+`data/extractions/.local` (extracted renditions), `.local/intake` (optional intake
+recovery ledger), and `.local/diagnostics/retrieval.jsonl` (default path for the
+diagnostics CLI; MCP retrieval logging is opt-in via `--diagnostics-log`). Each
+catalog `submit` and review-event `append` takes a verified snapshot before the
+write only when the store has none for the current UTC day, then deletes
+snapshots older than seven days (set `backup_retention_days` in
+`config/policy.local.json` to change). `python3 -m tools.backups status` reports
+backup count and size; `python3 -m tools.backups prune` is a dry run and
+`--apply` keeps the newest verified snapshot per day. See
+[decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
 
 ## Ingesting files (current manual method)
 
@@ -71,6 +81,15 @@ Every file gets a counted disposition; nothing in the inbox is changed, and
 extracted renditions stay unselected until a standing-policy review qualifies
 them.
 
+To watch a run, use the read-only, body-free progress view (CLI or a
+loopback-only page that refreshes itself; see
+[context/intake.md](context/intake.md#progress-view)):
+
+```sh
+.venv/bin/python -m tools.intake.cli --root . progress --format text
+.venv/bin/python -m tools.intake.cli --root . progress-serve   # http://127.0.0.1:8765/
+```
+
 1. **Drop** the original file under `sources/` (for example `sources/memo.pdf`).
 2. **Discover** what has not been registered yet:
    ```sh
@@ -86,28 +105,29 @@ them.
      --request-id intake-001 --expected-state "$TOKEN" --reason "Register memo"
    ```
 4. **Extract** text (optional):
-   - For UTF-8 text, Gemini transcripts or ODT:
+   - For UTF-8 text, Gemini transcripts, or ODT (`--format {text,gemini-txt,odt}`):
      `.venv/bin/python -m tools.extraction.extract {prepare,verify,register} D1 --format odt ...`
-   - For PDF or images: use Docling. See
-     [tools/extraction/README.md](tools/extraction/README.md). Docling needs its
+   - For PDF or images (`--format {pdf,image}`): use Docling (`{inspect,prepare,verify,register}`).
+     See [tools/extraction/README.md](tools/extraction/README.md). Docling needs its
      own environment and pinned models. A Docling result can be selected for
      retrieval only after a recorded review of that exact output.
 5. **Write** the reviewed knowledge as Markdown under `documents/`, citing the
-   receipt. Record reviews with `python -m tools.review_events.event_store` if needed.
-6. **Select** the document in `config/selection.local.json`:
+   receipt. Record reviews with `python -m tools.review_events.event_store append` if needed.
+6. **Select** the document (and up to 10 registered `renditions`) in `config/selection.local.json`:
    ```json
    {"schema_version": 1, "audience": "authorized-local",
     "documents": [{"path": "documents/memo.md", "role": "business-rule", "context": []}],
     "context_rules": {}, "renditions": []}
    ```
-7. **Rebuild** the index. Do this after every change to content or selection:
+7. **Rebuild** the index. Do this after every change to content or selection
+   (`config/selection.local.json` is used automatically when present):
    ```sh
    .venv/bin/librarian-preflight --root "$PWD" \
      --manifest config/selection.local.json --refresh-index
    ```
 
-Registering a file does not make it retrievable. Only documents listed in the
-selection file are indexed.
+Registering a file does not make it retrievable. Only documents and renditions
+listed in the selection file are indexed.
 
 **Optional: durable intake.** `python -m tools.intake.cli` can run catalog
 registration, Docling extraction, review recording, and the index rebuild as a
@@ -121,22 +141,38 @@ Run these from the clone root. Each supports `--help`.
 
 | Command | Purpose |
 | --- | --- |
-| `python -m tools.catalog.catalog_store` | Catalog: init, status, submit, query, backup, restore |
-| `python -m tools.catalog.inventory` | List files under a directory (metadata only) |
-| `python -m tools.extraction.extract` | Text, transcript, and ODT extraction |
-| `python -m tools.extraction.docling_extract` | Optional PDF and image extraction |
-| `python -m tools.review_events.event_store` | Record reviews |
-| `python -m tools.review_events.event_reader` | Query and export reviews |
-| `python -m tools.context_index.cli` | Build, search, and read the index from the shell |
-| `python -m tools.intake.cli` | Optional durable intake |
+| `python -m tools.initialize` | Initialize stores/index, or `--migrate-storage`, `--recover-migration`, `--relocate` |
+| `python -m tools.catalog.catalog_store` | Catalog: `init`, `status`, `audit`, `submit`, `query`, `export`, `backup`, `verify-backup`, `restore` |
+| `python -m tools.catalog.inventory` | List files under a configured root (`--root`, `--limit`, `directory`; metadata only) |
+| `python -m tools.extraction.extract` | Text, Gemini transcript, and ODT extraction (`prepare`, `verify`, `register`) |
+| `python -m tools.extraction.docling_extract` | Optional PDF and image extraction (`inspect`, `prepare`, `verify`, `register`) |
+| `python -m tools.review_events.event_store` | Review store: `init`, `status`, `audit`, `schema`, `get`, `append`, `backup`, `verify-backup`, `restore` |
+| `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
+| `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
+| `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `acknowledge` |
+| `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
+| `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
+| `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
 | `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index |
-| `librarian-mcp` | Read-only MCP server |
+| `librarian-mcp` | Read-only stdio MCP server |
 
 ## MCP for consumer agents
 
-`librarian-mcp` is a read-only stdio MCP server. Its tools are `status`,
-`search`, `get`, `get_many`, `catalog`, and `review_events`. Paths must be
-absolute. `--root` must be the full instance copy.
+`librarian-mcp` is a read-only stdio MCP server. `--root` must be an absolute
+path to the full instance copy; `--manifest`, `--db`, and `--diagnostics-log`
+stay within `--root` (`--manifest` defaults to `config/selection.local.json` when
+present, otherwise `config/selection.json`). Both `librarian-mcp` and
+`librarian-preflight` also accept `--max-source-chars` (30000),
+`--max-output-chars` (60000), `--max-results` (25, max 50),
+`--timeout-seconds` (30), and `--diagnostics-log <path>.jsonl`.
+
+Exposed MCP tools:
+- `status()` — check selected index freshness
+- `search(query, limit?, path?)` — keyword discovery (default `limit` 5)
+- `get(locator, format?, max_chars?, max_output_chars?)` — read exact qualified text (`format`: `"full"` or `"compact"`)
+- `get_many(locators, format?, max_chars?, max_output_chars?)` — read 1–10 qualified packets (`format` default `"full"`)
+- `catalog(receipt?, source?, path?, kind?, coverage?, audience?, after?, expected_state?, limit?, format?, max_output_chars?)` — query live catalog metadata
+- `review_events(receipt?, source?, scope?, outcome?, content?, unit?, origin?, include_history?, after?, expected_state?, limit?, max_output_chars?)` — query stored review events (requires `receipt`, `source`, or `scope`)
 
 ```sh
 .venv/bin/librarian-mcp --root "$PWD" --manifest "$PWD/config/selection.local.json"

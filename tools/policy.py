@@ -17,6 +17,7 @@ BASE = ROOT / "config/policy.json"
 LOCAL = ROOT / "config/policy.local.json"
 INSTANCE_FILE = ".local/instance.json"
 MIGRATION_FILE = ".local/migration.json"
+DEFAULT_BACKUP_RETENTION_DAYS = 7
 DEFAULT_STORAGE_ROOTS = {
     "catalog_home": ".local/catalog",
     "review_events_home": ".local/review-events",
@@ -54,6 +55,12 @@ def _validate_relative_path(name, label="Policy path"):
     if path.is_absolute() or any(p in ("", ".", "..") for p in name.split("/")):
         raise ValueError(f"{label} must be a canonical relative path")
     return name
+
+
+def _validate_retention_days(days):
+    if type(days) is not int or days < 1:
+        raise ValueError("Policy backup_retention_days must be an integer of at least 1")
+    return days
 
 
 def _validate_storage_roots(raw_roots, markdown_roots, original_roots):
@@ -121,7 +128,7 @@ def load(root=None):
     binding = [raw]
     if local_path.exists() or local_path.is_symlink():
         override, local_raw = read(local_path)
-        allowed_keys = set(value) | {"storage_roots"}
+        allowed_keys = set(value) | {"storage_roots", "backup_retention_days"}
         if set(override) - allowed_keys:
             raise ValueError("Unknown local policy field")
         if ("storage_roots" in override
@@ -139,7 +146,7 @@ def load(root=None):
         "schema_version", "audience", "handling", "markdown_roots", "original_roots",
         "excluded_directory_names", "excluded_name_patterns", "transcript",
     }
-    optional = {"storage_roots"}
+    optional = {"storage_roots", "backup_retention_days"}
     if (not expected <= set(value) or set(value) - expected - optional
             or type(value["schema_version"]) is not int or value["schema_version"] != 1):
         raise ValueError("Unsupported policy schema")
@@ -168,6 +175,8 @@ def load(root=None):
         if not isinstance(transcript[key], str) or not transcript[key]:
             raise ValueError("Transcript rules must be nonempty strings")
     re.compile(transcript["end_pattern"])
+    if "backup_retention_days" in value:
+        _validate_retention_days(value["backup_retention_days"])
     if "storage_roots" in value:
         _validate_storage_roots(value["storage_roots"], value["markdown_roots"], value["original_roots"])
     return value, hashlib.sha256(b"\0".join(binding)).hexdigest()
@@ -225,6 +234,12 @@ def storage_roots(root=None):
         settings["markdown_roots"],
         settings["original_roots"],
     )
+
+
+def backup_retention_days(root=None):
+    """Days of verified store snapshots to keep; a versioned default with an instance override."""
+    settings = for_root(root)[0]
+    return _validate_retention_days(settings.get("backup_retention_days", DEFAULT_BACKUP_RETENTION_DAYS))
 
 
 def selection_path(root, explicit=None):

@@ -20,6 +20,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0007](0007-execution-traces.md) | Agent execution traces: diagnostics, not memory | Accepted as a boundary; agent memory declined, coverage-gap diagnostics implemented with bare read counts, dead-weight requirement withdrawn, no retrieval-quality figure derived |
 | [0008](0008-proof-of-concept-closure.md) | Concluded proof of concept and adopted reusable lessons | Accepted |
 | [0009](0009-read-only-cohort-intake.md) | Read-only cohort intake and model-assisted standing review | Implemented; bulk review gated per instance |
+| [0010](0010-daily-snapshots-and-retention.md) | Daily store snapshots with bounded retention | Accepted |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in

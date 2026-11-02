@@ -16,8 +16,8 @@ named stage. The ledger is operational recovery state, never corpus authority.
   argument fields. Preserve native attribution and original concurrency tokens.
 - Intake stores exact requests before effects. Prepared intent commits before
   an execution attempt. Restart reconciles unfinished attempts without charging
-  another attempt. Catalog/review retries use original request IDs and verified
-  native backups; evidence records original committed revisions, not current
+  another attempt. Catalog/review retries use original request IDs and daily
+  verified native snapshots (a retry or same-day write reports `backup: null`); evidence records original committed revisions, not current
   unrelated revisions. Docling reruns the offline native lifecycle, binding
   source/runtime/rendition identity; no auto-review or selection. Intake passes
   the pinned identity to the native lifecycle as `expected_identity`, so a
@@ -109,6 +109,40 @@ named stage. The ledger is operational recovery state, never corpus authority.
   `NAME` paired with `NAME.submission.json` (the v1 descriptor fields). The drop
   must exist and contain `.librarian-drop`; a missing or unmarked mount is
   `drop_unavailable`, never an empty success. Drop contents are never modified.
+
+## Progress view
+
+`progress` and `progress-serve` are read-only, body-free observation of a run;
+they never stage, run, replay, repair or initialize anything, and a missing,
+locked, public or corrupt ledger, catalog, review-event store or index is
+reported as that source being unavailable with its error class, never a crash.
+
+```sh
+.venv/bin/python -m tools.intake.cli --root . progress [--format text] [--run bulk=upload-bulk-]
+.venv/bin/python -m tools.intake.cli --root . progress-serve [--port 8765] [--refresh 5]
+```
+
+- The ledger is opened `mode=ro` without the writer lock and fully validated in
+  one read transaction; the catalog and review events use their validated
+  read paths, and the index reports freshness, stale reasons, indexed
+  documents/sections and selected documents/renditions.
+- Each request maps to one funnel state from its ordered stage statuses and
+  last attempt: `staged`, `received` (receipt committed), `extracting`,
+  `extracted`, `pending-review`, `reviewed`, `qualified`, `selected`,
+  `published`, or the exceptions `rejected`, `deferred`, `exception`
+  (blocked `standing-<outcome>-*` codes), `skipped-by-format`
+  (`unsupported-type`, `type-mismatch`, `unsupported-format`,
+  `skipped-by-format`), `needs-reader` (`needs-reader*`), `blocked` and
+  `dead-letter`. Per kind, stage counts by ledger status are also shown.
+- Recent and needs-attention items carry correlation ID, current stage,
+  operation, status, funnel state and last attempt outcome/category/code and
+  times only; request arguments, intents, evidence and document text are never
+  read into the report. `--run NAME=PREFIX` groups correlation IDs by prefix.
+- `progress-serve` serves `/` (HTML, `meta refresh`, no scripts or external
+  assets) and `/progress.json`, GET/HEAD only, with `Cache-Control: no-store`
+  and a deny-all CSP. It binds `127.0.0.1` by default, rejects non-loopback
+  `Host` headers, and refuses any non-loopback `--host` with
+  `non_loopback_bind` unless `--allow-non-loopback` records explicit approval.
 
 No acquisition, connector, scheduler, unauthorized review/selection, migration,
 model service or return transport is supplied by this interface.
