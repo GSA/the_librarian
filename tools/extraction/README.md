@@ -175,3 +175,15 @@ operator must retry after reconciling them. Worker-specific format, encryption,
 geometry and incomplete-conversion errors are non-successful. Preserve saved
 `registration.json` after a committed-but-unconfirmed write and retry the exact
 same request.
+
+## MIME HTML (Confluence export)
+
+`--format mhtml` reads a text-suffix file whose content is a MIME message
+(for example a Confluence "Exported From Confluence" `.doc`). Only non-attachment
+`text/html` parts are decoded (strict transfer encoding and charset) and converted
+to plain-text lines; images, attachments, links and scripts are ignored. Malformed
+MIME, an unknown encoding or charset, or a message with no HTML part is refused
+with a stable code (`mime-malformed`, `mime-encoding`, `mime-charset`,
+`mime-no-html`, `mime-empty`) instead of being read as raw text. The payload
+records `method` (`mhtml-html-text` and its version) and the parts read.
+Select it in `config/selection.local.json` with `format: "mhtml"`.

@@ -22,6 +22,7 @@ import zipfile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.extraction import mhtml
 from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store
 from .contracts import IntakeError, canonical, decode, digest, fields, identifier, relative, require, sha, text
@@ -39,6 +40,7 @@ FORMATS = {
     "odt": ({".odt"}, 16 * MIB),
     "text": (set(TEXT_SUFFIXES), 16 * MIB),
     "gemini-txt": ({".txt"}, 16 * MIB),
+    "mhtml": (set(TEXT_SUFFIXES), 16 * MIB),
 }
 IDENTITY_BASIS = {"declared-remote": "declared-origin", "operator-supplied": "operator-supplied-bytes",
                   "local-path": "local-path-copy"}
@@ -156,6 +158,8 @@ def check_type(raw, format_name, name):
         except (zipfile.BadZipFile, KeyError, OSError, RuntimeError, ValueError) as error:
             raise IntakeError("type_mismatch") from error
         require(mimetype == b"application/vnd.oasis.opendocument.text", "type_mismatch")
+    elif format_name == "mhtml":
+        require(mhtml.recognised(raw), "type_mismatch")
     else:
         try:
             decoded = raw.decode("utf-8")

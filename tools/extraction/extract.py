@@ -19,6 +19,7 @@ from zipfile import BadZipFile, ZipFile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.extraction import mhtml
 
 
 HOME = Path("data/extractions/.local")
@@ -104,6 +105,22 @@ def text(raw):
             "Strict UTF-8 text decoding only; successful decoding is not review or qualification."
         ],
     }
+
+
+def mime_html(raw):
+    """Confluence-style MIME/MHTML to plain-text lines; refusals keep the stable reader code."""
+    try:
+        return mhtml.payload(raw)
+    except mhtml.MhtmlError as error:
+        raise ExtractionError("MIME HTML refused (" + error.code + "); a different reader is needed") from error
+
+
+def fingerprint(root, format_name):
+    """Extractor identity hash; the MIME reader's code is part of identity only for its format."""
+    code = Path(__file__).read_bytes()
+    if format_name == "mhtml":
+        code += Path(mhtml.__file__).read_bytes()
+    return digest(code + policy.fingerprint(root).encode())
 
 
 def gemini(raw, root=None):
@@ -286,7 +303,8 @@ def source(root, receipt, format_name):
     relative = Path(data["path"])
     require(policy.allowed(relative.as_posix(), "original_roots", root),
             "Original path is outside configured extraction roots or excluded by policy")
-    suffixes = {"gemini-txt": {".txt"}, "text": TEXT_SUFFIXES, "odt": {".odt"}}[format_name]
+    suffixes = {"gemini-txt": {".txt"}, "text": TEXT_SUFFIXES, "mhtml": TEXT_SUFFIXES,
+                "odt": {".odt"}}[format_name]
     require(relative.suffix.lower() in suffixes, "Selected format disagrees with source extension")
     path = catalog.safe_path(root / relative)
     raw = read_source(path)
@@ -306,9 +324,10 @@ def bundle(root, receipt, format_name):
     state, original, identity, raw = source(root, receipt, format_name)
     settings = policy.for_root(root)[0]
     extractions_home = policy.validate_instance_roots(root)["extractions_home"]
-    engine = {"version": VERSION, "sha256": digest(Path(__file__).read_bytes() + policy.fingerprint(root).encode())}
+    engine = {"version": VERSION, "sha256": fingerprint(root, format_name)}
     run = digest(encoded({"source": identity, "extractor": engine, "format": format_name}))
-    payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "odt": odt}[format_name](raw)
+    payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "mhtml": mime_html,
+               "odt": odt}[format_name](raw)
     value = {"schema_version": VERSION, "run_id": run, "extractor": engine,
              "source": identity, "boundary": BOUNDARY + " " + settings["handling"], "payload": payload}
     path = root / extractions_home / receipt / run / "extraction.json"
@@ -319,7 +338,7 @@ def unchanged(root, value):
     path = catalog.safe_path(root / value["source"]["path"])
     require(digest(read_source(path)) == value["source"]["sha256"],
             "Source changed during extraction/registration")
-    require(digest(Path(__file__).read_bytes() + policy.fingerprint(root).encode()) == value["extractor"]["sha256"],
+    require(fingerprint(root, value["payload"]["format"]) == value["extractor"]["sha256"],
             "Extractor changed during operation")
 
 
@@ -355,7 +374,10 @@ def registration_records(root, original, path, value):
     data = parent["data"]
     data.update(sha256=value["source"]["sha256"], hash_basis="observed",
                 bytes=value["source"]["bytes"], extraction="existing-rendition")
-    if value["payload"]["format"] in {"gemini-txt", "text"}:
+    if value["payload"]["format"] == "mhtml":
+        data["coverage"] = "deferred"
+        data["reason"] = "Plain text converted from MIME HTML in a machine rendition; review/indexing remain separate."
+    elif value["payload"]["format"] in {"gemini-txt", "text"}:
         data["coverage"] = "deferred"
         data["reason"] = "All supplied UTF-8 lines preserved in a machine rendition; review/indexing remain separate."
     else:
@@ -458,7 +480,7 @@ def main(argv=None):
     for name in ("prepare", "verify", "register"):
         command = commands.add_parser(name)
         command.add_argument("receipt")
-        command.add_argument("--format", choices=("gemini-txt", "text", "odt"), required=True)
+        command.add_argument("--format", choices=("gemini-txt", "text", "mhtml", "odt"), required=True)
         if name == "register":
             command.add_argument("--actor", required=True)
             command.add_argument("--expected-state", required=True)
