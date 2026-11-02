@@ -141,6 +141,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
 | `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index |
 | `librarian-mcp` | Read-only stdio MCP server |
+| `librarian-audit` | Body-free `report` of the opt-in MCP audit log |
 
 ## MCP for consumer agents
 
@@ -173,6 +174,15 @@ Pi (`.local/environment/pi/mcp.json` in The Engineer) or any MCP client:
            "--manifest", "/abs/instance/config/selection.local.json"],
   "timeout": 60}}}
 ```
+
+Add `--audit-log --agent-label <agent>` to a binding to keep a private,
+full-text record of every call: the arguments and the exact text returned, in
+`.local/audit/<agent>-mcp-access.jsonl` (rotated at 64 MiB, never deleted by the
+toolkit). It contains corpus text and agent queries, so treat it at the
+instance's audience. If a record cannot be written the call fails instead of
+returning unrecorded text. `.venv/bin/librarian-audit --root "$PWD"
+report` summarizes it without bodies. See
+[decision 0011](docs/decisions/0011-full-text-mcp-audit-log.md).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
 the cited text. A search with no hits returns an `absence` reason: the indexed

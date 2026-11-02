@@ -38,6 +38,7 @@
   "tools/schemas/intake.sql",
   "tests/support.py",
   "tests/test_mcp.py",
+  "tests/test_mcp_audit.py",
   "tools/__init__.py",
   "tools/backups.py",
   "tools/policy.py",
@@ -85,5 +86,6 @@
   "tests/test_docling.py",
   "tools/extraction/README.md",
   "docs/decisions/0008-proof-of-concept-closure.md",
-  "docs/decisions/0010-daily-snapshots-and-retention.md"
+  "docs/decisions/0010-daily-snapshots-and-retention.md",
+  "docs/decisions/0011-full-text-mcp-audit-log.md"
 ]

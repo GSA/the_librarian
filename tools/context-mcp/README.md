@@ -15,6 +15,26 @@ The toolkit root README describes empty initialization, external policy and
 content selection, preflight, source packaging and permission boundaries.
 No organization data or demonstration corpus is bundled.
 
+## Full-text audit log
+
+`--audit-log [PATH] --agent-label LABEL` opts into a full-text audit of every
+tool call, separate from the body-free diagnostics below. Each
+`librarian-mcp-audit-v1` JSONL record holds the label, tool, complete
+arguments, outcome, the complete text returned to the client, its SHA-256, and
+the locators, source hashes and record ids it mentions. A bare `--audit-log`
+writes `.local/audit/<label>-mcp-access.jsonl`; any path must be a `.jsonl`
+file below `<root>/.local` without symlinks. Files are 0600 in a 0700
+directory, appended with fsync and rotated into `<name>.<n>.jsonl` before
+exceeding 64 MiB; nothing is truncated or deleted. A write failure returns an
+error instead of the result. The log contains corpus text and agent queries;
+it is never retrieval context and no tool reads it. Summarize it without bodies:
+
+```
+librarian-audit --root <root> report
+```
+
+See [decision 0011](../../docs/decisions/0011-full-text-mcp-audit-log.md).
+
 ## Retrieval diagnostics
 
 `--diagnostics-log <path>.jsonl` opts into body-free retrieval diagnostics,

@@ -138,6 +138,12 @@ class AuditLog(unittest.TestCase):
         tampered["returned_text"] = "edited"
         log.path.write_text(json.dumps(tampered) + "\n" + lines[1] + "\n")
         self.assertEqual(audit.report(self.root)["hash_mismatches"], 1)
+        output = subprocess.run(
+            [sys.executable, "-m", "the_librarian_mcp.audit", "--root", str(self.root), "report"],
+            capture_output=True, text=True, check=True,
+            env=dict(os.environ, PYTHONPATH=str(ROOT / "tools/context-mcp/src"))).stdout
+        self.assertEqual(json.loads(output)["records"], 2)
+        self.assertNotIn("zzsecret", output)
 
 
 class AuditConfig(unittest.TestCase):
