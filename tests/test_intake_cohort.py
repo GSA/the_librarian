@@ -192,6 +192,9 @@ class IngestTests(CohortCase):
         self.assertNotEqual(entry["submission_id"], old["submission_id"])
         sidecar = json.loads((self.root / Path(entry["original"]).parent / "submission.json").read_text())
         self.assertEqual(sidecar["correction_of"], old["submission_id"])
+        again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        entry = next(e for e in again["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        self.assertEqual(entry["outcome"], "extracted")
 
     def test_rerun_is_idempotent(self):
         first = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
@@ -277,6 +280,7 @@ class QualifyTests(CohortCase):
         self.assertEqual(plain["qualification"], "pending-review")
         stage = store.inspect(
             self.root, "standing-" + plain["submission_id"] + "-" + plain["rendition_sha256"][:12]
+            + "-" + hashlib.sha256((self.root / "config/standing-policy.local.json").read_bytes()).hexdigest()[:8]
         )["stages"][0]
         self.assertEqual(stage["status"], "blocked")
         self.assertEqual(stage["attempts"][-1]["code"],
@@ -386,6 +390,47 @@ class QualifyTests(CohortCase):
         self.assertEqual(calls, [])
         self.assertFalse((self.root / "config/standing-policy.local.json").exists())
         self.assertEqual(store.list_requests(self.root), [])
+
+    def test_qualify_refuses_bad_paths_and_unknown_context_before_touching_anything(self):
+        transport, calls = self._transport()
+        cases = [dict(policy_path="../escape.local.json"), dict(manifest="/tmp/x.json"),
+                 dict(context=["documents/missing.md"]),
+                 dict(context=["documents/context.md#no-such-section"]),
+                 dict(context=["config/policy.local.json"])]
+        for extra in cases:
+            with self.subTest(extra), self.assertRaises(IntakeError):
+                self._qualify(transport, **extra)
+        self.assertEqual(calls, [])
+        self.assertEqual(store.list_requests(self.root), [])
+        self.assertFalse((self.root / "config/standing-policy.local.json").exists())
+        self.assertFalse((self.root.parent / "escape.local.json").exists())
+
+    def test_limited_run_replaces_only_the_processed_items_prior_selection(self):
+        from tools.context_index import context_index as index
+        transport, _ = self._transport()
+        self._qualify(transport)
+        self.writable()
+        (self.inbox / "a/notes.md").write_bytes(b"# Notes\nCorrected cohort line\n")
+        report = self._qualify(transport, limit=15)
+        notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
+        selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
+        self.assertEqual(len(selected), 6)
+        self.assertIn(notes["rendition"], [r["path"] for r in selected])
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            self.assertEqual(len(index.search(db, "Corrected cohort", 10, None, root=self.root)["hits"]), 1)
+            paths = {h["path"] for h in index.search(db, "Notes", 10, None, root=self.root)["hits"]}
+            self.assertEqual(paths, {notes["rendition"]})
+
+    def test_changed_standing_policy_does_not_report_old_evidence_as_qualified(self):
+        transport, _ = self._transport()
+        self._qualify(transport)
+        policy_file = self.root / "config/standing-policy.local.json"
+        raw = json.loads(policy_file.read_text())
+        raw["version"] = 2
+        policy_file.write_text(json.dumps(raw))
+        report = self._qualify(transport)
+        self.assertNotIn("qualified", report["counts"]["qualification"])
+        self.assertEqual(report["counts"]["published"], 1)
 
     def test_qualify_restores_a_selection_missing_from_the_manifest(self):
         transport, calls = self._transport()

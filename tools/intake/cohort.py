@@ -190,12 +190,20 @@ def _process(root, inbox, entry, system, actor):
         if orig is not None and orig["data"]["sha256"] != entry["sha256"]:
             superseded = identity["submission_id"]
             identity = submission(entry["relative"], system, entry["format"], entry["sha256"])
+        elif prior.get("correction_of"):
+            # An existing identity keeps the correction it was first submitted with.
+            superseded = prior["correction_of"].removeprefix("upload-")
     elif entry["format"] == "mhtml":
         # An entry ingested before MIME recognition (as plain text) is corrected, not kept.
         earlier = submission(entry["relative"], system)["submission_id"]
         if upload.ledger_request(root, upload.correlation(earlier)) is not None:
             superseded = earlier
     entry.update(identity)
+    if superseded:
+        old = upload.ledger_request(root, upload.correlation(superseded))
+        if old is not None:
+            entry["superseded_receipt"] = next(
+                r["id"] for r in upload.submit_records(old) if r["kind"] == "receipt")
     try:
         ack = upload.submit(root, Path(inbox) / entry["relative"], upload.descriptor(
             submission_id=identity["submission_id"], format_name=entry["format"],
@@ -270,6 +278,45 @@ def _replace_json(path, value, mode=0o644):
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _instance_file(root, name):
+    """An instance-relative path with no symlink component, checked before any read or write."""
+    try:
+        index.relative_name(name)
+        path = root / name
+        for part in path.relative_to(root).parents:
+            if (root / part).is_symlink():
+                raise IntakeError("unsafe_path")
+        if path.is_symlink():
+            raise IntakeError("unsafe_path")
+    except index.IndexError_ as error:
+        raise IntakeError("unsafe_path") from error
+    return path
+
+
+def _validate_inputs(root, policy_path, manifest, context):
+    """Refuse bad paths and a missing maintained context before ingesting or writing anything."""
+    _instance_file(root, policy_path)
+    _instance_file(root, manifest)
+    locators = context
+    policy_file = root / policy_path
+    if policy_file.is_file():
+        try:
+            locators = json.loads(policy_file.read_text(encoding="utf-8"))["selection"]["context"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise IntakeError("context_invalid") from error
+    try:
+        for locator in locators:
+            canonical = index.canonical_locator(locator, root)
+            document, _, fragment = canonical.partition("#")
+            source = index.source_path(root, document)
+            _, aliases, _, _ = index.parse_document(
+                document, source.read_text(encoding="utf-8"))
+            if fragment and fragment not in aliases:
+                raise IntakeError("context_invalid")
+    except (index.IndexError_, OSError, UnicodeError) as error:
+        raise IntakeError("context_invalid") from error
 
 
 def _ensure_standing_inputs(root, policy_path, manifest, model, context):
@@ -355,7 +402,7 @@ def _set_manifest_renditions(root, manifest, renditions_):
 def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
                        model, transport, usage):
     """Review and select one extracted rendition; identity is bound to the exact rendition."""
-    token = entry["submission_id"] + "-" + entry["rendition_sha256"][:12]
+    token = "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
     corr, event_id = "standing-" + token, "rev-" + token
     current = _inspect(root, corr)
     if current is None:
@@ -436,6 +483,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
         raise IntakeError("context_required")
+    _validate_inputs(root, policy_path, manifest, context)
     report = ingest(root, inbox, system=system, actor=actor, limit=limit)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
@@ -451,15 +499,19 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
                            model, transport, usage)
     selected = _manifest_renditions(root, manifest)
-    have = {r["path"] for r in selected}
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
     # Reconcile from validated review evidence: add missing and, for a full run, drop the rest.
     desired = [e["selection"] for e in qualified]
     if limit is None:
         _set_manifest_renditions(root, manifest, desired)
     else:
-        _set_manifest_renditions(root, manifest, selected + [
-            s for s in desired if s["path"] not in have])
+        # A partial run replaces only what it processed: drop the superseded and the
+        # re-reviewed selections of processed items and keep everything else.
+        superseded = {e["superseded_receipt"] for e in extracted if "superseded_receipt" in e}
+        replaced = {e["rendition"] for e in extracted}
+        _set_manifest_renditions(root, manifest, [
+            r for r in selected
+            if r["receipt_id"] not in superseded and r["path"] not in replaced] + desired)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     report["counts"]["qualification"] = dict(
         Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
