@@ -174,41 +174,60 @@ def validate_records(records):
         seen.add(record["id"])
 
 
+def _links(records, record_id, record):
+    """Per-record reference checks shared by full and incremental graph validation."""
+    data = record["data"]
+
+    def target(target_id, kind):
+        require(target_id in records and records[target_id]["kind"] == kind,
+                f"Missing {kind} reference: {target_id}")
+        return records[target_id]["data"]
+
+    if record["kind"] == "receipt":
+        for source_id in data["source_ids"]:
+            target(source_id, "source")
+        artifact = target(data["artifact_id"], "artifact")
+        require(artifact["receipt_id"] == record_id, "Receipt artifact must link back to receipt")
+    elif record["kind"] == "relationship":
+        for endpoint in ("from_id", "to_id"):
+            endpoint_id = data[endpoint]
+            require(endpoint_id in records and records[endpoint_id]["kind"] in {"artifact", "source"},
+                    f"Missing artifact/source relationship endpoint: {endpoint_id}")
+    elif record["kind"] == "artifact":
+        if data["receipt_id"] is not None:
+            target(data["receipt_id"], "receipt")
+        parent_id = data["parent_id"]
+        if parent_id is not None:
+            parent = target(parent_id, "artifact")
+            require(parent_id != record_id, "Artifact cannot parent itself")
+            if parent["receipt_id"] is not None:
+                require(data["receipt_id"] == parent["receipt_id"],
+                        "Child receipt must agree with known parent receipt")
+
+
+def _references(record):
+    data = record["data"]
+    if record["kind"] == "receipt":
+        return [*data["source_ids"], data["artifact_id"]]
+    if record["kind"] == "relationship":
+        return [data["from_id"], data["to_id"]]
+    if record["kind"] == "artifact":
+        return [value for value in (data["receipt_id"], data["parent_id"]) if value is not None]
+    return []
+
+
 def validate_graph(records):
+    """Full-state reference, path and parent-cycle validation."""
     paths, parents = {}, {}
-
-    def target(record_id, kind):
-        require(record_id in records and records[record_id]["kind"] == kind,
-                f"Missing {kind} reference: {record_id}")
-        return records[record_id]["data"]
-
     for record_id, record in records.items():
-        data = record["data"]
-        if record["kind"] == "receipt":
-            for source_id in data["source_ids"]:
-                target(source_id, "source")
-            artifact = target(data["artifact_id"], "artifact")
-            require(artifact["receipt_id"] == record_id, "Receipt artifact must link back to receipt")
-        elif record["kind"] == "relationship":
-            for endpoint in ("from_id", "to_id"):
-                endpoint_id = data[endpoint]
-                require(endpoint_id in records and records[endpoint_id]["kind"] in {"artifact", "source"},
-                        f"Missing artifact/source relationship endpoint: {endpoint_id}")
-        elif record["kind"] == "artifact":
-            path = data["path"]
+        _links(records, record_id, record)
+        if record["kind"] == "artifact":
+            path = record["data"]["path"]
             if path is not None:
                 require(path not in paths, f"Distinct artifacts share path: {path}")
                 paths[path] = record_id
-            if data["receipt_id"] is not None:
-                target(data["receipt_id"], "receipt")
-            parent_id = data["parent_id"]
-            if parent_id is not None:
-                parent = target(parent_id, "artifact")
-                require(parent_id != record_id, "Artifact cannot parent itself")
-                if parent["receipt_id"] is not None:
-                    require(data["receipt_id"] == parent["receipt_id"],
-                            "Child receipt must agree with known parent receipt")
-                parents[record_id] = parent_id
+            if record["data"]["parent_id"] is not None:
+                parents[record_id] = record["data"]["parent_id"]
     visited = set()
     for record_id in parents:
         active = set()
@@ -218,3 +237,58 @@ def validate_graph(records):
             active.add(cursor)
             cursor = parents[cursor]
         visited.update(active)
+
+
+class GraphValidator:
+    """Replays revisions with work bounded by each revision's neighbourhood, not by history.
+
+    Each apply() leaves the state a full validate_graph() would accept, or raises
+    CatalogError with the same refusal. A revision can only invalidate the records it
+    writes, their referrers, the path claims it moves, and parent chains that start at a
+    changed artifact, because every earlier revision was accepted under the same rules.
+    A raised error leaves the validator unusable; discard it.
+    """
+
+    def __init__(self):
+        self.records, self.paths, self.parents, self.referrers = {}, {}, {}, {}
+        self.checked = 0
+
+    def apply(self, batch):
+        changed = []
+        for record in batch:
+            old = self.records.get(record["id"])
+            if old is not None:
+                for reference in _references(old):
+                    self.referrers.get(reference, set()).discard(record["id"])
+                if old["kind"] == "artifact":
+                    path = old["data"]["path"]
+                    if path is not None and self.paths.get(path) == record["id"]:
+                        del self.paths[path]
+                    self.parents.pop(record["id"], None)
+            changed.append(record["id"])
+            self.records[record["id"]] = record
+        affected = dict.fromkeys(changed)
+        for record in batch:
+            for reference in _references(record):
+                self.referrers.setdefault(reference, set()).add(record["id"])
+            affected.update(dict.fromkeys(self.referrers.get(record["id"], ())))
+        for record_id in changed:
+            record = self.records[record_id]
+            if record["kind"] == "artifact":
+                path = record["data"]["path"]
+                if path is not None:
+                    require(path not in self.paths, f"Distinct artifacts share path: {path}")
+                    self.paths[path] = record_id
+                    self.checked += 1
+                if record["data"]["parent_id"] is not None:
+                    self.parents[record_id] = record["data"]["parent_id"]
+        for record_id in affected:
+            _links(self.records, record_id, self.records[record_id])
+            self.checked += 1
+        for record_id in changed:
+            active, cursor = set(), record_id
+            while cursor in self.parents:
+                require(cursor not in active, "Cyclic artifact parent relationship")
+                active.add(cursor)
+                cursor = self.parents[cursor]
+                self.checked += 1

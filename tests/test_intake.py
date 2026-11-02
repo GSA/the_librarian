@@ -109,6 +109,32 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(contracts.IntakeError):
             store.inspect(self.root, "req-one")
 
+    def test_repeated_validation_decodes_each_distinct_request_once(self):
+        from unittest.mock import patch
+        for number in range(5):
+            store.stage(self.root, request(f"req-{number}"))
+        store.inspect(self.root, "req-0")
+        with patch.object(contracts, "decode_request", wraps=contracts.decode_request) as decoded, \
+                patch.object(store, "decode_request", wraps=contracts.decode_request) as in_store:
+            for _ in range(4):
+                store.inspect(self.root, "req-0")
+        self.assertEqual(decoded.call_count + in_store.call_count, 0)
+
+    def test_cached_decode_does_not_hide_a_rewritten_request(self):
+        store.stage(self.root, request())
+        store.inspect(self.root, "req-one")  # primes any decode cache
+        changed = request(retry={"max_attempts": 3, "backoff_seconds": 5})
+        with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
+            connection.execute("update requests set raw=?", (changed,))
+        with self.assertRaises(contracts.IntakeError):
+            store.inspect(self.root, "req-one")  # digest no longer matches
+        with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
+            connection.execute("update requests set raw=?, request_sha256=?",
+                               (changed, hashlib.sha256(changed).hexdigest()))
+            connection.execute("update requests set correlation_id='req-two'")
+        with self.assertRaises(contracts.IntakeError):
+            store.inspect(self.root, "req-two")  # identity no longer matches the saved request
+
     def test_rejected_ledger_releases_lock_for_later_operations(self):
         import multiprocessing
         store.stage(self.root, request())

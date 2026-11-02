@@ -1,4 +1,5 @@
 """Closed, body-preserving intake request contracts."""
+import functools
 import hashlib
 import json
 import re
@@ -129,3 +130,16 @@ def decode_request(raw):
         if "event_id" in args:
             require(re.fullmatch(r"rev-[a-z0-9-]{1,100}", args["event_id"]) is not None)
     return value
+
+
+@functools.lru_cache(maxsize=16384)
+def request_shape(raw):
+    """Immutable identity of a fully validated saved request, memoized by its exact bytes.
+
+    decode_request is a pure function of the bytes, so a hit proves these exact bytes
+    already passed every check; a rewritten request is a different key and is decoded
+    and refused afresh. Failures are never cached.
+    """
+    value = decode_request(raw)
+    return (value["correlation_id"], value["correction_of"],
+            tuple(stage["id"] for stage in value["stages"]))

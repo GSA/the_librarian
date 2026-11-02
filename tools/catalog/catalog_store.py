@@ -19,7 +19,7 @@ from tools import backups as snapshots, policy
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
     CatalogError, canonical, choice, exact, fingerprint, hash_value, identifier,
-    now, path_value, refs, require, safe_relative, text, validate_graph,
+    now, path_value, refs, require, safe_relative, text, validate_graph, GraphValidator,
     validate_record, validate_records,
 )
 
@@ -244,6 +244,7 @@ def inspect(connection):
         by_revision.setdefault(row["revision"], []).append(dict(row))
     require(set(by_revision) == {batch["revision"] for batch in batches}, "Invalid revision membership")
     current, projection, histories, committed_states = {}, {}, {}, {}
+    graph = GraphValidator()  # same refusals as validate_graph(current), without re-walking history
     previous = ""
     for revision, batch in enumerate(batches, 1):
         require(batch["revision"] == revision and batch["previous_hash"] == previous, "Broken revision chain")
@@ -269,7 +270,7 @@ def inspect(connection):
                 "reason": batch["reason"], "committed_at": batch["committed_at"], "record": record,
             })
         validate_records(records)
-        validate_graph(current)
+        graph.apply(records)
         require(batch["input_hash"] == fingerprint({
             "actor": batch["actor"], "reason": batch["reason"], "records": records,
         }), "Revision input hash mismatch")

@@ -68,6 +68,9 @@ snapshots older than seven days (set `backup_retention_days` in
 backup count and size; `python3 -m tools.backups prune` is a dry run and
 `--apply` keeps the newest verified snapshot per day. See
 [decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
+Ingest cost still grows with history; measure it on synthetic cohorts with
+`python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see
+[decision 0012](docs/decisions/0012-bounded-validation-cost.md).
 
 ## Ingesting files (current manual method)
 
@@ -211,7 +214,7 @@ toolkit). It contains corpus text and agent queries, so treat it at the
 instance's audience. If a record cannot be written the call fails instead of
 returning unrecorded text. `.venv/bin/librarian-audit --root "$PWD"
 report` summarizes it without bodies. See
-[decision 0011](docs/decisions/0011-full-text-mcp-audit-log.md).
+[decision 0012](docs/decisions/0011-full-text-mcp-audit-log.md).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
 the cited text. A search with no hits returns an `absence` reason: the indexed
