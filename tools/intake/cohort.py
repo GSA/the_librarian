@@ -13,7 +13,9 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
+import tempfile
 import unicodedata
 from urllib.parse import quote
 
@@ -21,7 +23,7 @@ from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import model_review, runner, standing, store, upload
+from . import cli, model_review, runner, standing, store, upload
 from .contracts import IntakeError
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
@@ -245,10 +247,35 @@ def _write_private(path, value):
     _write_json(path, value, 0o600)
 
 
+def _replace_json(path, value, mode=0o644):
+    """Atomically replace a JSON file; the old file stays intact if anything fails."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    descriptor, temporary = tempfile.mkstemp(prefix=".cohort-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def _ensure_standing_inputs(root, policy_path, manifest, model, context):
     policy_file = root / policy_path
     if not policy_file.is_file():
-        _write_private(policy_file, {
+        _replace_json(policy_file, {
             "schema": standing.POLICY_SCHEMA,
             "policy_id": "cohort-standing",
             "version": 1,
@@ -263,8 +290,8 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
                 "max_records": renditions.DOCLING_MAX_RECORDS,
                 "max_findings_bytes": standing.LIMIT,
             },
-            "selection": {"context": list(context or ["context/intake.md"])},
-        })
+            "selection": {"context": list(context)},
+        }, 0o600)
     policy_sha = hashlib.sha256(policy_file.read_bytes()).hexdigest()
     standing_policy = standing.load_policy(root, policy_path, policy_sha)
     manifest_file = root / manifest
@@ -284,7 +311,7 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
             docs.add(doc)
             changed = True
     if changed:
-        _write_json(manifest_file, raw)
+        _replace_json(manifest_file, raw)
     return standing_policy, policy_sha
 
 
@@ -296,92 +323,149 @@ def _standing_outcome(stage):
     return "pending-review", code
 
 
+def _stage_request(root, corr, stages):
+    store.stage(root, json.dumps({
+        "version": 1, "correlation_id": corr, "correction_of": None,
+        "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+        "retry": {"max_attempts": 3, "backoff_seconds": 0},
+        "stages": stages,
+    }).encode())
+
+
+def _inspect(root, corr):
+    try:
+        return store.inspect(root, corr)
+    except IntakeError as error:
+        if error.code != "unknown_request":
+            raise
+        return None
+
+
+def _manifest_renditions(root, manifest):
+    return json.loads((root / manifest).read_text(encoding="utf-8")).get("renditions", [])
+
+
+def _set_manifest_renditions(root, manifest, renditions_):
+    raw = json.loads((root / manifest).read_text(encoding="utf-8"))
+    if raw.get("renditions", []) != renditions_:
+        raw["renditions"] = renditions_
+        _replace_json(root / manifest, raw)
+
+
+def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
+                       model, transport, usage):
+    """Review and select one extracted rendition; identity is bound to the exact rendition."""
+    token = entry["submission_id"] + "-" + entry["rendition_sha256"][:12]
+    corr, event_id = "standing-" + token, "rev-" + token
+    current = _inspect(root, corr)
+    if current is None:
+        reviewed = model_review.review(
+            root, entry["rendition"], standing_policy, model, transport)
+        usage.update(reviewed["usage"])
+        if reviewed["status"] != "reviewed":
+            entry.update(qualification="pending-review", review_status=reviewed["status"])
+            return
+        review_args = {
+            "policy_path": policy_path, "policy_sha256": policy_sha,
+            "rendition": entry["rendition"], "rendition_sha256": entry["rendition_sha256"],
+            "findings_path": reviewed["findings_path"],
+            "findings_sha256": reviewed["findings_sha256"], "event_id": event_id,
+        }
+        _stage_request(root, corr, [
+            {"id": "review", "kind": "review", "operation": "standing-review",
+             "arguments": {**review_args, "request_id": "req-" + corr + "-review"}},
+            {"id": "select", "kind": "publication", "operation": "standing-select",
+             "arguments": {**review_args, "request_id": "req-" + corr + "-select",
+                           "manifest": manifest}}])
+        current = store.inspect(root, corr)
+    if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
+        current = runner.run(root, corr, "review")
+    if (current["stages"][0]["status"] == "succeeded"
+            and current["stages"][1]["status"] in {"staged", "running", "retryable"}):
+        current = runner.run(root, corr, "select")
+    if all(s["status"] == "succeeded" for s in current["stages"]):
+        selection = current["stages"][1]["evidence"]["selection"]
+        if (selection["path"] != entry["rendition"]
+                or selection["sha256"] != entry["rendition_sha256"]):
+            entry.update(qualification="exception", review_code="selection-evidence-mismatch")
+            return
+        entry.update(qualification="qualified", review_event_id=event_id, selection=selection)
+    else:
+        failed = next(s for s in current["stages"] if s["status"] != "succeeded")
+        outcome_name, code = _standing_outcome(failed)
+        entry.update(qualification=outcome_name, review_code=code)
+
+
+def _publish(root, policy_path, policy_sha, manifest, index_path):
+    """Return the publish stage, staging a fresh request when saved success is stale."""
+    manifest_sha = hashlib.sha256((root / manifest).read_bytes()).hexdigest()[:16]
+    destination = hashlib.sha256(str(index_path).encode("utf-8")).hexdigest()[:8]
+    base = f"publish-{policy_sha[:12]}-{manifest_sha}-{destination}"
+    previous = None
+    for number in range(100):
+        corr = base if number == 0 else f"{base}-r{number}"
+        current = _inspect(root, corr)
+        if current is None:
+            store.stage(root, json.dumps({
+                "version": 1, "correlation_id": corr, "correction_of": previous,
+                "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+                "retry": {"max_attempts": 3, "backoff_seconds": 0},
+                "stages": [{"id": "publish", "kind": "publication",
+                            "operation": "standing-publish",
+                            "arguments": {"policy_path": policy_path, "policy_sha256": policy_sha,
+                                          "manifest": manifest, "db": str(index_path)}}],
+            }).encode())
+            current = store.inspect(root, corr)
+        stage = current["stages"][0]
+        if stage["status"] in {"staged", "running", "retryable"}:
+            stage = runner.run(root, corr, "publish")["stages"][0]
+            return stage, cli.inspection(root, corr)["stages"][0]
+        if stage["status"] != "succeeded":
+            return stage, stage
+        inspected = cli.inspection(root, corr)["stages"][0]
+        if inspected.get("availability", {}).get("available"):
+            return stage, inspected
+        previous = corr
+    raise IntakeError("publication_revisions_exhausted")
+
+
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
             context=None, index_path=DEFAULT_INDEX, limit=None):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage."""
     root = Path(root).resolve()
+    if not context:
+        # A maintained context document must be named; guessing one would not satisfy the policy.
+        raise IntakeError("context_required")
     report = ingest(root, inbox, system=system, actor=actor, limit=limit)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
-    usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
-    for entry in report["entries"]:
-        if entry.get("outcome") != "extracted":
-            continue
-        corr = "standing-" + entry["submission_id"]
-        event_id = "rev-" + entry["submission_id"]
-        try:
-            current = store.inspect(root, corr)
-        except IntakeError as error:
-            if error.code != "unknown_request":
-                raise
-            current = None
-        if current is None:
-            reviewed = model_review.review(
-                root, entry["rendition"], standing_policy, model, transport)
-            usage.update(reviewed["usage"])
-            if reviewed["status"] != "reviewed":
-                entry.update(qualification="pending-review", review_status=reviewed["status"])
-                continue
-            review_args = {
-                "policy_path": policy_path, "policy_sha256": policy_sha,
-                "rendition": entry["rendition"], "rendition_sha256": entry["rendition_sha256"],
-                "findings_path": reviewed["findings_path"],
-                "findings_sha256": reviewed["findings_sha256"], "event_id": event_id,
-            }
-            store.stage(root, json.dumps({
-                "version": 1, "correlation_id": corr, "correction_of": None,
-                "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-                "retry": {"max_attempts": 3, "backoff_seconds": 0},
-                "stages": [
-                    {"id": "review", "kind": "review", "operation": "standing-review",
-                     "arguments": {**review_args, "request_id": "req-" + corr + "-review"}},
-                    {"id": "select", "kind": "publication", "operation": "standing-select",
-                     "arguments": {**review_args, "request_id": "req-" + corr + "-select",
-                                   "manifest": manifest}},
-                ],
-            }).encode())
-            current = store.inspect(root, corr)
-        if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
-            current = runner.run(root, corr, "review")
-        if (current["stages"][0]["status"] == "succeeded"
-                and current["stages"][1]["status"] in {"staged", "running", "retryable"}):
-            current = runner.run(root, corr, "select")
-        if all(s["status"] == "succeeded" for s in current["stages"]):
-            entry.update(qualification="qualified", review_event_id=event_id)
-        else:
-            failed = next(s for s in current["stages"] if s["status"] != "succeeded")
-            outcome_name, code = _standing_outcome(failed)
-            entry.update(qualification=outcome_name, review_code=code)
+    extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
     if limit is None:
-        qualified_paths = {e["rendition"] for e in report["entries"]
-                           if e.get("qualification") == "qualified"}
-        manifest_file = root / manifest
-        raw = json.loads(manifest_file.read_text(encoding="utf-8"))
-        kept = [r for r in raw.get("renditions", []) if r["path"] in qualified_paths]
-        if kept != raw.get("renditions", []):
-            raw["renditions"] = kept
-            _write_json(manifest_file, raw)
-    manifest_sha = hashlib.sha256((root / manifest).read_bytes()).hexdigest()[:16]
-    pub_corr = f"publish-{policy_sha[:12]}-{manifest_sha}"
-    try:
-        pub = store.inspect(root, pub_corr)["stages"][0]
-    except IntakeError as error:
-        if error.code != "unknown_request":
-            raise
-        store.stage(root, json.dumps({
-            "version": 1, "correlation_id": pub_corr, "correction_of": None,
-            "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-            "retry": {"max_attempts": 3, "backoff_seconds": 0},
-            "stages": [{"id": "publish", "kind": "publication", "operation": "standing-publish",
-                        "arguments": {"policy_path": policy_path, "policy_sha256": policy_sha,
-                                      "manifest": manifest, "db": str(index_path)}}],
-        }).encode())
-        pub = store.inspect(root, pub_corr)["stages"][0]
-    if pub["status"] in {"staged", "running", "retryable"}:
-        pub = runner.run(root, pub_corr, "publish")["stages"][0]
+        # Drop selections for renditions the cohort no longer has before selecting replacements,
+        # so replacing a rendition never needs spare manifest capacity.
+        current = {e["rendition"] for e in extracted}
+        _set_manifest_renditions(root, manifest, [
+            r for r in _manifest_renditions(root, manifest) if r["path"] in current])
+    usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
+    for entry in extracted:
+        _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
+                           model, transport, usage)
+    selected = _manifest_renditions(root, manifest)
+    have = {r["path"] for r in selected}
+    qualified = [e for e in extracted if e.get("qualification") == "qualified"]
+    # Reconcile from validated review evidence: add missing and, for a full run, drop the rest.
+    desired = [e["selection"] for e in qualified]
+    if limit is None:
+        _set_manifest_renditions(root, manifest, desired)
+    else:
+        _set_manifest_renditions(root, manifest, selected + [
+            s for s in desired if s["path"] not in have])
+    pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     report["counts"]["qualification"] = dict(
         Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
-    report["counts"]["published"] = int(pub["status"] == "succeeded")
+    report["counts"]["published"] = int(
+        pub["status"] == "succeeded"
+        and bool(inspected.get("availability", {}).get("available")))
     report["usage"] = {"prompt_tokens": usage["prompt_tokens"],
                        "completion_tokens": usage["completion_tokens"]}
     return report

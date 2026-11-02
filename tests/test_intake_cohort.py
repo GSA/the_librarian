@@ -10,6 +10,7 @@ from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.intake import cohort, store
+from tools.intake.contracts import IntakeError
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
               b"------=_Part_1\r\nContent-Type: text/html; charset=utf-8\r\n"
@@ -274,7 +275,9 @@ class QualifyTests(CohortCase):
         self.assertEqual(report["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
         plain = next(e for e in report["entries"] if e["relative"] == "m/plain.txt")
         self.assertEqual(plain["qualification"], "pending-review")
-        stage = store.inspect(self.root, "standing-" + plain["submission_id"])["stages"][0]
+        stage = store.inspect(
+            self.root, "standing-" + plain["submission_id"] + "-" + plain["rendition_sha256"][:12]
+        )["stages"][0]
         self.assertEqual(stage["status"], "blocked")
         self.assertEqual(stage["attempts"][-1]["code"],
                          "standing-pending-review-insufficient-inspected-scope")
@@ -366,6 +369,71 @@ class QualifyTests(CohortCase):
                 len(index.search(db, "Fresh cohort item", 10, None, root=self.root)["hits"]), 1)
             notes_hits = index.search(db, "Notes", 10, None, root=self.root)["hits"]
             self.assertEqual([h["path"] for h in notes_hits], [new_notes["rendition"]])
+
+    def _qualify(self, transport, **extra):
+        args = dict(system="inbox", actor="cohort-runner",
+                    policy_path="config/standing-policy.local.json",
+                    manifest="config/selection.local.json", model="gpt-5.6-terra",
+                    transport=transport, context=["documents/context.md"])
+        args.update(extra)
+        return cohort.qualify(self.root, self.inbox, **args)
+
+    def test_qualify_requires_a_maintained_context_before_touching_anything(self):
+        transport, calls = self._transport()
+        with self.assertRaises(IntakeError) as caught:
+            self._qualify(transport, context=None)
+        self.assertEqual(caught.exception.code, "context_required")
+        self.assertEqual(calls, [])
+        self.assertFalse((self.root / "config/standing-policy.local.json").exists())
+        self.assertEqual(store.list_requests(self.root), [])
+
+    def test_qualify_restores_a_selection_missing_from_the_manifest(self):
+        transport, calls = self._transport()
+        self._qualify(transport)
+        manifest = self.root / "config/selection.local.json"
+        raw = json.loads(manifest.read_text())
+        dropped = raw["renditions"].pop()
+        manifest.write_text(json.dumps(raw))
+        report = self._qualify(transport)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        restored = json.loads(manifest.read_text())["renditions"]
+        self.assertIn(dropped, restored)
+        self.assertEqual(len(restored), 6)
+        self.assertEqual([p.name for p in manifest.parent.iterdir()
+                          if p.name.startswith(".")], [])
+
+    def test_a_new_rendition_of_the_same_submission_is_reviewed_and_selected_again(self):
+        from unittest.mock import patch
+        from tools.extraction import mhtml
+        transport, calls = self._transport()
+        first = self._qualify(transport)
+        old = next(e for e in first["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        calls.clear()
+        from tools.extraction import extract
+        real = extract.fingerprint
+        with patch.object(mhtml, "METHOD_VERSION", mhtml.METHOD_VERSION + 1), \
+                patch.object(extract, "fingerprint", lambda r, f: real(r, f)[::-1]):
+            second = self._qualify(transport)
+        new = next(e for e in second["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        self.assertNotEqual(new["rendition"], old["rendition"])
+        self.assertEqual(len(calls), 1)
+        paths = [r["path"] for r in
+                 json.loads((self.root / "config/selection.local.json").read_text())["renditions"]]
+        self.assertIn(new["rendition"], paths)
+        self.assertNotIn(old["rendition"], paths)
+        self.assertEqual(len(paths), 6)
+
+    def test_qualify_republishes_when_the_index_is_missing(self):
+        from tools.context_index import context_index as index
+        transport, _ = self._transport()
+        self._qualify(transport)
+        (self.root / cohort.DEFAULT_INDEX).unlink()
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["published"], 1)
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            self.assertEqual(
+                len(index.search(db, "Fund codes", 10, None, root=self.root)["hits"]), 1)
 
 
 class CliTests(CohortCase):

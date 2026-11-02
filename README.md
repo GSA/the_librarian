@@ -99,6 +99,19 @@ Every file gets a counted disposition; nothing in the inbox is changed, and
 extracted renditions stay unselected until a standing-policy review qualifies
 them.
 
+To review, select and publish the extracted cohort in one rerunnable step
+(model traffic stays within the configured USAi provider):
+
+```sh
+.venv/bin/python -m tools.intake.cohort qualify --root . --inbox /path/to/inbox \
+  --system my-inbox --actor "$USER" --policy config/standing-policy.local.json \
+  --manifest config/selection.local.json --models-config /path/to/models.json \
+  --model MODEL --context documents/CONTEXT.md
+```
+
+It prints body-free outcome counts and token usage; incomplete reviews stay
+visibly `pending-review` and are not indexed.
+
 To watch a run, use the read-only, body-free progress view (CLI or a
 loopback-only page that refreshes itself; see
 [context/intake.md](context/intake.md#progress-view)):

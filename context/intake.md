@@ -187,14 +187,20 @@ optional `--report` (0600) lists per-file paths, hashes and outcomes and is
 private instance data. Extraction never reviews, selects or qualifies.
 
 `qualify ... --system LABEL --actor A --policy PATH --manifest PATH
---models-config FILE --model M [--context LOCATOR ...] [--index DB] [--limit N]`
-runs `ingest`, ensures the private standing policy and selection manifest exist,
-runs `model_review.review` and stages `standing-review` + `standing-select`
-(`standing-<submission-id>`) for each unreviewed extracted rendition, reconciles
-the selection manifest to active qualified renditions when `--limit` is omitted,
-and runs `standing-publish` to build the context index. Incomplete or failing
-reviews remain visibly `pending-review`, `rejected`, `deferred` or `exception`
-without indexing; reruns reuse existing ledger stages without extra model calls.
+--models-config FILE --model M --context LOCATOR [--context LOCATOR ...]
+[--index DB] [--limit N]` runs `ingest`, ensures the private standing policy and
+selection manifest exist (`--context` names maintained documents under the
+policy's `markdown_roots` and is required; nothing is written without it), and
+runs `model_review.review` then stages `standing-review` + `standing-select`
+(`standing-<submission-id>-<rendition-hash>`) for each extracted rendition that
+has no saved review. A changed rendition gets a new review; an unchanged one
+reuses its ledger stages with no model call. When `--limit` is omitted the
+manifest is first pruned to the cohort's current renditions, then reconciled
+to exactly the qualified ones, adding any that are missing. Manifest and policy
+files are replaced atomically. `standing-publish` builds the context index;
+a saved publication is reused only while the index is present and fresh,
+otherwise a new revision is staged. Incomplete or failing reviews remain visibly
+`pending-review`, `rejected`, `deferred` or `exception` without indexing.
 Stdout prints body-free `counts` and token `usage`.
 
 ## Model-assisted standing review
