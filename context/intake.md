@@ -178,11 +178,35 @@ new `mhtml` submission that is recorded as a correction of the old one
 `ingest ... --system LABEL --actor A [--limit N]` submits each admitted file as
 a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,
 percent-encoded inbox-relative locator, pinned SHA-256) and runs
-`extract-prepare` then `extract-register` through the ledger. Outcomes are
+`extract-prepare` then `extract-register` through the ledger. When an inbox
+file's bytes change after intake, a content-salted submission ID is derived and
+submitted as a correction of the prior submission (`correction_of`). Outcomes are
 counted as `received`, `extracted`, `failed`, `changed-since-intake` and
 `not-processed`; reruns are idempotent. The inbox is never written. The
 optional `--report` (0600) lists per-file paths, hashes and outcomes and is
 private instance data. Extraction never reviews, selects or qualifies.
+
+`qualify ... --system LABEL --actor A --policy PATH --manifest PATH
+--models-config FILE --model M --context LOCATOR [--context LOCATOR ...]
+[--index DB]` runs `ingest`, ensures the private standing policy and
+selection manifest exist (`--context` names maintained documents under the
+policy's `markdown_roots` and is required; nothing is written without it), and
+runs `model_review.review` then stages `standing-review` + `standing-select`
+(`standing-<submission-id>-<rendition-hash>-<policy-hash>`) for each extracted rendition that
+has no saved review. A changed rendition gets a new review; an unchanged one
+reuses its ledger stages with no model call. The
+manifest is first pruned to the cohort's current renditions, then reconciled
+to exactly the qualified ones, adding any that are missing. Policy, manifest and context paths are validated (instance-relative, no
+symlinks, existing maintained sections) before anything is ingested or written;
+manifest and policy files are replaced atomically.  `qualify` always processes the whole inbox
+(`--limit` exists only on `ingest`). Changing an active policy's content does not
+requalify old evidence: renditions already reviewed under another policy stay
+`pending-review` until an explicit policy-change review correction is made. `standing-publish` builds the context index;
+a saved publication is reused only while the index is present and fresh,
+otherwise a new revision is staged. A review an operator later superseded is reported `pending-review` (`review-superseded`) and its saved selection is not restored; the operator's corrected selection is kept.
+The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
+`pending-review`, `rejected`, `deferred` or `exception` without indexing.
+Stdout prints body-free `counts` and token `usage`.
 
 ## Model-assisted standing review
 
