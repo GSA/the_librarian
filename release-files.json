@@ -64,6 +64,7 @@
   "tools/context-mcp/src/the_librarian_mcp/preflight.py",
   "tools/context-mcp/src/the_librarian_mcp/server.py",
   "tools/diagnostics/__init__.py",
+  "tools/diagnostics/ingest_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
   "tools/extraction/extract.py",
@@ -89,5 +90,7 @@
   "tools/extraction/README.md",
   "docs/decisions/0008-proof-of-concept-closure.md",
   "docs/decisions/0009-read-only-cohort-intake.md",
-  "docs/decisions/0010-daily-snapshots-and-retention.md"
+  "docs/decisions/0010-daily-snapshots-and-retention.md",
+  "docs/decisions/0011-bounded-validation-cost.md",
+  "tests/test_validation_cost.py"
 ]

@@ -53,6 +53,9 @@ snapshots older than seven days (set `backup_retention_days` in
 backup count and size; `python3 -m tools.backups prune` is a dry run and
 `--apply` keeps the newest verified snapshot per day. See
 [decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
+Ingest cost still grows with history; measure it on synthetic cohorts with
+`python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see
+[decision 0011](docs/decisions/0011-bounded-validation-cost.md).
 
 ## Ingesting files (current manual method)
 

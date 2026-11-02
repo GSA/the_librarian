@@ -21,6 +21,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0008](0008-proof-of-concept-closure.md) | Concluded proof of concept and adopted reusable lessons | Accepted |
 | [0009](0009-read-only-cohort-intake.md) | Read-only cohort intake and model-assisted standing review | Implemented; bulk review gated per instance |
 | [0010](0010-daily-snapshots-and-retention.md) | Daily store snapshots with bounded retention | Accepted |
+| [0011](0011-bounded-validation-cost.md) | Bounded validation cost after daily snapshots | Accepted; per-file cost still grows with history |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in
