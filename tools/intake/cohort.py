@@ -297,6 +297,10 @@ def _validate_inputs(root, policy_path, manifest, context, index_path, model):
     _instance_file(root, policy_path)
     _instance_file(root, manifest)
     try:
+        # The ledger requires ASCII relative paths; refuse the same ones before any mutation.
+        for name in (policy_path, manifest, index_path):
+            contracts.relative(name)
+            name.encode("ascii")
         contracts.relative(index_path)
         index.validate_db_path(root, root / index_path)
         if (root / manifest).is_file():
@@ -306,7 +310,7 @@ def _validate_inputs(root, policy_path, manifest, context, index_path, model):
             loaded = standing.load_policy(root, policy_path, hashlib.sha256(raw).hexdigest())
             if loaded["reviewer"] != f"{model_review.PROVIDER}:{model}":
                 raise IntakeError("policy_reviewer_mismatch")
-    except (index.IndexError_, standing.Refusal, IntakeError, OSError) as error:
+    except (index.IndexError_, standing.Refusal, IntakeError, OSError, UnicodeError) as error:
         raise IntakeError(getattr(error, "code", None) if isinstance(error, IntakeError)
                           else "preflight_invalid") from error
     locators = context

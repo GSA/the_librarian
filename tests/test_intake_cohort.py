@@ -394,6 +394,7 @@ class QualifyTests(CohortCase):
     def test_qualify_refuses_bad_paths_and_unknown_context_before_touching_anything(self):
         transport, calls = self._transport()
         cases = [dict(policy_path="../escape.local.json"), dict(manifest="/tmp/x.json"),
+                 dict(manifest="config/s\u00e9lection.local.json"),
                  dict(context=["documents/missing.md"]),
                  dict(context=["documents/context.md#no-such-section"]),
                  dict(context=["config/policy.local.json"])]
