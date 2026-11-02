@@ -262,8 +262,17 @@ class Log:
 
 
 def read_lines(path):
+    """Yield a log's lines one at a time so a report never holds the history in memory."""
     require(not path.is_symlink(), f"Audit log cannot be a symlink: {path}")
-    return path.read_text(encoding="utf-8").splitlines()
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            yield line.rstrip("\r\n")
+
+
+def owns(active, candidate):
+    """Whether ``candidate`` is ``active`` or one of its rotated files."""
+    pattern = re.compile(re.escape(active.stem) + r"(\.[1-9][0-9]*)?" + re.escape(active.suffix))
+    return candidate.parent == active.parent and pattern.fullmatch(candidate.name) is not None
 
 
 def dedupe(files, active):
@@ -291,21 +300,11 @@ def report(root, log=None):
                          for lock in folder.glob("*.jsonl.lock")) if folder.is_dir() else []
     else:
         actives = [log_path(root, log)]
-    groups, covered = [], set()
-    for active in actives:
-        if not active.parent.is_dir():
-            continue
-        with locked(active):  # writers rotate under this lock; read a stable view
-            files = log_files(active)
-            groups.append([(path, read_lines(path)) for path in dedupe(files, active)])
-        covered.update(files)
-    if log is None and folder.is_dir():
-        groups.append([(path, read_lines(path)) for path in sorted(folder.glob("*.jsonl"))
-                       if path not in covered])
-    for lines in groups:
-        for path, content in lines:
+
+    def tally(paths):
+        for path in paths:
             summary["files"] += 1
-            for line in content:
+            for line in read_lines(path):
                 try:
                     record = json.loads(line)
                     assert record["schema"] == SCHEMA
@@ -321,6 +320,16 @@ def report(root, log=None):
                 summary["returned_bytes"] += len(text.encode("utf-8"))
                 if hashlib.sha256(text.encode("utf-8")).hexdigest() != record.get("returned_sha256"):
                     summary["hash_mismatches"] += 1
+
+    actives = [active for active in actives if active.parent.is_dir()]
+    for active in actives:
+        with locked(active):  # writers rotate under this lock; stream a stable view
+            tally(dedupe(log_files(active), active))
+    if log is None and folder.is_dir():
+        # Logs without a writer lock; files owned by a locked log were counted above,
+        # whatever rotation happened since.
+        tally(path for path in sorted(folder.glob("*.jsonl"))
+              if not any(owns(active, path) for active in actives))
     return {**summary, "by_tool": dict(sorted(tools.items())),
             "by_agent": dict(sorted(agents.items())),
             "by_outcome": dict(sorted(outcomes.items())),

@@ -197,6 +197,35 @@ class AuditLog(unittest.TestCase):
         thread.join(5)
         self.assertTrue(done.is_set())
 
+    def test_report_does_not_double_count_a_rotation_after_the_locked_read(self):
+        import contextlib
+        log = self.log()
+        log.write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
+        real, done = audit.locked, []
+
+        @contextlib.contextmanager
+        def rotating(path):
+            with real(path):
+                yield
+            if done:
+                return
+            done.append(True)
+            log.max_bytes = 1  # the next write rotates the active file after the report read it
+            log.write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
+            log.max_bytes = audit.MAX_FILE_BYTES
+        with unittest.mock.patch.object(audit, "locked", rotating):
+            result = audit.report(self.root)
+        self.assertEqual(result["records"], 1)
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(audit.report(self.root)["records"], 2)
+
+    def test_report_streams_lines_instead_of_loading_a_log(self):
+        log = self.log()
+        log.write(tool="status", arguments={}, outcome="ok", text="{}", **stamps())
+        lines = audit.read_lines(log.path)
+        self.assertIs(iter(lines), lines)
+        self.assertEqual(len(list(lines)), 1)
+
     def test_report_is_body_free_and_verifies_hashes(self):
         log = self.log()
         log.write(tool="search", arguments={"query": "zzsecret"}, outcome="ok",
