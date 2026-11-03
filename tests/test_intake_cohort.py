@@ -446,17 +446,40 @@ class QualifyTests(CohortCase):
         self.assertEqual(entry["review_code"], "review-superseded")
         selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
         self.assertNotIn(notes["review_event_id"], [e for r in selected for e in r["review_event_ids"]])
+        # A policy-version bump never supersedes the operator's correction of a standing review.
+        self._bump_policy_version()
+        bumped = self._qualify(transport)
+        entry = next(e for e in bumped["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual((entry["qualification"], entry["review_code"]),
+                         ("pending-review", "standing-pending-review-conflicting-review"))
+        self.assertNotIn("rev-operator-correction", event_reader.read_snapshot(self.root).successors)
+
+    def _bump_policy_version(self):
+        policy_file = self.root / "config/standing-policy.local.json"
+        raw = json.loads(policy_file.read_text())
+        raw["version"] += 1
+        policy_file.write_text(json.dumps(raw))
 
     def test_changed_standing_policy_rereviews_and_supersedes_its_earlier_version(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        from tools.intake import standing
         from tools.review_events import event_reader
+        fixed = datetime.now(timezone.utc).replace(microsecond=0)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed
         transport, calls = self._transport()
+        # Both versions are reviewed within the same second.
+        clock = patch.object(standing, "datetime", Clock)
+        clock.start()
+        self.addCleanup(clock.stop)
         self._qualify(transport)
         manifest = self.root / "config/selection.local.json"
         v1 = {e for r in json.loads(manifest.read_text())["renditions"] for e in r["review_event_ids"]}
-        policy_file = self.root / "config/standing-policy.local.json"
-        raw = json.loads(policy_file.read_text())
-        raw["version"] = 2
-        policy_file.write_text(json.dumps(raw))
+        self._bump_policy_version()
         report = self._qualify(transport)
         self.assertEqual(len(calls), 12)
         self.assertEqual(report["counts"]["qualification"], {"qualified": 6})

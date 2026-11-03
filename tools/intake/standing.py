@@ -8,7 +8,7 @@ page, text record, table and warning (Docling) or every extraction record and
 warning (text, transcript, ODT) of the exact rendition can qualify it.  Every other result stays a visible, unpublished
 outcome with explicit reasons.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -411,8 +411,9 @@ def review_event(result, args, recorded_at=None):
 
 
 def _earlier_standing_review(event, standing, source, qualified, args):
-    """True for this standing policy's review of the same rendition, source and scope
-    under an earlier policy version."""
+    """True for this standing policy's own review of the same rendition, source and
+    scope under an earlier policy version: its event ID must be the one that earlier
+    policy's review would have produced, so operator corrections never qualify."""
     if (event["source"]["locator"] != args["rendition"]
             or event["source"]["receipt_id"] != source["receipt_id"]
             or event["source"]["source_id"] != source["source_ids"][0]
@@ -422,8 +423,16 @@ def _earlier_standing_review(event, standing, source, qualified, args):
                                                  else qualification.EXTRACT_COMPLETE_SCOPE)):
         return False
     claims = [m.groups() for e in event["evidence"] for m in [STANDING_STATEMENT.fullmatch(e["quote"] or "")] if m]
-    return (len(claims) == 1 and claims[0][0] == standing["policy_id"]
-            and int(claims[0][1]) < standing["version"])
+    suffix = "-" + args["policy_sha256"][:8]
+    if len(claims) != 1 or not args["event_id"].endswith(suffix):
+        return False
+    policy_id, version, sha = claims[0]
+    own = args["event_id"][:-len(suffix)] + "-" + sha[:8]
+    reason = event["correction_reason"]
+    return (policy_id == standing["policy_id"] and int(version) < standing["version"]
+            and event["event_id"] == own
+            and (not event["supersedes"]
+                 or (reason or "").startswith(f"Re-reviewed under standing policy {policy_id} v{version},")))
 
 
 def bound_event(root, result, args):
