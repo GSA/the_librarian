@@ -19,7 +19,7 @@ import re
 
 METHOD = "mhtml-html-text"
 # Bump when conversion output can change so ingested entries are extracted again.
-METHOD_VERSION = 2
+METHOD_VERSION = 3
 MAX_HEADER = 64 * 1024
 MAX_PARTS = 5000
 MAX_DEPTH = 16
@@ -58,11 +58,15 @@ def _decode(part):
     """Return the strictly decoded text of one leaf part."""
     encoding = str(part.get("Content-Transfer-Encoding", "7bit")).strip().lower()
     require(encoding in ENCODINGS, "mime-encoding")
-    # as_bytes() keeps the body bytes as parsed; get_payload() would substitute characters.
-    wire = part.as_bytes()
-    split = BLANK.search(wire)
-    require(split is not None or wire.endswith(b"\n"), "mime-malformed")
-    data = wire[split.end():] if split else b""
+    # The parsed body holds non-ASCII bytes as surrogate escapes, so encoding it back recovers
+    # the exact wire bytes. as_bytes() normalises CR and CRLF, and get_payload() decodes the
+    # surrogates with the declared charset, so neither can feed a strict decoder.
+    body = part._payload
+    require(isinstance(body, str), "mime-malformed")
+    try:
+        data = body.encode("ascii", "surrogateescape")
+    except UnicodeError as error:
+        raise MhtmlError("mime-malformed") from error
     if encoding != "8bit" and encoding != "binary":
         require(data.isascii(), "mime-encoding")
     if encoding == "base64":

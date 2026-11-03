@@ -156,6 +156,20 @@ class ConvertTests(unittest.TestCase):
                          ["Encoded \u2014 text\n"])
 
 
+class ByteFidelityTests(unittest.TestCase):
+    def raw(self, text, charset, encoding="binary"):
+        head = HEAD.replace('; type="text/html"', "").encode()
+        part = ("--%s\r\nContent-Type: text/html; charset=%s\r\nContent-Transfer-Encoding: %s\r\n\r\n"
+                % (B, charset, encoding)).encode()
+        return head + part + text.encode(charset) + ("\r\n--%s--\r\n" % B).encode()
+
+    def test_binary_body_bytes_are_not_newline_normalised(self):
+        # U+010D is bytes 0D 01 in UTF-16LE; normalising CR to LF would yield U+010A.
+        for charset in ("utf-16le", "utf-16be", "utf-32le"):
+            lines = [line["text"] for line in mhtml.payload(self.raw("<p>\u010d \u0d01</p>", charset))["lines"]]
+            self.assertEqual(lines, ["\u010d \u0d01\n"], charset)
+
+
 class ConvertRegressionTests(unittest.TestCase):
     def lines(self, html, encoding="7bit"):
         raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
