@@ -506,14 +506,22 @@ class QualifyTests(CohortCase):
         blocked = [r["correlation_id"] for r in store.list_requests(self.root)
                    if r["correlation_id"].startswith("standing-") and not r["complete"]]
         self.assertEqual(len(blocked), 6)
-        for corr in blocked:
+        # An operator's own correction, under any valid name, is followed and corrected too.
+        fix = blocked[0] + "-fix"
+        stages = store.request(self.root, blocked[0])["stages"]
+        cohort._stage_request(self.root, fix, [
+            {**s, "arguments": {**s["arguments"], "request_id": f"req-{fix}-{s['id']}"}}
+            for s in stages], correction_of=blocked[0])
+        with patch.object(standing, "_earlier_standing_review", return_value=False):
+            runner.run(self.root, fix, "review")
+        for corr in blocked[1:] + [fix]:
             runner.replay(self.root, corr, "review")
         report = self._qualify(transport)
         self.assertEqual(len(calls), 12)
         self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
         heads = [store.head(self.root, corr) for corr in blocked]
         self.assertEqual({(h["correlation_id"], h["correction_of"], h["complete"]) for h in heads},
-                         {(c + "-c1", c, True) for c in blocked})
+                         {(c + "-c1", fix if c == blocked[0] else c, True) for c in blocked})
         # Settled corrections are reused, not corrected again.
         self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
         self.assertEqual([store.head(self.root, c)["correlation_id"] for c in blocked],

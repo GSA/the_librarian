@@ -405,6 +405,16 @@ def _head(root, corr):
         return None
 
 
+def _exists(root, corr):
+    try:
+        store.request(root, corr)
+    except IntakeError as error:
+        if error.code != "unknown_request":
+            raise
+        return False
+    return True
+
+
 def _inputs_changed(current):
     review = current["stages"][0]
     return (review["status"] == "blocked" and bool(review["attempts"])
@@ -414,7 +424,9 @@ def _inputs_changed(current):
 def _stage_correction(root, corr, active):
     """Restage a standing review whose pinned intent no longer matches its inputs as a
     correction of it: same review arguments and event, fresh request identities."""
-    number = 1 if active == corr else int(active.rsplit("-c", 1)[1]) + 1
+    number = 1
+    while _exists(root, f"{corr}-c{number}"):
+        number += 1
     corrected = f"{corr}-c{number}"
     stages = store.request(root, active)["stages"]
     _stage_request(root, corrected, [
