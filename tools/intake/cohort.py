@@ -387,13 +387,52 @@ def _standing_outcome(stage):
     return "pending-review", code
 
 
-def _stage_request(root, corr, stages):
+def _stage_request(root, corr, stages, correction_of=None):
     store.stage(root, json.dumps({
-        "version": 1, "correlation_id": corr, "correction_of": None,
+        "version": 1, "correlation_id": corr, "correction_of": correction_of,
         "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
         "retry": {"max_attempts": 3, "backoff_seconds": 0},
         "stages": stages,
     }).encode())
+
+
+def _head(root, corr):
+    try:
+        return store.head(root, corr)
+    except IntakeError as error:
+        if error.code != "unknown_request":
+            raise
+        return None
+
+
+def _exists(root, corr):
+    try:
+        store.request(root, corr)
+    except IntakeError as error:
+        if error.code != "unknown_request":
+            raise
+        return False
+    return True
+
+
+def _inputs_changed(current):
+    review = current["stages"][0]
+    return (review["status"] == "blocked" and bool(review["attempts"])
+            and review["attempts"][-1]["code"] == "changed-standing-inputs")
+
+
+def _stage_correction(root, corr, active):
+    """Restage a standing review whose pinned intent no longer matches its inputs as a
+    correction of it: same review arguments and event, fresh request identities."""
+    number = 1
+    while _exists(root, f"{corr}-c{number}"):
+        number += 1
+    corrected = f"{corr}-c{number}"
+    stages = store.request(root, active)["stages"]
+    _stage_request(root, corrected, [
+        {**s, "arguments": {**s["arguments"], "request_id": f"req-{corrected}-{s['id']}"}}
+        for s in stages], correction_of=active)
+    return corrected
 
 
 def _inspect(root, corr):
@@ -437,7 +476,7 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
             reviewed = prefetched()
         except Exception as error:
             failure = error
-    current = _inspect(root, corr)
+    current = _head(root, corr)
     if current is None:
         if failure is not None:
             raise failure
@@ -475,11 +514,17 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
             entry.update(qualification="pending-review", review_code="review-superseded",
                          superseded_event=event_id)
             return
+    active = current["correlation_id"]
     if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
-        current = runner.run(root, corr, "review")
+        current = runner.run(root, active, "review")
+    if _inputs_changed(current):
+        # The saved review's pinned intent is stale (e.g. an earlier-version review it
+        # conflicted with is now supersedable); re-pin it under a correction request.
+        active = _stage_correction(root, corr, active)
+        current = runner.run(root, active, "review")
     if (current["stages"][0]["status"] == "succeeded"
             and current["stages"][1]["status"] in {"staged", "running", "retryable"}):
-        current = runner.run(root, corr, "select")
+        current = runner.run(root, active, "select")
     if all(s["status"] == "succeeded" for s in current["stages"]):
         selection = current["stages"][1]["evidence"]["selection"]
         if (selection["path"] != entry["rendition"]

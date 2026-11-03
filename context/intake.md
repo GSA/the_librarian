@@ -212,6 +212,7 @@ requalify old evidence: renditions already reviewed under another policy stay
 a saved publication is reused only while the index is present and fresh,
 otherwise a new revision is staged. A review an operator later superseded is reported `pending-review` (`review-superseded`) and its saved selection is not restored; the operator's corrected selection is kept.
 Bumping the standing policy version re-reviews every rendition; a new-version review that qualifies supersedes the same policy's earlier-version standing review of that rendition (same source and scope) and replaces its manifest selection, (recorded at least a second after it); operator corrections, reviews from any other policy and independent reviews still block as `conflicting-review`.
+A standing review blocked as `changed-standing-inputs` (its saved intent no longer matches current inputs, e.g. after a replay) is restaged as a correction request `<correlation>-c<n>` with the same review arguments and event and fresh request IDs; later runs follow the `correction_of` chain to its newest request.
 The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
 `pending-review`, `rejected`, `deferred` or `exception` without indexing.
 `--concurrency N` (default 6) keeps up to N model calls in flight, each for a
