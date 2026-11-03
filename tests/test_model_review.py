@@ -94,13 +94,16 @@ class FindingsTests(ReviewCase):
         return model_review.review(self.root, self.rendition, self.policy, "model-a", transport)
 
     def test_accepted_reply_becomes_findings_that_qualify(self):
-        result = self.review(Transport(reply()))
+        cited = "Cites a repository README that this rendition does not contain."
+        result = self.review(Transport(reply(unverifiable_references=[cited])))
         self.assertEqual(result["status"], "reviewed")
         self.assertEqual(result["usage"], {"prompt_tokens": 100, "completion_tokens": 20})
         path = self.root / result["findings_path"]
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         findings = json.loads(path.read_text())
         self.assertEqual(findings["reviewer"], "usai:model-a")
+        self.assertEqual(findings["schema"], "standing-findings-v2")
+        self.assertEqual(findings["unverifiable_references"], [cited])
         self.assertEqual(findings["inspected"], {"records": [0, 1],
                                                  "warnings": ["#/payload/warnings/0"]})
         policy_sha = self.save_policy()
@@ -134,6 +137,20 @@ class FindingsTests(ReviewCase):
                 result = self.review(Transport(value))
                 self.assertEqual(result["status"], "invalid-reply")
                 self.assertNotIn("findings_path", result)
+
+    def test_advisory_references_are_bounded_and_default_to_empty(self):
+        expected = {"records": [0, 1], "warnings": ["#/payload/warnings/0"]}
+        legacy = json.loads(reply()["content"])
+        self.assertEqual(model_review._parse(json.dumps(legacy), expected)
+                         ["unverifiable_references"], [])
+        many = [" ", " cited spec "] + ["x" * 1200] * 60
+        parsed = model_review._parse(reply(unverifiable_references=many)["content"], expected)
+        self.assertEqual(parsed["unverifiable_references"][0], "cited spec")
+        self.assertEqual(len(parsed["unverifiable_references"]), 50)
+        self.assertEqual({len(s) for s in parsed["unverifiable_references"][1:]}, {1000})
+        for bad in ("cited spec", [1]):
+            self.assertIsNone(model_review._parse(
+                reply(unverifiable_references=bad)["content"], expected))
 
     def test_code_fenced_json_is_accepted(self):
         value = reply()

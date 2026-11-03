@@ -30,6 +30,10 @@ but parser or model success must never stand in for review.
   payload record and warning. A model reviewer's reply is recorded as findings
   exactly as reported; the standing policy, not the model, decides
   qualification.
+  Internal contradictions and evidence the rendition itself lacks block
+  qualification; references to cited material outside the rendition are
+  recorded as advisory (`standing-findings-v2`) and do not block. Earlier
+  `standing-findings-v1` records remain valid.
 - The reviewing model is chosen by a body-free sample evaluation over the
   configured provider's models, including synthetic garbled and
   instruction-injection controls, and model traffic stays within that provider.

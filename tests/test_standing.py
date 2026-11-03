@@ -73,7 +73,8 @@ class StandingCase(test_kit.WorkspaceCase):
                          "inspected": {"pages": [1, 2], "texts": ["#/texts/0"],
                                        "tables": ["#/tables/0"], "warnings": ["#/warnings/0"]},
                          "explanation": "Compared every page, text, table and warning to the original.",
-                         "contradictions": [], "missing_evidence": [], "correction_of": None,
+                         "contradictions": [], "missing_evidence": [],
+                         "unverifiable_references": [], "correction_of": None,
                          "new_mapping": False, "exception_resolution": None}
         self.write_private("config/standing-policy.json", self.policy)
         self.write_private("config/standing-findings.json", self.findings)
@@ -303,10 +304,37 @@ class StandingEvaluationTests(StandingCase):
         for update, expected in (({"decision": "reject"}, ("rejected", "reviewer-rejected")),
                                  ({"decision": "defer"}, ("deferred", "reviewer-deferred")),
                                  ({"contradictions": ["Table total differs."]},
+                                  ("pending-review", "unresolved-evidence")),
+                                 ({"missing_evidence": ["Referenced figure 2 is absent."],
+                                   "unverifiable_references": ["Cites an external spec."]},
                                   ("pending-review", "unresolved-evidence"))):
             with self.subTest(update=update):
                 self.write_private("config/standing-findings.json", {**self.findings, **update})
                 self.assert_outcome(*expected)
+
+    def test_advisory_references_do_not_block_and_are_counted_in_the_event(self):
+        cited = "Relies on a linked analysis document that is not included."
+        self.write_private("config/standing-findings.json",
+                           {**self.findings, "unverifiable_references": [cited, "Cites a repo."]})
+        result = self.assert_outcome("qualified", "complete-inspected-scope")
+        quotes = [e["quote"] for e in standing.review_event(result, self.review_args())["evidence"]]
+        self.assertIn("Reviewer noted 2 advisory references to material outside the rendition.",
+                      quotes)
+        self.assertNotIn(cited, " ".join(quotes))
+
+    def test_v1_findings_without_advisory_references_stay_valid(self):
+        v1 = {k: v for k, v in self.findings.items() if k != "unverifiable_references"}
+        for update, expected in (({}, ("qualified", "complete-inspected-scope")),
+                                 ({"missing_evidence": ["Section 3 is truncated."]},
+                                  ("pending-review", "unresolved-evidence")),
+                                 ({"unverifiable_references": []},
+                                  ("exception", "invalid-findings"))):
+            with self.subTest(update=update):
+                self.write_private("config/standing-findings.json",
+                                   {**v1, "schema": "standing-findings-v1", **update})
+                self.assert_outcome(*expected)
+        self.write_private("config/standing-findings.json", v1)
+        self.assert_outcome("exception", "invalid-findings")
 
     def test_findings_must_bind_policy_rendition_and_reviewer(self):
         for update in ({"reviewer": "someone-else"}, {"rendition_sha256": "f" * 64},
@@ -564,7 +592,8 @@ class StandingExtractTests(test_kit.WorkspaceCase):
                          "reviewer": "standing-reviewer", "decision": "accept",
                          "inspected": {"records": [0, 1], "warnings": ["#/payload/warnings/0"]},
                          "explanation": "Compared both lines and the warning to the original.",
-                         "contradictions": [], "missing_evidence": [], "correction_of": None,
+                         "contradictions": [], "missing_evidence": [],
+                         "unverifiable_references": [], "correction_of": None,
                          "new_mapping": False, "exception_resolution": None}
         self.save("config/standing-policy.json", self.policy)
         self.save("config/standing-findings.json", self.findings)

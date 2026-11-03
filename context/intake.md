@@ -34,13 +34,16 @@ named stage. The ledger is operational recovery state, never corpus authority.
 - Standing-policy stages (`tools/intake/standing.py`) pin a private (0600)
   `standing-policy-v1` file by SHA-256 (id, version, active/revoked status,
   reviewer, receipt/audience scope, page/record/findings budgets, selection
-  context) and an attributed `standing-findings-v1` record for one exact
+  context) and an attributed `standing-findings-v2` (or legacy `-v1`) record for one exact
   registered Docling or extraction rendition. Only findings that inspected every
   page, text record, table and individual warning (`#/warnings/N`) of a Docling
   rendition, or every payload record (`records: [index]`) and warning
   (`#/payload/warnings/N`) of a text, transcript or ODT rendition, with no
   contradictions or missing evidence, are
-  `qualified`; parser success and confidence never qualify. Other outcomes
+  `qualified`; parser success and confidence never qualify. The v2 advisory
+  `unverifiable_references` list (claims depending on material the document
+  cites but does not contain) never blocks; a qualified event states only its
+  count. Other outcomes
   (`pending-review`, `rejected`, `deferred`, `exception`) block visibly with a
   reason code and write nothing. Missing findings are a retryable
   `review-route-unavailable`. Corrections, new mappings or existing independent
@@ -211,12 +214,15 @@ Stdout prints body-free `counts` and token `usage`.
 ## Model-assisted standing review
 
 `tools/intake/model_review.py` turns one model's review of one exact extraction
-rendition into a private `standing-findings-v1` record under
+rendition into a private `standing-findings-v2` record under
 `<intake_home>/findings/`, exactly as the model reported it: partial inspection
 is never filled in, and replies that do not parse, name an unknown record or
 warning, or exceed the prompt or record budget write no findings. The standing
 policy's `reviewer` must be `usai:<model>`. Prompts mark document text as
-untrusted. The transport is restricted to models configured for the `usai`
+untrusted. The reply lists internal `contradictions`, `missing_evidence` the
+rendition itself needs (truncated sections, absent tables or figures), and
+advisory `unverifiable_references` to cited outside material; replies without
+the advisory list still parse. The transport is restricted to models configured for the `usai`
 provider in a Pi `models.json`.
 
 `python -m tools.intake.model_review evaluate --root ROOT --models-config FILE
