@@ -79,9 +79,14 @@ def _prepare(root, stage):
             intent = standing_intent(root, stage)
             if operation == "standing-review" and intent["outcome"] == "qualified":
                 # Fixed once in the saved intent so a crash-after-commit retry
-                # resubmits the identical event under the same request ID.
-                intent["recorded_at"] = standing.datetime.now(
-                    standing.timezone.utc).replace(microsecond=0).isoformat()
+                # resubmits the identical event under the same request ID. A
+                # correction must be recorded strictly after what it supersedes.
+                recorded = standing.datetime.now(standing.timezone.utc).replace(microsecond=0)
+                for predecessor in intent.get("supersedes", ()):
+                    prior = standing.datetime.fromisoformat(
+                        events.status(root, predecessor)["event"]["recorded_at"])
+                    recorded = max(recorded, prior.replace(microsecond=0) + standing.timedelta(seconds=1))
+                intent["recorded_at"] = recorded.isoformat()
             return intent
         if operation == "standing-publish":
             pinned = standing_publish_guard(root, args)
@@ -169,7 +174,8 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                 expected_state=catalog.status(root)["state_token"],
                 reason=child["data"]["reason"])
             entry = standing.selection_entry(result, review_args)
-            manifest_sha = standing.write_manifest(root, args["manifest"], entry)
+            manifest_sha = standing.write_manifest(root, args["manifest"], entry,
+                                                   result.get("supersedes", ()))
             return {"boundary": "selection-committed", "outcome": "qualified",
                     "catalog_revision": submitted["committed_revision"],
                     "request_id": args["request_id"], "selection": entry,
