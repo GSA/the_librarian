@@ -7,7 +7,8 @@ durable ledger. Extraction is not review: renditions stay deferred until a
 standing-policy review qualifies them. Printed output is body-free counts.
 """
 import argparse
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -415,15 +416,23 @@ def _set_manifest_renditions(root, manifest, renditions_):
         _replace_json(root / manifest, raw)
 
 
+def _standing_token(entry, policy_sha):
+    return "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
+
+
 def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                       model, transport, usage, snapshot=None):
-    """Review and select one extracted rendition; identity is bound to the exact rendition."""
-    token = "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
+                       model, transport, usage, snapshot=None, prefetched=None):
+    """Review and select one extracted rendition; identity is bound to the exact rendition.
+
+    ``prefetched`` optionally returns the model review already started for this entry
+    on a worker thread; every ledger step still runs here, on the calling thread.
+    """
+    token = _standing_token(entry, policy_sha)
     corr, event_id = "standing-" + token, "rev-" + token
     current = _inspect(root, corr)
     if current is None:
-        reviewed = model_review.review(
-            root, entry["rendition"], standing_policy, model, transport)
+        reviewed = (prefetched() if prefetched is not None else model_review.review(
+            root, entry["rendition"], standing_policy, model, transport))
         usage.update(reviewed["usage"])
         if reviewed["status"] != "reviewed":
             entry.update(qualification="pending-review", review_status=reviewed["status"])
@@ -441,6 +450,8 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
              "arguments": {**review_args, "request_id": "req-" + corr + "-select",
                            "manifest": manifest}}])
         current = store.inspect(root, corr)
+    elif prefetched is not None:
+        _discard(prefetched, usage)
     settled = all(st["status"] == "succeeded" for st in current["stages"])
     if settled and snapshot is not None:
         live = {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
@@ -465,6 +476,62 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
         failed = next(s for s in current["stages"] if s["status"] != "succeeded")
         outcome_name, code = _standing_outcome(failed)
         entry.update(qualification=outcome_name, review_code=code)
+
+
+def _discard(prefetched, usage):
+    """Another writer staged this review meanwhile; keep only the tokens actually spent."""
+    try:
+        usage.update(prefetched()["usage"])
+    except Exception:  # an unused review's failure must not fail the run
+        pass
+
+
+def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
+                model, transport, usage, snapshot, concurrency):
+    """Review and select each entry in input order, with up to ``concurrency`` model calls in flight.
+
+    Only model_review.review runs on worker threads, and only for entries without a
+    standing request; staging, runs, selection and usage stay on this thread in input
+    order, so the outcome does not depend on completion order.
+    """
+    def review(entry):
+        return model_review.review(root, entry["rendition"], standing_policy, model, transport)
+
+    if concurrency == 1:
+        for entry in extracted:
+            _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
+                               model, transport, usage, snapshot)
+        return
+    # Requests saved before this run need no model call; one read covers the run.
+    # A request another writer stages later is still found by the fresh per-entry
+    # read in _review_and_select, which then discards the unused review.
+    existing = {r["correlation_id"] for r in store.list_requests(root)}
+    window = deque()
+    upcoming = iter(extracted)
+    with ThreadPoolExecutor(max_workers=concurrency,
+                            thread_name_prefix="cohort-review") as pool:
+        try:
+            while True:
+                # At most `concurrency` calls run; a bounded lookahead keeps workers busy
+                # while this thread finishes the ledger work for the oldest entry.
+                while len(window) < 2 * concurrency:
+                    entry = next(upcoming, None)
+                    if entry is None:
+                        break
+                    corr = "standing-" + _standing_token(entry, policy_sha)
+                    window.append((entry, None if corr in existing
+                                   else pool.submit(review, entry)))
+                if not window:
+                    return
+                entry, future = window.popleft()
+                _review_and_select(root, entry, standing_policy, policy_path, policy_sha,
+                                   manifest, model, transport, usage, snapshot,
+                                   future.result if future is not None else None)
+        except BaseException:
+            for _, future in window:
+                if future is not None:
+                    future.cancel()
+            raise
 
 
 def _publish(root, policy_path, policy_sha, manifest, index_path):
@@ -501,8 +568,10 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
 
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
-            context=None, index_path=DEFAULT_INDEX):
+            context=None, index_path=DEFAULT_INDEX, concurrency=1):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage."""
+    if type(concurrency) is not int or concurrency < 1:
+        raise IntakeError("invalid_concurrency")
     root = Path(root).resolve()
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
@@ -519,9 +588,10 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         r for r in _manifest_renditions(root, manifest) if r["path"] in current])
     usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
     snapshot = event_reader.read_snapshot(root)
-    for entry in extracted:
-        _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                           model, transport, usage, snapshot)
+    retries = getattr(transport, "retries", None)
+    retried = Counter(retries) if retries is not None else None
+    _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
+                model, transport, usage, snapshot, concurrency)
     selected = _manifest_renditions(root, manifest)
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
     # Reconcile the manifest to exactly the qualified renditions from validated review
@@ -539,6 +609,10 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         and bool(inspected.get("availability", {}).get("available")))
     report["usage"] = {"prompt_tokens": usage["prompt_tokens"],
                        "completion_tokens": usage["completion_tokens"]}
+    if retries is not None:
+        # Body-free per-code retry counts made by the transport during this run.
+        report["retries"] = {code: count for code, count in sorted(
+            (Counter(retries) - retried).items())}
     return report
 
 
@@ -563,6 +637,8 @@ def main(argv=None):
             command.add_argument("--model", required=True)
             command.add_argument("--context", action="append", dest="context")
             command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
+            command.add_argument("--concurrency", type=int, default=6,
+                                 help="model review calls in flight (default 6; 1 is serial)")
     args = parser.parse_args(argv)
     try:
         if args.command == "qualify":
@@ -570,7 +646,8 @@ def main(argv=None):
                 args.root, args.inbox, system=args.system, actor=args.actor,
                 policy_path=args.policy_path, manifest=args.manifest, model=args.model,
                 transport=model_review.usai_transport(args.models_config),
-                context=args.context, index_path=args.index_path)
+                context=args.context, index_path=args.index_path,
+                concurrency=args.concurrency)
         elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                             limit=args.limit)
@@ -585,8 +662,9 @@ def main(argv=None):
     if args.report:
         _write_private(args.report, report)
     summary = {"counts": report["counts"]}
-    if "usage" in report:
-        summary["usage"] = report["usage"]
+    for key in ("usage", "retries"):
+        if key in report:
+            summary[key] = report[key]
     print(json.dumps(summary, sort_keys=True))
     return 0
 

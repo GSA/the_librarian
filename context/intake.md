@@ -188,7 +188,7 @@ private instance data. Extraction never reviews, selects or qualifies.
 
 `qualify ... --system LABEL --actor A --policy PATH --manifest PATH
 --models-config FILE --model M --context LOCATOR [--context LOCATOR ...]
-[--index DB]` runs `ingest`, ensures the private standing policy and
+[--index DB] [--concurrency N]` runs `ingest`, ensures the private standing policy and
 selection manifest exist (`--context` names maintained documents under the
 policy's `markdown_roots` and is required; nothing is written without it), and
 runs `model_review.review` then stages `standing-review` + `standing-select`
@@ -206,7 +206,12 @@ a saved publication is reused only while the index is present and fresh,
 otherwise a new revision is staged. A review an operator later superseded is reported `pending-review` (`review-superseded`) and its saved selection is not restored; the operator's corrected selection is kept.
 The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
 `pending-review`, `rejected`, `deferred` or `exception` without indexing.
-Stdout prints body-free `counts` and token `usage`.
+`--concurrency N` (default 6) keeps up to N model calls in flight, each for a
+rendition with no saved `standing-<...>` request; staging, runs, selection,
+manifest writes and usage accounting stay on one thread in inbox order, so
+results match `--concurrency 1`, which is fully serial.
+Stdout prints body-free `counts`, token `usage` and `retries`: per-code counts
+(`http-429`, `http-503`, `network`, ...) of transport retries during the run.
 
 ## Model-assisted standing review
 
