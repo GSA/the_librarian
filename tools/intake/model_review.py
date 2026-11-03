@@ -13,11 +13,14 @@ cost estimate required before any bulk run.
 import argparse
 from collections import Counter
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import random
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -266,33 +269,90 @@ def api_key(value):
     return resolved
 
 
-def usai_transport(models_path, provider=PROVIDER, timeout=300):
-    """OpenAI-compatible chat transport restricted to one configured provider's models."""
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: a reply must come from the configured baseUrl itself."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _retry_after(error):
+    """Seconds from a numeric Retry-After header; None when absent or not a number."""
+    value = (error.headers.get("Retry-After") if error.headers is not None else None) or ""
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 and seconds == seconds and seconds != float("inf") else None
+
+
+def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=5,
+                   backoff_seconds=2.0, max_wait_seconds=60.0, max_retry_seconds=600.0,
+                   sleep=time.sleep, clock=time.monotonic, jitter=random.random, urlopen=None):
+    """OpenAI-compatible chat transport restricted to one configured provider's models.
+
+    Rate limits (429), transient server errors (500, 502, 503, 504) and network
+    failures are retried up to ``max_attempts`` calls in total, waiting a numeric
+    Retry-After or exponential backoff with jitter, each wait capped at
+    ``max_wait_seconds`` and all waits within ``max_retry_seconds``. Other HTTP
+    errors, redirects and invalid replies fail at once. ``call.retries`` counts
+    retries per body-free code.
+    """
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
     config = json.loads(Path(models_path).read_text())["providers"][provider]
     allowed = {m["id"] for m in config.get("models", [])}
     url = config["baseUrl"].rstrip("/") + "/chat/completions"
+    opener = urllib.request.build_opener(_NoRedirect)
+    retries, lock = Counter(), threading.Lock()
 
-    def call(model, messages):
-        if model not in allowed:
-            raise TransportError("model-not-configured")
+    def attempt(model, messages):
+        """One request; returns the reply or (code, retryable, Retry-After seconds)."""
         request = urllib.request.Request(
             url, data=json.dumps({"model": model, "messages": messages}).encode(),
             headers={"Authorization": "Bearer " + api_key(config["apiKey"]),
                      "Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with (urlopen or opener.open)(request, timeout=timeout) as response:
                 value = json.loads(response.read())
         except urllib.error.HTTPError as error:
-            raise TransportError(f"http-{error.code}") from None
-        except (urllib.error.URLError, TimeoutError, OSError):
-            raise TransportError("network") from None
+            after = _retry_after(error)
+            error.close()
+            return None, (f"http-{error.code}", error.code in RETRY_STATUS, after)
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+            return None, ("network", True, None)
         except ValueError:
-            raise TransportError("invalid-response") from None
+            return None, ("invalid-response", False, None)
+        return value, None
+
+    def call(model, messages):
+        if model not in allowed:
+            raise TransportError("model-not-configured")
+        started = clock()
+        for number in range(1, max_attempts + 1):
+            value, failure = attempt(model, messages)
+            if failure is None:
+                break
+            code, retryable, after = failure
+            if not retryable or number == max_attempts:
+                raise TransportError(code)
+            delay = backoff_seconds * 2 ** (number - 1)
+            delay = after if after is not None else delay / 2 + jitter() * delay / 2
+            delay = min(delay, max_wait_seconds)
+            if clock() - started + delay > max_retry_seconds:
+                raise TransportError(code)
+            with lock:
+                retries[code] += 1
+            sleep(delay)
         try:
             content = value["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             raise TransportError("invalid-response") from None
         return {"content": content, "usage": value.get("usage") or {}}
+    call.retries = retries
     return call
 
 

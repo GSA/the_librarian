@@ -217,7 +217,12 @@ is never filled in, and replies that do not parse, name an unknown record or
 warning, or exceed the prompt or record budget write no findings. The standing
 policy's `reviewer` must be `usai:<model>`. Prompts mark document text as
 untrusted. The transport is restricted to models configured for the `usai`
-provider in a Pi `models.json`.
+provider in a Pi `models.json` and sends only to that provider's `baseUrl`
+(redirects are refused). HTTP 429, 500, 502, 503, 504 and network or timeout
+errors are retried up to 5 calls in total, waiting a numeric `Retry-After` or
+exponential backoff with jitter (2 s, 4 s, ...), each wait capped at 60 s and
+all waits within 600 s; other HTTP errors and invalid replies fail at once and
+the rendition stays `pending-review`.
 
 `python -m tools.intake.model_review evaluate --root ROOT --models-config FILE
 --model M ... --rendition PATH ... [--controls]` scores candidate models on a
