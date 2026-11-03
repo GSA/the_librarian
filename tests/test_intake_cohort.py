@@ -447,16 +447,28 @@ class QualifyTests(CohortCase):
         selected = json.loads((self.root / "config/selection.local.json").read_text())["renditions"]
         self.assertNotIn(notes["review_event_id"], [e for r in selected for e in r["review_event_ids"]])
 
-    def test_changed_standing_policy_does_not_report_old_evidence_as_qualified(self):
-        transport, _ = self._transport()
+    def test_changed_standing_policy_rereviews_and_supersedes_its_earlier_version(self):
+        from tools.review_events import event_reader
+        transport, calls = self._transport()
         self._qualify(transport)
+        manifest = self.root / "config/selection.local.json"
+        v1 = {e for r in json.loads(manifest.read_text())["renditions"] for e in r["review_event_ids"]}
         policy_file = self.root / "config/standing-policy.local.json"
         raw = json.loads(policy_file.read_text())
         raw["version"] = 2
         policy_file.write_text(json.dumps(raw))
         report = self._qualify(transport)
-        self.assertNotIn("qualified", report["counts"]["qualification"])
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
         self.assertEqual(report["counts"]["published"], 1)
+        selected = json.loads(manifest.read_text())["renditions"]
+        v2 = {e for r in selected for e in r["review_event_ids"]}
+        self.assertEqual((len(selected), len(v2), v1 & v2), (6, 6, set()))
+        snapshot = event_reader.read_snapshot(self.root)
+        self.assertEqual({p: snapshot.successors[p] in v2 for p in v1}, dict.fromkeys(v1, True))
+        # Unchanged v2 inputs reuse the v2 reviews instead of conflicting with themselves.
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(calls), 12)
 
     def test_qualify_restores_a_selection_missing_from_the_manifest(self):
         transport, calls = self._transport()

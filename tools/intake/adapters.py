@@ -169,7 +169,8 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                 expected_state=catalog.status(root)["state_token"],
                 reason=child["data"]["reason"])
             entry = standing.selection_entry(result, review_args)
-            manifest_sha = standing.write_manifest(root, args["manifest"], entry)
+            manifest_sha = standing.write_manifest(root, args["manifest"], entry,
+                                                   result.get("supersedes", ()))
             return {"boundary": "selection-committed", "outcome": "qualified",
                     "catalog_revision": submitted["committed_revision"],
                     "request_id": args["request_id"], "selection": entry,

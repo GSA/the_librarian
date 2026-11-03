@@ -324,10 +324,20 @@ def evaluate(root, args):
     qualified = {"source": source, "content": content,
                  "format": value["payload"]["format"] if _kind(value) == "extract" else "docling",
                  "reviewer": standing["reviewer"], "context": standing["selection"]["context"]}
+    # This policy's own earlier-version reviews of the same source and scope are
+    # replaced by this review; ones it already superseded stay listed so a
+    # crash-after-commit retry rebuilds the identical event.
+    earlier = sorted(e["event_id"] for e in snapshot.events
+                     if e["event_id"] != args["event_id"]
+                     and snapshot.successors.get(e["event_id"], args["event_id"]) == args["event_id"]
+                     and _earlier_standing_review(e, standing, source, qualified, args))
+    if earlier:
+        qualified["supersedes"] = earlier
     candidate = {**result, **qualified}
     # Only this exact standing event (a crash-after-commit retry) is exempt.
     others = [e for e in snapshot.events if e["source"]["locator"] == args["rendition"]
               and e["event_id"] not in snapshot.successors
+              and e["event_id"] not in earlier
               and not _matches(e, candidate, args)]
     if others:
         return outcome("pending-review", "conflicting-review")
@@ -392,8 +402,28 @@ def review_event(result, args, recorded_at=None):
         "handling": [events.contract.HANDLING],
         "provenance": {"origin": "agent_review", "record": None,
                        "mapping_version": None, "unmapped_fields": []},
-        "relationships": [], "supersedes": [], "correction_reason": None,
+        "relationships": [], "supersedes": list(result.get("supersedes", [])),
+        "correction_reason": (
+            f"Re-reviewed under standing policy {policy_ref['policy_id']} v{policy_ref['version']}, "
+            "replacing this policy's earlier-version standing review."
+            if result.get("supersedes") else None),
     }
+
+
+def _earlier_standing_review(event, standing, source, qualified, args):
+    """True for this standing policy's review of the same rendition, source and scope
+    under an earlier policy version."""
+    if (event["source"]["locator"] != args["rendition"]
+            or event["source"]["receipt_id"] != source["receipt_id"]
+            or event["source"]["source_id"] != source["source_ids"][0]
+            or event["provenance"]["origin"] != "agent_review"
+            or event["scope"]["content"] != qualified["content"]
+            or event["scope"]["description"] != (qualification.COMPLETE_SCOPE if qualified["format"] == "docling"
+                                                 else qualification.EXTRACT_COMPLETE_SCOPE)):
+        return False
+    claims = [m.groups() for e in event["evidence"] for m in [STANDING_STATEMENT.fullmatch(e["quote"] or "")] if m]
+    return (len(claims) == 1 and claims[0][0] == standing["policy_id"]
+            and int(claims[0][1]) < standing["version"])
 
 
 def bound_event(root, result, args):
@@ -477,8 +507,11 @@ def selected_child(result, args):
     return child
 
 
-def write_manifest(root, name, entry):
-    """Atomically add one selection entry to the manifest; idempotent for retries."""
+def write_manifest(root, name, entry, replaces=()):
+    """Atomically add one selection entry to the manifest; idempotent for retries.
+
+    An existing entry for the same path is replaced only when every review it
+    cites is one this review supersedes (``replaces``)."""
     path = index.no_symlinks(Path(root) / name)
     config, _ = index.load_manifest(path, root)
     raw = json.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=index.strict_object)
@@ -486,6 +519,10 @@ def write_manifest(root, name, entry):
     current = [item for item in selected if item["path"] == entry["path"]]
     if current == [entry]:
         return index.digest(path.read_bytes())
+    if current and all(item.get("review_event_ids") and set(item["review_event_ids"]) <= set(replaces)
+                       for item in current):
+        selected[:] = [item for item in selected if item["path"] != entry["path"]]
+        current = []
     if current or len(selected) >= renditions.MAX_SELECTIONS:
         raise Refusal("blocked", "selection-conflict")
     selected.append(entry)
