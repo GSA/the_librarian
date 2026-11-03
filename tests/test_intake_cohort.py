@@ -553,6 +553,30 @@ class QualifyTests(CohortCase):
         self.assertEqual(again["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
         self.assertEqual(event_store.status(self.root)["state_token"], state)
 
+    def test_review_staged_by_another_writer_during_the_model_call_is_reused(self):
+        import threading
+        base = self._transport()[0]
+        nested, lock = [], threading.Lock()
+
+        def transport(model, messages):
+            with lock:
+                first = not nested
+                nested.append(1)
+            if first:
+                # Another writer qualifies the whole cohort while this call is in flight.
+                self._qualify(base, concurrency=1)
+            reply = base(model, messages)
+            # A different reply would conflict with the other writer's saved request.
+            value = json.loads(reply["content"])
+            value["explanation"] = "concurrent writer reply"
+            return {**reply, "content": json.dumps(value)}
+
+        report = self._qualify(transport, concurrency=6)
+        reference = self._qualify(base, concurrency=1)
+        self.assertEqual(report["counts"], reference["counts"])
+        self.assertEqual([e for e in report["entries"]
+                          if e.get("review_code") == "review-superseded"], [])
+
     def test_memoised_store_validation_still_refuses_changed_content(self):
         from copy import deepcopy
         import sqlite3

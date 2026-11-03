@@ -429,10 +429,21 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
     """
     token = _standing_token(entry, policy_sha)
     corr, event_id = "standing-" + token, "rev-" + token
+    reviewed, failure = None, None
+    if prefetched is not None:
+        # Wait for the prefetched review before the ledger lookup, so a request another
+        # writer staged while the model call ran is found and staging follows at once.
+        try:
+            reviewed = prefetched()
+        except Exception as error:
+            failure = error
     current = _inspect(root, corr)
     if current is None:
-        reviewed = (prefetched() if prefetched is not None else model_review.review(
-            root, entry["rendition"], standing_policy, model, transport))
+        if failure is not None:
+            raise failure
+        if reviewed is None:
+            reviewed = model_review.review(
+                root, entry["rendition"], standing_policy, model, transport)
         usage.update(reviewed["usage"])
         if reviewed["status"] != "reviewed":
             entry.update(qualification="pending-review", review_status=reviewed["status"])
@@ -450,12 +461,16 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
              "arguments": {**review_args, "request_id": "req-" + corr + "-select",
                            "manifest": manifest}}])
         current = store.inspect(root, corr)
-    elif prefetched is not None:
-        _discard(prefetched, usage)
+    elif reviewed is not None:
+        # Another writer staged this review meanwhile; keep only the tokens actually spent.
+        usage.update(reviewed["usage"])
     settled = all(st["status"] == "succeeded" for st in current["stages"])
     if settled and snapshot is not None:
-        live = {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
-        if event_id not in live:
+        def live(snap):
+            return {e["event_id"] for e in snap.events if e["event_id"] not in snap.successors}
+        # An event absent from the run-start snapshot may come from another writer during
+        # this run; only a fresh read can show that it was superseded.
+        if event_id not in live(snapshot) and event_id not in live(event_reader.read_snapshot(root)):
             # An operator superseded this review; never resurrect its selection.
             entry.update(qualification="pending-review", review_code="review-superseded",
                          superseded_event=event_id)
@@ -476,14 +491,6 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
         failed = next(s for s in current["stages"] if s["status"] != "succeeded")
         outcome_name, code = _standing_outcome(failed)
         entry.update(qualification=outcome_name, review_code=code)
-
-
-def _discard(prefetched, usage):
-    """Another writer staged this review meanwhile; keep only the tokens actually spent."""
-    try:
-        usage.update(prefetched()["usage"])
-    except Exception:  # an unused review's failure must not fail the run
-        pass
 
 
 def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
