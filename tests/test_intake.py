@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from tools.intake import contracts, store
 
@@ -63,6 +64,34 @@ class LedgerTests(unittest.TestCase):
             connection.execute("update requests set request_sha256=?", ("0" * 64,))
         with self.assertRaises(contracts.IntakeError):
             store.inspect(self.root, "req-one")
+
+    def test_unchanged_ledger_is_validated_once_per_process(self):
+        store.stage(self.root, request())
+        calls = []
+        real = store.validate
+        with mock.patch.object(store, "validate", side_effect=lambda *a: calls.append(1) or real(*a)):
+            store.inspect(self.root, "req-one")
+            store.stage(self.root, request("req-two"))
+            store.list_requests(self.root)
+            self.assertEqual(calls, [])
+            with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
+                connection.execute("update requests set request_sha256=? where correlation_id='req-two'", ("0" * 64,))
+            with self.assertRaises(contracts.IntakeError) as caught:
+                store.list_requests(self.root)
+            self.assertEqual((caught.exception.code, calls), ("corrupt_request", [1]))
+            with self.assertRaises(contracts.IntakeError):
+                store.list_requests(self.root)
+            self.assertEqual(calls, [1, 1])
+
+    def test_foreign_commit_during_a_clean_lock_is_not_trusted(self):
+        store.stage(self.root, request())
+        store.list_requests(self.root)
+        with store.locked(self.root):
+            with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
+                connection.execute("update requests set request_sha256=?", ("0" * 64,))
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
 
     def test_wrong_identity_modes_and_missing_store_refuse(self):
         db = self.root / ".local/intake/intake.sqlite3"

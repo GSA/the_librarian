@@ -61,6 +61,10 @@ named stage. The ledger is operational recovery state, never corpus authority.
 - Undecodable or invalid native inputs block durably with a recorded attempt
   outcome instead of surfacing a traceback, and ledger write failures after
   validation report an unavailable ledger rather than claiming corruption.
+- Each process fully validates the ledger (SQLite integrity, digests, stage and
+  attempt shape) on its first lock, then skips that O(ledger) pass while the
+  file's identity and SQLite change counter still match what it left on its last
+  clean unlock; any other writer, journal or failed lock forces full validation.
 - Retryable failures record eligibility time; nothing sleeps or schedules itself.
   `replay` explicitly resets a blocked/dead-letter stage's bounded cycle while
   retaining exact request, intent and all attempt/replay history. Other requests
