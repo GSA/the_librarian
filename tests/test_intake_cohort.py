@@ -495,6 +495,99 @@ class QualifyTests(CohortCase):
         self.assertNotIn(old["rendition"], paths)
         self.assertEqual(len(paths), 6)
 
+    def test_concurrent_reviews_match_serial_outcomes_regardless_of_completion_order(self):
+        import random
+        import shutil
+        import threading
+        import time
+        from collections import Counter
+        from tools.review_events import event_reader
+        base, lock = self._transport(incomplete_text="Just text")[0], threading.Lock()
+
+        def run(concurrency):
+            started, finished = [], []
+
+            def transport(model, messages):
+                with lock:
+                    started.append(messages[-1]["content"])
+                    order = len(started)
+                    transport.retries["http-429"] += 1
+                # Earlier calls finish later, so completion order differs from input order.
+                time.sleep(0.02 * (8 - order) + random.uniform(0, 0.01))
+                with lock:
+                    finished.append(messages[-1]["content"])
+                return base(model, messages)
+            transport.retries = Counter()
+            root = self.root
+            self.root = Path(self.temp.name) / ("instance-%d" % concurrency)
+            shutil.copytree(root, self.root)
+            report = self._qualify(transport, concurrency=concurrency)
+            ledger = {r["correlation_id"]: [(st["id"], st["status"]) for st in
+                                            store.inspect(self.root, r["correlation_id"])["stages"]]
+                      for r in store.list_requests(self.root)}
+            events = sorted(e["event_id"] for e in event_reader.read_snapshot(self.root).events)
+            manifest = (self.root / "config/selection.local.json").read_text()
+            self.root = root
+            return report, ledger, events, manifest, started, finished
+
+        serial, parallel = run(1), run(6)
+        self.assertEqual(parallel[:4], serial[:4])
+        self.assertEqual(serial[0]["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
+        self.assertEqual(serial[0]["retries"], {"http-429": 6})
+        self.assertEqual(serial[0]["counts"]["qualification"],
+                         {"qualified": 5, "pending-review": 1})
+        self.assertEqual(serial[4], serial[5])
+        self.assertNotEqual(parallel[4], parallel[5])
+        with self.assertRaises(IntakeError):
+            self._qualify(base, concurrency=0)
+
+        # A review staged by another writer after the prefetch decision is not staged
+        # again: the prefetched reply is discarded and only its tokens are counted.
+        from unittest.mock import patch
+        from tools.review_events import event_store
+        self.root = Path(self.temp.name) / "instance-6"
+        state = event_store.status(self.root)["state_token"]
+        with patch.object(cohort.store, "list_requests", return_value=[]):
+            again = self._qualify(base, concurrency=6)
+        self.assertEqual(again["counts"], serial[0]["counts"])
+        self.assertEqual(again["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
+        self.assertEqual(event_store.status(self.root)["state_token"], state)
+
+    def test_memoised_store_validation_still_refuses_changed_content(self):
+        from copy import deepcopy
+        import sqlite3
+        from tools.review_events import event_reader, event_store as events
+        from tools.review_events.review_events import ReviewError
+        transport, _ = self._transport()
+        self._qualify(transport)
+        # Every event is now known valid; a changed event or envelope is still refused.
+        known = event_reader.read_snapshot(self.root).events
+        events.validate_history(known, self.root)
+        changed = deepcopy(known)
+        changed[-1]["unexpected"] = True
+        with self.assertRaises(ReviewError):
+            events.validate_history(changed, self.root)
+        with self.assertRaises(ReviewError):
+            events.contract.schema_validate({**events.bundle(known, self.root), "authority": "x"},
+                                            events.store_schema(self.root), root=self.root)
+        # A tampered ledger artifact or request is refused although its peers were memoised.
+        db = self.root / ".local/intake/intake.sqlite3"
+        store.list_requests(self.root)
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE stages SET evidence=evidence||' ' WHERE rowid="
+                               "(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
+        with self.assertRaises(IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_artifact")
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE stages SET evidence=substr(evidence,1,length(evidence)-1) "
+                               "WHERE rowid=(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
+            connection.execute("UPDATE stages SET evidence=NULL, evidence_sha256=NULL "
+                               "WHERE rowid=(SELECT max(rowid) FROM stages WHERE status='succeeded')")
+        with self.assertRaises(IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_stage")
+
     def test_qualify_republishes_when_the_index_is_missing(self):
         from tools.context_index import context_index as index
         transport, _ = self._transport()
@@ -559,7 +652,7 @@ class CliTests(CohortCase):
                 "--models-config", str(models_cfg),
                 "--model", "gpt-5.6-terra",
                 "--context", "documents/context.md",
-                "--report", str(report),
+                "--report", str(report), "--concurrency", "3",
             ])
         self.assertEqual(code, 0)
         raw = out.getvalue()

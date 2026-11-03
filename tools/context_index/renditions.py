@@ -18,23 +18,28 @@ DOCLING_RENDER_SCALE = 3.0
 DOCLING_MAX_PAGE_PIXELS = 32_000_000
 
 
-def eligible(path, root=None):
+def _eligible_pattern(root=None):
     from tools import policy
     prefix = re.escape(policy.storage_roots(root)["extractions_home"])
-    return isinstance(path, str) and bool(re.fullmatch(
-        prefix + r"/D\d+/[a-f0-9]{64}/extraction\.json", path
-    ))
+    return re.compile(prefix + r"/D\d+/[a-f0-9]{64}/extraction\.json")
+
+
+def eligible(path, root=None):
+    return isinstance(path, str) and bool(_eligible_pattern(root).fullmatch(path))
 
 
 def validate(config, engine, root=None):
     selections = config.get("renditions", [])
     if not isinstance(selections, list) or len(selections) > MAX_SELECTIONS:
         engine.fail(f"renditions must be a list of at most {MAX_SELECTIONS} explicit selections")
-    seen = set()
+    seen, valid_contexts = set(), set()
+    # Read the storage policy once per manifest, not once per selection.
+    pattern = _eligible_pattern(root) if selections else None
     for item in selections:
         engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),
                       "Rendition selection", optional=("review_event_ids",))
-        if (not eligible(item["path"], root) or item["path"] in seen
+        if (not isinstance(item["path"], str) or not pattern.fullmatch(item["path"])
+                or item["path"] in seen
                 or PurePosixPath(item["path"]).parts[-3] != item["receipt_id"]
                 or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "mhtml", "odt", "docling"}
                 or not isinstance(item["sha256"], str)
@@ -53,10 +58,17 @@ def validate(config, engine, root=None):
             engine.fail("Reviewed extraction selection requires unique review_event_ids")
         if not item["context"]:
             engine.fail("Rendition selection requires maintained source context")
-        engine.validate_context(item["context"])
-        if any(not engine.eligible(engine.canonical_locator(locator).partition("#")[0])
-               for locator in item["context"]):
-            engine.fail("Rendition context must select maintained Markdown")
+        context = item["context"]
+        key = (tuple(context) if isinstance(context, list)
+               and all(type(locator) is str for locator in context) else None)
+        if key is None or key not in valid_contexts:
+            # Identical context lists get identical answers within one manifest check.
+            engine.validate_context(context)
+            if any(not engine.eligible(engine.canonical_locator(locator).partition("#")[0])
+                   for locator in context):
+                engine.fail("Rendition context must select maintained Markdown")
+            if key is not None:
+                valid_contexts.add(key)
         seen.add(item["path"])
 
 

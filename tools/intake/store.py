@@ -1,6 +1,7 @@
 """Private transactional intake intent and recovery ledger."""
 from contextlib import closing, contextmanager
 import fcntl
+import functools
 import os
 from pathlib import Path
 import sqlite3
@@ -97,17 +98,40 @@ def initialize(root):
     return {"initialized": True, "schema": SCHEMA}
 
 
+@functools.lru_cache(maxsize=32768)
+def _digest_matches(raw, sha256):
+    return digest(raw) == sha256
+
+
+@functools.lru_cache(maxsize=65536)
+def _saved_artifact(raw, sha256):
+    """True when this exact saved artifact text matches its digest and is a JSON object.
+
+    Both checks are pure functions of the arguments, so revalidating an unchanged
+    ledger on every lock never re-hashes or re-decodes the same bytes.
+    """
+    return digest(raw.encode()) == sha256 and isinstance(decode(raw.encode()), dict)
+
+
 def validate(c, root):
     require(c.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
             and c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA, "incompatible_store")
     require(c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             and not c.execute("PRAGMA foreign_key_check").fetchall(), "corrupt_store")
+    # One query per table (not per request and stage); checks run in the same order.
+    stages_of, attempts_of, replays_of = {}, {}, {}
+    for saved in c.execute("SELECT * FROM stages ORDER BY correlation_id, ordinal"):
+        stages_of.setdefault(saved["correlation_id"], []).append(saved)
+    for attempt in c.execute("SELECT * FROM attempts ORDER BY correlation_id, stage_id, cycle, ordinal"):
+        attempts_of.setdefault((attempt["correlation_id"], attempt["stage_id"]), []).append(attempt)
+    for replay in c.execute("SELECT correlation_id, stage_id, cycle FROM replays ORDER BY correlation_id, stage_id, cycle"):
+        replays_of.setdefault((replay[0], replay[1]), []).append(replay[2])
     for row in c.execute("SELECT * FROM requests"):
         correlation_id, correction_of, stage_ids = request_shape(row["raw"])
-        require(digest(row["raw"]) == row["request_sha256"] and row["root"] == str(root)
+        require(_digest_matches(row["raw"], row["request_sha256"]) and row["root"] == str(root)
                 and correlation_id == row["correlation_id"]
                 and correction_of == row["correction_of"], "corrupt_request")
-        stages = c.execute("SELECT * FROM stages WHERE correlation_id=? ORDER BY ordinal", (row["correlation_id"],)).fetchall()
+        stages = stages_of.get(row["correlation_id"], [])
         require(len(stages) == len(stage_ids), "corrupt_stage")
         for ordinal, (stage_id, saved) in enumerate(zip(stage_ids, stages)):
             require(saved["ordinal"] == ordinal and saved["stage_id"] == stage_id
@@ -117,16 +141,14 @@ def validate(c, root):
                 raw = saved[key]
                 require((raw is None) == (saved[key + "_sha256"] is None), "corrupt_artifact")
                 if raw is not None:
-                    require(digest(raw.encode()) == saved[key + "_sha256"] and isinstance(decode(raw.encode()), dict), "corrupt_artifact")
+                    require(_saved_artifact(raw, saved[key + "_sha256"]), "corrupt_artifact")
             require(saved["status"] not in {"succeeded", "return-pending"}
                     or (saved["intent"] is not None and saved["evidence"] is not None), "corrupt_stage")
-            attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? ORDER BY cycle,ordinal", (row["correlation_id"], stage_id)).fetchall()
-            for attempt in attempts:
+            for attempt in attempts_of.get((row["correlation_id"], stage_id), []):
                 require(0 <= attempt["cycle"] <= saved["cycle"] and attempt["ordinal"] >= 1
                         and (attempt["outcome"] in {None, "succeeded", "failed", "return-pending"})
                         and ((attempt["ended"] is None) == (attempt["outcome"] is None)), "corrupt_attempt")
-            replays = c.execute("SELECT cycle FROM replays WHERE correlation_id=? AND stage_id=? ORDER BY cycle", (row["correlation_id"], stage_id)).fetchall()
-            require([r[0] for r in replays] == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
+            require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
 
 
 @contextmanager
