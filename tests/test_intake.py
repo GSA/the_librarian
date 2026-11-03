@@ -83,6 +83,16 @@ class LedgerTests(unittest.TestCase):
                 store.list_requests(self.root)
             self.assertEqual(calls, [1, 1])
 
+    def test_foreign_commit_during_a_clean_lock_is_not_trusted(self):
+        store.stage(self.root, request())
+        store.list_requests(self.root)
+        with store.locked(self.root):
+            with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
+                connection.execute("update requests set request_sha256=?", ("0" * 64,))
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
+
     def test_wrong_identity_modes_and_missing_store_refuse(self):
         db = self.root / ".local/intake/intake.sqlite3"
         db.chmod(0o644)

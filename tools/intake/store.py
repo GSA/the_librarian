@@ -193,6 +193,9 @@ def locked(root):
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("PRAGMA synchronous=FULL")
+            # Changes only when another connection commits; read before the identity check
+            # so no foreign commit can land unseen between the two.
+            foreign = c.execute("PRAGMA data_version").fetchone()[0]
             if known is None or known != _identity(db):
                 validate(c, root)
         except sqlite3.Error as error:
@@ -204,13 +207,18 @@ def locked(root):
             raise IntakeError("ledger_unavailable") from error
         clean = True
     finally:
+        identity = None
+        try:
+            # Recorded while still holding the writer lock, after this process's own commits,
+            # and only when no other connection committed since validation.
+            if clean:
+                identity = _identity(db)
+                if c.execute("PRAGMA data_version").fetchone()[0] != foreign:
+                    identity = None
+        except (OSError, sqlite3.Error):
+            identity = None
         if c is not None:
             c.close()
-        try:
-            # Recorded while still holding the writer lock, after this process's own commits.
-            identity = _identity(db) if clean else None
-        except OSError:
-            identity = None
         if identity is not None:
             _validated[key] = identity
         os.close(fd)
