@@ -220,7 +220,8 @@ def payload(raw):
     require(parts, "mime-no-html")
     records, used = [], []
     for index, part in parts:
-        text = _decode(part)
+        # Bytes stay exact through transfer and charset decoding; only then are line endings unified.
+        text = _decode(part).replace("\r\n", "\n").replace("\r", "\n")
         require("\x00" not in text, "mime-charset")
         converter = Converter()
         try:

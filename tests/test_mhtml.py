@@ -170,6 +170,13 @@ class ByteFidelityTests(unittest.TestCase):
             self.assertEqual(lines, ["\u010d \u0d01\n"], charset)
 
 
+    def test_cr_and_crlf_line_endings_in_preformatted_html_become_lines(self):
+        for charset, encoding in (("utf-8", "8bit"), ("utf-16le", "binary")):
+            raw = self.raw("<pre>First\rSecond\r\nThird\nFourth</pre>", charset, encoding)
+            self.assertEqual([line["text"] for line in mhtml.payload(raw)["lines"]],
+                             ["First\n", "Second\n", "Third\n", "Fourth\n"], charset)
+
+
 class ConvertRegressionTests(unittest.TestCase):
     def lines(self, html, encoding="7bit"):
         raw = (b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
