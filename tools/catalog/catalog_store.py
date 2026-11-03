@@ -628,6 +628,61 @@ def current_view(connection):
         FROM current_records c JOIN versions v ON v.revision=c.revision AND v.ordinal=c.ordinal""")
 
 
+def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None):
+    """Read each receipt's scoped records from one validated snapshot.
+
+    Each value equals ``read_records(root, receipt=id, limit=limit, expected_state=...)``, but the
+    catalog is validated once and every scope is resolved with set-based joins, not per receipt.
+    """
+    require(type(limit) is int and limit > 0, "limit must be a positive integer")
+    for receipt_id in receipt_ids:
+        identifier(receipt_id, "receipt")
+    home, db, _ = locations(root)
+    require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
+    with closing(connect(db)) as connection:
+        connection.execute("BEGIN")
+        state = validated_state(connection, home)
+        require(expected_state is None or expected_state == state["state_token"], "Stale query state")
+        current_view(connection)
+        connection.execute("CREATE TEMP TABLE current_rows AS SELECT * FROM catalog_current")
+        connection.execute("CREATE UNIQUE INDEX temp.current_rows_id ON current_rows(id)")
+        for name, field in (("receipt", "receipt_id"), ("from", "from_id"), ("to", "to_id")):
+            connection.execute(f"CREATE INDEX temp.current_rows_{name} ON current_rows"
+                               f"(json_extract(payload,'$.data.{field}'))")
+        connection.execute("CREATE TEMP TABLE wanted(receipt TEXT PRIMARY KEY)")
+        connection.executemany("INSERT OR IGNORE INTO wanted VALUES (?)", [(r,) for r in receipt_ids])
+        # Same scope as read_records(receipt=...): the receipt, its sources, its artifacts and the
+        # relationships touching those artifacts or sources.
+        connection.execute("""CREATE TEMP TABLE members AS
+            SELECT w.receipt, r.id FROM wanted w JOIN current_rows r ON r.id=w.receipt AND r.kind='receipt'
+            UNION SELECT w.receipt, j.value FROM wanted w JOIN current_rows r
+                ON r.id=w.receipt AND r.kind='receipt', json_each(r.payload,'$.data.source_ids') j
+            UNION SELECT w.receipt, a.id FROM wanted w JOIN current_rows a
+                ON a.kind='artifact' AND json_extract(a.payload,'$.data.receipt_id')=w.receipt""")
+        connection.execute("""CREATE TEMP TABLE scope AS
+            SELECT receipt, id FROM members
+            UNION SELECT m.receipt, r.id FROM members m JOIN current_rows e
+                ON e.id=m.id AND e.kind IN ('artifact','source')
+                JOIN current_rows r ON r.kind='relationship'
+                AND json_extract(r.payload,'$.data.from_id')=e.id
+            UNION SELECT m.receipt, r.id FROM members m JOIN current_rows e
+                ON e.id=m.id AND e.kind IN ('artifact','source')
+                JOIN current_rows r ON r.kind='relationship'
+                AND json_extract(r.payload,'$.data.to_id')=e.id""")
+        ids = {receipt_id: [] for receipt_id in receipt_ids}
+        for row in connection.execute("SELECT receipt,id FROM scope ORDER BY receipt,id"):
+            ids[row["receipt"]].append(row["id"])
+        result = {}
+        for receipt_id, members in ids.items():
+            page = members[:limit]
+            result[receipt_id] = {
+                "authority": AUTHORITY, "state": state,
+                "records": [current_record(connection, record_id) for record_id in page],
+                "count": len(page), "total_matching": len(members),
+                "next_after": page[-1] if len(members) > limit else None}
+        return result
+
+
 def current_record(connection, record_id):
     row = connection.execute("SELECT payload FROM catalog_current WHERE id=?", (record_id,)).fetchone()
     require(row is not None, "Record missing from authoritative catalog: " + record_id)

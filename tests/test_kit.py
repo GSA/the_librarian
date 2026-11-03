@@ -420,6 +420,38 @@ class WorkspaceTests(WorkspaceCase):
         catalog.restore(restored, snapshot)
         self.assertEqual(catalog.status(restored)["state_token"], result["state_token"])
 
+    def test_batched_receipt_reads_match_one_receipt_reads(self):
+        records, first = self.registration()
+        raw = b"second registration\n"
+        (self.root / "sources/two.txt").write_bytes(raw)
+        second = [
+            {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}},
+            {"id": "D2", "kind": "receipt", "data": {
+                "source_ids": ["S2"], "artifact_id": "A-two", "provenance": []}},
+            {"id": "A-two", "kind": "artifact", "data": {
+                **records[2]["data"], "path": "sources/two.txt", "receipt_id": "D2",
+                "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}},
+            # Touches both receipts' artifacts, so it belongs to each scope.
+            {"id": "R-two", "kind": "relationship", "data": {
+                "from_id": "A-two", "to_id": "A-input", "relation": "version-of",
+                "scope": "Synthetic.", "basis": "reported", "provenance": []}},
+        ]
+        written = catalog.submit(self.root, second, actor="test-runner", request_id="register-two",
+                                 expected_state=first["state_token"], reason="Structural contract test")
+        receipts = ["D1", "D2", "D1", "D9"]
+        for limit in (100, 2):
+            batch = catalog.read_records_by_receipt(self.root, receipts, limit=limit,
+                                                    expected_state=written["state_token"])
+            self.assertEqual(list(batch), ["D1", "D2", "D9"])
+            for receipt in batch:
+                self.assertEqual(batch[receipt], catalog.read_records(self.root, receipt=receipt, limit=limit))
+            if limit == 100:
+                self.assertIn("R-two", {r["id"] for r in batch["D1"]["records"]})
+                self.assertIn("R-two", {r["id"] for r in batch["D2"]["records"]})
+        self.assertEqual(catalog.read_records_by_receipt(self.root, ["D9"])["D9"]["records"], [])
+        with self.assertRaises(catalog.CatalogError):
+            catalog.read_records_by_receipt(self.root, ["D1"], expected_state="outdated")
+
     def test_native_review_correction_retry_and_restore(self):
         self.registration()
         state = events.initialize(self.root)

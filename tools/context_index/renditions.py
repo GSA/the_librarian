@@ -83,6 +83,9 @@ def inputs(root, config, engine, review_snapshot=None):
         review_snapshot = engine.load_event_reader().read_snapshot(root)
     snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
     state = snapshot["state"]["state_token"]
+    # One validated catalog snapshot for every selected receipt, not one per rendition.
+    receipt_records = catalog.read_records_by_receipt(
+        root, [item["receipt_id"] for item in selections], limit=100, expected_state=state)
     result, identities = [], []
     for item in selections:
         original = snapshot["registrations"][item["receipt_id"]]["artifact"]
@@ -121,8 +124,7 @@ def inputs(root, config, engine, review_snapshot=None):
                 or not isinstance(payload["warnings"], list)
                 or not all(isinstance(warning, str) for warning in payload["warnings"])):
             engine.fail("Unsupported extraction schema or warnings")
-        records = catalog.read_records(root, receipt=item["receipt_id"], limit=100,
-                                       expected_state=state)
+        records = receipt_records[item["receipt_id"]]
         if records["next_after"] is not None:
             engine.fail("Selected rendition receipt exceeds the bounded catalog lookup")
         by_id = {record["id"]: record for record in records["records"]}
