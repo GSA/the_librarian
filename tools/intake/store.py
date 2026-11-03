@@ -151,24 +151,50 @@ def validate(c, root):
             require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
 
 
+# Ledger files this process fully validated, keyed by (db, root), mapped to the file
+# identity it left behind on unlock. An unchanged identity at the next lock means no
+# other writer touched the file, so the full O(ledger) validation is skipped.
+_validated = {}
+
+
+def _identity(db):
+    """File identity plus SQLite's header file change counter, which every commit
+    increments in rollback-journal mode; ``None`` when a journal is present."""
+    if os.path.lexists(f"{db}-journal") or os.path.lexists(f"{db}-wal"):
+        return None
+    fd = os.open(db, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        header = os.pread(fd, 100, 0)
+    finally:
+        os.close(fd)
+    if len(header) < 100 or header[18:20] != b"\x01\x01":
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, header[24:28])
+
+
 @contextmanager
 def locked(root):
     root, home, db = locations(root)
+    key = (str(db), str(root))
     private(home, True)
     private(db)
     lock = home / "writer.lock"
     safe(lock)
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     c = None
+    clean = False
     try:
         try:
             private(lock)
             fcntl.flock(fd, fcntl.LOCK_EX)
+            known = _validated.pop(key, None)
             c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True)
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("PRAGMA synchronous=FULL")
-            validate(c, root)
+            if known is None or known != _identity(db):
+                validate(c, root)
         except sqlite3.Error as error:
             raise IntakeError("corrupt_store") from error
         try:
@@ -176,9 +202,17 @@ def locked(root):
             yield c
         except sqlite3.Error as error:
             raise IntakeError("ledger_unavailable") from error
+        clean = True
     finally:
         if c is not None:
             c.close()
+        try:
+            # Recorded while still holding the writer lock, after this process's own commits.
+            identity = _identity(db) if clean else None
+        except OSError:
+            identity = None
+        if identity is not None:
+            _validated[key] = identity
         os.close(fd)
 
 
