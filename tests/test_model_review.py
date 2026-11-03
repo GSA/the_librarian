@@ -94,13 +94,16 @@ class FindingsTests(ReviewCase):
         return model_review.review(self.root, self.rendition, self.policy, "model-a", transport)
 
     def test_accepted_reply_becomes_findings_that_qualify(self):
-        result = self.review(Transport(reply()))
+        cited = "Cites a repository README that this rendition does not contain."
+        result = self.review(Transport(reply(unverifiable_references=[cited])))
         self.assertEqual(result["status"], "reviewed")
         self.assertEqual(result["usage"], {"prompt_tokens": 100, "completion_tokens": 20})
         path = self.root / result["findings_path"]
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         findings = json.loads(path.read_text())
         self.assertEqual(findings["reviewer"], "usai:model-a")
+        self.assertEqual(findings["schema"], "standing-findings-v2")
+        self.assertEqual(findings["unverifiable_references"], [cited])
         self.assertEqual(findings["inspected"], {"records": [0, 1],
                                                  "warnings": ["#/payload/warnings/0"]})
         policy_sha = self.save_policy()
@@ -134,6 +137,20 @@ class FindingsTests(ReviewCase):
                 result = self.review(Transport(value))
                 self.assertEqual(result["status"], "invalid-reply")
                 self.assertNotIn("findings_path", result)
+
+    def test_advisory_references_are_bounded_and_default_to_empty(self):
+        expected = {"records": [0, 1], "warnings": ["#/payload/warnings/0"]}
+        legacy = json.loads(reply()["content"])
+        self.assertEqual(model_review._parse(json.dumps(legacy), expected)
+                         ["unverifiable_references"], [])
+        many = [" ", " cited spec "] + ["x" * 1200] * 60
+        parsed = model_review._parse(reply(unverifiable_references=many)["content"], expected)
+        self.assertEqual(parsed["unverifiable_references"][0], "cited spec")
+        self.assertEqual(len(parsed["unverifiable_references"]), 50)
+        self.assertEqual({len(s) for s in parsed["unverifiable_references"][1:]}, {1000})
+        for bad in ("cited spec", [1]):
+            self.assertIsNone(model_review._parse(
+                reply(unverifiable_references=bad)["content"], expected))
 
     def test_code_fenced_json_is_accepted(self):
         value = reply()
@@ -241,9 +258,6 @@ class TransportTests(ReviewCase):
             "usai": {"baseUrl": "https://api.example.invalid/v1", "api": "openai-completions",
                      "apiKey": "k", "models": [{"id": "model-a"}]},
             "other": {"baseUrl": "https://elsewhere", "apiKey": "k", "models": [{"id": "model-b"}]}}}))
-        transport = model_review.usai_transport(models)
-        with self.assertRaises(model_review.TransportError):
-            transport("model-b", [])
         sent = {}
 
         class Response:
@@ -261,13 +275,95 @@ class TransportTests(ReviewCase):
             sent.update(url=request.full_url, auth=request.get_header("Authorization"),
                         body=json.loads(request.data))
             return Response()
-        with patch.object(model_review.urllib.request, "urlopen", urlopen):
-            value = transport("model-a", [{"role": "user", "content": "x"}])
+        transport = model_review.usai_transport(models, urlopen=urlopen)
+        with self.assertRaises(model_review.TransportError):
+            transport("model-b", [])
+        value = transport("model-a", [{"role": "user", "content": "x"}])
         self.assertEqual(sent["url"], "https://api.example.invalid/v1/chat/completions")
         self.assertEqual(sent["auth"], "Bearer k")
         self.assertEqual(sent["body"]["model"], "model-a")
         self.assertEqual(value, {"content": "{}", "usage": {"prompt_tokens": 3,
                                                             "completion_tokens": 1}})
+
+
+class RetryTests(unittest.TestCase):
+    """usai_transport retries only transient failures, with bounded, injectable waits."""
+
+    def setUp(self):
+        import tempfile
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.models = Path(directory.name) / "models.json"
+        self.models.write_text(json.dumps({"providers": {"usai": {
+            "baseUrl": "https://api.example.invalid/v1", "apiKey": "k",
+            "models": [{"id": "model-a"}]}}}))
+
+    def transport(self, *outcomes, **options):
+        """Each outcome is an HTTP status (with optional Retry-After) or an exception."""
+        import email.message
+        import io as _io
+        import urllib.error
+        self.urls, self.waits, pending = [], [], list(outcomes)
+
+        def urlopen(request, timeout):
+            self.urls.append(request.full_url)
+            outcome = pending.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            status, after = outcome if isinstance(outcome, tuple) else (outcome, None)
+            if status == 200:
+                return _io.BytesIO(json.dumps({"choices": [{"message": {"content": "ok"}}],
+                                               "usage": {}}).encode())
+            headers = email.message.Message()
+            if after is not None:
+                headers["Retry-After"] = after
+            raise urllib.error.HTTPError(request.full_url, status, "error", headers,
+                                         _io.BytesIO(b"secret error body"))
+        options.setdefault("jitter", lambda: 1.0)
+        call = model_review.usai_transport(self.models, urlopen=urlopen,
+                                           sleep=self.waits.append, clock=lambda: 0.0,
+                                           **options)
+        return call
+
+    def test_rate_limits_and_server_errors_are_retried_honouring_retry_after(self):
+        import urllib.error
+        call = self.transport((429, "7"), 503, urllib.error.URLError("down"), 200)
+        self.assertEqual(call("model-a", [])["content"], "ok")
+        self.assertEqual(self.waits, [7.0, 4.0, 8.0])
+        self.assertEqual(dict(call.retries), {"http-429": 1, "http-503": 1, "network": 1})
+        self.assertEqual(set(self.urls), {"https://api.example.invalid/v1/chat/completions"})
+
+    def test_waits_are_capped(self):
+        call = self.transport((429, "3600"), (429, "soon"), 200, max_wait_seconds=30.0,
+                              jitter=lambda: 0.0)
+        call("model-a", [])
+        self.assertEqual(self.waits, [30.0, 2.0])
+
+    def test_client_errors_and_invalid_replies_are_not_retried(self):
+        for status in (400, 401, 404, 302):
+            with self.subTest(status):
+                call = self.transport(status, 200)
+                with self.assertRaises(model_review.TransportError) as caught:
+                    call("model-a", [])
+                self.assertEqual(caught.exception.code, "http-%d" % status)
+                self.assertEqual((len(self.urls), self.waits), (1, []))
+        call = self.transport(ValueError("not json"), 200)
+        with self.assertRaises(model_review.TransportError):
+            call("model-a", [])
+        self.assertEqual(len(self.urls), 1)
+
+    def test_gives_up_after_max_attempts(self):
+        call = self.transport(*[503] * 5, 200, max_attempts=3)
+        with self.assertRaises(model_review.TransportError) as caught:
+            call("model-a", [])
+        self.assertEqual(caught.exception.code, "http-503")
+        self.assertEqual((len(self.urls), len(self.waits)), (3, 2))
+        self.assertEqual(dict(call.retries), {"http-503": 2})
+
+    def test_redirects_are_refused(self):
+        handler = model_review._NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {},
+                                                   "https://elsewhere.invalid/"))
 
 
 if __name__ == "__main__":

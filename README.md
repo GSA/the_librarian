@@ -109,8 +109,12 @@ To review, select and publish the extracted cohort in one rerunnable step
   --model MODEL --context documents/CONTEXT.md
 ```
 
-It prints body-free outcome counts and token usage; incomplete reviews stay
-visibly `pending-review` and are not indexed.
+It prints body-free outcome counts, token usage and transport retry counts;
+incomplete reviews stay visibly `pending-review` and are not indexed. Up to
+`--concurrency N` (default 6; `1` is serial) model calls run at once, while all
+ledger writes stay serial and in inbox order. Rate limits (429), transient
+server errors (500/502/503/504) and network errors are retried with backoff,
+honouring `Retry-After`.
 
 To watch a run, use the read-only, body-free progress view (CLI or a
 loopback-only page that refreshes itself; see

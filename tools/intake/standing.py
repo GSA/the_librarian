@@ -26,7 +26,11 @@ from tools.review_events import event_store as events
 from .contracts import IntakeError, canonical, pairs
 
 POLICY_SCHEMA = "standing-policy-v1"
-FINDINGS_SCHEMA = "standing-findings-v1"
+# v2 adds the advisory, non-blocking `unverifiable_references` list; v1 findings
+# referenced by existing review events stay valid.
+FINDINGS_SCHEMA = "standing-findings-v2"
+FINDINGS_SCHEMAS = {"standing-findings-v1": frozenset(),
+                    FINDINGS_SCHEMA: frozenset({"unverifiable_references"})}
 OUTCOMES = ("qualified", "pending-review", "rejected", "deferred", "exception")
 LIMIT = 1024 * 1024
 DOCLING_INSPECTED = frozenset({"pages", "texts", "tables", "warnings"})
@@ -116,13 +120,15 @@ def load_policy(root, name, expected_sha):
 
 
 def _findings_valid(value):
-    if not (isinstance(value, dict) and set(value) == {
+    if not (isinstance(value, dict) and isinstance(value.get("schema"), str)
+            and value["schema"] in FINDINGS_SCHEMAS and set(value) == {
             "schema", "policy", "rendition", "rendition_sha256", "reviewer", "decision",
             "inspected", "explanation", "contradictions", "missing_evidence",
-            "correction_of", "new_mapping", "exception_resolution"}):
+            "correction_of", "new_mapping", "exception_resolution"}
+            | FINDINGS_SCHEMAS[value["schema"]]):
         return False
     inspected = value["inspected"]
-    return (value["schema"] == FINDINGS_SCHEMA
+    return (_texts(value.get("unverifiable_references", []))
             and isinstance(value["policy"], dict) and set(value["policy"]) == {"policy_id", "version"}
             and isinstance(value["decision"], str) and value["decision"] in {"accept", "reject", "defer"}
             and isinstance(inspected, dict) and set(inspected) in (DOCLING_INSPECTED, EXTRACT_INSPECTED)
@@ -262,6 +268,7 @@ def evaluate(root, args):
         return outcome("exception", "invalid-findings")
     result["explanation"] = findings["explanation"]
     result["exception_resolution"] = findings["exception_resolution"]
+    result["unverifiable_references"] = len(findings.get("unverifiable_references", []))
     if (findings["policy"] != {"policy_id": standing["policy_id"], "version": standing["version"]}
             or findings["rendition"] != args["rendition"]
             or findings["rendition_sha256"] != args["rendition_sha256"]
@@ -363,6 +370,9 @@ def review_event(result, args, recorded_at=None):
     ]
     if result["exception_resolution"]:
         statements.append("Exception resolution: " + result["exception_resolution"])
+    if result.get("unverifiable_references"):
+        statements.append(f"Reviewer noted {result['unverifiable_references']} advisory "
+                          "references to material outside the rendition.")
     source = result["source"]
     return {
         "event_id": args["event_id"],
