@@ -259,6 +259,30 @@ def inspect(root, correlation_id):
         return summary(c, correlation_id)
 
 
+def head(root, correlation_id):
+    """Summary of the newest request in ``correlation_id``'s correction chain."""
+    with locked(root) as c:
+        current, seen = correlation_id, {correlation_id}
+        require(c.execute("SELECT 1 FROM requests WHERE correlation_id=?", (current,)).fetchone()
+                is not None, "unknown_request")
+        while True:
+            children = [r[0] for r in c.execute(
+                "SELECT correlation_id FROM requests WHERE correction_of=?", (current,))]
+            if not children:
+                return summary(c, current)
+            require(len(children) == 1 and children[0] not in seen, "ambiguous_correction")
+            current = children[0]
+            seen.add(current)
+
+
+def request(root, correlation_id):
+    """The exact staged request, decoded."""
+    with locked(root) as c:
+        row = c.execute("SELECT raw FROM requests WHERE correlation_id=?", (correlation_id,)).fetchone()
+        require(row is not None, "unknown_request")
+        return decode_request(row["raw"])
+
+
 def list_requests(root, state=None):
     with locked(root) as c:
         rows = [summary(c, r[0]) for r in c.execute("SELECT correlation_id FROM requests ORDER BY correlation_id")]

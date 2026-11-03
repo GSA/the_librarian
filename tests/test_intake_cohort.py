@@ -493,6 +493,33 @@ class QualifyTests(CohortCase):
         self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
         self.assertEqual(len(calls), 12)
 
+    def test_replayed_review_with_a_stale_pinned_intent_is_restaged_as_a_correction(self):
+        from unittest.mock import patch
+        from tools.intake import runner, standing
+        transport, calls = self._transport()
+        self._qualify(transport)
+        self._bump_policy_version()
+        # Reviews pinned before earlier-version reviews became supersedable.
+        with patch.object(standing, "_earlier_standing_review", return_value=False):
+            pinned = self._qualify(transport)
+        self.assertEqual(pinned["counts"]["qualification"], {"pending-review": 6})
+        blocked = [r["correlation_id"] for r in store.list_requests(self.root)
+                   if r["correlation_id"].startswith("standing-") and not r["complete"]]
+        self.assertEqual(len(blocked), 6)
+        for corr in blocked:
+            runner.replay(self.root, corr, "review")
+        report = self._qualify(transport)
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        heads = [store.head(self.root, corr) for corr in blocked]
+        self.assertEqual({(h["correlation_id"], h["correction_of"], h["complete"]) for h in heads},
+                         {(c + "-c1", c, True) for c in blocked})
+        # Settled corrections are reused, not corrected again.
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual([store.head(self.root, c)["correlation_id"] for c in blocked],
+                         [c + "-c1" for c in blocked])
+        self.assertEqual(len(calls), 12)
+
     def test_qualify_restores_a_selection_missing_from_the_manifest(self):
         transport, calls = self._transport()
         self._qualify(transport)
