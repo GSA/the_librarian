@@ -63,6 +63,76 @@ def timestamp(value):
         raise ReviewError("Invalid recorded_at calendar, clock or offset; leap seconds are unsupported") from error
 
 
+# Events already proven schema-valid, per item schema. Re-reading a store
+# revalidates the same immutable history on every read; only unseen events
+# need the (expensive) schema walk.
+_SCHEMA_VALID = {}
+_SCHEMA_VALID_LIMIT = 200_000
+_BUNDLE_KEYWORDS = {"$schema", "$id", "title", "description", "type", "additionalProperties",
+                    "required", "properties", "$defs"}
+_EVENTS_KEYWORDS = {"type", "minItems", "maxItems", "items"}
+
+
+def _frozen(value):
+    """Exact hashable identity of a decoded JSON value, including Python types."""
+    if isinstance(value, dict):
+        return dict, tuple(sorted((k, _frozen(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return list, tuple(_frozen(v) for v in value)
+    return type(value), value
+
+
+def _valid_by_event(validator, schema, bundle):
+    """True only when every event and the envelope are known valid; False means "do the full walk".
+
+    Applies only when the schema validates ``events`` purely per item (type, item
+    count and ``items``), so bundle validity equals envelope validity plus count
+    bounds plus validity of each event alone. Any failure falls back to the full
+    validation, which reports the exact error.
+    """
+    events = bundle.get("events") if isinstance(bundle, dict) else None
+    properties = schema.get("properties")
+    rule = properties.get("events") if isinstance(properties, dict) else None
+    if (not isinstance(events, list) or not events or set(schema) - _BUNDLE_KEYWORDS
+            or schema.get("type") != "object" or not isinstance(rule, dict)
+            or set(rule) - _EVENTS_KEYWORDS or rule.get("type") != "array" or "items" not in rule
+            or not (rule.get("minItems", 0) <= len(events) <= rule.get("maxItems", len(events)))):
+        return False
+    try:
+        item_schema = _frozen({**schema, "properties": {
+            **properties, "events": {k: v for k, v in rule.items() if k not in {"minItems", "maxItems"}}}})
+        keys = [_frozen(event) for event in events]
+        known = _SCHEMA_VALID.get(item_schema, set())
+        unseen = [(key, event) for key, event in zip(keys, events) if key not in known]
+    except TypeError:
+        return False
+    # The envelope is always checked, alongside one event when all are known.
+    for key, event in unseen or [(keys[0], events[0])]:
+        if next(validator.iter_errors({**bundle, "events": [event]}), None) is not None:
+            return False
+    if sum(len(v) for v in _SCHEMA_VALID.values()) + len(unseen) > _SCHEMA_VALID_LIMIT:
+        _SCHEMA_VALID.clear()
+    _SCHEMA_VALID.setdefault(item_schema, set()).update(key for key, _ in unseen)
+    return True
+
+
+_SCHEMA_CHECKED = set()
+
+
+def _check_schema(validator_class, schema):
+    """Metaschema check, done once per exact schema; it is a pure function of the schema."""
+    try:
+        key = _frozen(schema)
+    except TypeError:
+        key = None
+    if key is None or key not in _SCHEMA_CHECKED:
+        validator_class.check_schema(schema)
+        if key is not None:
+            if len(_SCHEMA_CHECKED) >= 1024:
+                _SCHEMA_CHECKED.clear()
+            _SCHEMA_CHECKED.add(key)
+
+
 def schema_validate(bundle, schema=None, *, root=None):
     try:
         from jsonschema import Draft202012Validator, FormatChecker
@@ -76,14 +146,14 @@ def schema_validate(bundle, schema=None, *, root=None):
         schema["properties"]["audience"] = {"const": audience}
     def offline(uri):
         raise NoSuchResource(ref=uri)
-    Draft202012Validator.check_schema(schema)
+    _check_schema(Draft202012Validator, schema)
     checker = FormatChecker()
     @checker.checks("date-time", raises=(ValueError, ReviewError))
     def check_timestamp(value):
         return not isinstance(value, str) or bool(timestamp(value))
     validator = Draft202012Validator(schema, format_checker=checker,
                                     registry=Registry(retrieve=offline))
-    error = next(validator.iter_errors(bundle), None)
+    error = None if _valid_by_event(validator, schema, bundle) else next(validator.iter_errors(bundle), None)
     if error is not None:
         location = "/" + "/".join(str(p) for p in error.absolute_path)
         raise ReviewError(f"Schema violation at {location} ({error.validator}); input value omitted")

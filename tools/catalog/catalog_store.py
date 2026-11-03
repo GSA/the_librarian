@@ -214,6 +214,12 @@ def make_state(metadata, revision, head, count):
     return state
 
 
+# Payloads proven valid by validate_record. Validation is a pure function of the
+# exact payload text, so re-inspecting immutable history need not repeat it.
+_VALID_PAYLOADS = set()
+_VALID_PAYLOADS_LIMIT = 500_000
+
+
 def inspect(connection):
     """Verify physical integrity, every historical payload/graph, chain, and current projection."""
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
@@ -258,7 +264,11 @@ def inspect(connection):
         for ordinal, member in enumerate(members):
             require(member["ordinal"] == ordinal, "Broken revision ordinal")
             record = decode(member["payload"])
-            validate_record(record)
+            if member["payload"] not in _VALID_PAYLOADS:
+                validate_record(record)
+                if len(_VALID_PAYLOADS) >= _VALID_PAYLOADS_LIMIT:
+                    _VALID_PAYLOADS.clear()
+                _VALID_PAYLOADS.add(member["payload"])
             require(member["payload"] == canonical(record) and member["payload_hash"] == fingerprint(record),
                     "Payload integrity mismatch")
             require(member["record_id"] == record["id"], "Record identity mismatch")
@@ -269,7 +279,9 @@ def inspect(connection):
                 "revision": revision, "request_id": batch["request_id"], "actor": batch["actor"],
                 "reason": batch["reason"], "committed_at": batch["committed_at"], "record": record,
             })
-        validate_records(records)
+        # Each record was validated above; only validate_records' list checks remain.
+        require(bool(records), "records must be a nonempty list")
+        require(len({record["id"] for record in records}) == len(records), "Duplicate IDs in submission")
         graph.apply(records)
         require(batch["input_hash"] == fingerprint({
             "actor": batch["actor"], "reason": batch["reason"], "records": records,

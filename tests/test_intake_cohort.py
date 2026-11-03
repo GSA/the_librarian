@@ -495,6 +495,41 @@ class QualifyTests(CohortCase):
         self.assertNotIn(old["rendition"], paths)
         self.assertEqual(len(paths), 6)
 
+    def test_memoised_store_validation_still_refuses_changed_content(self):
+        from copy import deepcopy
+        import sqlite3
+        from tools.review_events import event_reader, event_store as events
+        from tools.review_events.review_events import ReviewError
+        transport, _ = self._transport()
+        self._qualify(transport)
+        # Every event is now known valid; a changed event or envelope is still refused.
+        known = event_reader.read_snapshot(self.root).events
+        events.validate_history(known, self.root)
+        changed = deepcopy(known)
+        changed[-1]["unexpected"] = True
+        with self.assertRaises(ReviewError):
+            events.validate_history(changed, self.root)
+        with self.assertRaises(ReviewError):
+            events.contract.schema_validate({**events.bundle(known, self.root), "authority": "x"},
+                                            events.store_schema(self.root), root=self.root)
+        # A tampered ledger artifact or request is refused although its peers were memoised.
+        db = self.root / ".local/intake/intake.sqlite3"
+        store.list_requests(self.root)
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE stages SET evidence=evidence||' ' WHERE rowid="
+                               "(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
+        with self.assertRaises(IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_artifact")
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE stages SET evidence=substr(evidence,1,length(evidence)-1) "
+                               "WHERE rowid=(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
+            connection.execute("UPDATE stages SET evidence=NULL, evidence_sha256=NULL "
+                               "WHERE rowid=(SELECT max(rowid) FROM stages WHERE status='succeeded')")
+        with self.assertRaises(IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_stage")
+
     def test_qualify_republishes_when_the_index_is_missing(self):
         from tools.context_index import context_index as index
         transport, _ = self._transport()

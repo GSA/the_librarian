@@ -145,19 +145,19 @@ def classify(root, inbox):
 
 
 def _request(root, correlation_id, stage_id, operation, arguments):
-    """Stage one single-stage request unless it already exists; return its stage summary."""
-    try:
-        store.inspect(root, correlation_id)
-    except IntakeError as error:
-        if error.code != "unknown_request":
-            raise
-        store.stage(root, json.dumps({
+    """Stage one single-stage request unless it already exists; return its stage summary.
+
+    ``arguments`` may be a callable, evaluated only when the request must be staged.
+    """
+    current = _inspect(root, correlation_id)
+    if current is None:
+        current = store.stage(root, json.dumps({
             "version": 1, "correlation_id": correlation_id, "correction_of": None,
             "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
             "retry": {"max_attempts": 3, "backoff_seconds": 0},
             "stages": [{"id": stage_id, "kind": "extraction", "operation": operation,
-                        "arguments": arguments}]}).encode())
-    stage = store.inspect(root, correlation_id)["stages"][0]
+                        "arguments": arguments() if callable(arguments) else arguments}]}).encode())
+    stage = current["stages"][0]
     if stage["status"] in {"staged", "running", "retryable"}:
         stage = runner.run(root, correlation_id, stage_id)["stages"][0]
     return stage
@@ -171,9 +171,11 @@ def _extract(root, entry, actor):
     if stage["status"] == "succeeded":
         # Registration pins the catalog state when staged, immediately before it runs;
         # a repeated registration is idempotent by its saved request.
+        # The catalog state is read only when a new registration is staged.
         stage = _request(root, "register-" + entry["submission_id"] + version, "register",
-                         "extract-register", {**base, "actor": actor,
-                                              "expected_state": catalog.status(root)["state_token"]})
+                         "extract-register", lambda: {
+                             **base, "actor": actor,
+                             "expected_state": catalog.status(root)["state_token"]})
     if stage["status"] != "succeeded":
         code = stage["attempts"][-1]["code"] if stage["attempts"] else stage["status"]
         return {"outcome": "failed", "stage": stage["id"], "code": code}
