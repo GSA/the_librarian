@@ -24,6 +24,24 @@ def request(correlation="req-one", **changes):
 
 
 class LedgerTests(unittest.TestCase):
+    def test_store_probe_waits_out_a_concurrent_commit(self):
+        import threading
+        import time
+        from tools import policy as tool_policy
+        db = self.root / "probe.sqlite3"
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.executescript("PRAGMA application_id=7; CREATE TABLE metadata(key TEXT, value TEXT);"
+                                     "INSERT INTO metadata VALUES ('store_id', '%s');" % ("1" * 32))
+        writer = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN EXCLUSIVE")
+        release = threading.Timer(0.3, lambda: writer.execute("COMMIT"))
+        release.start()
+        self.addCleanup(release.join)
+        started = time.monotonic()
+        self.assertEqual(tool_policy._probe_store_id(db, 7), (7, "11111111-1111-1111-1111-111111111111"))
+        self.assertGreaterEqual(time.monotonic() - started, 0.2)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

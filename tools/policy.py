@@ -307,6 +307,9 @@ def _write_private_json(path, payload):
         temporary.unlink(missing_ok=True)
 
 
+PROBE_BUSY_TIMEOUT = 5.0
+
+
 def _probe_store_id(db_path, expected_app_id):
     import sqlite3
     db_path = _no_symlinks(db_path)
@@ -315,7 +318,9 @@ def _probe_store_id(db_path, expected_app_id):
     if not db_path.is_file():
         raise ValueError(f"Store path is not a regular file: {db_path}")
     try:
-        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=0)) as conn:
+        # A short busy wait rides out another writer's commit instead of failing the probe.
+        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True,
+                                     timeout=PROBE_BUSY_TIMEOUT)) as conn:
             app_id = conn.execute("PRAGMA application_id").fetchone()[0]
             if app_id != expected_app_id:
                 return app_id, None
