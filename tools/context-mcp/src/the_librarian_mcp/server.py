@@ -133,15 +133,14 @@ class Reader:
             ) from error
         except (OSError, ValueError) as error:
             raise ToolError(f"Cannot execute configured reader: {error}") from error
-        if result.returncode == 1 and command == "status" and self.stale_status(result.stdout):
-            return TextContent(type="text", text=result.stdout.decode("utf-8"))
-        if result.returncode:
+        stale = result.returncode == 1 and command == "status" and self.stale_status(result.stdout)
+        if result.returncode and not stale:
             diagnostic = result.stderr.decode("utf-8", errors="replace").strip()
             raise ToolError(
                 f"Reader failed (exit {result.returncode}): "
                 f"{diagnostic or 'no stderr diagnostic supplied'}"
             )
-        if result.stderr:
+        if result.stderr and not stale:
             raise ToolError(
                 "Reader emitted an unexpected diagnostic; no result returned: "
                 + result.stderr.decode("utf-8", errors="replace").strip()
