@@ -379,7 +379,7 @@ def acknowledgment(root, correlation_id, existing):
     relation = next((r["id"] for r in records.values() if r["kind"] == "relationship"), None)
     stage = summary["stages"][0]
     receipt_state = {"state": RECEIPT_STATES[stage["status"]], "stage": stage["id"],
-                     "attempts": len(stage["attempts"])}
+                     "attempts": len(stage["attempts"]), "conflicts": runner.conflicts(stage)}
     if stage["evidence"]:
         receipt_state["committed_revision"] = stage["evidence"]["committed_revision"]
     elif stage["attempts"] and stage["attempts"][-1]["code"]:
@@ -438,7 +438,7 @@ def submit(root, path, value):
             store.stage(root, canonical(request).encode())
         if status_of(root, correlation_id) in {"staged", "running", "retryable"}:
             # Blocked and dead-letter receipts stay visible; recovery is explicit replay.
-            runner.run(root, correlation_id, "receipt")
+            runner.settle(root, correlation_id, "receipt")
         return acknowledgment(root, correlation_id, existing)
 
 

@@ -160,7 +160,7 @@ def _request(root, correlation_id, stage_id, operation, arguments):
                         "arguments": arguments() if callable(arguments) else arguments}]}).encode())
     stage = current["stages"][0]
     if stage["status"] in {"staged", "running", "retryable"}:
-        stage = runner.run(root, correlation_id, stage_id)["stages"][0]
+        stage = runner.settle(root, correlation_id, stage_id)["stages"][0]
     return stage
 
 
@@ -169,6 +169,7 @@ def _extract(root, entry, actor):
     # The reader version is part of the request identity: a new MIME reader version extracts again.
     version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
     stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare", "extract-prepare", base)
+    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
     if stage["status"] == "succeeded":
         # Registration pins the catalog state when staged, immediately before it runs;
         # a repeated registration is idempotent by its saved request.
@@ -177,12 +178,20 @@ def _extract(root, entry, actor):
                          "extract-register", lambda: {
                              **base, "actor": actor,
                              "expected_state": catalog.status(root)["state_token"]})
+        entry["conflicts"] += runner.conflicts(stage)
     if stage["status"] != "succeeded":
-        code = stage["attempts"][-1]["code"] if stage["attempts"] else stage["status"]
-        return {"outcome": "failed", "stage": stage["id"], "code": code}
+        return _failure(stage["id"], stage)
     evidence = stage["evidence"]
     return {"outcome": "extracted", "rendition": evidence["rendition"],
             "rendition_sha256": evidence["rendition_sha256"]}
+
+
+def _failure(stage_id, stage):
+    """A failed entry with its stage, status, category, code and attempt count (no private text)."""
+    last = stage["attempts"][-1] if stage["attempts"] else {}
+    return {"outcome": "failed", "stage": stage_id, "status": stage["status"],
+            "category": last.get("category"), "code": last.get("code") or stage["status"],
+            "attempts": len(stage["attempts"])}
 
 
 def _process(root, inbox, entry, system, actor):
@@ -215,9 +224,10 @@ def _process(root, inbox, entry, system, actor):
         outcome = "changed-since-intake" if error.code == "changed_input" else "failed"
         return {"outcome": outcome, "stage": "receipt", "code": error.code}
     entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
+    receipt = store.inspect(root, ack["correlation_id"])["stages"][0]
+    entry["conflicts"] = runner.conflicts(receipt)
     if ack["receipt"]["state"] != "committed":
-        return {"outcome": "failed", "stage": "receipt",
-                "code": ack["receipt"].get("code", ack["receipt"]["state"])}
+        return _failure("receipt", receipt)
     entry["received"] = True
     return _extract(root, entry, actor)
 
@@ -235,10 +245,19 @@ def ingest(root, inbox, *, system, actor, limit=None):
         entry.update(_process(root, inbox, entry, system, actor))
         outcome["received"] += bool(entry.get("received"))
         outcome[entry["outcome"]] += 1
+    retried = [e for e in admitted if e.get("conflicts")]
     counts = {"files": len(entries),
               "disposition": dict(Counter(e["disposition"] for e in entries)),
               "format": dict(Counter(e["format"] for e in admitted)),
-              "outcome": dict(outcome)}
+              "outcome": dict(outcome),
+              # Entries that lost a race with another writer and were retried; those that
+              # then succeeded are not failures.
+              "retried_after_conflict": {
+                  "entries": len(retried),
+                  "succeeded": sum(e["outcome"] != "failed" for e in retried),
+                  "attempts": sum(e["conflicts"] for e in retried)},
+              "failed_by_code": dict(Counter(
+                  "%s/%s" % (e["stage"], e["code"]) for e in admitted if e.get("outcome") == "failed"))}
     return {"counts": counts, "entries": entries}
 
 

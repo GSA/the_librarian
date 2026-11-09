@@ -276,7 +276,10 @@ class RecoveryTests(UploadCase):
         self.assertCode("correction_parent_pending", upload.submit, self.root,
                         self.file(), value("sub-a-fix", correction_of="sub-a"))
         upload.submit(self.root, self.file(name="other.txt"), value("sub-b", name="other.txt"))
-        stranded = upload.submit(self.root, self.file(), value("sub-a"))
+        # Its outdated pin alone now rebases; a durable refusal still strands it.
+        with patch.object(runner.adapters.catalog, "submit",
+                          side_effect=catalog.CatalogError("refused")):
+            stranded = upload.submit(self.root, self.file(), value("sub-a"))
         self.assertEqual(stranded["receipt"]["state"], "blocked")
         fixed = upload.submit(self.root, self.file(), value("sub-a-fix", correction_of="sub-a"))
         self.assertEqual(fixed["receipt"]["state"], "committed")
