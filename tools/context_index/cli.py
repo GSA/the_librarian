@@ -47,6 +47,8 @@ def arguments(argv=None):
     for option in ("kind", "receipt", "source", "path", "coverage", "audience", "after", "expected-state"):
         catalog.add_argument("--" + option)
     catalog.add_argument("--limit", type=int, default=25)
+    catalog.add_argument("--summary", action="store_true",
+                         help="Return aggregate counts (kind, coverage, source) instead of records")
     catalog.add_argument("--max-chars", type=int, default=60000)
     catalog.add_argument("--format", choices=("full", "compact"), default="full")
     return parser.parse_args(argv)
@@ -64,11 +66,15 @@ def main(argv=None):
         if args.command == "catalog":
             fingerprint = engine_fingerprint()
             catalog = load_catalog()
-            result = catalog.read_records(root, **{key: getattr(args, key) for key in
-                ("kind", "receipt", "source", "path", "coverage", "audience", "after", "limit", "expected_state")})
-            if args.format == "compact":
+            if args.summary:
+                result = catalog.summarize_records(root, expected_state=args.expected_state, limit=args.limit)
+            else:
+                result = catalog.read_records(root, **{key: getattr(args, key) for key in
+                    ("kind", "receipt", "source", "path", "coverage", "audience", "after", "limit",
+                     "expected_state")})
+            if args.format == "compact" and not args.summary:
                 result = load_compaction().compact_catalog(result)
-            output = render_result(result, compact=args.format == "compact")
+            output = render_result(result, compact=args.format == "compact" and not args.summary)
             if engine_fingerprint() != fingerprint:
                 fail("Catalog presentation code changed during read; retry")
             if args.max_chars < 1 or len(output) > args.max_chars:

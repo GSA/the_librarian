@@ -125,8 +125,37 @@ class MCP(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(payload["hits"], [])
                         else:
                             self.assertEqual(payload["count"], 0)
+                    response = await session.call_tool("catalog", {"summary": True})
+                    self.assertFalse(response.is_error, response)
+                    summary = json.loads(response.content[0].text)
+                    self.assertEqual((summary["total"], summary["by_kind"]), (summary["state"]["records"], summary["by_kind"]))
+                    self.assertEqual(summary["artifacts"]["coverage"], {})
+                    response = await session.call_tool("catalog", {"summary": True, "kind": "source"})
+                    self.assertTrue(response.is_error)
                     response = await session.call_tool("get", {"locator": "documents/missing.md"})
                     self.assertTrue(response.is_error)
+
+    def test_stale_status_output_is_reported_not_failed(self):
+        from the_librarian_mcp.server import Reader
+        stale = b'{"fresh": false, "reasons": ["source changed: a.md"], "documents": 1}'
+        self.assertTrue(Reader.stale_status(stale))
+        self.assertFalse(Reader.stale_status(b"not json"))
+        self.assertFalse(Reader.stale_status(b'{"fresh": true}'))
+
+    async def test_stale_status_still_obeys_the_output_budget(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from mcp.server.mcpserver.exceptions import ToolError
+        from the_librarian_mcp.server import Reader
+        reader = object.__new__(Reader)
+        reader.config = Config(root=ROOT)
+        stale = json.dumps({"fresh": False, "reasons": ["source changed: a.md"] * 50}).encode()
+        done = SimpleNamespace(returncode=1, stdout=stale, stderr=b"stale")
+        with mock.patch("the_librarian_mcp.server.anyio.run_process", mock.AsyncMock(return_value=done)):
+            result = await reader.execute("status", [], 100000)
+            self.assertIn('"fresh": false', result.text)
+            with self.assertRaisesRegex(ToolError, "budget is 200"):
+                await reader.execute("status", [], 200)
 
     async def test_opt_in_diagnostics_record_absence_without_the_query(self):
         with tempfile.TemporaryDirectory() as directory:
