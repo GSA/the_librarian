@@ -23,6 +23,17 @@ named stage. The ledger is operational recovery state, never corpus authority.
   the pinned identity to the native lifecycle as `expected_identity`, so a
   source or runtime change refuses before any rendition or registration is
   published and each attempt converts once.
+- Concurrent intake agents may share one instance ([0013](../docs/decisions/0013-concurrent-intake-writers.md)).
+  The catalog writer lock waits up to 10s across processes. A lost race is a
+  retryable `catalog-stale-state` (another writer committed after the pin) or
+  `catalog-busy` (lock wait exceeded) attempt, never `native-input`.
+  `catalog-submit`, `extract-register` and `docling-register` rebase an outdated
+  pin when no later revision wrote any record they write; overlap blocks as
+  `catalog-conflict` and needs a correction. Upload and cohort ingest retry
+  retryable stages within the request's attempt budget. `recover-conflicts`
+  reports registration stages blocked by writer races (including legacy
+  `native-input`), skipping corrected parents and overlapping writes; add
+  `--apply` to replay and settle them.
 - Publication pins manifest bytes, source hashes and native metadata/freshness.
   A matching fresh publication can reconcile without rebuilding. Input drift
   blocks; correction requires a new linked request, not refreshed replay tokens.
@@ -189,7 +200,10 @@ percent-encoded inbox-relative locator, pinned SHA-256) and runs
 file's bytes change after intake, a content-salted submission ID is derived and
 submitted as a correction of the prior submission (`correction_of`). Outcomes are
 counted as `received`, `extracted`, `failed`, `changed-since-intake` and
-`not-processed`; reruns are idempotent. The inbox is never written. The
+`not-processed`; reruns are idempotent. `retried_after_conflict` counts entries
+(and attempts) that lost a writer race and were retried, separately from
+failures; `failed_by_code` groups failures by `stage/code`, and each failed
+entry carries body-free `stage`, `status`, `category`, `code` and `attempts`. The inbox is never written. The
 optional `--report` (0600) lists per-file paths, hashes and outcomes and is
 private instance data. Extraction never reviews, selects or qualifies.
 
