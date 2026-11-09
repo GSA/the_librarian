@@ -385,7 +385,7 @@ def _unchanged(root, receipt, format_name, expected_source, expected_binding,
 
 def run(root: Path, command: str, receipt: str, format_name: str,
         artifacts_path: Path, python: Path, actor=None, expected_state=None,
-        expected_identity=None):
+        expected_identity=None, rebase=False):
     require(command in ("prepare", "verify", "register"), "Unsupported Docling command")
     root = bridge.catalog.safe_path(root)
     state, original, path, value, raw = _bundle(
@@ -410,13 +410,15 @@ def run(root: Path, command: str, receipt: str, format_name: str,
             with bridge.catalog.writer_lock(bridge.catalog.locations(root)[0]):
                 current_state = _unchanged(root, receipt, format_name, value["source"],
                                            binding, worker_sha)
-                require(current_state == state, "Catalog changed during Docling operation; retry")
+                require(current_state == state, "Catalog changed during Docling operation; retry",
+                        "catalog-stale-state")
                 created = _publish(path, raw)
                 published = path.stat(follow_symlinks=False) if created else None
                 try:
                     current_state = _unchanged(root, receipt, format_name, value["source"],
                                                binding, worker_sha)
-                    require(current_state == state, "Catalog changed during Docling operation; retry")
+                    require(current_state == state, "Catalog changed during Docling operation; retry",
+                        "catalog-stale-state")
                 except Exception:
                     if published is not None:
                         observed = path.stat(follow_symlinks=False)
@@ -434,7 +436,8 @@ def run(root: Path, command: str, receipt: str, format_name: str,
         if command != "prepare":
             current_state = _unchanged(root, receipt, format_name, value["source"], binding,
                                        worker_sha)
-            require(current_state == state, "Catalog changed during Docling operation; retry")
+            require(current_state == state, "Catalog changed during Docling operation; retry",
+                        "catalog-stale-state")
         result = {"command": command, "receipt_id": receipt,
                   "run_id": value["run_id"], "rendition": path.relative_to(root).as_posix(),
                   "created": created, "source_sha256": value["source"]["sha256"],
@@ -501,7 +504,7 @@ def run(root: Path, command: str, receipt: str, format_name: str,
                         == _file_identity(path.stat(follow_symlinks=False)),
                         "Prepared rendition changed during commit check")
                 check_rendition()
-                outcome = bridge.catalog.submit(root, expected_state=expected_state,
+                outcome = bridge.catalog.submit(root, expected_state=expected_state, rebase=rebase,
                                                 precommit_check=check_rendition, **recipe)
                 try:
                     check_rendition()

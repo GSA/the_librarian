@@ -66,6 +66,9 @@ def arguments(argv):
             view.add_argument("--refresh", type=int, default=5, help="Page refresh seconds")
             view.add_argument("--allow-non-loopback", action="store_true",
                               help="Explicit approval to expose the view beyond this machine")
+    recover = commands.add_parser(
+        "recover-conflicts", help="Report (or with --apply replay) registrations blocked by concurrent writers")
+    recover.add_argument("--apply", action="store_true")
     inspect = commands.add_parser("inspect")
     inspect.add_argument("correlation")
     for name in ("run", "resume", "replay", "acknowledge"):
@@ -125,6 +128,8 @@ def main(argv=None):
             result = inspection(args.root, args.correlation)
         elif args.command in {"run", "resume"}:
             result = runner.run(args.root, args.correlation, args.stage)
+        elif args.command == "recover-conflicts":
+            result = runner.recover_conflicts(args.root, apply=args.apply)
         elif args.command == "replay":
             result = runner.replay(args.root, args.correlation, args.stage)
         else:

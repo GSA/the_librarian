@@ -11,6 +11,21 @@ class CatalogError(ValueError):
     """A catalog contract or integrity violation."""
 
 
+class StaleState(CatalogError):
+    """The pinned state is outdated; re-read the catalog and retry."""
+    code = "catalog-stale-state"
+
+
+class WriterBusy(CatalogError):
+    """Another writer held the catalog lock past the bounded wait; retry."""
+    code = "catalog-busy"
+
+
+class ConflictingWrite(StaleState):
+    """A later revision rewrote a record this request writes; a retry cannot succeed."""
+    code = "catalog-conflict"
+
+
 KINDS = {"receipt", "source", "artifact", "policy", "relationship"}
 ROLES = {
     "maintained-context", "historical-context", "instructions", "navigation",

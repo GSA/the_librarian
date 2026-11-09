@@ -98,6 +98,27 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
         return store.summary(c, correlation_id)
 
 
+def settle(root, correlation_id, stage_id):
+    """Run a stage and retry it while it is retryable, within its attempt budget.
+
+    Concurrent catalog writers surface as retryable stale-state or busy attempts;
+    each retry re-reads the catalog, so the stage settles without manual replay.
+    """
+    while True:
+        result = run(root, correlation_id, stage_id)
+        stage = next(s for s in result["stages"] if s["id"] == stage_id)
+        if stage["status"] != "retryable":
+            return result
+
+
+def conflicts(stage):
+    """Count attempts of this stage that lost a race with another catalog writer."""
+    return sum(a["code"] in CONFLICT_CODES for a in stage["attempts"])
+
+
+CONFLICT_CODES = {"catalog-stale-state", "catalog-busy", "sqlite-operational"}
+
+
 def replay(root, correlation_id, stage_id, *, now=None):
     now = time.time() if now is None else now
     with store.locked(root) as c:
@@ -136,3 +157,71 @@ def acknowledge(root, correlation_id, stage_id, acknowledgment):
             save_artifact(c, correlation_id, stage_id, "evidence", {"boundary": "delivered", "acknowledgment": acknowledgment, "basis": "explicit-transport-acknowledgment"})
             c.execute("UPDATE stages SET status='succeeded' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
         return store.summary(c, correlation_id)
+
+
+REGISTER_OPERATIONS = {"catalog-submit", "extract-register", "docling-register"}
+# Legacy concurrent-writer failures were recorded as native-input before
+# catalog-stale-state and catalog-busy existed.
+RECOVERABLE_CODES = {"native-input", "catalog-stale-state", "catalog-busy", "sqlite-operational"}
+
+
+def conflict_candidates(root):
+    """Blocked or dead-letter registration stages whose failure was a writer race.
+
+    Skips requests already corrected by another request; a catalog-submit is
+    included only when its records would rebase onto the current catalog.
+    """
+    from tools.catalog import catalog_store as catalog
+    tokens, last_writer = catalog.rebase_index(store.safe(root))
+    found, skipped = [], {}
+    with store.locked(root) as c:
+        rows = c.execute("SELECT s.correlation_id, s.stage_id, s.ordinal, s.status, s.cycle, r.raw "
+                         "FROM stages s JOIN requests r USING(correlation_id) "
+                         "WHERE s.status IN ('blocked','dead-letter') ORDER BY s.correlation_id").fetchall()
+        for row in rows:
+            stage = decode_request(row["raw"])["stages"][row["ordinal"]]
+            if stage["operation"] not in REGISTER_OPERATIONS:
+                continue
+            last = c.execute("SELECT code FROM attempts WHERE correlation_id=? AND stage_id=? AND cycle=? "
+                             "ORDER BY ordinal DESC LIMIT 1",
+                             (row["correlation_id"], row["stage_id"], row["cycle"])).fetchone()
+            reason = None
+            if last is None or last[0] not in RECOVERABLE_CODES:
+                continue
+            if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
+                reason = "corrected"
+            elif stage["operation"] == "catalog-submit":
+                args = stage["arguments"]
+                pinned = tokens.get(args["expected_state"])
+                if pinned is None or any(last_writer.get(r["id"], 0) > pinned for r in args["records"]):
+                    reason = "conflicting-write"
+            if reason is not None:
+                skipped[reason] = skipped.get(reason, 0) + 1
+                continue
+            found.append({"correlation_id": row["correlation_id"], "stage": row["stage_id"],
+                          "operation": stage["operation"], "status": row["status"], "code": last[0]})
+    return found, skipped
+
+
+def recover_conflicts(root, *, apply=False):
+    """Report, and with ``apply`` replay and settle, stages blocked by writer races."""
+    found, skipped = conflict_candidates(root)
+    counts = {}
+    for item in found:
+        key = item["operation"] + "/" + item["code"]
+        counts[key] = counts.get(key, 0) + 1
+    report = {"apply": apply, "candidates": len(found), "by_operation_code": counts,
+              "skipped": skipped}
+    if not apply:
+        return report
+    results = {}
+    for item in found:
+        replay(root, item["correlation_id"], item["stage"])
+        try:
+            status = next(s["status"] for s in settle(root, item["correlation_id"], item["stage"])["stages"]
+                          if s["id"] == item["stage"])
+        except IntakeError as error:
+            status = error.code
+        results[status] = results.get(status, 0) + 1
+    report["results"] = results
+    return report

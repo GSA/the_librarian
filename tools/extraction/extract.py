@@ -402,7 +402,7 @@ def registration_records(root, original, path, value):
     return [parent, child, relation]
 
 
-def run(root, command, receipt, format_name, actor=None, expected_state=None):
+def run(root, command, receipt, format_name, actor=None, expected_state=None, rebase=False):
     root = catalog.safe_path(root)
     state, original, path, value = bundle(root, receipt, format_name)
     raw = encoded(value)
@@ -454,7 +454,7 @@ def run(root, command, receipt, format_name, actor=None, expected_state=None):
             else:
                 publish(saved_path, encoded(recipe))
             unchanged(root, value)
-            outcome = catalog.submit(root, expected_state=expected_state, **recipe)
+            outcome = catalog.submit(root, expected_state=expected_state, rebase=rebase, **recipe)
             try:
                 completion = path.parent / "completion.json"
                 if not completion.exists():

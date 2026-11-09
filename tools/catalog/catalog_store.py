@@ -11,6 +11,8 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import threading
+import time
 import sys
 import unicodedata
 import uuid
@@ -18,7 +20,7 @@ import uuid
 from tools import backups as snapshots, policy
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
-    CatalogError, canonical, choice, exact, fingerprint, hash_value, identifier,
+    CatalogError, ConflictingWrite, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
     now, path_value, refs, require, safe_relative, text, validate_graph, GraphValidator,
     validate_record, validate_records,
 )
@@ -128,21 +130,43 @@ def reserve(path):
     os.close(descriptor)
 
 
+# Seconds a writer waits for another process's catalog lock before WriterBusy.
+WRITER_WAIT_SECONDS = 10.0
+# Seconds a SQLite reader waits for a writer's in-progress commit.
+BUSY_TIMEOUT_SECONDS = 10.0
+_held = threading.local()
+
+
 @contextmanager
-def writer_lock(home):
+def writer_lock(home, wait=None):
     import fcntl
     private_directory(home)
+    key = str(safe_path(home))
+    held = getattr(_held, "homes", None)
+    if held is None:
+        held = _held.homes = set()
+    # Re-entry from this thread can never succeed by waiting, so it fails at once.
+    wait = 0 if key in held else WRITER_WAIT_SECONDS if wait is None else wait
     descriptor = os.open(safe_path(home / "writer.lock"),
                          os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(descriptor)
         require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600,
                 "Writer lock must be a private regular file")
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                if time.monotonic() >= deadline:
+                    raise WriterBusy("Another catalog writer is active; retry later") from error
+                time.sleep(0.05)
+        held.add(key)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise CatalogError("Another catalog writer is active; retry later") from error
-        yield
+            yield
+        finally:
+            held.discard(key)
     finally:
         os.close(descriptor)
 
@@ -153,7 +177,7 @@ def connect(path, write=False):
         sidecar = safe_path(str(path) + suffix)
         require(not sidecar.exists(), "SQLite sidecar present; explicit recovery required")
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=0, isolation_level=None)
+                                 uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -468,8 +492,12 @@ def status(root, *, audit=False):
 
 
 def submit(root, records, *, actor, request_id, expected_state, reason,
-           precommit_check=None):
+           precommit_check=None, rebase=False):
     """Submit metadata; an optional local guard runs inside the final transaction.
+
+    With ``rebase``, an outdated ``expected_state`` is accepted when no later
+    revision wrote any record this request writes; the full graph is still
+    validated against the current state. Overlap raises ConflictingWrite.
 
     Guards must raise CatalogError on failure and must not write this catalog.
     They are invocation-only checks, never part of a persisted request recipe.
@@ -486,7 +514,7 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
     private_file(db)
     with writer_lock(home), closing(connect(db, write=True)) as connection:
         connection.execute("BEGIN")
-        state, current, _, batches, committed_states = inspect(connection)
+        state, current, histories, batches, committed_states = inspect(connection)
         prior = next((batch for batch in batches if batch["request_id"] == request_id), None)
         if prior is not None:
             require(prior["input_hash"] == input_hash, "Request ID reused with different actor, reason, or records")
@@ -496,7 +524,19 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
                     "request_id": request_id, "committed_revision": prior["revision"],
                     "committed_at": prior["committed_at"], "committed_state": committed_states[prior["revision"]],
                     "backup": None, "retention": None}
-        require(expected_state == state["state_token"], "Stale expected state; re-read before writing")
+        rebased_from = None
+        if expected_state != state["state_token"]:
+            pinned = {committed["state_token"]: number for number, committed in committed_states.items()}
+            pinned[make_state(state, 0, "", 0)["state_token"]] = 0
+            if not rebase:
+                raise StaleState("Stale expected state; re-read before writing")
+            if expected_state not in pinned:
+                raise ConflictingWrite("Pinned state is not in this catalog's history")
+            rebased_from = pinned[expected_state]
+            later = {record_id for record_id, versions in histories.items()
+                     if any(version["revision"] > rebased_from for version in versions)}
+            if later & {record["id"] for record in incoming}:
+                raise ConflictingWrite("A later revision rewrote a record in this request")
         resulting = dict(current)
         resulting.update((record["id"], record) for record in incoming)
         validate_graph(resulting)
@@ -534,7 +574,23 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             raise
         return {"command": "submit", "idempotent": False, **written, "state": written,
                 "request_id": request_id, "committed_revision": revision, "committed_at": batch["committed_at"],
-                "committed_state": written, "backup": taken, "retention": retention}
+                "committed_state": written, "backup": taken, "retention": retention,
+                "rebased_from": rebased_from}
+
+
+def rebase_index(root):
+    """Map every committed state token to its revision and each record to its last writer.
+
+    Lets a caller check offline, without a write, whether ``submit(..., rebase=True)``
+    would accept a request pinned at an older state.
+    """
+    home, db, _ = locations(root)
+    with closing(connect(db)) as connection:
+        connection.execute("BEGIN")
+        state, _, histories, _, committed_states = inspect(connection)
+    tokens = {committed["state_token"]: number for number, committed in committed_states.items()}
+    tokens[make_state(state, 0, "", 0)["state_token"]] = 0
+    return tokens, {record_id: versions[-1]["revision"] for record_id, versions in histories.items()}
 
 
 def read_records(root, *, kind=None, receipt=None, source=None, path=None, coverage=None,
@@ -559,7 +615,8 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
         state = validated_state(connection, home)
-        require(expected_state is None or expected_state == state["state_token"], "Stale query state")
+        if expected_state is not None and expected_state != state["state_token"]:
+            raise StaleState("Stale query state")
         current_view(connection)
         scopes = []
         parameters = {}
@@ -642,7 +699,8 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
         state = validated_state(connection, home)
-        require(expected_state is None or expected_state == state["state_token"], "Stale query state")
+        if expected_state is not None and expected_state != state["state_token"]:
+            raise StaleState("Stale query state")
         current_view(connection)
         connection.execute("CREATE TEMP TABLE current_rows AS SELECT * FROM catalog_current")
         connection.execute("CREATE UNIQUE INDEX temp.current_rows_id ON current_rows(id)")

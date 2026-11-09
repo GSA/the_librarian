@@ -29,6 +29,13 @@ def native_failure(error):
     """Classify wrapped native failures without persisting private diagnostics."""
     current = error
     while current is not None:
+        # Concurrent catalog writers: a lost race retries; an overlapping write cannot.
+        if isinstance(current, catalog.ConflictingWrite):
+            return StageFailure("blocked", "catalog-conflict")
+        if (isinstance(current, (catalog.StaleState, catalog.WriterBusy))
+                or isinstance(current, docling.AdapterError) and current.code == "catalog-stale-state"):
+            return StageFailure("retryable", "catalog-busy" if isinstance(current, catalog.WriterBusy)
+                                else "catalog-stale-state")
         if (isinstance(current, subprocess.TimeoutExpired)
                 or isinstance(current, docling.AdapterError) and current.code == "timeout"):
             return StageFailure("retryable", "native-timeout")
@@ -218,7 +225,9 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             return {"boundary": "publication-confirmed", "selection_validated": True,
                     "manifest_sha256": checksum, "metadata": intent["metadata"], "database": args["db"]}
         if operation == "catalog-submit":
-            result = catalog.submit(root, **args)
+            # The pinned state may be outdated by another writer; the commit still
+            # refuses when a later revision wrote one of these records.
+            result = catalog.submit(root, **args, rebase=True)
             return {"boundary": "receipt-committed", "committed_revision": result["committed_revision"],
                     "request_id": args["request_id"], "record_ids": [r["id"] for r in args["records"]],
                     "receipt_ids": [r["id"] for r in args["records"] if r["kind"] == "receipt"],
@@ -238,7 +247,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             require(prepare(root, stage) == intent, "changed_extraction_identity")
             command = operation.removeprefix("extract-")
             result = extract.run(root, command, args["receipt"], args["format_name"],
-                                 args.get("actor"), args.get("expected_state"))
+                                 args.get("actor"), args.get("expected_state"), rebase=True)
             require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"],
                     "changed_extraction_identity")
             evidence = {"boundary": "extraction-" + command, "run_id": result["run_id"],
@@ -254,7 +263,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             result = docling.run(root, operation.removeprefix("docling-"), args["receipt"], args["format_name"],
                                  Path(args["artifacts_path"]), Path(args["python"]),
                                  actor=args.get("actor"), expected_state=args.get("expected_state"),
-                                 expected_identity=identity)
+                                 expected_identity=identity, rebase=True)
             require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"], "changed_extraction_identity")
             evidence = {"boundary": "extraction-" + operation.removeprefix("docling-"),
                         "run_id": result["run_id"], "rendition": result["rendition"],
