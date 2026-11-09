@@ -182,6 +182,19 @@ REGISTER_OPERATIONS = {"catalog-submit", "extract-register", "docling-register"}
 RECOVERABLE_CODES = {"native-input", "catalog-stale-state", "catalog-busy", "sqlite-operational"}
 
 
+def written_ids(root, stage):
+    """Pre-existing records a registration stage rewrites (new rendition records cannot overlap)."""
+    args = stage["arguments"]
+    if stage["operation"] == "catalog-submit":
+        return [r["id"] for r in args["records"]]
+    from tools.catalog import catalog_store as catalog
+    try:
+        return [catalog.receipt_metadata(store.safe(root), [args["receipt"]])
+                ["registrations"][args["receipt"]]["artifact"]["id"]]
+    except (catalog.CatalogError, KeyError):
+        return None  # unresolvable receipt: never replay blindly
+
+
 def conflict_candidates(root):
     """Blocked or dead-letter registration stages whose failure was a writer race.
 
@@ -207,10 +220,11 @@ def conflict_candidates(root):
                 continue
             if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
                 reason = "corrected"
-            elif stage["operation"] == "catalog-submit":
+            else:
                 args = stage["arguments"]
                 pinned = tokens.get(args["expected_state"])
-                if pinned is None or any(last_writer.get(r["id"], 0) > pinned for r in args["records"]):
+                ids = written_ids(root, stage)
+                if pinned is None or ids is None or any(last_writer.get(i, 0) > pinned for i in ids):
                     reason = "conflicting-write"
             if reason is not None:
                 skipped[reason] = skipped.get(reason, 0) + 1

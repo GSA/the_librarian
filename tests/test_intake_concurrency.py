@@ -196,6 +196,28 @@ class RecoveryTests(Case):
         self.assertEqual(applied["results"], {"succeeded": 1})
         self.assertEqual(runner.recover_conflicts(self.root)["candidates"], 0)
 
+    def test_recover_conflicts_skips_extraction_registration_when_original_was_rewritten(self):
+        inbox = Path(self.temp.name) / "inbox"
+        inbox.mkdir()
+        (inbox / "a.md").write_bytes(b"# a\n")
+        real = catalog.submit
+
+        def legacy(root, records, **kwargs):
+            if kwargs["request_id"].startswith("extract-"):
+                raise catalog.CatalogError("Stale expected state; re-read before writing")
+            return real(root, records, **kwargs)
+        with patch.object(adapters.extract.catalog, "submit", side_effect=legacy):
+            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner")
+        self.assertFalse(report["counts"]["outcome"].get("extracted"))
+        self.assertEqual(runner.recover_conflicts(self.root)["candidates"], 1)
+        original = next(r for r in catalog.read_records(self.root, kind="artifact", limit=100)["records"]
+                        if r["data"]["role"] == "original")
+        rewritten = {**original, "data": {**original["data"], "reason": "Corrected after the failed registration."}}
+        catalog.submit(self.root, [rewritten], actor="a", request_id="rewrite", reason="r",
+                       expected_state=catalog.status(self.root)["state_token"])
+        report = runner.recover_conflicts(self.root)
+        self.assertEqual((report["candidates"], report["skipped"]), (0, {"conflicting-write": 1}))
+
 
 if __name__ == "__main__":
     unittest.main()
