@@ -97,6 +97,15 @@ class Reader:
                 f"{type(failure).__name__}: {failure}"
             ) from failure
 
+    @staticmethod
+    def stale_status(stdout: bytes) -> bool:
+        """A stale index exits nonzero but still reports its reasons and counts as JSON."""
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            return False
+        return isinstance(payload, dict) and payload.get("fresh") is False and bool(payload.get("reasons"))
+
     async def execute(self, command: str, arguments: list[str], output_budget: int) -> TextContent:
         if command == "review-events":
             argv = [
@@ -124,6 +133,8 @@ class Reader:
             ) from error
         except (OSError, ValueError) as error:
             raise ToolError(f"Cannot execute configured reader: {error}") from error
+        if result.returncode == 1 and command == "status" and self.stale_status(result.stdout):
+            return TextContent(type="text", text=result.stdout.decode("utf-8"))
         if result.returncode:
             diagnostic = result.stderr.decode("utf-8", errors="replace").strip()
             raise ToolError(
@@ -258,12 +269,25 @@ def create_server(config: Config) -> MCPServer:
         after: Text | None = None, expected_state: Text | None = None,
         limit: Positive | None = None, format: Format = "full",
         max_output_chars: Positive | None = None,
+        summary: Annotated[bool, Field(strict=True)] = False,
     ) -> TextContent:
-        """Read bounded live metadata, not source text. Pagination requires the returned catalog state token."""
+        """Read bounded live metadata, not source text. Pagination requires the returned catalog state token.
+
+        summary=true returns aggregate counts (kinds, artifact coverage/role, source categories,
+        artifacts per source up to limit) instead of records; record filters do not apply.
+        """
         count = config.max_results if limit is None else limit
         reader.budget(count, config.max_results, "limit")
         output = reader.budget(max_output_chars, config.max_output_chars, "max_output_chars")
         args = [f"--limit={count}", f"--format={format}", f"--max-chars={output}"]
+        if summary:
+            filters = (receipt, source, path, kind, coverage, audience, after)
+            if any(value is not None for value in filters):
+                raise ToolError("summary counts the whole catalog; omit record filters and after")
+            args.append("--summary")
+            if expected_state is not None:
+                args.append(f"--expected-state={expected_state}")
+            return await reader.read("catalog", args, output)
         for key, value in (
             ("receipt", receipt), ("source", source), ("path", path), ("kind", kind),
             ("coverage", coverage), ("audience", audience), ("after", after),

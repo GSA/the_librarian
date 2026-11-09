@@ -622,6 +622,42 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
                 "next_after": ids[-1] if len(page) > limit else None}
 
 
+def summarize_records(root, *, expected_state=None, limit=25):
+    """Aggregate counts over the current catalog from one validated snapshot; no record bodies."""
+    require(type(limit) is int and limit > 0, "limit must be a positive integer")
+    home, db, _ = locations(root)
+    require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
+    with closing(connect(db)) as connection:
+        connection.execute("BEGIN")
+        state = validated_state(connection, home)
+        require(expected_state is None or expected_state == state["state_token"], "Stale query state")
+        current_view(connection)
+
+        def counts(field, kind):
+            return {str(row[0]): row[1] for row in connection.execute(
+                f"SELECT json_extract(payload,'$.data.{field}') AS k,count(*) FROM catalog_current "
+                "WHERE kind=? GROUP BY k ORDER BY count(*) DESC,k", (kind,))}
+
+        per_source = connection.execute(
+            "SELECT s.value AS source,count(DISTINCT a.id) AS artifacts FROM catalog_current r "
+            "JOIN json_each(r.payload,'$.data.source_ids') s "
+            "JOIN catalog_current a ON a.kind='artifact' AND "
+            "json_extract(a.payload,'$.data.receipt_id')=r.id "
+            "WHERE r.kind='receipt' GROUP BY s.value ORDER BY artifacts DESC,source").fetchall()
+        return {
+            "authority": AUTHORITY, "state": state,
+            "total": connection.execute("SELECT count(*) FROM catalog_current").fetchone()[0],
+            "by_kind": {row[0]: row[1] for row in connection.execute(
+                "SELECT kind,count(*) FROM catalog_current GROUP BY kind ORDER BY kind")},
+            "artifacts": {key: counts(key, "artifact")
+                          for key in ("coverage", "role", "audience", "presence")},
+            "sources_by_category": counts("category", "source"),
+            "artifacts_by_source": {row["source"]: row["artifacts"] for row in per_source[:limit]},
+            "sources_with_artifacts": len(per_source),
+            "artifacts_by_source_truncated": len(per_source) > limit,
+        }
+
+
 def current_view(connection):
     connection.execute("""CREATE TEMP VIEW catalog_current AS
         SELECT c.record_id AS id,json_extract(v.payload,'$.kind') AS kind,v.payload

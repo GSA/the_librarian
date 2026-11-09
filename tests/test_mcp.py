@@ -125,8 +125,22 @@ class MCP(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(payload["hits"], [])
                         else:
                             self.assertEqual(payload["count"], 0)
+                    response = await session.call_tool("catalog", {"summary": True})
+                    self.assertFalse(response.is_error, response)
+                    summary = json.loads(response.content[0].text)
+                    self.assertEqual((summary["total"], summary["by_kind"]), (summary["state"]["records"], summary["by_kind"]))
+                    self.assertEqual(summary["artifacts"]["coverage"], {})
+                    response = await session.call_tool("catalog", {"summary": True, "kind": "source"})
+                    self.assertTrue(response.is_error)
                     response = await session.call_tool("get", {"locator": "documents/missing.md"})
                     self.assertTrue(response.is_error)
+
+    def test_stale_status_output_is_reported_not_failed(self):
+        from the_librarian_mcp.server import Reader
+        stale = b'{"fresh": false, "reasons": ["source changed: a.md"], "documents": 1}'
+        self.assertTrue(Reader.stale_status(stale))
+        self.assertFalse(Reader.stale_status(b"not json"))
+        self.assertFalse(Reader.stale_status(b'{"fresh": true}'))
 
     async def test_opt_in_diagnostics_record_absence_without_the_query(self):
         with tempfile.TemporaryDirectory() as directory:
