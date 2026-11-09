@@ -105,7 +105,8 @@ class EmptyInstanceTests(ProgressCase):
         self.assertEqual(result["catalog"]["artifacts"], 0)
         page = progress.render_html(result, refresh=5)
         self.assertIn('http-equiv="refresh" content="5"', page)
-        self.assertNotIn("<script", page.lower())
+        self.assertEqual(page.lower().count("<script"), 1)
+        self.assertIn("<time datetime=", page)
         self.assertNotIn("http://", page.replace('http-equiv', ''))
 
 
@@ -301,6 +302,7 @@ class ServerTests(ProgressCase):
         with urllib.request.urlopen(base + "/") as response:
             page = response.read().decode()
             self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+            self.assertIn(progress.SCRIPT_SRC, response.headers["Content-Security-Policy"])
             self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertIn('content="7"', page)
         with urllib.request.urlopen(base + "/progress.json") as response:

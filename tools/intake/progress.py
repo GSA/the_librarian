@@ -9,6 +9,8 @@ approved by the operator.
 from collections import Counter
 from contextlib import closing
 from datetime import datetime, timezone
+import base64
+import hashlib
 import html
 import http.server
 import ipaddress
@@ -262,6 +264,21 @@ def when(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds")
 
 
+LOCAL_TIME_SCRIPT = (
+    "for(const t of document.querySelectorAll('time[datetime]')){"
+    "const d=new Date(t.getAttribute('datetime'));"
+    "if(!isNaN(d)){t.title=t.textContent;t.textContent=d.toLocaleString(undefined,"
+    "{dateStyle:'medium',timeStyle:'medium'})}}")
+SCRIPT_SRC = "'sha256-" + base64.b64encode(
+    hashlib.sha256(LOCAL_TIME_SCRIPT.encode()).digest()).decode() + "'"
+
+
+def time_tag(value):
+    if value is None or value == "-":
+        return "-"
+    return f'<time datetime="{html.escape(str(value), quote=True)}">{html.escape(str(value))}</time>'
+
+
 def source_line(name, value):
     if value.get("available"):
         return name + ": available"
@@ -303,6 +320,11 @@ td,th{border:1px solid #ccc;padding:.25rem .5rem;text-align:left}th{background:#
 """
 
 
+class Raw:
+    def __init__(self, html_text):
+        self.html = html_text
+
+
 def esc(value):
     return html.escape("-" if value is None else str(value), quote=True)
 
@@ -317,14 +339,15 @@ def cards(funnel):
 
 def table(headers, rows):
     head = "".join(f"<th>{esc(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in row) + "</tr>" for row in rows)
+    body = "".join("<tr>" + "".join(
+        f"<td>{c.html}</td>" if isinstance(c, Raw) else f"<td>{esc(c)}</td>" for c in row) + "</tr>" for row in rows)
     return f"<table><tr>{head}</tr>{body or '<tr><td colspan=99>none</td></tr>'}</table>"
 
 
 def item_rows(values):
     return [(v["correlation_id"], v["stage"], v["operation"], v["state"], v["funnel"],
              (v["last_attempt"] or {}).get("outcome"), (v["last_attempt"] or {}).get("category"),
-             (v["last_attempt"] or {}).get("code"), when(v["updated"])) for v in values]
+             (v["last_attempt"] or {}).get("code"), Raw(time_tag(when(v["updated"])))) for v in values]
 
 
 def render_html(report, *, refresh=5):
@@ -333,8 +356,8 @@ def render_html(report, *, refresh=5):
              f'<meta http-equiv="refresh" content="{int(refresh)}">'
              f"<title>Intake progress</title><style>{STYLE}</style></head><body>",
              "<h1>Intake progress</h1>",
-             f'<p class="muted">Read-only and body-free. Updated {esc(report["generated_at"])}; '
-             f"refreshes every {int(refresh)} s. Last ledger activity {esc(when(overall['last_activity']))}.</p>"]
+             f'<p class="muted">Read-only and body-free. Updated {time_tag(report["generated_at"])}; '
+             f"refreshes every {int(refresh)} s. Last ledger activity {time_tag(when(overall['last_activity']))}.</p>"]
     sources = []
     for name in ("ledger", "catalog", "review_events", "index"):
         value = report[name]
@@ -371,10 +394,10 @@ def render_html(report, *, refresh=5):
         parts.append("<h2>Review events</h2>" + table(
             ("current events", *reviews["outcomes"]), [(reviews["current"], *reviews["outcomes"].values())]))
     headers = ("correlation", "stage", "operation", "state", "funnel", "last outcome",
-               "category", "code", "updated (UTC)")
+               "category", "code", "updated")
     parts.append("<h2>Needs attention</h2>" + table(headers, item_rows(report["attention"])))
     parts.append("<h2>Recent items</h2>" + table(headers, item_rows(report["recent"])))
-    parts.append("</body></html>")
+    parts.append(f"<script>{LOCAL_TIME_SCRIPT}</script></body></html>")
     return "".join(parts)
 
 
@@ -411,7 +434,8 @@ def make_server(root, *, host="127.0.0.1", port=8765, refresh=5, limit=50, runs=
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Security-Policy",
-                             "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+                             f"default-src 'none'; style-src 'unsafe-inline'; script-src {SCRIPT_SRC}; "
+                             "frame-ancestors 'none'")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
