@@ -88,6 +88,24 @@ class CatalogRebaseTests(Case):
             self.assertGreater(time.monotonic() - started, 0.1)
 
 
+    def test_reader_waits_for_an_active_writers_journal_but_refuses_an_abandoned_one(self):
+        home, db, _ = catalog.locations(self.root)
+        journal = Path(str(db) + "-journal")
+        journal.write_bytes(b"")
+        journal.chmod(0o600)
+        with self.assertRaises(catalog.CatalogError):
+            catalog.status(self.root)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl,os,sys,time\n"
+             "fd=os.open(sys.argv[1],os.O_RDWR)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"
+             "print('held',flush=True)\ntime.sleep(0.3)\nos.unlink(sys.argv[2])",
+             str(home / "writer.lock"), str(journal)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertIn("state_token", catalog.status(self.root))
+
+
 class AgentTests(Case):
     def test_two_agent_processes_commit_every_receipt_once(self):
         context = multiprocessing.get_context("spawn")
@@ -134,6 +152,33 @@ class AgentTests(Case):
         self.assertEqual(report["counts"]["retried_after_conflict"],
                          {"entries": 2, "succeeded": 2, "attempts": 2})
         self.assertEqual(report["counts"]["failed_by_code"], {})
+
+
+class SettleTests(Case):
+    def test_settle_waits_out_backoff_and_completes_within_budget(self):
+        real = catalog.submit
+        calls = []
+
+        def racing(*args, **kwargs):
+            if not calls:
+                calls.append(1)
+                raise catalog.StaleState("Stale expected state; re-read before writing")
+            return real(*args, **kwargs)
+        import json
+        from tools import policy
+        records = [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}]
+        store.stage(self.root, json.dumps({
+            "version": 1, "correlation_id": "req-backoff", "correction_of": None,
+            "policy": {"version": 1, "sha256": policy.load()[1]},
+            "retry": {"max_attempts": 3, "backoff_seconds": 1},
+            "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit", "arguments": {
+                "records": records, "actor": "a", "request_id": "backoff", "reason": "r",
+                "expected_state": catalog.status(self.root)["state_token"]}}]}).encode())
+        with patch.object(runner, "SETTLE_MAX_WAIT", 5), \
+                patch.object(adapters.catalog, "submit", side_effect=racing):
+            result = runner.settle(self.root, "req-backoff", "receipt")
+        self.assertEqual(result["stages"][0]["status"], "succeeded")
+        self.assertEqual(len(result["stages"][0]["attempts"]), 2)
 
 
 class RecoveryTests(Case):

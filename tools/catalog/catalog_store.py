@@ -171,8 +171,42 @@ def writer_lock(home, wait=None):
         os.close(descriptor)
 
 
+def _writer_active(home):
+    """Whether another holder has the catalog writer lock (never this thread)."""
+    import fcntl
+    if str(safe_path(home)) in getattr(_held, "homes", ()):
+        return False
+    try:
+        descriptor = os.open(safe_path(home / "writer.lock"), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _await_journal(path):
+    """Let a reader wait out a supported writer's rollback journal, boundedly.
+
+    A journal left without a writer holding the lock is abandoned and still
+    needs explicit recovery.
+    """
+    journal = Path(str(path) + "-journal")
+    deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+    while journal.exists() and _writer_active(path.parent):
+        if time.monotonic() >= deadline:
+            raise WriterBusy("Another catalog writer is active; retry later")
+        time.sleep(0.02)
+
+
 def connect(path, write=False):
     path = private_file(path)
+    if not write:
+        _await_journal(path)
     for suffix in ("-journal", "-wal", "-shm"):
         sidecar = safe_path(str(path) + suffix)
         require(not sidecar.exists(), "SQLite sidecar present; explicit recovery required")

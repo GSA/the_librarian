@@ -169,6 +169,7 @@ def _extract(root, entry, actor):
     # The reader version is part of the request identity: a new MIME reader version extracts again.
     version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
     stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare", "extract-prepare", base)
+    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
     if stage["status"] == "succeeded":
         # Registration pins the catalog state when staged, immediately before it runs;
         # a repeated registration is idempotent by its saved request.
@@ -177,7 +178,7 @@ def _extract(root, entry, actor):
                          "extract-register", lambda: {
                              **base, "actor": actor,
                              "expected_state": catalog.status(root)["state_token"]})
-    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
+        entry["conflicts"] += runner.conflicts(stage)
     if stage["status"] != "succeeded":
         return _failure(stage["id"], stage)
     evidence = stage["evidence"]

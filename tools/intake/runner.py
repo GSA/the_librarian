@@ -105,10 +105,27 @@ def settle(root, correlation_id, stage_id):
     each retry re-reads the catalog, so the stage settles without manual replay.
     """
     while True:
-        result = run(root, correlation_id, stage_id)
+        try:
+            result = run(root, correlation_id, stage_id)
+        except IntakeError as error:
+            if error.code != "backoff_pending":
+                raise
+            result = store.inspect(root, correlation_id)
+            stage = next(s for s in result["stages"] if s["id"] == stage_id)
+            current = [a for a in stage["attempts"] if a["cycle"] == stage["cycle"]]
+            # Honour the request's backoff outside the ledger lock; a long backoff
+            # leaves the stage visibly retryable instead of stalling the caller.
+            wait = current[-1]["eligible_at"] - time.time()
+            if wait > SETTLE_MAX_WAIT:
+                return result
+            time.sleep(max(wait, 0))
+            continue
         stage = next(s for s in result["stages"] if s["id"] == stage_id)
         if stage["status"] != "retryable":
             return result
+
+
+SETTLE_MAX_WAIT = 60
 
 
 def conflicts(stage):
