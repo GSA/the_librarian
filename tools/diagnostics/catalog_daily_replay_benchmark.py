@@ -291,7 +291,19 @@ def inspect_profile(args):
         queue = context.Queue()
         proc = context.Process(target=_inspect_once, args=(tree, db, args.detail == "true", queue))
         proc.start()
-        rows.append(queue.get())
+        row = None
+        while row is None:
+            try:
+                row = queue.get(timeout=1)
+            except Exception:  # queue.Empty: keep waiting only while the worker is alive
+                if not proc.is_alive():
+                    try:
+                        row = queue.get(timeout=1)  # a result put just before exit
+                    except Exception:
+                        proc.join()
+                        raise SystemExit(f"inspect sample failed: worker exited with code {proc.exitcode} "
+                                         "without a result (out of memory?)")
+        rows.append(row)
         proc.join()
     print(json.dumps({"seed": json.loads((Path(args.dir) / "seed.json").read_text()), "detail": args.detail,
                       "samples": rows, "median_wall_s": statistics.median(r["wall_s"] for r in rows),
