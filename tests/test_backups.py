@@ -109,6 +109,21 @@ class DailySnapshots(unittest.TestCase):
         self.assertIn("refused", result["retention"])
         self.assertTrue(before <= set(self.backups.iterdir()))
 
+    def test_failed_daily_snapshot_refuses_the_write_and_a_retry_commits_cleanly(self):
+        self.write("S1")
+        self.clock.advance(days=1)
+        state = catalog.status(self.root)["state_token"]
+        with patch.object(catalog, "_snapshot_in_transaction", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                catalog.submit(self.root, [source("S2")], actor="t", request_id="req-S2",
+                               expected_state=state, reason="Daily snapshot test")
+        self.assertEqual(catalog.status(self.root)["revision"], 1)  # nothing half-written
+        retry = catalog.submit(self.root, [source("S2")], actor="t", request_id="req-S2",
+                               expected_state=state, reason="Daily snapshot test")
+        self.assertEqual(retry["committed_state"]["revision"], 2)
+        self.assertIsNotNone(retry["backup"])
+        catalog.verify_backup(Path(retry["backup"]["snapshot"]))
+
     def test_never_deletes_the_only_verified_snapshot(self):
         self.clock.advance(days=30)
         report = catalog.prune(self.root, apply=True)
