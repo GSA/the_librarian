@@ -314,6 +314,23 @@ class DoclingLifecycle(unittest.TestCase):
                 bridge.source(self.root, "D1", "pdf")
             read.assert_not_called()
 
+    def test_source_open_refuses_intermediate_directory_swapped_to_symlink(self):
+        """Review 71: validation by pathname must not be defeated by a later directory swap."""
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "input.pdf").write_bytes(b"%PDF-1.7\noutside policy")
+        target = self.root / "sources"
+        moved = self.root / "sources-moved"
+        target.rename(moved)
+        target.symlink_to(outside, target_is_directory=True)
+        # Simulate the swap completing after validation passed.
+        with patch.object(bridge.catalog, "safe_path", side_effect=lambda p: Path(p)):
+            with self.assertRaisesRegex(bridge.BridgeError, "without following links"):
+                bridge._read_source(self.path)
+        target.unlink()
+        moved.rename(target)
+        self.assertEqual(bridge._read_source(self.path), self.raw)
+
     def test_importing_cli_does_not_import_optional_inference_modules(self):
         source = (ROOT / "tools/extraction/docling_extract.py").read_text()
         self.assertNotIn("import docling\n", source)

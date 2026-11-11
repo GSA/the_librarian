@@ -71,27 +71,52 @@ def binding(root=None):
     return result
 
 
+def _open_pinned(path):
+    """Open path component by component without following any symlink.
+
+    Validation by pathname alone leaves a window in which an intermediate
+    directory could be swapped for a symlink; O_NOFOLLOW only covers the last
+    component. Returns (parent directory descriptor, file name, file descriptor).
+    """
+    parts = Path(os.path.abspath(path)).parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent = os.open(parts[0], flags)
+    try:
+        for component in parts[1:-1]:
+            child = os.open(component, flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=parent)
+    except BaseException:
+        os.close(parent)
+        raise
+    return parent, parts[-1], descriptor
+
+
 def _read_source(path):
     path = catalog.safe_path(path)
-    before = path.stat(follow_symlinks=False)
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(descriptor, "rb") as stream:
-        opened = os.fstat(stream.fileno())
-        require(stat.S_ISREG(opened.st_mode), "Source must be a regular file")
-        require((before.st_dev, before.st_ino) == (opened.st_dev, opened.st_ino),
-                "Source changed while being opened")
-        raw = stream.read(MAX_SOURCE + 1)
-        after = os.fstat(stream.fileno())
-    require(len(raw) <= MAX_SOURCE, "Source exceeds 64 MiB limit")
-    require((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
-             opened.st_ctime_ns) ==
-            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
-             after.st_ctime_ns), "Source changed while being read")
-    final = path.stat(follow_symlinks=False)
-    require((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
-             after.st_ctime_ns) ==
-            (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns,
-             final.st_ctime_ns), "Source path changed while being read")
+    try:
+        parent, name, descriptor = _open_pinned(path)
+    except OSError as error:
+        raise BridgeError("Source cannot be opened without following links") from error
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            require(stat.S_ISREG(opened.st_mode), "Source must be a regular file")
+            raw = stream.read(MAX_SOURCE + 1)
+            after = os.fstat(stream.fileno())
+        require(len(raw) <= MAX_SOURCE, "Source exceeds 64 MiB limit")
+        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+                    opened.st_ctime_ns)
+        require(identity == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                             after.st_ctime_ns), "Source changed while being read")
+        # The entry in the directory we pinned must still be the file we read.
+        final = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        require(identity == (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns,
+                             final.st_ctime_ns), "Source path changed while being read")
+    finally:
+        os.close(parent)
     return raw
 
 
