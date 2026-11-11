@@ -1,4 +1,4 @@
-# 0017 - Lost catalog races do not spend an intake stage's fault budget
+# 0018 - Lost catalog races do not spend an intake stage's fault budget
 
 **Audience:** maintainers and operators.
 **Date:** November 12, 2026.

@@ -49,6 +49,7 @@
   "tools/__init__.py",
   "tools/backups.py",
   "tools/policy.py",
+  "tools/file_identity.py",
   "tools/initialize.py",
   "tools/package.py",
   "tools/catalog/__init__.py",
@@ -108,8 +109,10 @@
   "docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md",
   "docs/decisions/0015-trusted-head-catalog-commit.md",
   "docs/decisions/0016-single-replay-daily-snapshot.md",
-  "docs/decisions/0017-catalog-contention-outside-the-fault-budget.md",
+  "docs/decisions/0018-catalog-contention-outside-the-fault-budget.md",
   "tests/test_catalog_delta_commit.py",
   "tests/test_catalog_daily_snapshot.py",
+  "docs/decisions/0017-attested-file-identity-for-catalog-receipts.md",
+  "tests/test_catalog_identity_binding.py",
   "tests/test_validation_cost.py"
 ]

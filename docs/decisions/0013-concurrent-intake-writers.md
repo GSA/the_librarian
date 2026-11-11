@@ -5,7 +5,7 @@
 **Status:** Implemented. Amended by
 [0014](0014-intake-ledger-handoff-and-bounded-waits.md) (bounded ledger waits),
 [0015](0015-trusted-head-catalog-commit.md) (the catalog lock hold is no longer
-O(catalog)) and [0017](0017-catalog-contention-outside-the-fault-budget.md) (lost
+O(catalog)) and [0018](0018-catalog-contention-outside-the-fault-budget.md) (lost
 races no longer spend the attempt budget).
 
 ## Context
