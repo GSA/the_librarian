@@ -10,6 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from tests.support import default_policy_hash
 from tools.catalog import catalog_store as catalog
 from tools.intake import adapters, cohort, runner, store, upload
 
@@ -213,7 +214,7 @@ class SettleTests(Case):
         records = [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}]
         store.stage(self.root, json.dumps({
             "version": 1, "correlation_id": "req-backoff", "correction_of": None,
-            "policy": {"version": 1, "sha256": policy.load()[1]},
+            "policy": {"version": 1, "sha256": default_policy_hash()},
             "retry": {"max_attempts": 3, "backoff_seconds": 1},
             "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit", "arguments": {
                 "records": records, "actor": "a", "request_id": "backoff", "reason": "r",

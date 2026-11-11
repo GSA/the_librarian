@@ -52,7 +52,7 @@ MCP tests or install packages globally to hide the setup failure.
 | File | Purpose |
 | --- | --- |
 | `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` and `backup_retention_days` |
-| `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git |
+| `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git; applies to this checkout only, never to another `--root` that lacks its own policy files |
 | `config/selection.local.json` | Instance selection override, ignored by Git (same schema as `config/selection.json`; auto-selected when `--manifest` is omitted) |
 
 Default stores (configurable via `storage_roots` and bound in `.local/instance.json`):

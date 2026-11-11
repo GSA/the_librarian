@@ -5,8 +5,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
-from tools import package
+from tools import package, policy
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,3 +26,9 @@ def run_json(*argv: str, cwd: Path, expected: int = 0):
             f"expected exit {expected}, got {result.returncode}: {result.stderr}"
         )
     return json.loads(result.stdout)
+
+
+def default_policy_hash():
+    """Policy hash a temporary workspace without its own policy files resolves to."""
+    with tempfile.TemporaryDirectory() as directory:
+        return policy.for_root(Path(directory))[1]

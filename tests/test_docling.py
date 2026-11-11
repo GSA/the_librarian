@@ -306,7 +306,7 @@ class DoclingLifecycle(unittest.TestCase):
                 "--python", "python", "--artifact", "member"])
 
     def test_excluded_policy_refuses_before_source_read(self):
-        tightened = deepcopy(bridge.policy.SETTINGS)
+        tightened = deepcopy(bridge.policy.for_root(self.root)[0])
         tightened["original_roots"] = []
         with (patch.object(bridge.policy, "load", return_value=(tightened, "tight")),
               patch.object(bridge, "_read_source") as read):
