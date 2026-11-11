@@ -97,7 +97,7 @@ def _open_pinned(path):
 def _read_source(path):
     path = catalog.safe_path(path)
     try:
-        parent, name, descriptor = _open_pinned(path)
+        parent, _, descriptor = _open_pinned(path)
     except OSError as error:
         raise BridgeError("Source cannot be opened without following links") from error
     try:
@@ -111,8 +111,17 @@ def _read_source(path):
                     opened.st_ctime_ns)
         require(identity == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
                              after.st_ctime_ns), "Source changed while being read")
-        # The entry in the directory we pinned must still be the file we read.
-        final = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        # The pinned directory may itself have been renamed away and replaced:
+        # reopen the original pathname component-wise and compare identities.
+        try:
+            recheck_parent, _, recheck = _open_pinned(path)
+        except OSError as error:
+            raise BridgeError("Source path changed while being read") from error
+        try:
+            final = os.fstat(recheck)
+        finally:
+            os.close(recheck)
+            os.close(recheck_parent)
         require(identity == (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns,
                              final.st_ctime_ns), "Source path changed while being read")
     finally:
