@@ -49,6 +49,7 @@
   "tools/__init__.py",
   "tools/backups.py",
   "tools/policy.py",
+  "tools/file_identity.py",
   "tools/initialize.py",
   "tools/package.py",
   "tools/catalog/__init__.py",
@@ -70,7 +71,6 @@
   "tools/context-mcp/src/the_librarian_mcp/server.py",
   "tools/diagnostics/__init__.py",
   "tools/diagnostics/catalog_commit_ceiling.py",
-  "tools/diagnostics/catalog_binding_benchmark.py",
   "tools/diagnostics/catalog_lock_benchmark.py",
   "tools/diagnostics/ingest_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
@@ -107,5 +107,6 @@
   "docs/decisions/0015-trusted-head-catalog-commit.md",
   "docs/decisions/0016-attested-file-identity-for-catalog-receipts.md",
   "tests/test_catalog_delta_commit.py",
+  "tests/test_catalog_identity_binding.py",
   "tests/test_validation_cost.py"
 ]

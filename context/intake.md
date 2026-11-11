@@ -25,9 +25,12 @@ named stage. The ledger is operational recovery state, never corpus authority.
   published and each attempt converts once.
 - Concurrent intake agents may share one instance ([0013](../docs/decisions/0013-concurrent-intake-writers.md)).
   The catalog writer lock waits up to 10s across processes. A catalog write
-  validates only its delta when the database bytes match a prior full
-  validation, and replays all history otherwise, on the first write of each UTC
-  day and under `status --audit` ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md)). A lost race is a
+  validates only its delta when the database file identity (device, inode, size,
+  mtime, ctime, SQLite change counter) matches a prior full validation made the
+  same UTC day, and replays all history otherwise, on the first read or write
+  of each UTC day and under `status --audit`
+  ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md),
+  [0016](../docs/decisions/0016-attested-file-identity-for-catalog-receipts.md)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
   `catalog-busy` (lock wait exceeded) attempt, never `native-input`.
   `catalog-submit`, `extract-register` and `docling-register` rebase an outdated

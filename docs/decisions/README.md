@@ -26,7 +26,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0013](0013-concurrent-intake-writers.md) | Concurrent intake writers retry and rebase instead of blocking | Accepted |
 | [0014](0014-intake-ledger-handoff-and-bounded-waits.md) | Intake ledger hand-off without re-validation, bounded lock waits, short readers | Accepted; amends 0012 and 0013 |
 | [0015](0015-trusted-head-catalog-commit.md) | Catalog writers validate only their delta on a trusted head | Accepted; amends 0012 and 0013 |
-| [0016](0016-attested-file-identity-for-catalog-receipts.md) | Bind catalog validation receipts to file identity, with a daily full check | Proposed; awaiting owner approval, not implemented |
+| [0016](0016-attested-file-identity-for-catalog-receipts.md) | Catalog validation receipts bind to file identity, with a daily full check | Accepted; amends 0012, 0014 and 0015 |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in
