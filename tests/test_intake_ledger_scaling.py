@@ -175,6 +175,38 @@ class BusyTests(Case):
         self.assertEqual((failed["outcome"], failed["code"], failed["category"]),
                          ("failed", "ledger_busy", "retryable"))
 
+    def test_cohort_retries_a_busy_receipt_through_the_real_process_path(self):
+        inbox = self.root / "inbox"
+        inbox.mkdir()
+        (inbox / "a.md").write_bytes(b"# a\n")
+        from tools.catalog import catalog_store as catalog
+        from tools.intake import upload
+        catalog.initialize(self.root)
+        real = upload.submit
+        calls = []
+
+        def busy_once(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise contracts.LedgerBusy()
+            return real(*args, **kwargs)
+        with mock.patch.object(upload, "submit", side_effect=busy_once):
+            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner")
+        self.assertEqual(report["counts"]["outcome"].get("extracted"), 1)
+        self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 1)
+        with mock.patch.object(upload, "submit", side_effect=contracts.LedgerBusy()):
+            again = cohort.ingest(self.root, self.root / "inbox", system="inbox2", actor="cohort-runner")
+        self.assertEqual(again["counts"]["failed_by_code"], {"ledger/ledger_busy": 1})
+
+    def test_invalid_explicit_waits_are_rejected_before_taking_the_lock(self):
+        self.seed(1)
+        self.hold_lock()
+        for bad in (float("nan"), float("inf"), -1, "x", 3601):
+            with self.subTest(wait=bad), self.assertRaises(contracts.IntakeError) as caught:
+                with store.locked(self.root, wait=bad):
+                    pass
+            self.assertEqual(caught.exception.code, "invalid_lock_wait")
+
     def test_cli_reports_the_busy_code_as_retryable(self):
         from tools.intake import cli
         self.seed(1)

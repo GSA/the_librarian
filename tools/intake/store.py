@@ -178,15 +178,16 @@ LOCK_WAIT_SECONDS = 30.0
 
 
 def lock_wait(wait=None):
-    """The bounded wait: an explicit value, else the environment override, else the default."""
-    if wait is not None:
-        return float(wait)
-    configured = os.environ.get(LOCK_WAIT_ENV)
+    """The bounded wait: an explicit value, else the environment override, else the default.
+
+    Every source passes the same finite 0-3600 second check, so no value can wait forever.
+    """
+    configured = wait if wait is not None else os.environ.get(LOCK_WAIT_ENV)
     if configured is None:
         return LOCK_WAIT_SECONDS
     try:
         value = float(configured)
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         raise IntakeError("invalid_lock_wait") from error
     require(math.isfinite(value) and 0 <= value <= 3600, "invalid_lock_wait")
     return value

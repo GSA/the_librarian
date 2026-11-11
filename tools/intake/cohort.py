@@ -220,12 +220,14 @@ def _process(root, inbox, entry, system, actor):
             name=identity["name"], actor=actor, reason=REASON, origin_kind="local-path",
             origin_system=system, origin_locator=identity["locator"],
             expected_sha256=entry["sha256"]))
+    except LedgerBusy:
+        raise  # retried by _settled, never reported as a receipt refusal
     except IntakeError as error:
         outcome = "changed-since-intake" if error.code == "changed_input" else "failed"
         return {"outcome": outcome, "stage": "receipt", "code": error.code}
     entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
     receipt = store.inspect(root, ack["correlation_id"])["stages"][0]
-    entry["conflicts"] = runner.conflicts(receipt)
+    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(receipt)
     if ack["receipt"]["state"] != "committed":
         return _failure("receipt", receipt)
     entry["received"] = True
