@@ -70,7 +70,10 @@ backup count and size; `python3 -m tools.backups prune` is a dry run and
 [decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
 Ingest cost still grows with history; measure it on synthetic cohorts with
 `python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see
-[decision 0012](docs/decisions/0012-bounded-validation-cost.md).
+[decision 0012](docs/decisions/0012-bounded-validation-cost.md). Catalog writes
+validate only their delta when the database bytes match a prior full validation
+([decision 0015](docs/decisions/0015-trusted-head-catalog-commit.md)); profile the
+lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`.
 
 ## Ingesting files (current manual method)
 

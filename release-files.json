@@ -69,6 +69,8 @@
   "tools/context-mcp/src/the_librarian_mcp/preflight.py",
   "tools/context-mcp/src/the_librarian_mcp/server.py",
   "tools/diagnostics/__init__.py",
+  "tools/diagnostics/catalog_commit_ceiling.py",
+  "tools/diagnostics/catalog_lock_benchmark.py",
   "tools/diagnostics/ingest_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
@@ -101,5 +103,7 @@
   "docs/decisions/0012-bounded-validation-cost.md",
   "docs/decisions/0013-concurrent-intake-writers.md",
   "docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md",
+  "docs/decisions/0015-trusted-head-catalog-commit.md",
+  "tests/test_catalog_delta_commit.py",
   "tests/test_validation_cost.py"
 ]
