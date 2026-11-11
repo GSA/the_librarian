@@ -575,7 +575,10 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
         binding = _binding(connection)
         # A receipt for these exact bytes (a prior full inspection, or this writer's own
         # validated commit) stands in for the O(history) replay; any other bytes get the full one.
-        trusted = _trusted_state(connection, home, binding)
+        try:
+            trusted = _trusted_state(connection, home, binding)
+        except (CatalogError, OSError):
+            trusted = None  # an unusable receipt only costs the full replay; it never blocks a write
         if trusted is None:
             state, current, _, _, _ = inspect(connection)
         else:
@@ -710,32 +713,36 @@ class _CommittedStates:
 
     def __init__(self, connection, head):
         self.connection, self.head = connection, head
-        self._states = None
+        self._added = None
 
     def prior(self, request_id):
         row = self.connection.execute("SELECT * FROM revisions WHERE request_id=?", (request_id,)).fetchone()
         return None if row is None else dict(row)
 
-    def _all(self):
-        if self._states is None:
-            added = dict(self.connection.execute(
+    def _first_writes(self):
+        if self._added is None:
+            self._added = dict(self.connection.execute(
                 "SELECT first,count(*) FROM (SELECT min(revision) AS first FROM versions GROUP BY record_id) "
                 "GROUP BY first"))
-            states, total = {}, 0
-            for row in self.connection.execute("SELECT revision,revision_hash FROM revisions ORDER BY revision"):
-                total += added.get(row["revision"], 0)
-                states[row["revision"]] = make_state(self.head, row["revision"], row["revision_hash"], total)
-            self._states = states
-        return self._states
+        return self._added
 
     def state(self, revision):
-        return self._all()[revision]
+        row = self.connection.execute("SELECT revision_hash FROM revisions WHERE revision=?", (revision,)).fetchone()
+        later = sum(count for number, count in self._first_writes().items() if number > revision)
+        return make_state(self.head, revision, row[0], self.head["records"] - later)
 
     def revision_of(self, token):
-        """The revision whose committed state carries ``token`` (0 for the empty catalog)."""
-        if token == make_state(self.head, 0, "", 0)["state_token"]:
-            return 0
-        return next((number for number, state in self._all().items() if state["state_token"] == token), None)
+        """The revision whose committed state carries ``token`` (0 for the empty catalog).
+
+        Searches newest first, so the cost follows how far behind the pin is.
+        """
+        hashes = dict(self.connection.execute("SELECT revision,revision_hash FROM revisions"))
+        records = self.head["records"]
+        for number in range(self.head["revision"], 0, -1):
+            if make_state(self.head, number, hashes[number], records)["state_token"] == token:
+                return number
+            records -= self._first_writes().get(number, 0)
+        return 0 if token == make_state(self.head, 0, "", 0)["state_token"] else None
 
     def written_after(self, revision, ids):
         for start in range(0, len(ids), 500):

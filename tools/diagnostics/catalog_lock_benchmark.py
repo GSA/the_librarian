@@ -69,22 +69,32 @@ def seed(root, count):
         cs.seal(db)
 
 
-PHASES = ("inspect_1", "validate_graph", "snapshot_check", "inspect_2", "insert_commit", "seal")
+PHASES = ("inspect_1", "validate_graph", "snapshot_check", "inspect_2", "insert_commit", "seal",
+          "snapshot_hash", "validate_delta", "attest_commit")
+# Present only in trees with the trusted-head commit path; absent names are skipped.
+OPTIONAL = {"snapshot_hash": "_binding", "validate_delta": "validate_delta", "attest_commit": "_attest_commit"}
 
 
 def instrumented_submit(root, records, request_id, **kwargs):
     """Run ``catalog_store.submit`` and return (result, lock_hold_s, per-phase seconds)."""
     from tools.catalog import catalog_store as cs
-    marks = {"inspect": [], "graph": 0.0, "snap": 0.0, "seal": 0.0, "hold": None, "pre": 0.0}
+    marks = {"inspect": [], "graph": 0.0, "snap": 0.0, "seal": 0.0, "hold": None, "pre": 0.0,
+             "snapshot_hash": 0.0, "validate_delta": 0.0, "attest_commit": 0.0, "depth": 0}
     originals = {n: getattr(cs, n) for n in ("inspect", "validate_graph", "_daily_snapshot", "seal", "writer_lock")}
+    optional = {key: name for key, name in OPTIONAL.items() if hasattr(cs, name)}
+    originals.update({name: getattr(cs, name) for name in optional.values()})
 
     def timed(name, key):
         def run(*args, **kw):
             start = time.perf_counter()
+            marks["depth"] += 1
             try:
                 return originals[name](*args, **kw)
             finally:
+                marks["depth"] -= 1
                 spent = time.perf_counter() - start
+                if marks["depth"] and key == "snapshot_hash":
+                    return  # already inside a timed phase (the attestation re-hashes the new file)
                 if key == "inspect":
                     marks["inspect"].append(spent)
                 else:
@@ -105,6 +115,8 @@ def instrumented_submit(root, records, request_id, **kwargs):
         return Hold()
     cs.inspect, cs.validate_graph = timed("inspect", "inspect"), timed("validate_graph", "graph")
     cs._daily_snapshot, cs.seal, cs.writer_lock = timed("_daily_snapshot", "snap"), timed("seal", "seal"), locked
+    for key, name in optional.items():
+        setattr(cs, name, timed(name, key))
     try:
         start = time.perf_counter()
         result = cs.submit(root, records, request_id=request_id, **kwargs)
@@ -113,10 +125,14 @@ def instrumented_submit(root, records, request_id, **kwargs):
         for name, original in originals.items():
             setattr(cs, name, original)
     first, second = (marks["inspect"] + [0.0, 0.0])[:2]
-    inner = marks["hold"] - sum(marks["inspect"]) - marks["graph"] - marks["snap"] - marks["seal"]
+    # Time inside the hold not attributed to another phase: SQL reads, INSERTs and the COMMIT itself.
+    inner = (marks["hold"] - sum(marks["inspect"]) - marks["graph"] - marks["snap"] - marks["seal"]
+             - marks["snapshot_hash"] - marks["validate_delta"] - marks["attest_commit"])
     return result, marks["hold"], total, {
         "inspect_1": first, "validate_graph": marks["graph"], "snapshot_check": marks["snap"],
-        "inspect_2": second, "insert_commit": inner, "seal": marks["seal"]}
+        "inspect_2": second, "insert_commit": inner, "seal": marks["seal"],
+        "snapshot_hash": marks["snapshot_hash"], "validate_delta": marks["validate_delta"],
+        "attest_commit": marks["attest_commit"]}
 
 
 def profile(size, samples, work):
