@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests.support import default_policy_hash
 from tools.intake import contracts, store
 
 
@@ -208,7 +209,7 @@ class RunnerTests(unittest.TestCase):
     setUp = LedgerTests.setUp
     def stage_live(self):
         from tools import policy
-        raw = request(policy={"version": 1, "sha256": policy.load()[1]})
+        raw = request(policy={"version": 1, "sha256": default_policy_hash()})
         store.stage(self.root, raw)
         return raw
 
@@ -315,7 +316,7 @@ class RunnerTests(unittest.TestCase):
         from tools import policy
         path = self.root / "disposition.json"
         path.write_bytes(b"private disposition")
-        raw = json.loads(request(policy={"version": 1, "sha256": policy.load()[1]}))
+        raw = json.loads(request(policy={"version": 1, "sha256": default_policy_hash()}))
         raw["stages"][0]["arguments"]["disposition_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         raw["stages"][0]["arguments"]["delivery_correlation"] = "d" * 500
         store.stage(self.root, json.dumps(raw).encode())
@@ -335,7 +336,7 @@ class RunnerTests(unittest.TestCase):
         path = self.root / "disposition.json"
         path.write_bytes(b"private disposition")
         checksum = hashlib.sha256(path.read_bytes()).hexdigest()
-        raw = json.loads(request(policy={"version": 1, "sha256": policy.load()[1]}))
+        raw = json.loads(request(policy={"version": 1, "sha256": default_policy_hash()}))
         raw["stages"][0]["arguments"]["disposition_sha256"] = checksum
         store.stage(self.root, json.dumps(raw).encode())
         runner.run(self.root, "req-one", "delivery")

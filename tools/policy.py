@@ -197,17 +197,37 @@ def _has_instance_policy(root):
 
 
 def for_root(root=None):
+    """Policy for an instance root.
+
+    A root with its own ``config/policy*.json`` loads exactly those files. ``root=None``
+    names the toolkit's own policy, including its ignored local override. Any other root
+    without policy files gets the toolkit's versioned defaults only: the checkout's
+    ``policy.local.json`` is deployment data for that checkout and never reaches an
+    unrelated root such as a temporary workspace. An in-process change to ``SETTINGS``
+    still applies, as an overlay of the changed fields.
+    """
     if _has_instance_policy(root):
         return load(root)
-    disk_settings, disk_hash = load()
-    if disk_hash == _IMPORT_HASH and SETTINGS != _IMPORT_SETTINGS:
-        return (
-            SETTINGS,
-            hashlib.sha256(
-                json.dumps(SETTINGS, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest(),
-        )
-    return disk_settings, disk_hash
+    if root is None:
+        disk_settings, disk_hash = load()
+        if disk_hash == _IMPORT_HASH and SETTINGS != _IMPORT_SETTINGS:
+            return SETTINGS, _settings_hash(SETTINGS)
+        return disk_settings, disk_hash
+    settings, defaults_hash = load(root)
+    changed = {key: deepcopy(value) for key, value in SETTINGS.items()
+               if _IMPORT_SETTINGS.get(key) != value}
+    if changed or set(_IMPORT_SETTINGS) - set(SETTINGS):
+        settings = dict(settings, **changed)
+        for key in set(_IMPORT_SETTINGS) - set(SETTINGS):
+            settings.pop(key, None)
+        return settings, _settings_hash(settings)
+    return settings, defaults_hash
+
+
+def _settings_hash(settings):
+    return hashlib.sha256(
+        json.dumps(settings, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def fingerprint(root=None):

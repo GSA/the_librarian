@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest import mock
 
+from tests.support import default_policy_hash
 from tools import policy
 from tools.intake import cohort, contracts, progress, runner, store
 
@@ -20,7 +21,7 @@ WAIT_ENV = "LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS"
 
 def request(correlation, **changes):
     value = {"version": 1, "correlation_id": correlation, "correction_of": None,
-             "policy": {"version": 1, "sha256": policy.load()[1]},
+             "policy": {"version": 1, "sha256": default_policy_hash()},
              "retry": {"max_attempts": 2, "backoff_seconds": 0},
              "stages": [{"id": "delivery", "kind": "return", "operation": "await-ack",
                          "arguments": {"delivery_correlation": "delivery-one",
