@@ -94,8 +94,8 @@ def instrumented_submit(root, records, request_id, **kwargs):
                 marks["depth"] -= 1
                 spent = time.perf_counter() - start
                 if marks["depth"] and key == "snapshot_hash":
-                    return  # already inside a timed phase (the attestation re-hashes the new file)
-                if key == "inspect":
+                    pass  # already inside a timed phase (the attestation re-hashes the new file)
+                elif key == "inspect":
                     marks["inspect"].append(spent)
                 else:
                     marks[key] += spent

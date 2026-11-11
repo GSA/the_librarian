@@ -169,11 +169,16 @@ class FastPathEquivalence(Case):
         results = {}
         for mode in ("delta", "full"):
             self.setUp()
-            tokens = []
+            tokens, replays = [], 0
             for n in range(8):
+                pinned = catalog.status(self.root)["state_token"]
                 if mode == "full" and self.receipt.exists():
-                    self.receipt.unlink()  # no receipt: every write replays the full history
-                tokens.append(self.write(n)["revision"])
+                    self.receipt.unlink()  # no receipt: submit itself replays the full history
+                calls, patched = self.writes_inspect()
+                with patched:
+                    tokens.append(self.write(n, expected_state=pinned)["revision"])
+                replays += len(calls)
+            self.assertEqual(replays > 0, mode == "full")  # the two modes really take distinct paths
             state, current, histories, batches, _ = self.full_inspection()
             results[mode] = (state["revision"], state["records"], state["head_hash"], current, histories, batches)
         self.assertEqual(results["delta"], results["full"])
@@ -216,6 +221,18 @@ class FastPathEquivalence(Case):
             catalog.submit(self.root, duplicate, actor="a", request_id="dup", reason="x",
                            expected_state=before["state_token"])
         self.assertEqual(catalog.status(self.root), before)
+
+
+class ProfilerKeepsBehaviour(Case):
+    def test_instrumented_commit_still_attests_the_new_head(self):
+        from tools.diagnostics.catalog_lock_benchmark import instrumented_submit
+        self.write(0)
+        instrumented_submit(self.root, registration(1), "profiled", actor="a", reason="t",
+                            expected_state=catalog.status(self.root)["state_token"])
+        calls, patched = self.writes_inspect()
+        with patched:
+            self.assertEqual(catalog.status(self.root)["revision"], 2)
+        self.assertEqual(calls, [])
 
 
 class TamperDetection(Case):
