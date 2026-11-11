@@ -1,9 +1,11 @@
-# 0016 - Catalog validation receipts bind to file identity, with a daily full check
+# 0017 - Catalog validation receipts bind to file identity, with a daily full check
 
 **Audience:** maintainers and operators.
 **Status:** Accepted by the owner. Amends [0012](0012-bounded-validation-cost.md),
 [0014](0014-intake-ledger-handoff-and-bounded-waits.md) and
-[0015](0015-trusted-head-catalog-commit.md).
+[0015](0015-trusted-head-catalog-commit.md); builds on
+[0016](0016-single-replay-daily-snapshot.md), whose daily snapshot relies on `serialize()` equalling
+the file bytes and is not changed here.
 
 ## Context
 

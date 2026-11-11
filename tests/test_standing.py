@@ -391,7 +391,7 @@ class StandingIntakeTests(StandingCase):
                      if r["id"] == "A-docling-" + RUN)
         self.assertEqual(child["data"]["coverage"], "indexed")
         with closing(index.readonly(self.root / DB)) as db:
-            hit = index.search(db, "Standing phrase", 10, None)["hits"][0]
+            hit = index.search(db, "Standing phrase", 10, None, root=self.root)["hits"][0]
             self.assertEqual(hit["locator"], RENDITION + "#text-1")
         summary = adapters.availability(self.root, self.publish_stage(), self.evidence("publish"))
         self.assertTrue(summary["available"])
@@ -462,7 +462,7 @@ class StandingIntakeTests(StandingCase):
                                                {"manifest_sha256": "0" * 64, "metadata": {},
                                                 "standing_policy": None})["available"])
         with closing(index.readonly(self.root / DB)) as db:
-            self.assertEqual(index.search(db, "Standing phrase", 10, None)["hits"], [])
+            self.assertEqual(index.search(db, "Standing phrase", 10, None, root=self.root)["hits"], [])
 
     def test_stale_policy_or_source_invalidates_publication(self):
         self.stage_all()
@@ -495,7 +495,7 @@ class StandingIntakeTests(StandingCase):
 
     def has_hit(self):
         with closing(index.readonly(self.root / DB)) as db:
-            return bool(index.search(db, "Standing phrase", 10, None)["hits"])
+            return bool(index.search(db, "Standing phrase", 10, None, root=self.root)["hits"])
 
     def test_publication_under_unrelated_policy_after_revocation_is_refused(self):
         self.stage_all()
@@ -560,7 +560,7 @@ class StandingIntakeTests(StandingCase):
         self.assertNotIn("verified", json.dumps(event).lower().replace("not verification", ""))
         with closing(index.readonly(self.root / DB)) as db:
             packet = index.packet(db, self.config | json.loads(
-                (self.root / "config/selection.json").read_text()), RENDITION + "#text-1", 60000)
+                (self.root / "config/selection.json").read_text()), RENDITION + "#text-1", 60000, root=self.root)
         self.assertEqual(packet["renditions"][RENDITION]["confidence"], {"layout": 0.99})
         self.assertEqual(packet["renditions"][RENDITION]["qualification"]["review_event_ids"],
                          ["rev-standing"])
@@ -656,8 +656,8 @@ class StandingExtractTests(test_kit.WorkspaceCase):
         self.assertEqual(manifest["renditions"][0]["format"], "text")
         self.assertEqual(manifest["renditions"][0]["review_event_ids"], ["rev-standing-text"])
         with closing(index.readonly(self.root / DB)) as db:
-            hit = index.search(db, "Extract phrase", 10, None)["hits"][0]
-            packet = index.packet(db, manifest, hit["locator"], 60000)
+            hit = index.search(db, "Extract phrase", 10, None, root=self.root)["hits"][0]
+            packet = index.packet(db, manifest, hit["locator"], 60000, root=self.root)
         qualified = packet["renditions"][self.rendition]["qualification"]
         self.assertEqual(qualified["review_event_ids"], ["rev-standing-text"])
         self.assertEqual(qualified["reviewed_content"], ["text"])

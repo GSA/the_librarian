@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest import mock
 
+from tests.support import default_policy_hash
 from tools import policy
 from tools.intake import cohort, contracts, progress, runner, store
 
@@ -20,7 +21,7 @@ WAIT_ENV = "LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS"
 
 def request(correlation, **changes):
     value = {"version": 1, "correlation_id": correlation, "correction_of": None,
-             "policy": {"version": 1, "sha256": policy.load()[1]},
+             "policy": {"version": 1, "sha256": default_policy_hash()},
              "retry": {"max_attempts": 2, "backoff_seconds": 0},
              "stages": [{"id": "delivery", "kind": "return", "operation": "await-ack",
                          "arguments": {"delivery_correlation": "delivery-one",
@@ -84,6 +85,42 @@ class HandOffTests(Case):
             validations[got] = calls
         # Each hand-off sees a foreign commit; none may repeat the O(ledger) pass.
         self.assertEqual(validations, {"turn-%d" % n: 0 for n in range(6)})
+
+    def test_read_only_refusal_still_hands_off_the_attestation(self):
+        # Cohort ingest probes for requests that do not exist yet; that refusal wrote nothing,
+        # so the next writer must not repeat the O(ledger) validation because of it.
+        self.seed(3)
+        store.list_requests(self.root)
+        with mock.patch.object(store, "validate", wraps=store.validate) as validate:
+            with self.assertRaises(contracts.IntakeError) as caught:
+                store.inspect(self.root, "no-such-request")
+            self.assertEqual(caught.exception.code, "unknown_request")
+            store.list_requests(self.root)
+            store.stage(self.root, request("after-probe"))
+            store.list_requests(self.root)
+        self.assertEqual(validate.call_count, 0)
+
+    def test_refusal_after_a_write_does_not_hand_off_the_attestation(self):
+        self.seed(2)
+        store.list_requests(self.root)
+        with self.assertRaises(RuntimeError):
+            with store.locked(self.root) as connection:
+                with connection:
+                    connection.execute("UPDATE stages SET status='blocked' WHERE correlation_id='seed-000'")
+                raise RuntimeError("failed after committing")
+        with mock.patch.object(store, "validate", wraps=store.validate) as validate:
+            store.list_requests(self.root)
+        self.assertEqual(validate.call_count, 1)
+
+    def test_tampering_after_a_read_only_refusal_is_still_fully_validated(self):
+        self.seed(3)
+        with self.assertRaises(contracts.IntakeError):
+            store.inspect(self.root, "no-such-request")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
 
     def test_foreign_tampering_between_hand_offs_is_still_fully_validated(self):
         self.seed(3)

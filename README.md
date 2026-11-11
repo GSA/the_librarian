@@ -52,7 +52,7 @@ MCP tests or install packages globally to hide the setup failure.
 | File | Purpose |
 | --- | --- |
 | `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` and `backup_retention_days` |
-| `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git |
+| `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git; applies to this checkout only, never to another `--root` that lacks its own policy files |
 | `config/selection.local.json` | Instance selection override, ignored by Git (same schema as `config/selection.json`; auto-selected when `--manifest` is omitted) |
 
 Default stores (configurable via `storage_roots` and bound in `.local/instance.json`):
@@ -74,8 +74,14 @@ Ingest cost still grows with history; measure it on synthetic cohorts with
 validate only their delta when the database file is unchanged since a prior full
 validation, judged by file identity with a full check each UTC day
 ([decision 0015](docs/decisions/0015-trusted-head-catalog-commit.md),
-[0016](docs/decisions/0016-attested-file-identity-for-catalog-receipts.md)); profile the
-lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`.
+[0017](docs/decisions/0017-attested-file-identity-for-catalog-receipts.md)); profile the
+lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`, and a production-sized
+ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py`. The
+throughput target and its derivation are in
+[context/intake.md](context/intake.md#throughput-target-and-measurement).
+The first write of each UTC day replays the history once for its daily snapshot
+([decision 0016](docs/decisions/0016-single-replay-daily-snapshot.md); profile it with
+`tools/diagnostics/catalog_daily_replay_benchmark.py`).
 
 ## Ingesting files (current manual method)
 
@@ -236,7 +242,7 @@ toolkit). It contains corpus text and agent queries, so treat it at the
 instance's audience. If a record cannot be written the call fails instead of
 returning unrecorded text. `.venv/bin/librarian-audit --root "$PWD"
 report` summarizes it without bodies. See
-[decision 0012](docs/decisions/0011-full-text-mcp-audit-log.md).
+[decision 0011](docs/decisions/0011-full-text-mcp-audit-log.md).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
 the cited text. A search with no hits returns an `absence` reason: the indexed

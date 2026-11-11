@@ -27,10 +27,12 @@ named stage. The ledger is operational recovery state, never corpus authority.
   The catalog writer lock waits up to 10s across processes. A catalog write
   validates only its delta when the database file identity (device, inode, size,
   mtime, ctime, SQLite change counter) matches a prior full validation made the
-  same UTC day, and replays all history otherwise, on the first read or write
-  of each UTC day and under `status --audit`
-  ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md),
-  [0016](../docs/decisions/0016-attested-file-identity-for-catalog-receipts.md)). A lost race is a
+  same UTC day ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md),
+  [0017](../docs/decisions/0017-attested-file-identity-for-catalog-receipts.md)), and replays all history otherwise,
+  on the first read or write of each UTC day and under `status --audit`; that
+  first write replays the history once, holding the writer lock about as long as one `inspect`
+  plus writing the snapshot (about 5 s at 25k registrations, 20 s at 100k;
+  [0016](../docs/decisions/0016-single-replay-daily-snapshot.md)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
   `catalog-busy` (lock wait exceeded) attempt, never `native-input`.
   `catalog-submit`, `extract-register` and `docling-register` rebase an outdated
@@ -89,6 +91,9 @@ named stage. The ledger is operational recovery state, never corpus authority.
   writers do not repeat it per hand-off. The attestation is a hint that a
   validated writer finished last, not proof against someone who edits the file
   and forges the counter.
+- A locked block that raises a read-only refusal (for example `unknown_request` from a
+  cohort existence probe) still hands off the attestation, because the file is
+  byte-identical to what the writer validated; a raise after any write does not.
 - The ledger writer lock wait is bounded (default 30s, set
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` or pass `wait`; the same value is the SQLite
   busy timeout). Exceeding it, or a transient SQLite BUSY/LOCKED during a stage,
@@ -149,6 +154,30 @@ named stage. The ledger is operational recovery state, never corpus authority.
   `NAME` paired with `NAME.submission.json` (the v1 descriptor fields). The drop
   must exist and contain `.librarian-drop`; a missing or unmarked mount is
   `drop_unavailable`, never an empty success. Drop contents are never modified.
+
+## Throughput target and measurement
+
+Reference target for a large cohort on an instance of production size (about 100 MB
+catalog, 25,000 revisions, about 130 MB ledger, 35,000 requests), on a host that is not
+otherwise saturated: **at least 10 files/min sustained on the instance (a 5,000-file
+cohort in under 8.5 hours), at least 20 files/min on the synthetic production-size harness
+(`ledger_scale_benchmark.py`, which measured about 28), p95 per-file latency under 10 s,
+and the last decile of a run no more than 2x the first decile** (measured 1.7x at 1,600
+synthetic files). Each file is two catalog commits. The model behind it is, per file, at this size:
+about 14 whole-file catalog bindings (`serialize` + SHA-256, about 0.11 s each at 100 MB),
+at most one full ledger validation per process, two delta commits (about 0.1 s each), and
+extraction. Measure with the synthetic harnesses; never point them at a real instance:
+
+```sh
+python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200,400 --resume
+python3 tools/diagnostics/catalog_lock_benchmark.py --sizes 400,1600,6400,16000 --samples 3
+python3 tools/diagnostics/catalog_commit_ceiling.py --size 1600 --workers 1,2,4
+python3 tools/diagnostics/ledger_scale_benchmark.py --ledger 36000 --catalog 25600 --files 40
+```
+
+`ledger_scale_benchmark.py` reports `full_ledger_validations`; it should be about 1 per
+process, not about 2 per file. Timings come from a shared host: compare shapes, CPU and
+counts rather than third digits.
 
 ## Progress view
 

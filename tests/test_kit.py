@@ -257,7 +257,7 @@ class WorkspaceCase(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.manifest = self.root / "config/selection.json"
         self.manifest.parent.mkdir()
-        self.config = {"schema_version": 1, "audience": policy.SETTINGS["audience"],
+        self.config = {"schema_version": 1, "audience": policy.for_root(self.root)[0]["audience"],
                        "documents": [], "context_rules": {}, "renditions": []}
         self.db = self.root / "tools/context_index/.local/index.sqlite3"
         self.save_config()
@@ -267,7 +267,7 @@ class WorkspaceCase(unittest.TestCase):
 
     def build(self):
         self.save_config()
-        config, checksum = index.load_manifest(self.manifest)
+        config, checksum = index.load_manifest(self.manifest, self.root)
         with index.publication_lock(self.db):
             return index.build(self.root, self.manifest, self.db, config, checksum)
 
@@ -325,7 +325,7 @@ class WorkspaceCase(unittest.TestCase):
             "evidence": [{"kind": "agent_statement", "pointer": None,
                           "quote": "No semantic review performed by this test."}],
             "uncertainties": ["Source version is not attested by this event."],
-            "handling": [policy.SETTINGS["handling"]],
+            "handling": [policy.for_root(self.root)[0]["handling"]],
             "provenance": {"origin": "agent_review", "record": None,
                            "mapping_version": None, "unmapped_fields": []},
             "relationships": [], "supersedes": [], "correction_reason": None,
@@ -339,13 +339,13 @@ class WorkspaceTests(WorkspaceCase):
         self.assertEqual(events.initialize(self.root)["events"], 0)
         self.assertEqual(self.build()["documents"], 0)
         with closing(index.readonly(self.db)) as db:
-            self.assertEqual(index.search(db, "documentation", 5, None)["hits"], [])
+            self.assertEqual(index.search(db, "documentation", 5, None, root=self.root)["hits"], [])
         self.assertEqual(event_reader.read_snapshot(self.root).query()["records"], [])
 
     def test_exact_packets_and_compaction(self):
         self.docs()
         with closing(index.readonly(self.db)) as db:
-            packet = index.packet(db, self.config, "documents/README.md#interfaces", 60000)
+            packet = index.packet(db, self.config, "documents/README.md#interfaces", 60000, root=self.root)
             self.assertIn("documents/AGENTS.md", {p["path"] for p in packet["pieces"]})
             for piece in packet["pieces"]:
                 raw = (self.root / piece["path"]).read_bytes()
@@ -355,12 +355,12 @@ class WorkspaceTests(WorkspaceCase):
             compact = index.compact_packet(packet)
             self.assertEqual([p["text"] for p in compact["pieces"]], [p["text"] for p in packet["pieces"]])
             many = index.packet_many(db, self.config,
-                                     ["documents/README.md#interfaces", "documents/AGENTS.md"], 60000)
+                                     ["documents/README.md#interfaces", "documents/AGENTS.md"], 60000, root=self.root)
             self.assertEqual(len(many["requests"]), 2)
             with self.assertRaises(index.IndexError_):
-                index.packet(db, self.config, "documents/README.md", 1)
+                index.packet(db, self.config, "documents/README.md", 1, root=self.root)
             with self.assertRaises(index.IndexError_):
-                index.packet_many(db, self.config, [], 60000)
+                index.packet_many(db, self.config, [], 60000, root=self.root)
 
     def test_missing_context_refuses_build(self):
         self.docs()
@@ -373,7 +373,7 @@ class WorkspaceTests(WorkspaceCase):
     def test_refusing_publication_guard_preserves_prior_index(self):
         self.docs()
         before = self.db.read_bytes()
-        config, checksum = index.load_manifest(self.manifest)
+        config, checksum = index.load_manifest(self.manifest, self.root)
         def refuse():
             raise index.IndexError_("Caller refused publication")
         with index.publication_lock(self.db), self.assertRaises(index.IndexError_):
@@ -385,7 +385,7 @@ class WorkspaceTests(WorkspaceCase):
     def test_stale_content_detected(self):
         self.docs()
         (self.root / "documents/AGENTS.md").write_bytes((ROOT / "README.md").read_bytes())
-        config, digest = index.load_manifest(self.manifest)
+        config, digest = index.load_manifest(self.manifest, self.root)
         with closing(index.readonly(self.db)) as db:
             self.assertTrue(index.freshness(db, self.root, self.manifest, self.db, config, digest))
 
@@ -523,10 +523,10 @@ class WorkspaceTests(WorkspaceCase):
                b"four=\r\n characters.</p></body></html>\r\n")
         prepared = self.selected_text(raw, "sources/page.doc", "mhtml")
         with closing(index.readonly(self.db)) as db:
-            found = index.search(db, "exactly four characters", 10, None)
+            found = index.search(db, "exactly four characters", 10, None, root=self.root)
             self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
-            self.assertEqual(index.search(db, "class", 10, None)["hits"], [])
-            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            self.assertEqual(index.search(db, "class", 10, None, root=self.root)["hits"], [])
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000, root=self.root)
             self.assertEqual(packet["renditions"][prepared["rendition"]]["method"]["name"],
                              "mhtml-html-text")
 
@@ -551,13 +551,13 @@ class WorkspaceTests(WorkspaceCase):
                 "json_pointer": "/payload/lines/0", "original_line": 1,
                 "byte_start": 0, "byte_end": 7, "terminator": "crlf",
             })
-            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000)
+            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000, root=self.root)
             piece = next(piece for piece in packet["pieces"] if piece["locator"].endswith("#line-2"))
             self.assertIn('"text": "β\\n"', piece["text"])
             metadata = packet["renditions"][prepared["rendition"]]
             self.assertEqual(metadata["format"], "text")
             self.assertEqual(metadata["bom_bytes"], 0)
-            found = index.search(db, "β", 10, None)
+            found = index.search(db, "β", 10, None, root=self.root)
             self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
             self.assertIsInstance(found["hits"][0]["line_start"], int)
             self.assertGreaterEqual(found["hits"][0]["line_end"], found["hits"][0]["line_start"])
@@ -569,7 +569,7 @@ class WorkspaceTests(WorkspaceCase):
         prepared = self.selected_text(content.encode("utf-8"))
         locator = prepared["rendition"] + "#line-1"
         with closing(index.readonly(self.db)) as db:
-            packet = index.packet(db, self.config, locator, 60000)
+            packet = index.packet(db, self.config, locator, 60000, root=self.root)
         piece = next(piece for piece in packet["pieces"] if piece["locator"] == locator)
         physical = (self.root / prepared["rendition"]).read_text().splitlines(keepends=True)
         # splitlines() is intentionally unsuitable here; derive physical JSON
@@ -659,10 +659,10 @@ class WorkspaceTests(WorkspaceCase):
                      "sha256": "b" * 64, "receipt_id": f"D{n + 1}", "format": "text",
                      "context": ["documents/context.md"]} for n in range(count)]
         self.assertGreater(index.renditions.MAX_SELECTIONS, 10)
-        index.renditions.validate({"renditions": selections(11)}, api)
+        index.renditions.validate({"renditions": selections(11)}, api, root=self.root)
         with self.assertRaises(index.IndexError_):
             index.renditions.validate(
-                {"renditions": selections(index.renditions.MAX_SELECTIONS + 1)}, api)
+                {"renditions": selections(index.renditions.MAX_SELECTIONS + 1)}, api, root=self.root)
 
     def test_strict_docling_qualification_accepts_only_active_exact_file_review(self):
         api = index.rendition_api()
@@ -786,7 +786,7 @@ class WorkspaceTests(WorkspaceCase):
         with closing(index.readonly(self.db)) as db:
             rows = db.execute("SELECT locator,payload FROM rendition_locations ORDER BY locator").fetchall()
             self.assertEqual([row[0] for row in rows], [path + "#table-1", path + "#text-1"])
-            text_packet = index.packet(db, self.config, path + "#text-1", 60000)
+            text_packet = index.packet(db, self.config, path + "#text-1", 60000, root=self.root)
             text_piece = next(piece for piece in text_packet["pieces"]
                               if piece["locator"] == path + "#text-1")
             self.assertEqual(json.loads(text_piece["text"]), value["conversion"]["document"]["texts"][0])
@@ -796,7 +796,7 @@ class WorkspaceTests(WorkspaceCase):
             text_location = text_piece["source_location"]
             self.assertEqual(text_piece["text"].encode(),
                              rendition_raw[text_location["byte_start"]:text_location["byte_end"]])
-            table_packet = index.packet(db, self.config, path + "#table-1", 60000)
+            table_packet = index.packet(db, self.config, path + "#table-1", 60000, root=self.root)
             table_piece = next(piece for piece in table_packet["pieces"]
                                if piece["locator"] == path + "#table-1")
             self.assertEqual(json.loads(table_piece["text"]), value["conversion"]["document"]["tables"][0])
@@ -807,7 +807,7 @@ class WorkspaceTests(WorkspaceCase):
             self.assertIsNone(table_piece["line_end"])
             self.assertEqual(location["page_no"], 1)
             self.assertEqual(location["json_pointer"], "/conversion/document/tables/0")
-            hit = index.search(db, "Reviewed phrase", 10, None)["hits"][0]
+            hit = index.search(db, "Reviewed phrase", 10, None, root=self.root)["hits"][0]
             self.assertEqual(hit["locator"], path + "#text-1")
             self.assertIsNone(hit["line_start"])
             self.assertIsNone(hit["line_end"])
@@ -824,7 +824,7 @@ class WorkspaceTests(WorkspaceCase):
             # A broad context rule attached to the table must not leak into a
             # packet for the distinct non-line-based text record.
             self.config["context_rules"] = {path + "#table-1": ["documents/README.md"]}
-            isolated = index.packet(db, self.config, path + "#text-1", 60000)
+            isolated = index.packet(db, self.config, path + "#text-1", 60000, root=self.root)
             self.assertNotIn("documents/README.md", {piece["path"] for piece in isolated["pieces"]})
             self.assertIn("null", text_packet["renditions"][path]["citation_contract"])
             self.assertIn("byte", text_packet["renditions"][path]["citation_contract"])
@@ -974,7 +974,7 @@ class WorkspaceTests(WorkspaceCase):
 
         self.docs()
         before = self.db.read_bytes()
-        config, manifest_hash = index.load_manifest(self.manifest)
+        config, manifest_hash = index.load_manifest(self.manifest, self.root)
         with patch.object(index.renditions, "inputs", side_effect=index.IndexError_(
                 "Configured Docling review event is missing or superseded")):
             with self.assertRaisesRegex(index.IndexError_, "missing or superseded"):
@@ -986,20 +986,20 @@ class WorkspaceTests(WorkspaceCase):
         base = {"path": "data/extractions/.local/D1/" + "a" * 64 + "/extraction.json",
                 "sha256": "b" * 64, "receipt_id": "D1", "format": "docling",
                 "context": ["documents/README.md"], "review_event_ids": ["rev-exact"]}
-        index.renditions.validate({"renditions": [base]}, api)
+        index.renditions.validate({"renditions": [base]}, api, root=self.root)
         for review_ids in ([], ["rev-exact", "rev-exact"], [1], [{}]):
             invalid = deepcopy(base)
             invalid["review_event_ids"] = review_ids
             with self.subTest(review_ids=review_ids), self.assertRaises(index.IndexError_):
-                index.renditions.validate({"renditions": [invalid]}, api)
+                index.renditions.validate({"renditions": [invalid]}, api, root=self.root)
         reviewed_text = deepcopy(base)
         reviewed_text["format"] = "text"
-        index.renditions.validate({"renditions": [reviewed_text]}, api)
+        index.renditions.validate({"renditions": [reviewed_text]}, api, root=self.root)
         for review_ids in ([], ["rev-exact", "rev-exact"], [1]):
             invalid = deepcopy(reviewed_text)
             invalid["review_event_ids"] = review_ids
             with self.subTest(text_review_ids=review_ids), self.assertRaises(index.IndexError_):
-                index.renditions.validate({"renditions": [invalid]}, api)
+                index.renditions.validate({"renditions": [invalid]}, api, root=self.root)
 
     def test_selected_empty_text_is_refused_without_replacing_index(self):
         self.docs()
@@ -1059,7 +1059,7 @@ class WorkspaceTests(WorkspaceCase):
         self.selected_odt()
         with closing(index.readonly(self.db)) as db:
             row = db.execute("SELECT locator FROM rendition_locations ORDER BY locator LIMIT 1").fetchone()
-            packet = index.packet(db, self.config, row[0], 60000)
+            packet = index.packet(db, self.config, row[0], 60000, root=self.root)
             self.assertIn("renditions", packet)
             self.assertIn("documents/AGENTS.md", {p["path"] for p in packet["pieces"]})
 
@@ -1098,7 +1098,7 @@ class WorkspaceTests(WorkspaceCase):
                 self.assertEqual(self.db.read_bytes(), preserved)
         self.build()
         with closing(index.readonly(self.db)) as db:
-            self.assertTrue(index.packet(db, self.config, locator, 60000)["pieces"])
+            self.assertTrue(index.packet(db, self.config, locator, 60000, root=self.root)["pieces"])
 
     def test_text_extraction_contract(self):
         raw = b"\xef\xbb\xbfalpha\r\n\r\n\xce\xb2\nlast\r"
@@ -1594,7 +1594,7 @@ class AbsenceClassificationTests(WorkspaceCase):
 
     def absence(self, query, path=None):
         with closing(index.readonly(self.db)) as db:
-            result = index.search(db, query, 5, path)
+            result = index.search(db, query, 5, path, root=self.root)
             self.assertEqual(result["hits"], [])
             return result["absence"]
 
@@ -1644,7 +1644,7 @@ class AbsenceClassificationTests(WorkspaceCase):
     def test_successful_search_carries_no_absence_report(self):
         self.corpus({"a.md": "# Alpha\n\nalphaonly material.\n"})
         with closing(index.readonly(self.db)) as db:
-            result = index.search(db, "alphaonly", 5, None)
+            result = index.search(db, "alphaonly", 5, None, root=self.root)
         self.assertTrue(result["hits"])
         self.assertNotIn("absence", result)
 

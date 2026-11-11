@@ -1,7 +1,8 @@
 # 0014 - Intake ledger writers hand off without re-validation and never wait unbounded
 
 **Audience:** maintainers and operators.
-**Status:** Accepted. Amends [0012](0012-bounded-validation-cost.md) and
+**Date:** November 10, 2026.
+**Status:** Implemented. Amends [0012](0012-bounded-validation-cost.md) and
 [0013](0013-concurrent-intake-writers.md).
 
 ## Context
@@ -30,8 +31,9 @@ and a repair job running together collapsed: the ingest blocked in `flock` for
   or fails leaves the file truncated, and any commit not followed by a fresh
   attestation changes the identity, so those cases validate in full. Validation
   cost per hand-off no longer depends on ledger size. Tamper detection is the
-  same as before for every change that moves the identity; like 0012's
-  per-process shortcut, the attestation does not defend against an actor who
+  same as before for every change that moves the identity; like the earlier
+  per-process shortcut (added after 0012 without a decision record of its own), the
+  attestation does not defend against an actor who
   rewrites the file and restores size, timestamps and change counter.
 - **Bounded waits.** The writer lock is polled non-blocking with jitter for at
   most `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values
@@ -45,6 +47,20 @@ and a repair job running together collapsed: the ingest blocked in `flock` for
   verifies digests and shapes after it ends (`store.snapshot` then
   `store.verify`, the same rules as `store.validate`), so it cannot hold a read
   lock across O(ledger) CPU work.
+
+## Amendment: read-only refusals still hand off (Kata 2rye)
+
+Cohort ingest probes for requests that do not exist yet; `store.inspect` then raises
+`unknown_request` inside the locked block. That raise skipped the clean-unlock
+attestation, so the next writer replayed the whole ledger: on a synthetic ledger of
+36,000 requests, 61 full validations per 30 files (about 92% of ingest wall time,
+2.25 s per file against 0.14 s on an empty ledger). A block that raises now also
+hands off, but only when the file identity (device, inode, size, mtime, ctime,
+change counter) equals the identity the writer validated on entry, so nothing
+was written. A failure after a partial write, a foreign commit during the lock or a
+crash still leaves no attestation and the next writer validates in full. Measured
+with `tools/diagnostics/ledger_scale_benchmark.py`: 81 full validations fell to 1
+for 40 files, and CPU for the same ingest fell from about 170 s to 79 s.
 
 ## Consequences
 

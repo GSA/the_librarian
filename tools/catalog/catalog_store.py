@@ -204,13 +204,49 @@ def _await_journal(path):
         time.sleep(0.02)
 
 
+def _journal_state(path):
+    """Classify the rollback journal as none, live (a writer holds the lock) or abandoned.
+
+    Holding the lock shared while looking keeps a writer from starting between
+    the writer check and the journal check, and a finishing writer deletes its
+    journal before releasing the lock, so neither is mistaken for abandoned.
+    """
+    import fcntl
+    journal = safe_path(str(path) + "-journal")
+    home = path.parent
+    if str(safe_path(home)) in getattr(_held, "homes", ()):
+        return "abandoned" if journal.exists() else "none"
+    try:
+        descriptor = os.open(safe_path(home / "writer.lock"), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "abandoned" if journal.exists() else "none"
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "live" if journal.exists() else "none"
+        return "abandoned" if journal.exists() else "none"
+    finally:
+        os.close(descriptor)
+
+
 def connect(path, write=False):
     path = private_file(path)
     if not write:
         _await_journal(path)
-    for suffix in ("-journal", "-wal", "-shm"):
-        sidecar = safe_path(str(path) + suffix)
-        require(not sidecar.exists(), "SQLite sidecar present; explicit recovery required")
+    deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+    while True:
+        for suffix in ("-wal", "-shm"):
+            require(not safe_path(str(path) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+        state = _journal_state(path)
+        if state == "none":
+            break
+        # A writer can journal between _await_journal and here: a live writer's
+        # journal is waited out; only one with no writer is abandoned.
+        require(state == "live" and not write, "SQLite sidecar present; explicit recovery required")
+        if time.monotonic() >= deadline:
+            raise WriterBusy("Another catalog writer is active; retry later")
+        time.sleep(0.02)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
                                  uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
     try:
@@ -365,12 +401,18 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def _daily_snapshot(root, connection, backups, state):
-    """Verified snapshot before the write, only when the UTC day has none; then bounded retention."""
+def _daily_snapshot(root, connection, backups, state, inspected=False):
+    """Verified snapshot before the write, only when the UTC day has none; then bounded retention.
+
+    The snapshot is the serialized image of the transaction that is fully inspected here (or was
+    just inspected by the caller, ``inspected``), so the history is replayed once for the day; the
+    published bytes are then bound to that image by hash instead of being replayed again.
+    """
     return snapshots.daily_snapshot(
         backups, store_id=state["store_id"],
-        take=lambda: _snapshot_in_transaction(connection, backups, "daily"),
-        verify=verify_backup, errors=(CatalogError,), days=policy.backup_retention_days(root))
+        take=lambda: _snapshot_in_transaction(connection, backups, "daily", image=True, inspected=inspected),
+        verify=verify_backup, verify_fresh=lambda path: verify_backup(path, replay=False),
+        errors=(CatalogError,), days=policy.backup_retention_days(root))
 
 
 def backup_inventory(root):
@@ -400,20 +442,43 @@ def _snapshot(connection, backups, reason):
             connection.execute("ROLLBACK")
 
 
-def _snapshot_in_transaction(connection, backups, reason):
-    state = inspect(connection)[0]
+def _partial_hash(path):
+    return file_hash(path)
+
+
+def _snapshot_in_transaction(connection, backups, reason, image=False, inspected=False):
+    """Publish a snapshot of the open transaction.
+
+    By default the SQLite backup API copies the database and the copy is fully inspected. With
+    ``image`` the open transaction (inspected here, unless ``inspected``) is written as its
+    serialized image and the written bytes must hash to that image; the copy is not replayed again.
+    """
+    state = inspect(connection)[0] if not (image and inspected) else _head_state(connection)
     private_directory(backups)
     name = f"{state['store_id']}-r{state['revision']:08d}-{reason}-{uuid.uuid4().hex}"
     partial, final, receipt = (backups / (name + suffix) for suffix in (".partial", ".sqlite3", ".json"))
     reserve(partial)
     try:
-        with closing(sqlite3.connect(partial)) as target:
-            connection.backup(target)
-        with closing(connect(partial)) as target:
-            require(inspect(target)[0] == state, "Backup state mismatch")
-        seal(partial)
+        if image:
+            data = connection.serialize()
+            expected = hashlib.sha256(data).hexdigest()
+            descriptor = os.open(safe_path(partial), os.O_WRONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            del data
+            written = _partial_hash(partial)
+            require(written == expected and partial.stat().st_size > 0, "Backup bytes mismatch")
+        else:
+            with closing(sqlite3.connect(partial)) as target:
+                connection.backup(target)
+            with closing(connect(partial)) as target:
+                require(inspect(target)[0] == state, "Backup state mismatch")
+            seal(partial)
+            written = _partial_hash(partial)
         record = {"backup_version": VERSION, "created_at": snapshots.utcnow().isoformat(), "reason": reason, "database": final.name,
-                  "sha256": file_hash(partial), "bytes": partial.stat().st_size, "state": state}
+                  "sha256": written, "bytes": partial.stat().st_size, "state": state}
         os.link(partial, final, follow_symlinks=False)
         partial.unlink()
         fsync_directory(backups)
@@ -468,7 +533,7 @@ def _binding(connection):
     """What a validation covers: the database file, the validator bytes and the runtime.
 
     The file is bound by its identity (device, inode, size, mtime, ctime, SQLite change counter,
-    decision 0016) when it is a plain rollback-journal file; otherwise by the SHA-256 of its exact
+    decision 0017) when it is a plain rollback-journal file; otherwise by the SHA-256 of its exact
     bytes. Either way it is taken once this connection holds the read snapshot, so no commit can
     land between the check and the validation it vouches for.
     """
@@ -524,9 +589,9 @@ def _write_receipt(home, binding, state, validated_on=None):
 def _trusted_state(connection, home, binding):
     """``(state, validated_on)`` a receipt vouches for when it covers exactly this file, else None.
 
-    An identity-bound receipt (0016) is trusted only on the UTC day of its last full validation,
+    An identity-bound receipt (0017) is trusted only on the UTC day of its last full validation,
     so a change the identity cannot see is found by the first full check of the next day. A
-    receipt from before 0016 carries no date and is a miss, never a refusal.
+    receipt from before 0017 carries no date and is a miss, never a refusal.
     """
     cache_home = safe_path(home / ".local")
     receipt = safe_path(cache_home / "read-validation.json")
@@ -633,7 +698,7 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             validate_graph(resulting)
         else:
             validate_delta(incoming, get=old.get, referrers=old.referrers, claimants=old.claimants)
-        taken, retention = _daily_snapshot(root, connection, backups, state)
+        taken, retention = _daily_snapshot(root, connection, backups, state, trusted is None)
         connection.execute("COMMIT")
         committed_flag = False
         revision = state["revision"] + 1
@@ -1014,7 +1079,13 @@ def receipt_metadata(root, receipt_ids):
         return {"state": state, "registrations": selected}
 
 
-def verify_backup(path):
+def verify_backup(path, replay=True):
+    """Verify a snapshot against its receipt and fully inspect it.
+
+    ``replay=False`` skips only the inspection, for the snapshot the daily path has just written
+    from a fully inspected image and bound by hash; restore, ``verify-backup``, retention of older
+    snapshots and every other caller keep the default.
+    """
     path = private_file(path)
     require(path.suffix == ".sqlite3", "Snapshot must be a .sqlite3 file")
     receipt = private_file(path.with_suffix(".json"))
@@ -1029,12 +1100,13 @@ def verify_backup(path):
     require(type(record["bytes"]) is int and record["bytes"] >= 0, "Invalid snapshot size")
     require(path.stat().st_size == record["bytes"] and file_hash(path) == record["sha256"],
             "Snapshot bytes differ from receipt")
-    with closing(connect(path)) as connection:
-        connection.execute("BEGIN")
-        state = inspect(connection)[0]
-    require(state == record["state"], "Snapshot state differs from receipt")
-    require(file_hash(path) == record["sha256"], "Snapshot changed while verifying")
-    return state
+    if replay:
+        with closing(connect(path)) as connection:
+            connection.execute("BEGIN")
+            state = inspect(connection)[0]
+        require(state == record["state"], "Snapshot state differs from receipt")
+        require(file_hash(path) == record["sha256"], "Snapshot changed while verifying")
+    return record["state"]
 
 
 def restore(root, snapshot, expected_state=None):

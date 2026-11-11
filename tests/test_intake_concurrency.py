@@ -5,10 +5,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
+from tests.support import default_policy_hash
 from tools.catalog import catalog_store as catalog
 from tools.intake import adapters, cohort, runner, store, upload
 
@@ -105,6 +107,49 @@ class CatalogRebaseTests(Case):
         self.assertEqual(holder.stdout.readline().strip(), "held")
         self.assertIn("state_token", catalog.status(self.root))
 
+    def inject_writer_after_wait(self, hold_seconds):
+        """A writer takes the lock and journals after the reader's wait, before its check."""
+        import fcntl
+        home, db, _ = catalog.locations(self.root)
+        journal = Path(str(db) + "-journal")
+        real = catalog._await_journal
+
+        def late_writer(path):
+            real(path)
+            descriptor = os.open(home / "writer.lock", os.O_RDWR)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            journal.write_bytes(b"")
+            journal.chmod(0o600)
+
+            def finish():
+                journal.unlink()
+                os.close(descriptor)
+            threading.Timer(hold_seconds, finish).start()
+        return patch.object(catalog, "_await_journal", late_writer), journal
+
+    def test_reader_waits_for_a_writer_that_journals_after_the_wait(self):
+        injected, journal = self.inject_writer_after_wait(0.3)
+        with injected:
+            self.assertIn("state_token", catalog.status(self.root))
+        self.assertFalse(journal.exists())
+
+    def test_reader_gives_up_on_a_stuck_live_writer_as_busy_not_abandoned(self):
+        injected, journal = self.inject_writer_after_wait(0.6)
+        with injected, patch.object(catalog, "BUSY_TIMEOUT_SECONDS", 0.2):
+            with self.assertRaises(catalog.WriterBusy):
+                catalog.status(self.root)
+        time.sleep(0.8)
+
+    def test_reader_still_refuses_wal_and_shm_sidecars(self):
+        _, db, _ = catalog.locations(self.root)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(db) + suffix)
+            sidecar.write_bytes(b"")
+            sidecar.chmod(0o600)
+            with self.assertRaises(catalog.CatalogError):
+                catalog.status(self.root)
+            sidecar.unlink()
+
 
 class AgentTests(Case):
     def test_two_agent_processes_commit_every_receipt_once(self):
@@ -169,7 +214,7 @@ class SettleTests(Case):
         records = [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}]
         store.stage(self.root, json.dumps({
             "version": 1, "correlation_id": "req-backoff", "correction_of": None,
-            "policy": {"version": 1, "sha256": policy.load()[1]},
+            "policy": {"version": 1, "sha256": default_policy_hash()},
             "retry": {"max_attempts": 3, "backoff_seconds": 1},
             "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit", "arguments": {
                 "records": records, "actor": "a", "request_id": "backoff", "reason": "r",

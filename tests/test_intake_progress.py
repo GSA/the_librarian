@@ -10,6 +10,7 @@ from unittest.mock import patch
 import urllib.error
 import urllib.request
 
+from tests.support import default_policy_hash
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.intake import adapters, cli, progress, runner, store, upload
@@ -39,7 +40,7 @@ def request(correlation, stages):
                 args[key] = "dir/" + SECRET
         full.append({"id": name, "kind": kind, "operation": operation, "arguments": args})
     return json.dumps({"version": 1, "correlation_id": correlation, "correction_of": None,
-                       "policy": {"version": 1, "sha256": policy.load()[1]},
+                       "policy": {"version": 1, "sha256": default_policy_hash()},
                        "retry": {"max_attempts": 2, "backoff_seconds": 0},
                        "stages": full}).encode()
 
@@ -211,7 +212,7 @@ class CatalogAndIndexTests(ProgressCase):
         from tools.context_index import cli as index_cli
         manifest = self.root / "config/selection.json"
         manifest.parent.mkdir()
-        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.SETTINGS["audience"],
+        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.for_root(self.root)[0]["audience"],
                                         "documents": [], "context_rules": {}, "renditions": []}))
         with patch("sys.stdout"):
             self.assertEqual(index_cli.main(["--root", str(self.root), "build"]), 0)
