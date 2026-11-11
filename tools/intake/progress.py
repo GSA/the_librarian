@@ -70,22 +70,28 @@ def read_ledger(root, timeout):
     with closing(connection) as c:
         c.row_factory = sqlite3.Row
         try:
+            # The read transaction only copies rows: SQLite's own checks and one pass per
+            # table. Digest and shape verification runs after it ends, so a large ledger
+            # cannot hold a read lock long enough to starve a writer's commit.
             c.execute("BEGIN")
-            store.validate(c, root)
-            requests = [(row["correlation_id"], row["correction_of"], decode_request(row["raw"]))
-                        for row in c.execute("SELECT correlation_id,correction_of,raw FROM requests")]
-            stages = {}
-            for row in c.execute("SELECT correlation_id,stage_id,ordinal,status,cycle FROM stages"):
-                stages.setdefault(row["correlation_id"], {})[row["ordinal"]] = dict(row)
-            attempts = {}
-            for row in c.execute("SELECT correlation_id,stage_id,cycle,ordinal,started,ended,outcome,"
-                                 "category,code,eligible_at FROM attempts ORDER BY cycle,ordinal"):
-                attempts.setdefault((row["correlation_id"], row["stage_id"]), []).append(dict(row))
+            store.check_identity(c)
+            rows = store.snapshot(c)
             c.execute("COMMIT")
         except sqlite3.OperationalError as error:
             raise IntakeError("ledger_unavailable") from error
         except sqlite3.DatabaseError as error:
             raise IntakeError("corrupt_store") from error
+        store.verify(rows, root)
+        requests = [(row["correlation_id"], row["correction_of"], decode_request(row["raw"]))
+                    for row in rows[0]]
+        stages = {}
+        for correlation_id, saved in rows[1].items():
+            for row in saved:
+                stages.setdefault(correlation_id, {})[row["ordinal"]] = {
+                    key: row[key] for key in ("correlation_id", "stage_id", "ordinal", "status", "cycle")}
+        attempts = {key: [{name: row[name] for name in (
+            "correlation_id", "stage_id", "cycle", "ordinal", "started", "ended", "outcome",
+            "category", "code", "eligible_at")} for row in saved] for key, saved in rows[2].items()}
     return requests, stages, attempts
 
 

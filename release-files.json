@@ -27,6 +27,7 @@
   "tests/test_intake_upload.py",
   "tests/test_intake_cohort.py",
   "tests/test_intake_concurrency.py",
+  "tests/test_intake_ledger_scaling.py",
   "tests/test_mhtml.py",
   "tests/test_model_review.py",
   "tests/test_intake_progress.py",
@@ -99,5 +100,6 @@
   "docs/decisions/0011-full-text-mcp-audit-log.md",
   "docs/decisions/0012-bounded-validation-cost.md",
   "docs/decisions/0013-concurrent-intake-writers.md",
+  "docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md",
   "tests/test_validation_cost.py"
 ]

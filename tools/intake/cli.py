@@ -138,7 +138,8 @@ def main(argv=None):
         return 0
     except (IntakeError, OSError, adapters.StageFailure) as error:
         code = error.code if isinstance(error, (IntakeError, adapters.StageFailure)) else "os-error"
-        print(json.dumps({"error": code}))
+        print(json.dumps({"error": code, "retryable": True} if getattr(error, "retryable", False)
+                         else {"error": code}))
         return 1
 
 

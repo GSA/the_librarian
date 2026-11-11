@@ -27,7 +27,7 @@ from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
 from . import cli, model_review, runner, standing, store, upload
 from . import contracts
-from .contracts import IntakeError
+from .contracts import IntakeError, LedgerBusy
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
 RUNTIME_FORMATS = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
@@ -232,6 +232,22 @@ def _process(root, inbox, entry, system, actor):
     return _extract(root, entry, actor)
 
 
+def _settled(root, inbox, entry, system, actor):
+    """Process one entry, retrying a busy ledger within the entry's attempt budget.
+
+    Every step is idempotent by request identity, so repeating the entry is safe. An
+    entry that is still busy after the budget fails visibly as retryable ``ledger_busy``
+    and the run continues; the next run resumes it.
+    """
+    for attempt in range(runner.BUSY_RETRIES):
+        try:
+            return _process(root, inbox, entry, system, actor)
+        except LedgerBusy:
+            entry["conflicts"] = entry.get("conflicts", 0) + 1
+    return {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
+            "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
+
+
 def ingest(root, inbox, *, system, actor, limit=None):
     """Classify the inbox, then submit and extract admitted files; return the report."""
     entries = classify(root, inbox)
@@ -242,7 +258,7 @@ def ingest(root, inbox, *, system, actor, limit=None):
             entry["outcome"] = "not-processed"
             outcome["not-processed"] += 1
             continue
-        entry.update(_process(root, inbox, entry, system, actor))
+        entry.update(_settled(root, inbox, entry, system, actor))
         outcome["received"] += bool(entry.get("received"))
         outcome[entry["outcome"]] += 1
     retried = [e for e in admitted if e.get("conflicts")]

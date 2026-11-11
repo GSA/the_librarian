@@ -72,10 +72,26 @@ named stage. The ledger is operational recovery state, never corpus authority.
 - Undecodable or invalid native inputs block durably with a recorded attempt
   outcome instead of surfacing a traceback, and ledger write failures after
   validation report an unavailable ledger rather than claiming corruption.
-- Each process fully validates the ledger (SQLite integrity, digests, stage and
-  attempt shape) on its first lock, then skips that O(ledger) pass while the
-  file's identity and SQLite change counter still match what it left on its last
-  clean unlock; any other writer, journal or failed lock forces full validation.
+- A writer fully validates the ledger (SQLite integrity, digests, stage and
+  attempt shape) unless the previous clean writer attested the file
+  ([0014](../docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md)).
+  On clean unlock a writer records the file identity and SQLite change counter
+  in `writer.lock` (any process, not just the same one); the next writer consumes
+  and truncates it under the lock, and skips the O(ledger) pass only when the file
+  still matches. A foreign commit, journal, replaced file, crash or failed unlock
+  leaves no matching attestation and forces full validation, so alternating
+  writers do not repeat it per hand-off. The attestation is a hint that a
+  validated writer finished last, not proof against someone who edits the file
+  and forges the counter.
+- The ledger writer lock wait is bounded (default 30s, set
+  `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` or pass `wait`; the same value is the SQLite
+  busy timeout). Exceeding it, or a transient SQLite BUSY/LOCKED during a stage,
+  raises retryable `ledger_busy` (CLI: `{"error":"ledger_busy","retryable":true}`),
+  never `ledger_unavailable` or a hang. `runner.settle` and `cohort ingest` retry it
+  up to three times; an entry still busy fails visibly as `ledger/ledger_busy` and
+  the run continues, so the next run resumes it. A stage whose run reports busy
+  while recording a failure is a retryable attempt, not blocked. `ledger_unavailable`
+  remains for non-transient SQLite failures after validation.
 - Retryable failures record eligibility time; nothing sleeps or schedules itself.
   `replay` explicitly resets a blocked/dead-letter stage's bounded cycle while
   retaining exact request, intent and all attempt/replay history. Other requests
@@ -140,8 +156,11 @@ reported as that source being unavailable with its error class, never a crash.
 .venv/bin/python -m tools.intake.cli --root . progress-serve [--port 8765] [--refresh 5]
 ```
 
-- The ledger is opened `mode=ro` without the writer lock and fully validated in
-  one read transaction; the catalog and review events use their validated
+- The ledger is opened `mode=ro` without the writer lock. The read transaction
+  only runs SQLite's integrity checks and copies rows; digest and shape
+  verification runs after it ends, so a large ledger cannot starve a writer's
+  commit. Both paths verify the same rules. The page still reports
+  `ledger_unavailable` if a writer holds the database past its read timeout. The catalog and review events use their validated
   read paths, and the index reports freshness, stale reasons, indexed
   documents/sections and selected documents/renditions.
 - Each request maps to one funnel state from its ordered stage statuses and
