@@ -422,6 +422,67 @@ class WorkerTests(unittest.TestCase):
                     self.assertEqual(observed["error"]["code"], "timeout")
                 self.assertEqual(result.stat().st_mode & 0o777, 0o600)
 
+    def test_worker_preserves_tighter_inherited_soft_limits(self):
+        """Review 24: a coordinator's lower soft cap must not be raised to the worker ceiling."""
+        job = self.home / "job.json"
+        job.write_bytes(b"{}")
+        job.chmod(0o600)
+        result = self.home / "inherited.json"
+        gib, mib = 1024**3, 1024**2
+        script = (
+            f"import sys,resource;sys.path.insert(0,{str(HERE)!r});"
+            f"resource.setrlimit(resource.RLIMIT_AS,(4*{gib},resource.RLIM_INFINITY));"
+            f"resource.setrlimit(resource.RLIMIT_FSIZE,(8*{mib},resource.RLIM_INFINITY));"
+            "import docling_worker as w;"
+            "w.execute_job=lambda _: {'address_space':resource.getrlimit(resource.RLIMIT_AS),"
+            "'file_bytes':resource.getrlimit(resource.RLIMIT_FSIZE)};"
+            "raise SystemExit(w.main(sys.argv[1:]))")
+        process = subprocess.run([sys.executable, "-c", script, str(job), str(result)],
+                                 capture_output=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        payload = json.loads(result.read_bytes())["payload"]
+        self.assertEqual(payload["address_space"][0], 4 * gib)
+        self.assertEqual(payload["file_bytes"][0], 8 * mib)
+        self.assertLessEqual(payload["address_space"][1], 16 * gib)
+        self.assertLessEqual(payload["file_bytes"][1], 64 * mib)
+
+    def test_failed_result_publication_leaves_no_artifact_and_can_retry(self):
+        """Review 60: a write/fsync failure must unlink the created result so RESULT can be reused."""
+        job = self.home / "job.json"
+        job.write_bytes(b"{}")
+        job.chmod(0o600)
+        for point in ("fsync", "write"):
+            with self.subTest(point=point):
+                result = self.home / (point + "-failure.json")
+                script = (
+                    f"import sys,os;sys.path.insert(0,{str(HERE)!r});"
+                    "import docling_worker as w;"
+                    "import errno\n"
+                    "w.execute_job=lambda _: {'complete':True}\n"
+                    "real_fsync=os.fsync\n"
+                    "def failing(fd):\n"
+                    " raise OSError(errno.EIO,'injected')\n"
+                    f"if {point!r}=='fsync': w.os.fsync=failing\n"
+                    "else:\n"
+                    " real_fdopen=os.fdopen\n"
+                    " class Broken:\n"
+                    "  def __init__(self,s): self.s=s\n"
+                    "  def __enter__(self): return self\n"
+                    "  def __exit__(self,*a): self.s.close()\n"
+                    "  def write(self,raw): self.s.write(raw[:3]); raise OSError(errno.ENOSPC,'full')\n"
+                    "  def __getattr__(self,n): return getattr(self.s,n)\n"
+                    " w.os.fdopen=lambda fd,mode: Broken(real_fdopen(fd,mode))\n"
+                    "raise SystemExit(w.main(sys.argv[1:]))\n")
+                process = subprocess.run([sys.executable, "-c", script, str(job), str(result)],
+                                         capture_output=True, timeout=10)
+                self.assertEqual(process.returncode, 2, process.stderr)
+                self.assertNotIn(b"Traceback", process.stderr)
+                self.assertFalse(result.exists())
+                retry = subprocess.run([sys.executable, str(HERE / "docling_worker.py"),
+                                        str(job), str(result)], capture_output=True, timeout=20)
+                self.assertEqual(retry.returncode, 1, retry.stderr)
+                self.assertTrue(result.exists())
+
     def test_worker_cli_enforces_process_and_output_budgets(self):
         job = self.home / "job.json"
         job.write_bytes(b"{}")
