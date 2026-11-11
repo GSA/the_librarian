@@ -1,7 +1,8 @@
 # 0015 - Catalog writers validate only their delta on a trusted head
 
 **Audience:** maintainers and operators.
-**Status:** Accepted. Amends [0012](0012-bounded-validation-cost.md) and
+**Date:** November 11, 2026.
+**Status:** Implemented. Amends [0012](0012-bounded-validation-cost.md) and
 [0013](0013-concurrent-intake-writers.md).
 
 ## Context
@@ -76,9 +77,10 @@ restore, the schema, and the decision not to add a single-writer queue.
   so a parallel intake front end can scale further.
 - Remaining cost grows linearly through hashing the database file (about 80 ms for
   73 MB, done at entry, at the re-check and at attestation).
-- **Residual risk.** The receipt is unkeyed, like the reader receipt in 0012 and the
-  ledger hand-off in 0014. An actor who rewrites the database and the receipt so that
-  they agree can get one write accepted without a replay. The next daily snapshot,
+- **Residual risk.** The receipt is unkeyed, like the reader receipt in
+  `catalog_store.validated_state` (which predates these records and has none of its
+  own) and the ledger hand-off in 0014. An actor who rewrites the database and the
+  receipt so that they agree can get one write accepted without a replay. The next daily snapshot,
   `status --audit` and backup verification still replay all history and refuse. This
   is not a defense against that actor.
 - The writer now writes the reader receipt; both need a private `.local/` directory

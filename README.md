@@ -234,7 +234,7 @@ toolkit). It contains corpus text and agent queries, so treat it at the
 instance's audience. If a record cannot be written the call fails instead of
 returning unrecorded text. `.venv/bin/librarian-audit --root "$PWD"
 report` summarizes it without bodies. See
-[decision 0012](docs/decisions/0011-full-text-mcp-audit-log.md).
+[decision 0011](docs/decisions/0011-full-text-mcp-audit-log.md).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
 the cited text. A search with no hits returns an `absence` reason: the indexed

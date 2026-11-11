@@ -1,7 +1,11 @@
 # 0012 - Bounded validation cost after daily snapshots
 
 **Audience:** maintainers and operators.
-**Status:** Accepted. Follows [0010](0010-daily-snapshots-and-retention.md).
+**Date:** November 2, 2026.
+**Status:** Implemented. Follows [0010](0010-daily-snapshots-and-retention.md).
+Amended by [0014](0014-intake-ledger-handoff-and-bounded-waits.md) (ledger) and
+[0015](0015-trusted-head-catalog-commit.md) (catalog); the *Result and remaining
+cost* section describes the state before them.
 
 ## Context
 

@@ -1,7 +1,11 @@
 # 0013 - Concurrent intake writers retry and rebase instead of blocking
 
 **Audience:** maintainers and operators.
-**Status:** Accepted.
+**Date:** November 9, 2026.
+**Status:** Implemented. Amended by
+[0014](0014-intake-ledger-handoff-and-bounded-waits.md) (bounded ledger waits) and
+[0015](0015-trusted-head-catalog-commit.md) (the catalog lock hold is no longer
+O(catalog)).
 
 ## Context
 

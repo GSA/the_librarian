@@ -49,10 +49,12 @@ migrates authority data implicitly and always rebuilds the derived index; one
 Librarian per project with its own data root; inbox-first source onboarding
 with read-only remote scopes; and an open evaluation that declines a graph
 database server in favor of a rebuildable derived projection if traversal is
-ever needed. These are design commitments and inventory, not implemented
-capability. The configuration work they depend on - per-instance store homes,
-policy that follows the data root, and index identity that does not bind an
-absolute host path - is not built.
+ever needed. These were design commitments and inventory when recorded. The
+configuration work they depend on - per-instance store homes, policy that follows the data root, and index identity that does not
+bind an absolute host path - was built afterwards and is now implemented (see
+[0003](docs/decisions/0003-store-compatibility.md) and
+[0004](docs/decisions/0004-instance-topology.md)); the pinned lock file, image and
+installer of [0002](docs/decisions/0002-updateable-distribution.md) are not.
 
 Decision 0006 is updated with a generic report that its first precondition -
 a recorded real question the existing reads, search and selection could not
@@ -254,8 +256,9 @@ Define pause, clean shutdown and explicit resume before enabling scheduling.
 
 **Status: Partly implemented.** Search absence classification and an opt-in
 body-free diagnostics log are implemented and tested; see
-[What is implemented](#what-is-implemented) below. Dead-weight and
-retrieval-quality diagnostics are still proposed and unimplemented. This
+[What is implemented](#what-is-implemented) below. The dead-weight requirement is
+withdrawn and no retrieval-quality figure is derived (see
+[decision 0007](docs/decisions/0007-execution-traces.md)). This
 supersedes an earlier, broader proposal to ingest agent execution traces as
 durable memory. That broader version is declined; the reasoning is recorded in
 [decision 0007](docs/decisions/0007-execution-traces.md).
