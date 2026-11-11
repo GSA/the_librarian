@@ -307,6 +307,38 @@ class WorkerTests(unittest.TestCase):
                 worker.convert(b"source", "source.pdf", "pdf", self.assets)
             inference.assert_not_called()
 
+    def test_asset_swap_restored_before_return_still_fails(self):
+        """Review 56: swapping an asset during inference and restoring it is detected.
+
+        Restoring bytes or names updates ctime/directory mtime, which the
+        before/after observation includes, so the original manifest is never
+        reported for a run that overlapped a substitution.
+        """
+        source_pages = [{"page_no": 1, "width": 100, "height": 100}]
+        path = self.assets / "weights.bin"
+        for mode in ("rewrite", "rename_swap"):
+            with self.subTest(mode=mode):
+                path.write_bytes(b"synthetic")
+
+                def inference(*args):
+                    if mode == "rewrite":
+                        path.write_bytes(b"substituted")
+                        path.write_bytes(b"synthetic")
+                    else:
+                        held = self.home / "held.bin"
+                        path.rename(held)
+                        path.write_bytes(b"substituted")
+                        path.unlink()
+                        held.rename(path)
+                    return self.payload()
+
+                with (patch.object(worker, "_inspect_source", return_value=source_pages),
+                      patch.object(worker, "_versions", return_value={}),
+                      patch.object(worker, "_validate_assets"),
+                      patch.object(worker, "_run_conversion", side_effect=inference)):
+                    with self.assertRaisesRegex(worker.WorkerError, "during inference"):
+                        worker.convert(b"source", "source.pdf", "pdf", self.assets)
+
     def test_inspection_and_conversion_have_distinct_exact_job_schemas(self):
         job = {"schema": "docling-worker-job-v1", "operation": "inspect",
                "artifacts_path": str(self.assets)}
