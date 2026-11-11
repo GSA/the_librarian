@@ -504,7 +504,7 @@ def migrate_storage(root, *, interrupt_after=None, interrupt_before_journal=None
     cat_db = instance_root / from_roots["catalog_home"] / "catalog.sqlite3"
     rev_db = instance_root / from_roots["review_events_home"] / "events.sqlite3"
     with closing(catalog.connect(cat_db)) as conn:
-        cat_state = catalog.inspect(conn)[0]
+        cat_state = catalog.inspect(conn, detail=False)[0]
     with closing(events.connect(rev_db)) as conn:
         rev_state = events.inspect(conn, instance_root)[0]
     if (cat_state["store_id"] != instance["catalog_store_id"]
@@ -605,7 +605,7 @@ def recover_migration(root):
     cat_db = instance_root / journal["from_roots"]["catalog_home"] / "catalog.sqlite3"
     rev_db = instance_root / journal["from_roots"]["review_events_home"] / "events.sqlite3"
     with closing(catalog.connect(cat_db)) as conn:
-        cat_state = catalog.inspect(conn)[0]
+        cat_state = catalog.inspect(conn, detail=False)[0]
     with closing(events.connect(rev_db)) as conn:
         rev_state = events.inspect(conn, instance_root)[0]
     if (cat_state["state_token"] != journal["catalog_state_token"]

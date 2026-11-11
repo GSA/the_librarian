@@ -52,9 +52,13 @@ def require(condition, message):
         raise CatalogError(message)
 
 
+# The same encoder json.dumps builds on every call with these arguments, built once.
+_ENCODER = json.JSONEncoder(ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 def canonical(value):
     try:
-        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return _ENCODER.encode(value)
     except (TypeError, ValueError, RecursionError) as error:
         raise CatalogError("Value is not canonical JSON") from error
 
@@ -67,9 +71,18 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _no_control(value):
+    """No character of the string is in Unicode category Cc or Cs."""
+    # In ASCII exactly the C0 controls and DEL are not printable, so the per-character category
+    # check is only needed for strings with other characters.
+    if value.isascii():
+        return value.isprintable()
+    return not any(unicodedata.category(c) in {"Cc", "Cs"} for c in value)
+
+
 def text(value, name, maximum=500):
     require(isinstance(value, str) and bool(value.strip()) and len(value) <= maximum
-            and not any(unicodedata.category(c) in {"Cc", "Cs"} for c in value),
+            and _no_control(value),
             f"{name} must be nonempty short text without control characters")
 
 
@@ -96,16 +109,19 @@ def choice(value, choices, name):
     require(isinstance(value, str) and value in choices, f"Invalid {name}")
 
 
+_ID_PATTERNS = {kind: re.compile(pattern) for kind, pattern in {
+    "receipt": r"D[0-9]+", "source": r"[SIO][0-9]+", "artifact": r"A-[A-Za-z0-9][A-Za-z0-9-]*",
+    "policy": r"corpus-policy", "relationship": r"R-[A-Za-z0-9][A-Za-z0-9-]*"}.items()}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
 def identifier(value, kind):
-    patterns = {"receipt": r"D[0-9]+", "source": r"[SIO][0-9]+",
-                "artifact": r"A-[A-Za-z0-9][A-Za-z0-9-]*", "policy": r"corpus-policy",
-                "relationship": r"R-[A-Za-z0-9][A-Za-z0-9-]*"}
     require(isinstance(value, str) and len(value) <= 200
-            and re.fullmatch(patterns[kind], value) is not None, f"Invalid {kind} ID")
+            and _ID_PATTERNS[kind].fullmatch(value) is not None, f"Invalid {kind} ID")
 
 
 def hash_value(value):
-    require(value is None or (isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)),
+    require(value is None or (isinstance(value, str) and _SHA256.fullmatch(value) is not None),
             "SHA-256 must be null or 64 lowercase hexadecimal characters")
 
 
@@ -331,6 +347,22 @@ def validate_delta(batch, *, get, referrers, claimants):
             cursor = current["data"]["parent_id"] if current is not None and current["kind"] == "artifact" else None
 
 
+# The data fields graph validation reads, per kind; the replay keeps only these for every record.
+_GRAPH_FIELDS = {
+    "receipt": ("source_ids", "artifact_id"),
+    "relationship": ("from_id", "to_id"),
+    "artifact": ("path", "parent_id", "receipt_id"),
+    "source": (),
+    "policy": (),
+}
+
+
+def _graph_view(record):
+    """The part of a validated record that reference, path and parent checks can see."""
+    data = record["data"]
+    return {"kind": record["kind"], "data": {key: data[key] for key in _GRAPH_FIELDS[record["kind"]]}}
+
+
 class GraphValidator:
     """Replays revisions with work bounded by each revision's neighbourhood, not by history.
 
@@ -338,7 +370,9 @@ class GraphValidator:
     CatalogError with the same refusal. A revision can only invalidate the records it
     writes, their referrers, the path claims it moves, and parent chains that start at a
     changed artifact, because every earlier revision was accepted under the same rules.
-    A raised error leaves the validator unusable; discard it.
+    A raised error leaves the validator unusable; discard it. Only the fields graph checks read
+    are kept per record, so memory follows the number of records, not their payload size.
+    Batches must hold validated records (every field of its kind present).
     """
 
     def __init__(self):
@@ -358,7 +392,7 @@ class GraphValidator:
                         del self.paths[path]
                     self.parents.pop(record["id"], None)
             changed.append(record["id"])
-            self.records[record["id"]] = record
+            self.records[record["id"]] = _graph_view(record)
         affected = dict.fromkeys(changed)
         for record in batch:
             for reference in _references(record):

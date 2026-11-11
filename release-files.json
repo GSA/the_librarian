@@ -114,5 +114,8 @@
   "tests/test_catalog_daily_snapshot.py",
   "docs/decisions/0017-attested-file-identity-for-catalog-receipts.md",
   "tests/test_catalog_identity_binding.py",
+  "docs/decisions/0019-cheaper-catalog-inspect.md",
+  "tests/test_catalog_inspect_equivalence.py",
+  "tests/reference_inspect.py",
   "tests/test_validation_cost.py"
 ]
