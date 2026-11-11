@@ -212,7 +212,7 @@ class CatalogAndIndexTests(ProgressCase):
         from tools.context_index import cli as index_cli
         manifest = self.root / "config/selection.json"
         manifest.parent.mkdir()
-        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.SETTINGS["audience"],
+        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.for_root(self.root)[0]["audience"],
                                         "documents": [], "context_rules": {}, "renditions": []}))
         with patch("sys.stdout"):
             self.assertEqual(index_cli.main(["--root", str(self.root), "build"]), 0)

@@ -257,7 +257,7 @@ class WorkspaceCase(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.manifest = self.root / "config/selection.json"
         self.manifest.parent.mkdir()
-        self.config = {"schema_version": 1, "audience": policy.SETTINGS["audience"],
+        self.config = {"schema_version": 1, "audience": policy.for_root(self.root)[0]["audience"],
                        "documents": [], "context_rules": {}, "renditions": []}
         self.db = self.root / "tools/context_index/.local/index.sqlite3"
         self.save_config()
@@ -325,7 +325,7 @@ class WorkspaceCase(unittest.TestCase):
             "evidence": [{"kind": "agent_statement", "pointer": None,
                           "quote": "No semantic review performed by this test."}],
             "uncertainties": ["Source version is not attested by this event."],
-            "handling": [policy.SETTINGS["handling"]],
+            "handling": [policy.for_root(self.root)[0]["handling"]],
             "provenance": {"origin": "agent_review", "record": None,
                            "mapping_version": None, "unmapped_fields": []},
             "relationships": [], "supersedes": [], "correction_reason": None,

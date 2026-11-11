@@ -36,7 +36,7 @@ class NativeTests(unittest.TestCase):
     def publication(self):
         manifest = self.root / "config/selection.json"
         manifest.parent.mkdir()
-        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.SETTINGS["audience"],
+        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.for_root(self.root)[0]["audience"],
                                         "documents": [], "context_rules": {}, "renditions": []}))
         stage_request(self.root, [stage("publication", "index-build", {"manifest": "config/selection.json", "db": "tools/context_index/.local/index.sqlite3"})])
         return manifest
