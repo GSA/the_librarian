@@ -73,7 +73,10 @@ Ingest cost still grows with history; measure it on synthetic cohorts with
 [decision 0012](docs/decisions/0012-bounded-validation-cost.md). Catalog writes
 validate only their delta when the database bytes match a prior full validation
 ([decision 0015](docs/decisions/0015-trusted-head-catalog-commit.md)); profile the
-lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`.
+lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`, and a production-sized
+ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py`. The
+throughput target and its derivation are in
+[context/intake.md](context/intake.md#throughput-target-and-measurement).
 
 ## Ingesting files (current manual method)
 

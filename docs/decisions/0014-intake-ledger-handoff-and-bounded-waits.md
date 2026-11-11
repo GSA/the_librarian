@@ -48,6 +48,20 @@ and a repair job running together collapsed: the ingest blocked in `flock` for
   `store.verify`, the same rules as `store.validate`), so it cannot hold a read
   lock across O(ledger) CPU work.
 
+## Amendment: read-only refusals still hand off (Kata 2rye)
+
+Cohort ingest probes for requests that do not exist yet; `store.inspect` then raises
+`unknown_request` inside the locked block. That raise skipped the clean-unlock
+attestation, so the next writer replayed the whole ledger: on a synthetic ledger of
+36,000 requests, 61 full validations per 30 files (about 92% of ingest wall time,
+2.25 s per file against 0.14 s on an empty ledger). A block that raises now also
+hands off, but only when the file identity (device, inode, size, mtime, ctime,
+change counter) equals the identity the writer validated on entry, so nothing
+was written. A failure after a partial write, a foreign commit during the lock or a
+crash still leaves no attestation and the next writer validates in full. Measured
+with `tools/diagnostics/ledger_scale_benchmark.py`: 81 full validations fell to 1
+for 40 files, and CPU for the same ingest fell from about 170 s to 79 s.
+
 ## Consequences
 
 Writers taking turns validate once, not per hand-off. A starved writer reports
