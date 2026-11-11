@@ -253,34 +253,135 @@ def ledger_request(root, correlation_id):
         return None if row is None else decode(row[0])
 
 
-def catalog_view(root):
+class Taken:
+    """What the planner needs to know about catalog IDs that are already used or promised.
+
+    ``highest`` maps each allocation prefix to the largest number in use (0 when none);
+    ``present`` holds those of the probed IDs that are in use. Two views combine with ``|``.
+    """
+    __slots__ = ("highest", "present")
+
+    def __init__(self, highest=None, present=frozenset()):
+        self.highest = {prefix: 0 for prefix in PREFIXES} if highest is None else highest
+        self.present = frozenset(present)
+
+    def __or__(self, other):
+        return Taken({p: max(self.highest[p], other.highest[p]) for p in PREFIXES},
+                     self.present | other.present)
+
+    def next_id(self, prefix):
+        return f"{prefix}{self.highest[prefix] + 1}"
+
+
+PREFIXES = ("S", "D")
+# A digit run this short always fits SQLite's 64-bit integer, so ``CAST`` cannot saturate.
+SQL_SAFE_DIGITS = 17
+
+
+def number_of(identifier, prefix):
+    """The number a ``prefix`` ID allocates from, or None for any other ID (unchanged rule)."""
+    return int(identifier[1:]) if identifier[:1] == prefix and identifier[1:].isdigit() else None
+
+
+def highest_number(identifiers, prefix):
+    return max((n for n in (number_of(i, prefix) for i in identifiers) if n is not None), default=0)
+
+
+def catalog_highest(connection, prefix):
+    """Largest ``prefix`` number among current record IDs, read from the primary-key index.
+
+    Equal to ``highest_number`` over every current ID (the catalog validates record IDs as ASCII
+    ``[A-Za-z0-9-]``, so every current ID is covered by the ASCII-digit filter). IDs with a digit run
+    too long for SQLite's integers take the exact Python path over the same indexed range.
+    """
+    low, high = prefix, chr(ord(prefix) + 1)
+    number, longest = connection.execute(
+        "SELECT max(CAST(substr(record_id,2) AS INTEGER)), max(length(record_id)) FROM current_records "
+        "WHERE record_id >= ? AND record_id < ? AND length(record_id) > 1 "
+        "AND substr(record_id,2) NOT GLOB '*[^0-9]*'", (low, high)).fetchone()
+    if longest is not None and longest - 1 > SQL_SAFE_DIGITS:
+        return highest_number((r[0] for r in connection.execute(
+            "SELECT record_id FROM current_records WHERE record_id >= ? AND record_id < ?", (low, high))), prefix)
+    return number or 0
+
+
+def catalog_view(root, probe=()):
+    """The validated catalog state and a ``Taken`` for the current records, from one snapshot.
+
+    Only the highest ``S``/``D`` numbers and which ``probe`` IDs exist are read; the current
+    records are never materialized (decision 0020).
+    """
+    probe = sorted(set(probe))
     try:
         home, db, _ = catalog.locations(root)
         require(home.is_dir(), "catalog_unavailable")
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
             state = catalog.validated_state(connection, home)
-            catalog.current_view(connection)
-            ids = {row[0] for row in connection.execute("SELECT id FROM catalog_current")}
+            highest = {prefix: catalog_highest(connection, prefix) for prefix in PREFIXES}
+            present = {row[0] for row in connection.execute(
+                "SELECT record_id FROM current_records WHERE record_id IN (%s)" % ",".join("?" * len(probe)),
+                probe)} if probe else set()
     except (catalog.CatalogError, OSError) as error:
         raise IntakeError("catalog_unavailable") from error
-    return state, ids
+    return state, Taken(highest, present)
 
 
-def reserved_ids(root):
-    """Catalog IDs promised by staged upload requests that may not be committed yet."""
+# Promised IDs of a saved request, by the SHA-256 the ledger stores for its exact bytes. The key is
+# the content, so a hit is correct for any row carrying that digest; a rewritten request has a
+# different digest and is decoded afresh. Each fresh entry is checked against its own bytes, and
+# the ledger's validation (or its attested hand-off, decision 0014) is what ties every other
+# stored digest to its row. The memo is per process, bounded, and never persisted.
+PROMISES = {}
+PROMISES_LIMIT = 65536
+# Above this many unseen rows one scan of the upload requests beats a lookup per row.
+BULK = 64
+
+
+def promised(raw):
+    """``(ids, highest S, highest D)`` for every ``catalog-submit`` stage of one saved request."""
     ids = set()
+    for stage in decode(raw)["stages"]:
+        if stage["operation"] == "catalog-submit":
+            ids.update(record["id"] for record in stage["arguments"]["records"])
+    return (tuple(ids), *(highest_number(ids, prefix) for prefix in PREFIXES))
+
+
+def reserved_ids(root, probe=()):
+    """A ``Taken`` for catalog IDs promised by staged upload requests that may not be committed yet.
+
+    Every ``upload-*`` request counts, whatever its stage status, so a blocked, retrying or
+    dead-lettered request keeps its IDs. Only requests whose digest was not seen before are decoded.
+    """
+    probe = frozenset(probe)
     with store.locked(root) as c:
-        for (raw,) in c.execute("SELECT raw FROM requests WHERE correlation_id LIKE 'upload-%'"):
-            for stage in decode(raw)["stages"]:
-                if stage["operation"] == "catalog-submit":
-                    ids.update(record["id"] for record in stage["arguments"]["records"])
-    return ids
+        rows = c.execute("SELECT correlation_id, request_sha256 FROM requests "
+                         "WHERE correlation_id LIKE 'upload-%'").fetchall()
+        unseen = {sha256 for _, sha256 in rows if sha256 not in PROMISES}
+        fresh = {}
+        if len(unseen) > BULK:
+            fetched = c.execute("SELECT request_sha256, raw FROM requests WHERE correlation_id LIKE 'upload-%'")
+        else:
+            fetched = (c.execute("SELECT request_sha256, raw FROM requests WHERE correlation_id=?",
+                                 (correlation_id,)).fetchone()
+                       for correlation_id, sha256 in rows if sha256 in unseen)
+        for sha256, raw in fetched:
+            if sha256 in unseen and sha256 not in fresh:
+                require(digest(raw) == sha256, "corrupt_request")
+                fresh[sha256] = promised(raw)
+        for sha256, entry in fresh.items():
+            if len(PROMISES) >= PROMISES_LIMIT:
+                break
+            PROMISES[sha256] = entry
+        entries = [PROMISES.get(sha256) or fresh[sha256] for _, sha256 in rows]
+    highest = {prefix: max((entry[index] for entry in entries), default=0)
+               for index, prefix in enumerate(PREFIXES, 1)}
+    present = {i for entry in entries for i in entry[0] if i in probe} if probe else set()
+    return Taken(highest, present)
 
 
 def next_id(prefix, taken):
-    numbers = [int(i[1:]) for i in taken if i[:1] == prefix and i[1:].isdigit()]
-    return f"{prefix}{max(numbers, default=0) + 1}"
+    return taken.next_id(prefix) if isinstance(taken, Taken) else f"{prefix}{highest_number(taken, prefix) + 1}"
 
 
 def submit_records(request):
@@ -308,13 +409,14 @@ def plan(root, value, raw):
 
 
 def records_for(root, value, raw, original_path, sidecar_path, sidecar):
-    state, taken = catalog_view(root)
-    taken |= reserved_ids(root)
     sid = value["submission_id"]
     # Distinct role suffixes keep every submission's IDs disjoint from every other's.
     artifact_id, meta_id = f"A-upload-{sid}-original", f"A-upload-{sid}-submission"
     relation_id = f"R-upload-{sid}-version-of"
-    require(not {artifact_id, meta_id, relation_id} & taken, "identifier_conflict")
+    mine = {artifact_id, meta_id, relation_id}
+    state, taken = catalog_view(root, mine)
+    taken |= reserved_ids(root, mine)
+    require(not taken.present, "identifier_conflict")
     parent_artifact = None
     if value["correction_of"]:
         parent = ledger_request(root, correlation(value["correction_of"]))
@@ -328,11 +430,11 @@ def records_for(root, value, raw, original_path, sidecar_path, sidecar):
             # Only a durably refused, never-committed parent may be replaced; work that
             # can still commit is finished by retrying the exact original submission.
             require(parent_status in {"blocked", "dead-letter"}, "correction_parent_pending")
-            committed = catalog_view(root)[1]
-            require(not {r["id"] for r in submit_records(parent)} & committed, "correction_parent_pending")
+            committed = catalog_view(root, {r["id"] for r in submit_records(parent)})[1]
+            require(not committed.present, "correction_parent_pending")
     if parent_artifact is None:
-        source_id = next_id("S", taken)
-    receipt_id = next_id("D", taken)
+        source_id = taken.next_id("S")
+    receipt_id = taken.next_id("D")
     provenance = [{"path": sidecar_path, "sha256": digest(sidecar), "line_start": None, "line_end": None}]
     records = []
     if parent_artifact is None:

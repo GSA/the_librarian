@@ -76,6 +76,7 @@
   "tools/diagnostics/catalog_lock_benchmark.py",
   "tools/diagnostics/ingest_benchmark.py",
   "tools/diagnostics/ledger_scale_benchmark.py",
+  "tools/diagnostics/upload_planning_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
   "tools/extraction/extract.py",
@@ -117,5 +118,7 @@
   "docs/decisions/0019-cheaper-catalog-inspect.md",
   "tests/test_catalog_inspect_equivalence.py",
   "tests/reference_inspect.py",
-  "tests/test_validation_cost.py"
+  "tests/test_validation_cost.py",
+  "docs/decisions/0020-constant-cost-upload-planning.md",
+  "tests/test_upload_planning.py"
 ]
