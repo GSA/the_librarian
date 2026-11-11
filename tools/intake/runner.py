@@ -25,6 +25,33 @@ def save_artifact(c, correlation, stage_id, key, value):
     c.execute(f"UPDATE stages SET {key}=?, {key}_sha256=? WHERE correlation_id=? AND stage_id=?", (raw, digest(raw.encode()), correlation, stage_id))
 
 
+# Retryable outcomes of a lost catalog race: another writer held the lock for the whole wait or
+# committed after the pin. Nothing was written, like a busy ledger, so they are not input faults.
+CONTENTION_CODES = {"catalog-busy", "catalog-stale-state"}
+# Lost catalog races one stage records per cycle before it dead-letters (explicit replay or
+# ``recover-conflicts`` resumes it): 5 minutes of lost 10 s waits, so a lock stuck for good
+# cannot grow the ledger or retry forever.
+CONTENTION_BUDGET = 30
+# Consecutive lost catalog races one ``settle`` call retries before it leaves the stage retryable.
+# Each already waited the catalog's bounded wait, so a call spends at most this many waits (60 s,
+# which covers the 58 s first-of-day hold measured at 100k registrations before decision 0016).
+CONTENTION_RETRIES = 6
+
+
+def contention(failure):
+    return failure.category == "retryable" and failure.code in CONTENTION_CODES
+
+
+def lost_race(attempt):
+    return attempt["outcome"] == "failed" and attempt["category"] == "retryable" and attempt["code"] in CONTENTION_CODES
+
+
+def spent(attempts):
+    """(charged, lost): attempts counting against ``max_attempts``, and lost catalog races."""
+    lost = sum(lost_race(a) for a in attempts)
+    return len(attempts) - lost, lost
+
+
 def classify(error):
     if isinstance(error, adapters.StageFailure):
         return error
@@ -53,7 +80,8 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             require(started >= attempts[-1]["eligible_at"], "backoff_pending")
         ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
         if unfinished is None:
-            require(ordinal <= request["retry"]["max_attempts"], "attempt_limit")
+            charged, lost = spent(attempts)
+            require(charged < request["retry"]["max_attempts"] and lost < CONTENTION_BUDGET, "attempt_limit")
 
         def begin():
             if unfinished is None:
@@ -65,7 +93,13 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             failure = classify(error)
             if isinstance(error, IntakeError):
                 failure = adapters.StageFailure("retryable" if error.retryable else "blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
-            status = "blocked" if failure.category == "blocked" else "dead-letter" if failure.category == "permanent" or ordinal >= request["retry"]["max_attempts"] else "retryable"
+            # A lost catalog race wrote nothing: it is charged to its own bounded budget, not to
+            # the fault budget (each recorded race is one bounded wait).
+            charged, lost = spent([a for a in attempts if a["ordinal"] != ordinal])
+            charged, lost = (charged, lost + 1) if contention(failure) else (charged + 1, lost)
+            status = ("blocked" if failure.category == "blocked" else "dead-letter"
+                      if failure.category == "permanent" or charged >= request["retry"]["max_attempts"]
+                      or lost >= CONTENTION_BUDGET else "retryable")
             ended = clock()
             with c:
                 c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (ended, failure.category, failure.code, ended + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
@@ -101,10 +135,12 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
 def settle(root, correlation_id, stage_id):
     """Run a stage and retry it while it is retryable, within its attempt budget.
 
-    Concurrent catalog writers surface as retryable stale-state or busy attempts;
-    each retry re-reads the catalog, so the stage settles without manual replay.
+    Concurrent catalog writers surface as retryable stale-state or busy attempts; each retry
+    re-reads the catalog, so the stage settles without manual replay. Those attempts write
+    nothing, so they do not spend the fault budget; one call retries at most
+    ``CONTENTION_RETRIES`` of them in a row and then leaves the stage retryable.
     """
-    busy = 0
+    busy = lost = 0
     while True:
         try:
             result = run(root, correlation_id, stage_id)
@@ -131,6 +167,15 @@ def settle(root, correlation_id, stage_id):
         stage = next(s for s in result["stages"] if s["id"] == stage_id)
         if stage["status"] != "retryable":
             return result
+        current = [a for a in stage["attempts"] if a["cycle"] == stage["cycle"]]
+        if current[-1]["code"] in CONTENTION_CODES:
+            # Each lost race already waited the catalog's bounded wait; leave a still-contended
+            # stage visibly retryable for the next run rather than waiting on without limit.
+            lost += 1
+            if lost >= CONTENTION_RETRIES:
+                return result
+        else:
+            lost = 0
 
 
 SETTLE_MAX_WAIT = 60

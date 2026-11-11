@@ -28,6 +28,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0015](0015-trusted-head-catalog-commit.md) | Catalog writers validate only their delta on a trusted head | Implemented; amends 0012 and 0013; amended by 0016 |
 | [0016](0016-single-replay-daily-snapshot.md) | The first write of a UTC day replays the history once | Implemented; amends 0010 and 0015 |
 | [0017](0017-attested-file-identity-for-catalog-receipts.md) | Catalog validation receipts bind to file identity, with a daily full check | Accepted; amends 0012, 0014 and 0015 |
+| [0018](0018-catalog-contention-outside-the-fault-budget.md) | Lost catalog races do not spend an intake stage's fault budget | Implemented; amends 0013 and 0014 |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in
