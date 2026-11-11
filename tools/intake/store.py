@@ -260,6 +260,7 @@ def locked(root, wait=None):
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     c = None
     clean = False
+    entered = None
     try:
         try:
             private(lock)
@@ -276,6 +277,7 @@ def locked(root, wait=None):
             # it was last written by a validated writer, so the O(ledger) pass is skipped.
             if known is None or known != _identity(db):
                 validate(c, root)
+            entered = _identity(db)
         except sqlite3.Error as error:
             raise (LedgerBusy() if _busy(error) else IntakeError("corrupt_store")) from error
         try:
@@ -288,9 +290,13 @@ def locked(root, wait=None):
         try:
             # Recorded while still holding the writer lock, after this process's own commits,
             # and only when no other connection committed since validation.
-            if clean:
+            if c is not None:
                 identity = _identity(db)
-                if identity is not None and c.execute("PRAGMA data_version").fetchone()[0] == foreign:
+                # A block that raised is attested only when the file is exactly as it was when
+                # validated (a read-only refusal such as ``unknown_request``): nothing was
+                # written, so a partial write can never be handed off as validated.
+                if identity is not None and (clean or identity == entered) \
+                        and c.execute("PRAGMA data_version").fetchone()[0] == foreign:
                     _attest(fd, root, identity)
         except (OSError, sqlite3.Error):
             pass
