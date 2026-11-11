@@ -14,7 +14,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0001](0001-project-identity.md) | Project, package, command and protocol identity | Implemented |
 | [0002](0002-updateable-distribution.md) | Reproducible runtime and an updateable distribution | Accepted; allowlist packaging (`tools/package.py`) and the preflight probe exist, the lock file, image and installer do not |
 | [0003](0003-store-compatibility.md) | Data-store compatibility and upgrade contract | Implemented; retention bullet superseded by 0010 |
-| [0004](0004-instance-topology.md) | One Librarian per project, with its own data root | Implemented |
+| [0004](0004-instance-topology.md) | One Librarian per project, with its own data root | Implemented, except the per-instance version record |
 | [0005](0005-source-onboarding.md) | Starting empty and onboarding sources through an inbox | Accepted; manual upload and cohort intake ([0009](0009-read-only-cohort-intake.md)) exist, connectors and scheduling do not |
 | [0006](0006-relationship-traversal.md) | Relationship traversal and graph storage options | Open; no graph capability exists, precondition 1 unsatisfied |
 | [0007](0007-execution-traces.md) | Agent execution traces: diagnostics, not memory | Accepted as a boundary; agent memory declined, coverage-gap diagnostics implemented with bare read counts, dead-weight requirement withdrawn, no retrieval-quality figure derived |

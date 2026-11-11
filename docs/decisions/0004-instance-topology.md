@@ -5,7 +5,10 @@
 **Status:** Accepted and implemented. Per-instance policy and selection
 overrides (`config/policy.local.json`, `config/selection.local.json`),
 configurable relative `storage_roots`, `.local/instance.json` lineage binding,
-and host-path-independent index freshness are implemented.
+and host-path-independent index freshness are implemented. The per-instance
+record of the distribution version and store contract versions described below is
+not: `.local/instance.json` holds only the instance and store identities and the
+storage layout.
 
 ## Context
 
