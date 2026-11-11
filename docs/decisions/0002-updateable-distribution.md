@@ -2,8 +2,9 @@
 
 **Audience:** maintainers and operators.
 **Date:** October 21, 2026.
-**Status:** Accepted. Not implemented; no lock file, image or installer exists
-in this repository yet.
+**Status:** Accepted. Partly implemented: the explicit source allowlist
+(`release-files.json`, `tools/package.py`) and the preflight probe exist; no lock
+file, image or installer exists in this repository yet.
 
 ## Context
 

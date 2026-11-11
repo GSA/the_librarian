@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests.support import default_policy_hash
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
@@ -16,7 +17,7 @@ from tools.intake import store, runner, adapters
 
 def stage_request(root, stages, correlation="req-native"):
     raw = json.dumps({"version": 1, "correlation_id": correlation, "correction_of": None,
-                      "policy": {"version": 1, "sha256": policy.load()[1]},
+                      "policy": {"version": 1, "sha256": default_policy_hash()},
                       "retry": {"max_attempts": 2, "backoff_seconds": 0}, "stages": stages}).encode()
     return store.stage(root, raw)
 
@@ -35,7 +36,7 @@ class NativeTests(unittest.TestCase):
     def publication(self):
         manifest = self.root / "config/selection.json"
         manifest.parent.mkdir()
-        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.SETTINGS["audience"],
+        manifest.write_text(json.dumps({"schema_version": 1, "audience": policy.for_root(self.root)[0]["audience"],
                                         "documents": [], "context_rules": {}, "renditions": []}))
         stage_request(self.root, [stage("publication", "index-build", {"manifest": "config/selection.json", "db": "tools/context_index/.local/index.sqlite3"})])
         return manifest

@@ -5,7 +5,9 @@
 **Status:** Accepted and implemented. The store-home configuration, logical
 corpus-root binding, per-instance policy evaluation, and explicit migration and
 recovery paths described below are active in `tools/policy.py` and
-`tools/initialize.py`.
+`tools/initialize.py`. The backup-retention bullet is superseded by
+[0010](0010-daily-snapshots-and-retention.md). The Context, Consequences and
+Not decided sections describe the state before that work.
 
 ## Context
 
@@ -108,6 +110,10 @@ growth is an operational fact that per-project instances multiply.
   `config/policy.json` and `config/policy.local.json` against the target `--root`
   instance directory on every operation, fail-closed on symlinks, unknown fields,
   or overlapping storage roots.
+  A root with no policy files of its own (for example a temporary test workspace)
+  gets the toolkit's versioned `config/policy.json` defaults only; the checkout's
+  ignored `config/policy.local.json` applies to the checkout itself, never to
+  another root.
 - **Backup retention is bounded.** Superseded by
   [0010](0010-daily-snapshots-and-retention.md): one verified snapshot per UTC
   day, seven days retained, with a dry-run-by-default prune command and a

@@ -1,7 +1,8 @@
 # 0016 - The first write of a UTC day replays the history once
 
 **Audience:** maintainers and operators.
-**Status:** Accepted. Amends [0010](0010-daily-snapshots-and-retention.md) and
+**Date:** November 11, 2026.
+**Status:** Implemented. Amends [0010](0010-daily-snapshots-and-retention.md) and
 [0015](0015-trusted-head-catalog-commit.md); leaves [0013](0013-concurrent-intake-writers.md)'s linear chain unchanged.
 
 ## Context

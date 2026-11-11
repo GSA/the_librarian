@@ -2,7 +2,7 @@
 
 **Audience:** maintainers and operators.
 **Date:** November 2, 2026.
-**Status:** Accepted. Complements [0007](0007-execution-traces.md); does not change it.
+**Status:** Implemented. Complements [0007](0007-execution-traces.md); does not change it.
 
 ## Context
 

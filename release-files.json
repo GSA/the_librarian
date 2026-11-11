@@ -73,6 +73,7 @@
   "tools/diagnostics/catalog_daily_replay_benchmark.py",
   "tools/diagnostics/catalog_lock_benchmark.py",
   "tools/diagnostics/ingest_benchmark.py",
+  "tools/diagnostics/ledger_scale_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
   "tools/extraction/extract.py",
