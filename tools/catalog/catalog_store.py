@@ -203,13 +203,49 @@ def _await_journal(path):
         time.sleep(0.02)
 
 
+def _journal_state(path):
+    """Classify the rollback journal as none, live (a writer holds the lock) or abandoned.
+
+    Holding the lock shared while looking keeps a writer from starting between
+    the writer check and the journal check, and a finishing writer deletes its
+    journal before releasing the lock, so neither is mistaken for abandoned.
+    """
+    import fcntl
+    journal = safe_path(str(path) + "-journal")
+    home = path.parent
+    if str(safe_path(home)) in getattr(_held, "homes", ()):
+        return "abandoned" if journal.exists() else "none"
+    try:
+        descriptor = os.open(safe_path(home / "writer.lock"), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "abandoned" if journal.exists() else "none"
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "live" if journal.exists() else "none"
+        return "abandoned" if journal.exists() else "none"
+    finally:
+        os.close(descriptor)
+
+
 def connect(path, write=False):
     path = private_file(path)
     if not write:
         _await_journal(path)
-    for suffix in ("-journal", "-wal", "-shm"):
-        sidecar = safe_path(str(path) + suffix)
-        require(not sidecar.exists(), "SQLite sidecar present; explicit recovery required")
+    deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+    while True:
+        for suffix in ("-wal", "-shm"):
+            require(not safe_path(str(path) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+        state = _journal_state(path)
+        if state == "none":
+            break
+        # A writer can journal between _await_journal and here: a live writer's
+        # journal is waited out; only one with no writer is abandoned.
+        require(state == "live" and not write, "SQLite sidecar present; explicit recovery required")
+        if time.monotonic() >= deadline:
+            raise WriterBusy("Another catalog writer is active; retry later")
+        time.sleep(0.02)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
                                  uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
     try:
