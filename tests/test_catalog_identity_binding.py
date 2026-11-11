@@ -2,6 +2,7 @@
 from contextlib import closing
 import datetime
 import json
+from pathlib import Path
 import os
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from tools import backups as snapshots
 from tools.catalog import catalog_store as catalog
 from tools.catalog.contracts import CatalogError
 from tests.test_catalog_delta_commit import Case
+from tools.diagnostics.catalog_lock_benchmark import registration as catalog_records
 
 
 class IdentityBinding(Case):
@@ -131,3 +133,35 @@ class IdentityBinding(Case):
         self.assertEqual(first, again)
         self.write(30)
         self.assertNotEqual(identity(), first)
+
+
+class ReviewRegressions(Case):
+    def setUp(self):
+        super().setUp()
+        for n in range(3):
+            self.write(n)
+
+    def test_idempotent_retry_on_a_new_utc_day_replays_once(self):
+        later = snapshots.utcnow() + datetime.timedelta(days=1)
+        records = catalog_records(1)
+        calls, patched = self.writes_inspect()
+        with patched, patch.object(snapshots, "utcnow", lambda: later):
+            for _ in range(2):
+                again = catalog.submit(self.root, records, actor="a", request_id="r1", reason="test",
+                                       expected_state="outdated")
+                self.assertTrue(again["idempotent"])
+        self.assertEqual(len(calls), 1)
+
+    def test_reader_opened_before_a_restore_never_binds_the_restored_file(self):
+        snapshot = Path(catalog.backup(self.root)["snapshot"])
+        self.write(20)  # the live head now differs from the snapshot
+        old = catalog.connect(self.db)
+        try:
+            old.execute("BEGIN")
+            catalog.restore(self.root, snapshot, expected_state=catalog.status(self.root)["state_token"])
+            catalog.validated_state(old, self.home)  # sees the old file's state
+            # The receipt on disk must not pair the restored file's identity with the old state.
+            self.assertEqual(catalog.status(self.root)["revision"], 3)
+            self.assertEqual(catalog.status(self.root)["revision"], 3)
+        finally:
+            old.close()

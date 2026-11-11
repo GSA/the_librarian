@@ -230,6 +230,17 @@ def _journal_state(path):
         os.close(descriptor)
 
 
+class _Connection(sqlite3.Connection):
+    """Remembers the (device, inode) it opened, so a validation is never bound to a different
+    file that a concurrent restore moved into the path afterwards."""
+    opened = None
+
+
+def _file_key(path):
+    info = os.stat(path)
+    return (info.st_dev, info.st_ino)
+
+
 def connect(path, write=False):
     path = private_file(path)
     if not write:
@@ -247,8 +258,10 @@ def connect(path, write=False):
         if time.monotonic() >= deadline:
             raise WriterBusy("Another catalog writer is active; retry later")
         time.sleep(0.02)
+    before = _file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+                                 uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+                                 factory=_Connection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -257,7 +270,10 @@ def connect(path, write=False):
                 "Unsupported SQLite journal mode")
         if write:
             connection.execute("PRAGMA synchronous=FULL")
-    except (CatalogError, sqlite3.Error):
+        # The pragmas above opened the file; the path must still be the same file.
+        require(_file_key(path) == before, "Catalog file replaced while opening; retry")
+        connection.opened = before
+    except (CatalogError, OSError, sqlite3.Error):
         connection.close()
         raise
     return connection
@@ -544,7 +560,13 @@ def _binding(connection):
     # Acquire the read snapshot before looking at the file; a concurrent commit cannot change it.
     connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
     runtime = [sys.version, sqlite3.sqlite_version, unicodedata.unidata_version]
-    identity = file_identity(connection.execute("PRAGMA database_list").fetchone()["file"])
+    path = connection.execute("PRAGMA database_list").fetchone()["file"]
+    identity = file_identity(path)
+    opened = getattr(connection, "opened", None)
+    # A connection this module did not open, or whose file has since been replaced at the path,
+    # cannot be described by the path's identity: bind the bytes it actually reads instead.
+    if identity is not None and (opened is None or opened != (identity[0], identity[1])):
+        identity = None
     if identity is not None:
         return {"version": 2, "identity": identity, "validator_sha256": VALIDATOR_SHA256, "runtime": runtime}
     return {"version": 1, "snapshot_sha256": hashlib.sha256(connection.serialize()).hexdigest(),
@@ -675,6 +697,12 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
         prior = committed.prior(request_id)
         if prior is not None:
             require(prior["input_hash"] == input_hash, "Request ID reused with different actor, reason, or records")
+            if trusted is None:
+                # The replay above fully validated this file; keep the next retry or read from repeating it.
+                try:
+                    _write_receipt(home, binding, state)
+                except (OSError, CatalogError):
+                    pass
             if precommit_check is not None:
                 precommit_check()
             return {"command": "submit", "idempotent": True, **state, "state": state,
