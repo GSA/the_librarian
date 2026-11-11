@@ -28,7 +28,10 @@ STAGES = (
     ("tools.catalog.catalog_store", "read_records"),
     ("tools.catalog.catalog_store", "_daily_snapshot"), ("tools.catalog.catalog_store", "_snapshot"),
     ("tools.intake.upload", "catalog_view"), ("tools.intake.upload", "reserved_ids"),
-    ("tools.intake.upload", "publish"), ("tools.extraction.extract", "run"),
+    ("tools.intake.upload", "publish"), ("tools.intake.upload", "records_for"), ("tools.intake.upload", "next_id"),
+    ("tools.intake.upload", "plan"), ("tools.intake.upload", "acknowledgment"), ("tools.intake.upload", "submit"),
+    ("tools.intake.cohort", "classify"), ("tools.intake.cohort", "_extract"),
+    ("tools.extraction.extract", "run"),
     ("tools.intake.store", "stage"), ("tools.intake.runner", "run"),
 )
 
