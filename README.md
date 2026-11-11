@@ -77,6 +77,9 @@ lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`, and a productio
 ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py`. The
 throughput target and its derivation are in
 [context/intake.md](context/intake.md#throughput-target-and-measurement).
+The first write of each UTC day replays the history once for its daily snapshot
+([decision 0016](docs/decisions/0016-single-replay-daily-snapshot.md); profile it with
+`tools/diagnostics/catalog_daily_replay_benchmark.py`).
 
 ## Ingesting files (current manual method)
 

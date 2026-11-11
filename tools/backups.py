@@ -185,7 +185,7 @@ def retention_days(value=None):
 
 
 def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, apply=False,
-          thin=False, protect=(), now=None):
+          thin=False, protect=(), now=None, verified=()):
     """Delete backups older than the window, never leaving the store without a verified snapshot.
 
     With ``thin`` (operator prune) only the newest verified snapshot of each UTC day
@@ -200,11 +200,14 @@ def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, 
     report = {"applied": False, "window_days": days, "kept": len(entries), "deleted": 0,
               "bytes_freed": 0, "oldest_kept_revision": None, "unverified_kept": 0, "refused": None}
     inside = [e for e in entries if e.created >= cutoff]
+    known = {Path(p).absolute() for p in verified}
     verified = {}
 
     def good(entry):
         if entry.stem not in verified:
-            verified[entry.stem] = _verified(entry, store_id, verify, errors)
+            verified[entry.stem] = (entry.snapshot is not None and entry.record is not None
+                                    and Path(entry.snapshot).absolute() in known
+                                    or _verified(entry, store_id, verify, errors))
         return verified[entry.stem]
 
     if not any(good(e) for e in reversed(inside)):
@@ -240,8 +243,13 @@ def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, 
     return report
 
 
-def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_RETENTION_DAYS, protect=()):
+def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_RETENTION_DAYS, protect=(),
+                   verify_fresh=None):
     """Take ``take()`` only when today has no intact snapshot, then apply retention.
+
+    ``verify_fresh`` (default ``verify``) checks the snapshot ``take`` just wrote from an image it had
+    already validated; retention then reuses that result instead of verifying the same bytes again.
+    Every older snapshot is still verified with ``verify``.
 
     Returns ``(snapshot, retention)``; both are None when today is already covered.
     A retention failure never fails the write that triggered it.
@@ -252,10 +260,10 @@ def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_R
     snapshot = take()
     try:
         # Retention starts only after the new snapshot verifies; otherwise delete nothing.
-        if not _fresh_ok(snapshot, store_id, verify, errors):
+        if not _fresh_ok(snapshot, store_id, verify_fresh or verify, errors):
             return snapshot, {"applied": False, "refused": "new snapshot did not verify; nothing deleted"}
         retention = prune(backups, store_id=store_id, verify=verify, errors=errors, days=days,
-                          apply=True, protect=protect)
+                          apply=True, protect=protect, verified=(Path(snapshot["snapshot"]),))
     except (OSError, BackupError) as error:
         retention = {"applied": False, "refused": type(error).__name__}
     return snapshot, retention

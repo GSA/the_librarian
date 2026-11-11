@@ -20,12 +20,13 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0007](0007-execution-traces.md) | Agent execution traces: diagnostics, not memory | Accepted as a boundary; agent memory declined, coverage-gap diagnostics implemented with bare read counts, dead-weight requirement withdrawn, no retrieval-quality figure derived |
 | [0008](0008-proof-of-concept-closure.md) | Concluded proof of concept and adopted reusable lessons | Accepted |
 | [0009](0009-read-only-cohort-intake.md) | Read-only cohort intake and model-assisted standing review | Implemented; bulk review gated per instance |
-| [0010](0010-daily-snapshots-and-retention.md) | Daily store snapshots with bounded retention | Implemented; supersedes the retention bullet in 0003 |
+| [0010](0010-daily-snapshots-and-retention.md) | Daily store snapshots with bounded retention | Implemented; supersedes the retention bullet in 0003; amended by 0016 |
 | [0011](0011-full-text-mcp-audit-log.md) | Opt-in full-text MCP audit log, separate from diagnostics | Implemented |
 | [0012](0012-bounded-validation-cost.md) | Bounded validation cost after daily snapshots | Implemented; amended by 0014 and 0015 |
 | [0013](0013-concurrent-intake-writers.md) | Concurrent intake writers retry and rebase instead of blocking | Implemented; amended by 0014 and 0015 |
 | [0014](0014-intake-ledger-handoff-and-bounded-waits.md) | Intake ledger hand-off without re-validation, bounded lock waits, short readers | Implemented; amends 0012 and 0013 |
-| [0015](0015-trusted-head-catalog-commit.md) | Catalog writers validate only their delta on a trusted head | Implemented; amends 0012 and 0013 |
+| [0015](0015-trusted-head-catalog-commit.md) | Catalog writers validate only their delta on a trusted head | Implemented; amends 0012 and 0013; amended by 0016 |
+| [0016](0016-single-replay-daily-snapshot.md) | The first write of a UTC day replays the history once | Implemented; amends 0010 and 0015 |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in

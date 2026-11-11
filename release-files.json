@@ -70,6 +70,7 @@
   "tools/context-mcp/src/the_librarian_mcp/server.py",
   "tools/diagnostics/__init__.py",
   "tools/diagnostics/catalog_commit_ceiling.py",
+  "tools/diagnostics/catalog_daily_replay_benchmark.py",
   "tools/diagnostics/catalog_lock_benchmark.py",
   "tools/diagnostics/ingest_benchmark.py",
   "tools/diagnostics/ledger_scale_benchmark.py",
@@ -105,6 +106,8 @@
   "docs/decisions/0013-concurrent-intake-writers.md",
   "docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md",
   "docs/decisions/0015-trusted-head-catalog-commit.md",
+  "docs/decisions/0016-single-replay-daily-snapshot.md",
   "tests/test_catalog_delta_commit.py",
+  "tests/test_catalog_daily_snapshot.py",
   "tests/test_validation_cost.py"
 ]
