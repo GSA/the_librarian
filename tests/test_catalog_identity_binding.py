@@ -68,7 +68,7 @@ class IdentityBinding(Case):
         the identity, only by the first full check of the next UTC day or an audit."""
         self.raw_edit(restore_mtime=False)
         identity = self.saved()["binding"]["identity"]
-        with patch.object(catalog, "file_identity", lambda path: identity):
+        with patch.object(catalog, "file_identity", lambda path, connection: identity):
             self.assertEqual(catalog.status(self.root)["revision"], 3)
             with self.assertRaises(CatalogError):
                 catalog.status(self.root, audit=True)
@@ -117,7 +117,7 @@ class IdentityBinding(Case):
         self.assertEqual(self.saved()["binding"]["version"], 2)
 
     def test_journal_present_falls_back_to_the_byte_binding(self):
-        with patch.object(catalog, "file_identity", lambda path: None):
+        with patch.object(catalog, "file_identity", lambda path, connection: None):
             with closing(catalog.connect(self.db)) as connection:
                 connection.execute("BEGIN")
                 binding = catalog._binding(connection)

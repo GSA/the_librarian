@@ -602,7 +602,7 @@ def _binding(connection):
     connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
     runtime = [sys.version, sqlite3.sqlite_version, unicodedata.unidata_version]
     path = connection.execute("PRAGMA database_list").fetchone()["file"]
-    identity = file_identity(path)
+    identity = file_identity(path, connection)
     opened = getattr(connection, "opened", None)
     # A connection this module did not open, or whose file has since been replaced at the path,
     # cannot be described by the path's identity: bind the bytes it actually reads instead.
