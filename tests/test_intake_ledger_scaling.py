@@ -271,9 +271,9 @@ class ReaderTests(Case):
         self.seed(3)
         store.list_requests(self.root)  # attest the ledger so the writer does not validate
         outcome = []
-        real = store.request_shape
+        real = store.verify
 
-        def validate_while_writer_commits(raw):
+        def verify_while_writer_commits(rows, root):
             if not outcome:
                 outcome.append("running")
                 try:
@@ -281,9 +281,9 @@ class ReaderTests(Case):
                     outcome.append("committed")
                 except contracts.IntakeError as error:
                     outcome.append(error.code)
-            return real(raw)
+            return real(rows, root)
         with mock.patch.dict(os.environ, {WAIT_ENV: "0.3"}), \
-                mock.patch.object(store, "request_shape", side_effect=validate_while_writer_commits):
+                mock.patch.object(store, "verify", side_effect=verify_while_writer_commits):
             requests, _, _ = progress.read_ledger(self.root, timeout=1)
         self.assertEqual(outcome, ["running", "committed"])
         self.assertIn("during-read", [r[0] for r in progress.read_ledger(self.root, timeout=1)[0]])
@@ -296,6 +296,121 @@ class ReaderTests(Case):
         with self.assertRaises(contracts.IntakeError) as caught:
             progress.read_ledger(self.root, timeout=1)
         self.assertEqual(caught.exception.code, "corrupt_request")
+
+
+class MemoTests(Case):
+    """The verify memo is right-sized to the live ledger and never trusts changed bytes."""
+
+    def setUp(self):
+        super().setUp()
+        store.forget_verified()
+        self.addCleanup(store.forget_verified)
+
+    def snapshot(self):
+        with closing(sqlite3.connect(self.db)) as c:
+            c.row_factory = sqlite3.Row
+            return store.snapshot(c)
+
+    def refused(self, code):
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.verify(self.snapshot(), self.root)
+        self.assertEqual(caught.exception.code, code)
+
+    def test_repeat_verification_of_a_ledger_larger_than_the_old_caches_decodes_nothing(self):
+        from tools.diagnostics.ledger_scale_benchmark import seed_ledger
+        count = 16384 + 100
+        seed_ledger(self.root, count)
+        rows = self.snapshot()
+        with mock.patch.object(contracts, "decode_request", wraps=contracts.decode_request) as decoded, \
+                mock.patch.object(store, "decode", wraps=store.decode) as artifacts:
+            store.verify(rows, self.root)
+            self.assertEqual((decoded.call_count, artifacts.call_count), (count, 2 * count))
+            store.verify(self.snapshot(), self.root)
+            self.assertEqual((decoded.call_count, artifacts.call_count), (count, 2 * count))
+
+    def warm(self):
+        self.seed(2)
+        store.verify(self.snapshot(), self.root)
+
+    def test_request_rewritten_at_a_cached_position_is_refused(self):
+        self.warm()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update requests set raw=? where correlation_id='seed-000'", (request("seed-000", retry={"max_attempts": 3, "backoff_seconds": 0}),))
+        self.refused("corrupt_request")  # stale digest
+
+    def test_request_and_digest_rewritten_to_an_invalid_request_is_refused(self):
+        self.warm()
+        bad = b'{"version": 1}'
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update requests set raw=?, request_sha256=? where correlation_id='seed-000'",
+                      (bad, contracts.digest(bad)))
+        with self.assertRaises(contracts.IntakeError):
+            store.verify(self.snapshot(), self.root)
+
+    def test_request_with_a_forged_digest_for_cached_bytes_is_refused(self):
+        self.warm()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update requests set request_sha256=? where correlation_id='seed-000'", ("0" * 64,))
+        self.refused("corrupt_request")
+
+    def test_artifact_rewritten_at_a_cached_position_is_refused(self):
+        self.warm()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update stages set intent='{\"changed\": 1}' where correlation_id='seed-000'")
+            c.execute("update stages set intent='{}', intent_sha256=? where correlation_id='seed-001'",
+                      ("0" * 64,))
+        self.refused("corrupt_artifact")
+
+    def test_artifact_with_a_forged_digest_for_cached_text_is_refused(self):
+        self.warm()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update stages set intent='{}', intent_sha256=? where correlation_id='seed-000'",
+                      (contracts.digest(b"{}"),))
+        store.verify(self.snapshot(), self.root)  # now '{}' is a cached, verified text
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update stages set intent_sha256=? where correlation_id='seed-000'", ("0" * 64,))
+        self.refused("corrupt_artifact")
+
+    def test_artifact_and_digest_rewritten_to_a_non_object_is_refused(self):
+        self.warm()
+        store.verify(self.snapshot(), self.root)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update stages set evidence='[1]', evidence_sha256=? where correlation_id='seed-000'",
+                      (contracts.digest(b"[1]"),))
+        self.refused("corrupt_artifact")
+
+    def test_memo_total_is_capped_and_a_capped_ledger_is_still_fully_verified(self):
+        self.seed(5)
+        with mock.patch.object(store, "MEMO_BYTES", 1):
+            store.verify(self.snapshot(), self.root)
+            self.assertEqual(store.verified_bytes(), 0)
+            store.verify(self.snapshot(), self.root)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update requests set request_sha256=? where correlation_id='seed-000'", ("0" * 64,))
+        with mock.patch.object(store, "MEMO_BYTES", 1):
+            self.refused("corrupt_request")
+
+    def test_memo_follows_the_live_ledger_and_does_not_accumulate_history(self):
+        self.seed(3)
+        store.verify(self.snapshot(), self.root)
+        full = store.verified_bytes()
+        self.assertGreater(full, 0)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("pragma foreign_keys=off")
+            for table in ("attempts", "replays", "stages"):
+                c.execute(f"delete from {table} where correlation_id!='seed-000'")
+            c.execute("delete from requests where correlation_id!='seed-000'")
+        store.verify(self.snapshot(), self.root)
+        self.assertLess(store.verified_bytes(), full)
+
+    def test_failed_verification_leaves_the_previous_memo_intact_and_caches_no_failure(self):
+        self.warm()
+        before = store.verified_bytes()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
+        self.refused("corrupt_request")
+        self.assertEqual(store.verified_bytes(), before)
+        self.refused("corrupt_request")
 
 
 if __name__ == "__main__":
