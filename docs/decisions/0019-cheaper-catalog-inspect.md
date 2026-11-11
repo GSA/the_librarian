@@ -1,4 +1,4 @@
-# 0018 - Catalog `inspect` is cheaper and streams its history
+# 0019 - Catalog `inspect` is cheaper and streams its history
 
 **Audience:** maintainers and operators.
 **Date:** November 11, 2026.

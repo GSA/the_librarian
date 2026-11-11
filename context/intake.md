@@ -25,18 +25,25 @@ named stage. The ledger is operational recovery state, never corpus authority.
   published and each attempt converts once.
 - Concurrent intake agents may share one instance ([0013](../docs/decisions/0013-concurrent-intake-writers.md)).
   The catalog writer lock waits up to 10s across processes. A catalog write
-  validates only its delta when the database bytes match a prior full
-  validation, and replays all history otherwise, on the first write of each UTC
-  day and under `status --audit` ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md)); that
+  validates only its delta when the database file identity (device, inode, size,
+  mtime, ctime, SQLite change counter) matches a prior full validation made the
+  same UTC day ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md),
+  [0017](../docs/decisions/0017-attested-file-identity-for-catalog-receipts.md)), and replays all history otherwise,
+  on the first read or write of each UTC day and under `status --audit`; that
   first write replays the history once, holding the writer lock about as long as one `inspect`
   plus writing the snapshot (about 3 s at 25k registrations, 11 s at 100k;
-  [0016](../docs/decisions/0016-single-replay-daily-snapshot.md), [0018](../docs/decisions/0018-cheaper-catalog-inspect.md)). A lost race is a
+  [0016](../docs/decisions/0016-single-replay-daily-snapshot.md), [0019](../docs/decisions/0019-cheaper-catalog-inspect.md)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
-  `catalog-busy` (lock wait exceeded) attempt, never `native-input`.
+  `catalog-busy` (lock wait exceeded) attempt, never `native-input`. Such an attempt wrote
+  nothing, so it does not spend `max_attempts` ([0018](../docs/decisions/0018-catalog-contention-outside-the-fault-budget.md)):
+  it counts against a separate bound of 30 lost races per stage cycle, and one `settle`
+  call retries at most 6 in a row (about 60 s at the 10 s catalog wait) before it returns
+  the stage `retryable` for the next run to resume. Faults still spend `max_attempts`.
+  `tools/diagnostics/catalog_contention_budget.py` reproduces it.
   `catalog-submit`, `extract-register` and `docling-register` rebase an outdated
   pin when no later revision wrote any record they write; overlap blocks as
   `catalog-conflict` and needs a correction. Upload and cohort ingest retry
-  retryable stages within the request's attempt budget. `recover-conflicts`
+  retryable stages (see above for the lost-race bound). `recover-conflicts`
   reports registration stages blocked by writer races (including legacy
   `native-input`), skipping corrected parents and overlapping writes; add
   `--apply` to replay and settle them.

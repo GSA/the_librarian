@@ -41,13 +41,17 @@ class NativeTests(unittest.TestCase):
         stage_request(self.root, [stage("publication", "index-build", {"manifest": "config/selection.json", "db": "tools/context_index/.local/index.sqlite3"})])
         return manifest
 
-    def assert_lock_recovery(self, lock, code="native-busy"):
+    def assert_lock_recovery(self, lock, code="native-busy", charged=True):
         with lock:
             result = runner.run(self.root, "req-native", "native")
             self.assertEqual(result["stages"][0]["status"], "retryable")
             self.assertEqual(result["stages"][0]["attempts"][0]["code"], code)
             result = runner.run(self.root, "req-native", "native")
-            self.assertEqual(result["stages"][0]["status"], "dead-letter")
+            # A lost catalog race wrote nothing, so it never exhausts the attempt budget.
+            self.assertEqual(result["stages"][0]["status"], "dead-letter" if charged else "retryable")
+        if not charged:
+            self.assertEqual(runner.run(self.root, "req-native", "native")["stages"][0]["status"], "succeeded")
+            return
         runner.replay(self.root, "req-native", "native")
         self.assertTrue(runner.run(self.root, "req-native", "native")["complete"])
 
@@ -61,7 +65,7 @@ class NativeTests(unittest.TestCase):
                 "actor": "test-runner", "request_id": "req-source", "reason": "Structural test", "expected_state": state["state_token"]}
         stage_request(self.root, [stage("receipt", "catalog-submit", args)])
         # Same-thread contention fails at once; another process would wait first.
-        self.assert_lock_recovery(catalog.writer_lock(catalog.locations(self.root)[0]), "catalog-busy")
+        self.assert_lock_recovery(catalog.writer_lock(catalog.locations(self.root)[0]), "catalog-busy", charged=False)
 
     def test_review_lock_is_retryable(self):
         import test_kit

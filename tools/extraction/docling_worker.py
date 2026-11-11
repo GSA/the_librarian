@@ -710,6 +710,20 @@ def _result_directory(path):
         raise
 
 
+def _discard_result(parent_fd, name, created):
+    """Remove a result this run created but could not publish, so RESULT can be retried.
+
+    Only unlink the entry if it is still the file this run created.
+    """
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+    except OSError:
+        pass
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 2:
@@ -723,9 +737,11 @@ def main(argv=None):
     try:
         for kind, ceiling in ((resource.RLIMIT_AS, LIMITS["address_space_bytes"]),
                               (resource.RLIMIT_FSIZE, LIMITS["result_bytes"])):
-            hard = resource.getrlimit(kind)[1]
-            if hard != resource.RLIM_INFINITY:
-                ceiling = min(hard, ceiling)
+            # Never loosen what the coordinator already imposed: honor every
+            # finite inherited limit, soft as well as hard.
+            for inherited in resource.getrlimit(kind):
+                if inherited != resource.RLIM_INFINITY:
+                    ceiling = min(inherited, ceiling)
             resource.setrlimit(kind, (ceiling, ceiling))
         signal.signal(signal.SIGALRM, _timeout)
         signal.alarm(LIMITS["wall_seconds"])
@@ -744,14 +760,18 @@ def main(argv=None):
     # envelope without a late/pending alarm interrupting its write or fsync.
     signal.signal(signal.SIGALRM, signal.SIG_IGN)
     signal.alarm(0)
+    created = None
     try:
         fd = os.open(result_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=parent_fd)
+        created = os.fstat(fd)
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
     except OSError:
+        if created is not None:
+            _discard_result(parent_fd, result_name, created)
         print("cannot create private result file without replacement", file=sys.stderr)
         return 2
     finally:
