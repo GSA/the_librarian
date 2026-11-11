@@ -18,6 +18,7 @@ import unicodedata
 import uuid
 
 from tools import backups as snapshots, policy
+from tools.file_identity import file_identity
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
     CatalogError, ConflictingWrite, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
@@ -229,6 +230,17 @@ def _journal_state(path):
         os.close(descriptor)
 
 
+class _Connection(sqlite3.Connection):
+    """Remembers the (device, inode) it opened, so a validation is never bound to a different
+    file that a concurrent restore moved into the path afterwards."""
+    opened = None
+
+
+def _file_key(path):
+    info = os.stat(path)
+    return (info.st_dev, info.st_ino)
+
+
 def connect(path, write=False):
     path = private_file(path)
     if not write:
@@ -246,8 +258,10 @@ def connect(path, write=False):
         if time.monotonic() >= deadline:
             raise WriterBusy("Another catalog writer is active; retry later")
         time.sleep(0.02)
+    before = _file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+                                 uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+                                 factory=_Connection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -256,7 +270,10 @@ def connect(path, write=False):
                 "Unsupported SQLite journal mode")
         if write:
             connection.execute("PRAGMA synchronous=FULL")
-    except (CatalogError, sqlite3.Error):
+        # The pragmas above opened the file; the path must still be the same file.
+        require(_file_key(path) == before, "Catalog file replaced while opening; retry")
+        connection.opened = before
+    except (CatalogError, OSError, sqlite3.Error):
         connection.close()
         raise
     return connection
@@ -529,19 +546,35 @@ def initialize(root):
 
 
 def _binding(connection):
-    """Identity of the exact SQLite snapshot, validator bytes and runtime a validation covers."""
+    """What a validation covers: the database file, the validator bytes and the runtime.
+
+    The file is bound by its identity (device, inode, size, mtime, ctime, SQLite change counter,
+    decision 0017) when it is a plain rollback-journal file; otherwise by the SHA-256 of its exact
+    bytes. Either way it is taken once this connection holds the read snapshot, so no commit can
+    land between the check and the validation it vouches for.
+    """
     require(connection.in_transaction, "Validated reads require a transaction")
     require(hasattr(connection, "serialize"), "Validated reads require SQLite serialize support")
     require(validator_sha256() == VALIDATOR_SHA256,
             "Catalog validator changed after import; restart the reader")
-    # Acquire the read snapshot before hashing; a concurrent commit cannot change it.
+    # Acquire the read snapshot before looking at the file; a concurrent commit cannot change it.
     connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
-    return {
-        "version": 1,
-        "snapshot_sha256": hashlib.sha256(connection.serialize()).hexdigest(),
-        "validator_sha256": VALIDATOR_SHA256,
-        "runtime": [sys.version, sqlite3.sqlite_version, unicodedata.unidata_version],
-    }
+    runtime = [sys.version, sqlite3.sqlite_version, unicodedata.unidata_version]
+    path = connection.execute("PRAGMA database_list").fetchone()["file"]
+    identity = file_identity(path)
+    opened = getattr(connection, "opened", None)
+    # A connection this module did not open, or whose file has since been replaced at the path,
+    # cannot be described by the path's identity: bind the bytes it actually reads instead.
+    if identity is not None and (opened is None or opened != (identity[0], identity[1])):
+        identity = None
+    if identity is not None:
+        return {"version": 2, "identity": identity, "validator_sha256": VALIDATOR_SHA256, "runtime": runtime}
+    return {"version": 1, "snapshot_sha256": hashlib.sha256(connection.serialize()).hexdigest(),
+            "validator_sha256": VALIDATOR_SHA256, "runtime": runtime}
+
+
+def _today():
+    return snapshots.utcnow().strftime("%Y-%m-%d")
 
 
 def _head_state(connection):
@@ -554,10 +587,11 @@ def _head_state(connection):
                       latest["revision_hash"] if latest else "", count)
 
 
-def _write_receipt(home, binding, state):
+def _write_receipt(home, binding, state, validated_on=None):
+    """``validated_on`` is the UTC date of the last full validation this receipt descends from."""
     cache_home = safe_path(home / ".local")
     receipt = safe_path(cache_home / "read-validation.json")
-    record = {"binding": binding, "state": state}
+    record = {"binding": binding, "state": state, "validated_on": validated_on or _today()}
     record["checksum"] = fingerprint(record)
     private_directory(cache_home)
     partial = cache_home / (uuid.uuid4().hex + ".partial")
@@ -575,7 +609,12 @@ def _write_receipt(home, binding, state):
 
 
 def _trusted_state(connection, home, binding):
-    """The state a receipt vouches for when it covers exactly this snapshot, else None."""
+    """``(state, validated_on)`` a receipt vouches for when it covers exactly this file, else None.
+
+    An identity-bound receipt (0017) is trusted only on the UTC day of its last full validation,
+    so a change the identity cannot see is found by the first full check of the next day. A
+    receipt from before 0017 carries no date and is a miss, never a refusal.
+    """
     cache_home = safe_path(home / ".local")
     receipt = safe_path(cache_home / "read-validation.json")
     if cache_home.exists():
@@ -586,23 +625,28 @@ def _trusted_state(connection, home, binding):
     require(receipt.stat().st_size <= 4096, "Invalid read-validation receipt; run audit")
     with private_file(receipt).open("rb") as stream:
         saved = decode(stream.read())
-    exact(saved, {"binding", "state", "checksum"}, "read-validation receipt; run audit")
-    require(saved["checksum"] == fingerprint({"binding": saved["binding"], "state": saved["state"]}),
-            "Read-validation receipt checksum mismatch; run audit")
-    if saved["binding"] != binding:
+    legacy = isinstance(saved, dict) and set(saved) == {"binding", "state", "checksum"}
+    exact(saved, {"binding", "state", "checksum"} if legacy else {"binding", "state", "checksum", "validated_on"},
+          "read-validation receipt; run audit")
+    signed = {key: saved[key] for key in saved if key != "checksum"}
+    require(saved["checksum"] == fingerprint(signed), "Read-validation receipt checksum mismatch; run audit")
+    if legacy or saved["binding"] != binding:
+        return None
+    if binding["version"] == 2 and saved["validated_on"] != _today():
         return None
     state = _head_state(connection)
     require(state == saved["state"], "Read-validation state mismatch; run audit")
-    return state
+    return state, saved["validated_on"]
 
 
 def validated_state(connection, home, *, audit=False):
-    """Reuse full inspection only for identical SQLite snapshot and validator bytes."""
+    """Reuse full inspection only for the identical database file and validator bytes."""
     binding = _binding(connection)
-    state = None if audit else _trusted_state(connection, home, binding)
-    if state is None:
-        state = inspect(connection)[0]
-        _write_receipt(home, binding, state)
+    trusted = None if audit else _trusted_state(connection, home, binding)
+    if trusted is not None:
+        return trusted[0]
+    state = inspect(connection)[0]
+    _write_receipt(home, binding, state)
     return state
 
 
@@ -644,14 +688,21 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             trusted = _trusted_state(connection, home, binding)
         except (CatalogError, OSError):
             trusted = None  # an unusable receipt only costs the full replay; it never blocks a write
+        validated_on = None  # a full replay below (or the daily snapshot's) starts a new day
         if trusted is None:
             state, current, _, _, _ = inspect(connection)
         else:
-            state, current = trusted, None
+            (state, validated_on), current = trusted, None
         committed = _CommittedStates(connection, state)
         prior = committed.prior(request_id)
         if prior is not None:
             require(prior["input_hash"] == input_hash, "Request ID reused with different actor, reason, or records")
+            if trusted is None:
+                # The replay above fully validated this file; keep the next retry or read from repeating it.
+                try:
+                    _write_receipt(home, binding, state)
+                except (OSError, CatalogError):
+                    pass
             if precommit_check is not None:
                 precommit_check()
             return {"command": "submit", "idempotent": True, **state, "state": state,
@@ -707,18 +758,20 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
                     f"Write committed at revision {revision}, but durability/backup failed; retry the same request"
                 ) from error
             raise
-        _attest_commit(connection, home, written)
+        # A snapshot verification replays everything, so only then does the full-check date advance.
+        _attest_commit(connection, home, written, None if taken is not None else validated_on)
         return {"command": "submit", "idempotent": False, **written, "state": written,
                 "request_id": request_id, "committed_revision": revision, "committed_at": batch["committed_at"],
                 "committed_state": written, "backup": taken, "retention": retention,
                 "rebased_from": rebased_from}
 
 
-def _attest_commit(connection, home, written):
+def _attest_commit(connection, home, written, validated_on=None):
     """Vouch for the bytes this writer just committed after validating only its delta.
 
-    The receipt binds the new file's SHA-256 to the state derived from the database itself, so
-    the next writer or reader skips the full replay only for exactly these bytes. Best effort:
+    The receipt binds the new file's identity to the state derived from the database itself, so
+    the next writer or reader skips the full replay only for exactly this file, and the date of the
+    last full validation is carried forward, never refreshed by a delta. Best effort:
     without a receipt the next reader or writer simply validates in full.
     """
     try:
@@ -726,7 +779,7 @@ def _attest_commit(connection, home, written):
         try:
             binding = _binding(connection)
             if _head_state(connection) == written:
-                _write_receipt(home, binding, written)
+                _write_receipt(home, binding, written, validated_on)
         finally:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")

@@ -49,6 +49,7 @@
   "tools/__init__.py",
   "tools/backups.py",
   "tools/policy.py",
+  "tools/file_identity.py",
   "tools/initialize.py",
   "tools/package.py",
   "tools/catalog/__init__.py",
@@ -109,5 +110,7 @@
   "docs/decisions/0016-single-replay-daily-snapshot.md",
   "tests/test_catalog_delta_commit.py",
   "tests/test_catalog_daily_snapshot.py",
+  "docs/decisions/0017-attested-file-identity-for-catalog-receipts.md",
+  "tests/test_catalog_identity_binding.py",
   "tests/test_validation_cost.py"
 ]
