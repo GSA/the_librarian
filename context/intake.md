@@ -32,11 +32,16 @@ named stage. The ledger is operational recovery state, never corpus authority.
   plus writing the snapshot (about 5 s at 25k registrations, 20 s at 100k;
   [0016](../docs/decisions/0016-single-replay-daily-snapshot.md)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
-  `catalog-busy` (lock wait exceeded) attempt, never `native-input`.
+  `catalog-busy` (lock wait exceeded) attempt, never `native-input`. Such an attempt wrote
+  nothing, so it does not spend `max_attempts` ([0017](../docs/decisions/0017-catalog-contention-outside-the-fault-budget.md)):
+  it counts against a separate bound of 30 lost races per stage cycle, and one `settle`
+  call retries at most 6 in a row (about 60 s at the 10 s catalog wait) before it returns
+  the stage `retryable` for the next run to resume. Faults still spend `max_attempts`.
+  `tools/diagnostics/catalog_contention_budget.py` reproduces it.
   `catalog-submit`, `extract-register` and `docling-register` rebase an outdated
   pin when no later revision wrote any record they write; overlap blocks as
   `catalog-conflict` and needs a correction. Upload and cohort ingest retry
-  retryable stages within the request's attempt budget. `recover-conflicts`
+  retryable stages (see above for the lost-race bound). `recover-conflicts`
   reports registration stages blocked by writer races (including legacy
   `native-input`), skipping corrected parents and overlapping writes; add
   `--apply` to replay and settle them.

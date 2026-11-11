@@ -1,4 +1,5 @@
 """Concurrent intake agents: lost catalog races retry instead of blocking."""
+import errno
 import multiprocessing
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import patch
 from tests.support import default_policy_hash
 from tools.catalog import catalog_store as catalog
 from tools.intake import adapters, cohort, runner, store, upload
+from tools.intake.contracts import IntakeError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -224,6 +226,121 @@ class SettleTests(Case):
             result = runner.settle(self.root, "req-backoff", "receipt")
         self.assertEqual(result["stages"][0]["status"], "succeeded")
         self.assertEqual(len(result["stages"][0]["attempts"]), 2)
+
+
+def stage_registration(root, correlation, *, max_attempts=3, backoff=0):
+    import json
+    from tools import policy
+    records = [{"id": "S%d" % (sum(map(ord, correlation)) * 7 + len(correlation)), "kind": "source",
+                "data": {"category": "artifact", "provenance": []}}]
+    store.stage(root, json.dumps({
+        "version": 1, "correlation_id": correlation, "correction_of": None,
+        "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+        "retry": {"max_attempts": max_attempts, "backoff_seconds": backoff},
+        "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit", "arguments": {
+            "records": records, "actor": "a", "request_id": correlation, "reason": "r",
+            "expected_state": catalog.status(root)["state_token"]}}]}).encode())
+
+
+class ContentionBudgetTests(Case):
+    """Lost catalog waits and stale pins wrote nothing, so they do not spend the fault budget."""
+
+    def failing(self, *errors):
+        real = catalog.submit
+        pending = list(errors)
+
+        def submit(*args, **kwargs):
+            if pending:
+                raise pending.pop(0)
+            return real(*args, **kwargs)
+        return patch.object(adapters.catalog, "submit", side_effect=submit)
+
+    def codes(self, result):
+        return [a["code"] or a["outcome"] for a in result["stages"][0]["attempts"]]
+
+    def test_more_lost_waits_than_the_attempt_budget_still_settle(self):
+        stage_registration(self.root, "req-busy")
+        busy = catalog.WriterBusy("Another catalog writer is active; retry later")
+        with self.failing(*[busy] * 5):
+            result = runner.settle(self.root, "req-busy", "receipt")
+        self.assertEqual(result["stages"][0]["status"], "succeeded")
+        self.assertEqual(self.codes(result), ["catalog-busy"] * 5 + ["succeeded"])
+        self.assertEqual(runner.conflicts(result["stages"][0]), 5)
+
+    def test_stale_pins_do_not_spend_the_budget_either(self):
+        stage_registration(self.root, "req-stale", max_attempts=1)
+        stale = catalog.StaleState("Stale expected state; re-read before writing")
+        with self.failing(stale, catalog.WriterBusy("busy"), stale):
+            result = runner.settle(self.root, "req-stale", "receipt")
+        self.assertEqual(result["stages"][0]["status"], "succeeded")
+        self.assertEqual(self.codes(result), ["catalog-stale-state", "catalog-busy", "catalog-stale-state", "succeeded"])
+
+    def test_contention_beyond_the_bound_leaves_the_stage_retryable_and_resumable(self):
+        stage_registration(self.root, "req-long")
+        busy = catalog.WriterBusy("busy")
+        with patch.object(runner, "CONTENTION_RETRIES", 4), self.failing(*[busy] * 6):
+            result = runner.settle(self.root, "req-long", "receipt")
+            self.assertEqual(result["stages"][0]["status"], "retryable")
+            self.assertEqual(self.codes(result), ["catalog-busy"] * 4)
+            result = runner.settle(self.root, "req-long", "receipt")
+        self.assertEqual(result["stages"][0]["status"], "succeeded")
+        self.assertEqual(self.codes(result), ["catalog-busy"] * 6 + ["succeeded"])
+
+    def test_a_lock_stuck_past_the_contention_budget_dead_letters_and_recovers(self):
+        stage_registration(self.root, "req-stuck")
+        busy = catalog.WriterBusy("busy")
+        with patch.object(runner, "CONTENTION_BUDGET", 5), patch.object(runner, "CONTENTION_RETRIES", 100), \
+                self.failing(*[busy] * 5):
+            result = runner.settle(self.root, "req-stuck", "receipt")
+            self.assertEqual((result["stages"][0]["status"], self.codes(result)),
+                             ("dead-letter", ["catalog-busy"] * 5))
+            with self.assertRaises(IntakeError):
+                runner.run(self.root, "req-stuck", "receipt")
+        applied = runner.recover_conflicts(self.root, apply=True)
+        self.assertEqual((applied["candidates"], applied["results"]), (1, {"succeeded": 1}))
+
+    def test_faults_still_spend_the_budget_between_lost_waits(self):
+        stage_registration(self.root, "req-fault")
+        busy = catalog.WriterBusy("busy")
+        transient = OSError(errno.EAGAIN, "transient")
+        with self.failing(busy, transient, busy, transient, busy, transient):
+            result = runner.settle(self.root, "req-fault", "receipt")
+        self.assertEqual(result["stages"][0]["status"], "dead-letter")
+        self.assertEqual(self.codes(result), ["catalog-busy", "os-error", "catalog-busy", "os-error",
+                                              "catalog-busy", "os-error"])
+
+    def test_input_faults_and_overlapping_writes_still_block(self):
+        for name, error, code in (("req-input", catalog.CatalogError("bad input"), "native-input"),
+                                  ("req-overlap", catalog.ConflictingWrite("overlap"), "catalog-conflict")):
+            stage_registration(self.root, name)
+            with self.failing(catalog.WriterBusy("busy"), error):
+                result = runner.settle(self.root, name, "receipt")
+            self.assertEqual((result["stages"][0]["status"], self.codes(result)),
+                             ("blocked", ["catalog-busy", code]))
+
+    def test_single_run_after_lost_waits_is_not_an_attempt_limit(self):
+        stage_registration(self.root, "req-run", max_attempts=1)
+        busy = catalog.WriterBusy("busy")
+        with self.failing(busy, busy):
+            for _ in range(2):
+                self.assertEqual(runner.run(self.root, "req-run", "receipt")["stages"][0]["status"], "retryable")
+            self.assertEqual(runner.run(self.root, "req-run", "receipt")["stages"][0]["status"], "succeeded")
+
+    def test_a_real_lock_held_for_more_waits_than_the_budget_does_not_dead_letter_the_stage(self):
+        stage_registration(self.root, "req-held")
+        home = catalog.locations(self.root)[0]
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl,os,sys,time\n"
+             "fd=os.open(sys.argv[1],os.O_RDWR)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"
+             "print('held',flush=True)\ntime.sleep(float(sys.argv[2]))", str(home / "writer.lock"), "1.1"],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with patch.object(catalog, "WRITER_WAIT_SECONDS", 0.2):
+            result = runner.settle(self.root, "req-held", "receipt")
+        self.assertEqual(result["stages"][0]["status"], "succeeded")
+        self.assertGreater(self.codes(result).count("catalog-busy"), 3)
 
 
 class RecoveryTests(Case):

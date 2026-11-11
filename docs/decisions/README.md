@@ -27,6 +27,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0014](0014-intake-ledger-handoff-and-bounded-waits.md) | Intake ledger hand-off without re-validation, bounded lock waits, short readers | Implemented; amends 0012 and 0013 |
 | [0015](0015-trusted-head-catalog-commit.md) | Catalog writers validate only their delta on a trusted head | Implemented; amends 0012 and 0013; amended by 0016 |
 | [0016](0016-single-replay-daily-snapshot.md) | The first write of a UTC day replays the history once | Implemented; amends 0010 and 0015 |
+| [0017](0017-catalog-contention-outside-the-fault-budget.md) | Lost catalog races do not spend an intake stage's fault budget | Implemented; amends 0013 and 0014 |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in
