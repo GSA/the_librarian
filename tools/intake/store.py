@@ -2,13 +2,17 @@
 from contextlib import closing, contextmanager
 import fcntl
 import functools
+import json
+import math
 import os
 from pathlib import Path
+import random
 import sqlite3
 import stat
+import time
 
 from tools import policy
-from .contracts import IntakeError, canonical, decode, decode_request, digest, request_shape, require
+from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, request_shape, require
 
 APPLICATION_ID = 0x4C494E54
 SCHEMA = 1
@@ -113,12 +117,16 @@ def _saved_artifact(raw, sha256):
     return digest(raw.encode()) == sha256 and isinstance(decode(raw.encode()), dict)
 
 
-def validate(c, root):
+def check_identity(c):
+    """Application identity, SQLite integrity and foreign keys (no row decoding)."""
     require(c.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
             and c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA, "incompatible_store")
     require(c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             and not c.execute("PRAGMA foreign_key_check").fetchall(), "corrupt_store")
-    # One query per table (not per request and stage); checks run in the same order.
+
+
+def snapshot(c):
+    """Every ledger row, read in one pass so a caller can verify it without holding a read lock."""
     stages_of, attempts_of, replays_of = {}, {}, {}
     for saved in c.execute("SELECT * FROM stages ORDER BY correlation_id, ordinal"):
         stages_of.setdefault(saved["correlation_id"], []).append(saved)
@@ -126,7 +134,13 @@ def validate(c, root):
         attempts_of.setdefault((attempt["correlation_id"], attempt["stage_id"]), []).append(attempt)
     for replay in c.execute("SELECT correlation_id, stage_id, cycle FROM replays ORDER BY correlation_id, stage_id, cycle"):
         replays_of.setdefault((replay[0], replay[1]), []).append(replay[2])
-    for row in c.execute("SELECT * FROM requests"):
+    return c.execute("SELECT * FROM requests").fetchall(), stages_of, attempts_of, replays_of
+
+
+def verify(rows, root):
+    """Digest and shape checks over a ``snapshot``; pure, so it needs no database lock."""
+    requests, stages_of, attempts_of, replays_of = rows
+    for row in requests:
         correlation_id, correction_of, stage_ids = request_shape(row["raw"])
         require(_digest_matches(row["raw"], row["request_sha256"]) and row["root"] == str(root)
                 and correlation_id == row["correlation_id"]
@@ -151,10 +165,50 @@ def validate(c, root):
             require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
 
 
-# Ledger files this process fully validated, keyed by (db, root), mapped to the file
-# identity it left behind on unlock. An unchanged identity at the next lock means no
-# other writer touched the file, so the full O(ledger) validation is skipped.
-_validated = {}
+def validate(c, root):
+    """Full O(ledger) validation, run when no trusted attestation covers the file."""
+    check_identity(c)
+    verify(snapshot(c), root)
+
+
+LOCK_WAIT_ENV = "LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS"
+# Seconds a writer waits for the ledger lock, and for SQLite readers to finish, before
+# the retryable ``ledger_busy`` outcome.
+LOCK_WAIT_SECONDS = 30.0
+
+
+def lock_wait(wait=None):
+    """The bounded wait: an explicit value, else the environment override, else the default.
+
+    Every source passes the same finite 0-3600 second check, so no value can wait forever.
+    """
+    configured = wait if wait is not None else os.environ.get(LOCK_WAIT_ENV)
+    if configured is None:
+        return LOCK_WAIT_SECONDS
+    try:
+        value = float(configured)
+    except (TypeError, ValueError) as error:
+        raise IntakeError("invalid_lock_wait") from error
+    require(math.isfinite(value) and 0 <= value <= 3600, "invalid_lock_wait")
+    return value
+
+
+def _busy(error):
+    """True for SQLite's transient BUSY/LOCKED outcomes, which a retry can resolve."""
+    return isinstance(error, sqlite3.OperationalError) and (
+        getattr(error, "sqlite_errorcode", 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+
+
+def _acquire(fd, wait):
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as error:
+            if time.monotonic() >= deadline:
+                raise LedgerBusy() from error
+            time.sleep(random.uniform(0.02, 0.1))
 
 
 def _identity(db):
@@ -170,13 +224,35 @@ def _identity(db):
         os.close(fd)
     if len(header) < 100 or header[18:20] != b"\x01\x01":
         return None
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, header[24:28])
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, header[24:28].hex()]
+
+
+def _take_attestation(fd, root):
+    """The identity the previous clean writer left in the lock file, consumed on read.
+
+    The lock file is truncated as soon as this writer holds the lock, so a crash,
+    or any commit that does not finish with a fresh attestation, forces the next
+    writer to validate in full.
+    """
+    try:
+        raw = os.pread(fd, 4096, 0)
+        os.ftruncate(fd, 0)
+        value = json.loads(raw)
+        if value["version"] == 1 and value["root"] == str(root) and isinstance(value["identity"], list):
+            return value["identity"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _attest(fd, root, identity):
+    os.pwrite(fd, json.dumps({"version": 1, "root": str(root), "identity": identity}).encode(), 0)
 
 
 @contextmanager
-def locked(root):
+def locked(root, wait=None):
     root, home, db = locations(root)
-    key = (str(db), str(root))
+    seconds = lock_wait(wait)
     private(home, True)
     private(db)
     lock = home / "writer.lock"
@@ -187,40 +263,39 @@ def locked(root):
     try:
         try:
             private(lock)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            known = _validated.pop(key, None)
-            c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True)
+            _acquire(fd, seconds)
+            known = _take_attestation(fd, root)
+            c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=seconds)
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("PRAGMA synchronous=FULL")
             # Changes only when another connection commits; read before the identity check
             # so no foreign commit can land unseen between the two.
             foreign = c.execute("PRAGMA data_version").fetchone()[0]
+            # Another writer's clean hand-off left its attestation; a file that still matches
+            # it was last written by a validated writer, so the O(ledger) pass is skipped.
             if known is None or known != _identity(db):
                 validate(c, root)
         except sqlite3.Error as error:
-            raise IntakeError("corrupt_store") from error
+            raise (LedgerBusy() if _busy(error) else IntakeError("corrupt_store")) from error
         try:
             # A failure after validation is an unavailable ledger, not a corrupt one.
             yield c
         except sqlite3.Error as error:
-            raise IntakeError("ledger_unavailable") from error
+            raise (LedgerBusy() if _busy(error) else IntakeError("ledger_unavailable")) from error
         clean = True
     finally:
-        identity = None
         try:
             # Recorded while still holding the writer lock, after this process's own commits,
             # and only when no other connection committed since validation.
             if clean:
                 identity = _identity(db)
-                if c.execute("PRAGMA data_version").fetchone()[0] != foreign:
-                    identity = None
+                if identity is not None and c.execute("PRAGMA data_version").fetchone()[0] == foreign:
+                    _attest(fd, root, identity)
         except (OSError, sqlite3.Error):
-            identity = None
+            pass
         if c is not None:
             c.close()
-        if identity is not None:
-            _validated[key] = identity
         os.close(fd)
 
 

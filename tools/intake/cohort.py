@@ -27,7 +27,7 @@ from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
 from . import cli, model_review, runner, standing, store, upload
 from . import contracts
-from .contracts import IntakeError
+from .contracts import IntakeError, LedgerBusy
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
 RUNTIME_FORMATS = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
@@ -220,16 +220,34 @@ def _process(root, inbox, entry, system, actor):
             name=identity["name"], actor=actor, reason=REASON, origin_kind="local-path",
             origin_system=system, origin_locator=identity["locator"],
             expected_sha256=entry["sha256"]))
+    except LedgerBusy:
+        raise  # retried by _settled, never reported as a receipt refusal
     except IntakeError as error:
         outcome = "changed-since-intake" if error.code == "changed_input" else "failed"
         return {"outcome": outcome, "stage": "receipt", "code": error.code}
     entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
     receipt = store.inspect(root, ack["correlation_id"])["stages"][0]
-    entry["conflicts"] = runner.conflicts(receipt)
+    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(receipt)
     if ack["receipt"]["state"] != "committed":
         return _failure("receipt", receipt)
     entry["received"] = True
     return _extract(root, entry, actor)
+
+
+def _settled(root, inbox, entry, system, actor):
+    """Process one entry, retrying a busy ledger within the entry's attempt budget.
+
+    Every step is idempotent by request identity, so repeating the entry is safe. An
+    entry that is still busy after the budget fails visibly as retryable ``ledger_busy``
+    and the run continues; the next run resumes it.
+    """
+    for attempt in range(runner.BUSY_RETRIES):
+        try:
+            return _process(root, inbox, entry, system, actor)
+        except LedgerBusy:
+            entry["conflicts"] = entry.get("conflicts", 0) + 1
+    return {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
+            "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
 
 
 def ingest(root, inbox, *, system, actor, limit=None):
@@ -242,7 +260,7 @@ def ingest(root, inbox, *, system, actor, limit=None):
             entry["outcome"] = "not-processed"
             outcome["not-processed"] += 1
             continue
-        entry.update(_process(root, inbox, entry, system, actor))
+        entry.update(_settled(root, inbox, entry, system, actor))
         outcome["received"] += bool(entry.get("received"))
         outcome[entry["outcome"]] += 1
     retried = [e for e in admitted if e.get("conflicts")]

@@ -6,9 +6,22 @@ import re
 
 
 class IntakeError(ValueError):
+    retryable = False
+
     def __init__(self, code):
         self.code = code
         super().__init__(code)
+
+
+class LedgerBusy(IntakeError):
+    """The ledger writer lock or a SQLite lock stayed held past the bounded wait.
+
+    Retryable: nothing was written, so the same call can simply be repeated.
+    """
+    retryable = True
+
+    def __init__(self):
+        super().__init__("ledger_busy")
 
 
 def require(condition, code="invalid_request"):

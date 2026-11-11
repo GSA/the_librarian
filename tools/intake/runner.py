@@ -5,7 +5,7 @@ import time
 
 from tools import policy
 from . import adapters, store
-from .contracts import IntakeError, canonical, decode, decode_request, digest, require
+from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, require
 
 
 def selected(c, correlation, stage_id):
@@ -64,7 +64,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
         def failed(error):
             failure = classify(error)
             if isinstance(error, IntakeError):
-                failure = adapters.StageFailure("blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
+                failure = adapters.StageFailure("retryable" if error.retryable else "blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
             status = "blocked" if failure.category == "blocked" else "dead-letter" if failure.category == "permanent" or ordinal >= request["retry"]["max_attempts"] else "retryable"
             ended = clock()
             with c:
@@ -104,9 +104,17 @@ def settle(root, correlation_id, stage_id):
     Concurrent catalog writers surface as retryable stale-state or busy attempts;
     each retry re-reads the catalog, so the stage settles without manual replay.
     """
+    busy = 0
     while True:
         try:
             result = run(root, correlation_id, stage_id)
+        except LedgerBusy:
+            # Nothing was written, so a busy ledger is retried within the stage's attempt
+            # budget (read from the ledger, which may itself be busy); then it surfaces.
+            busy += 1
+            if busy >= BUSY_RETRIES:
+                raise
+            continue
         except IntakeError as error:
             if error.code != "backoff_pending":
                 raise
@@ -126,6 +134,8 @@ def settle(root, correlation_id, stage_id):
 
 
 SETTLE_MAX_WAIT = 60
+# Consecutive ledger-busy outcomes (each already a full bounded lock wait) before settle gives up.
+BUSY_RETRIES = 3
 
 
 def conflicts(stage):
