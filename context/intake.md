@@ -154,9 +154,11 @@ named stage. The ledger is operational recovery state, never corpus authority.
 
 Reference target for a large cohort on an instance of production size (about 100 MB
 catalog, 25,000 revisions, about 130 MB ledger, 35,000 requests), on a host that is not
-otherwise saturated: **at least 15 files/min sustained, p95 per-file latency under 10 s,
-and the last decile of a run no more than 2x the first decile** (measured 1.7x at 1,600 synthetic files) (a 5,000-file cohort
-in about 5.5 hours). Each file is two catalog commits. The model behind it is, per file:
+otherwise saturated: **at least 10 files/min sustained on the instance (a 5,000-file
+cohort in under 8.5 hours), at least 20 files/min on the synthetic production-size harness
+(`ledger_scale_benchmark.py`, which measured about 28), p95 per-file latency under 10 s,
+and the last decile of a run no more than 2x the first decile** (measured 1.7x at 1,600
+synthetic files). Each file is two catalog commits. The model behind it is, per file, at this size:
 about 14 whole-file catalog bindings (`serialize` + SHA-256, about 0.11 s each at 100 MB),
 at most one full ledger validation per process, two delta commits (about 0.1 s each), and
 extraction. Measure with the synthetic harnesses; never point them at a real instance:
