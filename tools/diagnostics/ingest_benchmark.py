@@ -69,6 +69,25 @@ def instrument(timers):
             module = importlib.import_module(module_name)
             if hasattr(module, name):
                 wrap(module, name)
+        # The catalog writer lock is a context manager, so time how long it is held.
+        from tools.catalog import catalog_store
+        lock = catalog_store.writer_lock
+
+        @contextlib.contextmanager
+        def timed_lock(home, *args, **kwargs):
+            with lock(home, *args, **kwargs):
+                if Path(home).name != "catalog":  # extraction has its own, separate lock
+                    yield
+                    return
+                start = time.perf_counter()
+                try:
+                    yield
+                finally:
+                    entry = timers.setdefault("catalog_store.writer_lock_held", [0, 0.0, 0.0])
+                    entry[0] += 1
+                    entry[1] += time.perf_counter() - start
+        saved.append((catalog_store, "writer_lock", lock))
+        catalog_store.writer_lock = timed_lock
         yield timers
     finally:
         for module, name, original in reversed(saved):
