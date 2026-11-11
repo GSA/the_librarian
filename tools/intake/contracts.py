@@ -1,5 +1,4 @@
 """Closed, body-preserving intake request contracts."""
-import functools
 import hashlib
 import json
 import re
@@ -145,13 +144,10 @@ def decode_request(raw):
     return value
 
 
-@functools.lru_cache(maxsize=16384)
 def request_shape(raw):
-    """Immutable identity of a fully validated saved request, memoized by its exact bytes.
+    """Immutable identity (correlation ID, correction parent, stage IDs) of a fully validated saved request.
 
-    decode_request is a pure function of the bytes, so a hit proves these exact bytes
-    already passed every check; a rewritten request is a different key and is decoded
-    and refused afresh. Failures are never cached.
+    A pure function of the bytes; ``store.verify`` memoizes it by the exact bytes.
     """
     value = decode_request(raw)
     return (value["correlation_id"], value["correction_of"],

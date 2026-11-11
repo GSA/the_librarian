@@ -1,7 +1,6 @@
 """Private transactional intake intent and recovery ledger."""
 from contextlib import closing, contextmanager
 import fcntl
-import functools
 import json
 import math
 import os
@@ -103,19 +102,28 @@ def initialize(root):
     return {"initialized": True, "schema": SCHEMA}
 
 
-@functools.lru_cache(maxsize=32768)
-def _digest_matches(raw, sha256):
-    return digest(raw) == sha256
+# Verified-ledger memo. ``verify`` walks every row in the same order each time, so a fixed-size
+# LRU smaller than the ledger never hits. Instead each pass consults the previous pass's memo and
+# builds the next one from the rows it just verified: memory follows the live ledger, not history,
+# and a cyclic walk cannot thrash. Entries are keyed by the exact bytes (request bytes, artifact
+# text) and record the digest those bytes were proven to have, so a hit requires identical bytes
+# and an identical stored digest; any rewritten row is a miss and is decoded and hashed afresh.
+# Entries are recorded only after the whole pass succeeded; failures are never cached.
+MEMO_BYTES = 128 * 1024 * 1024  # key bytes retained; rows beyond it are re-verified every pass
+_MEMO_ENTRY_OVERHEAD = 160  # digest string and dict slot per entry
+_verified = ({}, {})  # (request bytes -> (sha256, shape), artifact text -> sha256)
 
 
-@functools.lru_cache(maxsize=65536)
-def _saved_artifact(raw, sha256):
-    """True when this exact saved artifact text matches its digest and is a JSON object.
+def forget_verified():
+    global _verified
+    _verified = ({}, {})
 
-    Both checks are pure functions of the arguments, so revalidating an unchanged
-    ledger on every lock never re-hashes or re-decodes the same bytes.
-    """
-    return digest(raw.encode()) == sha256 and isinstance(decode(raw.encode()), dict)
+
+def verified_bytes():
+    """Bytes of keys (plus per-entry overhead) the memo currently holds."""
+    requests, artifacts = _verified
+    return (sum(len(raw) for raw in requests) + sum(len(text) for text in artifacts)
+            + _MEMO_ENTRY_OVERHEAD * (len(requests) + len(artifacts)))
 
 
 def check_identity(c):
@@ -140,12 +148,29 @@ def snapshot(c):
 
 def verify(rows, root):
     """Digest and shape checks over a ``snapshot``; pure, so it needs no database lock."""
+    global _verified
     requests, stages_of, attempts_of, replays_of = rows
+    known_requests, known_artifacts = _verified
+    remembered_requests, remembered_artifacts, held = {}, {}, 0
+
+    def remember(into, key, value):
+        nonlocal held
+        if key not in into and held + len(key) + _MEMO_ENTRY_OVERHEAD <= MEMO_BYTES:
+            held += len(key) + _MEMO_ENTRY_OVERHEAD
+            into[key] = value
+
     for row in requests:
-        correlation_id, correction_of, stage_ids = request_shape(row["raw"])
-        require(_digest_matches(row["raw"], row["request_sha256"]) and row["root"] == str(root)
-                and correlation_id == row["correlation_id"]
+        raw = row["raw"]
+        known = known_requests.get(raw)
+        if known is not None and known[0] == row["request_sha256"]:
+            shape = known[1]
+        else:
+            shape = request_shape(raw)
+            require(digest(raw) == row["request_sha256"], "corrupt_request")
+        correlation_id, correction_of, stage_ids = shape
+        require(row["root"] == str(root) and correlation_id == row["correlation_id"]
                 and correction_of == row["correction_of"], "corrupt_request")
+        remember(remembered_requests, raw, (row["request_sha256"], shape))
         stages = stages_of.get(row["correlation_id"], [])
         require(len(stages) == len(stage_ids), "corrupt_stage")
         for ordinal, (stage_id, saved) in enumerate(zip(stage_ids, stages)):
@@ -156,7 +181,10 @@ def verify(rows, root):
                 raw = saved[key]
                 require((raw is None) == (saved[key + "_sha256"] is None), "corrupt_artifact")
                 if raw is not None:
-                    require(_saved_artifact(raw, saved[key + "_sha256"]), "corrupt_artifact")
+                    if known_artifacts.get(raw) != saved[key + "_sha256"]:
+                        require(digest(raw.encode()) == saved[key + "_sha256"]
+                                and isinstance(decode(raw.encode()), dict), "corrupt_artifact")
+                    remember(remembered_artifacts, raw, saved[key + "_sha256"])
             require(saved["status"] not in {"succeeded", "return-pending"}
                     or (saved["intent"] is not None and saved["evidence"] is not None), "corrupt_stage")
             for attempt in attempts_of.get((row["correlation_id"], stage_id), []):
@@ -164,6 +192,7 @@ def verify(rows, root):
                         and (attempt["outcome"] in {None, "succeeded", "failed", "return-pending"})
                         and ((attempt["ended"] is None) == (attempt["outcome"] is None)), "corrupt_attempt")
             require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
+    _verified = (remembered_requests, remembered_artifacts)
 
 
 def validate(c, root):
