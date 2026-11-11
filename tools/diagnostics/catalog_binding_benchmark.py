@@ -30,13 +30,13 @@ import time
 from contextlib import closing
 
 
-def timed(function, repeat):
+def timed(function, repeat, digits=2):
     spent = []
     for _ in range(repeat):
         start = time.perf_counter()
         function()
         spent.append(time.perf_counter() - start)
-    return round(statistics.median(spent) * 1000, 2)
+    return round(statistics.median(spent) * 1000, digits)
 
 
 def file_sha256(path):
@@ -78,8 +78,7 @@ def primitives(cs, root, repeat):
         connection.execute("ROLLBACK")
     out["sha256_file_stream"] = timed(lambda: file_sha256(db), repeat)
     out["blake2b_file_stream"] = timed(lambda: file_blake2b(db), repeat)
-    out["identity_read"] = timed(lambda: identity(db), repeat * 20)
-    out["identity_read"] = round(out["identity_read"], 4)
+    out["identity_read"] = timed(lambda: identity(db), repeat * 20, digits=4)
     return out, db.stat().st_size
 
 
