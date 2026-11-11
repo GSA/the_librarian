@@ -49,8 +49,8 @@ migrates authority data implicitly and always rebuilds the derived index; one
 Librarian per project with its own data root; inbox-first source onboarding
 with read-only remote scopes; and an open evaluation that declines a graph
 database server in favor of a rebuildable derived projection if traversal is
-ever needed. These were design commitments and inventory when recorded. The configuration work they depend on - per-instance
-store homes, policy that follows the data root, and index identity that does not
+ever needed. These were design commitments and inventory when recorded. The
+configuration work they depend on - per-instance store homes, policy that follows the data root, and index identity that does not
 bind an absolute host path - was built afterwards and is now implemented (see
 [0003](docs/decisions/0003-store-compatibility.md) and
 [0004](docs/decisions/0004-instance-topology.md)); the pinned lock file, image and
