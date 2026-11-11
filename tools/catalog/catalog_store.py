@@ -22,7 +22,7 @@ from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
     CatalogError, ConflictingWrite, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
     now, path_value, refs, require, safe_relative, text, validate_graph, GraphValidator,
-    validate_record, validate_records,
+    validate_record, validate_records, validate_delta, _references,
 )
 
 AUTHORITY = "catalog-metadata-only"
@@ -463,42 +463,35 @@ def initialize(root):
                 partial.unlink()
 
 
-def validated_state(connection, home, *, audit=False):
-    """Reuse full inspection only for identical SQLite snapshot and validator bytes."""
+def _binding(connection):
+    """Identity of the exact SQLite snapshot, validator bytes and runtime a validation covers."""
     require(connection.in_transaction, "Validated reads require a transaction")
     require(hasattr(connection, "serialize"), "Validated reads require SQLite serialize support")
     require(validator_sha256() == VALIDATOR_SHA256,
             "Catalog validator changed after import; restart the reader")
     # Acquire the read snapshot before hashing; a concurrent commit cannot change it.
     connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
-    binding = {
+    return {
         "version": 1,
         "snapshot_sha256": hashlib.sha256(connection.serialize()).hexdigest(),
         "validator_sha256": VALIDATOR_SHA256,
         "runtime": [sys.version, sqlite3.sqlite_version, unicodedata.unidata_version],
     }
+
+
+def _head_state(connection):
+    """State derived from the metadata, newest revision and current-record count alone."""
+    metadata = dict(connection.execute("SELECT key,value FROM metadata"))
+    latest = connection.execute(
+        "SELECT revision,revision_hash FROM revisions ORDER BY revision DESC LIMIT 1").fetchone()
+    count = connection.execute("SELECT count(*) FROM current_records").fetchone()[0]
+    return make_state(metadata, latest["revision"] if latest else 0,
+                      latest["revision_hash"] if latest else "", count)
+
+
+def _write_receipt(home, binding, state):
     cache_home = safe_path(home / ".local")
     receipt = safe_path(cache_home / "read-validation.json")
-    if cache_home.exists():
-        require(cache_home.is_dir() and stat.S_IMODE(cache_home.stat().st_mode) == 0o700,
-                "Read-validation directory must be private (0700)")
-    if receipt.exists() and not audit:
-        require(receipt.stat().st_size <= 4096, "Invalid read-validation receipt; run audit")
-        with private_file(receipt).open("rb") as stream:
-            saved = decode(stream.read())
-        exact(saved, {"binding", "state", "checksum"}, "read-validation receipt; run audit")
-        require(saved["checksum"] == fingerprint({"binding": saved["binding"], "state": saved["state"]}),
-                "Read-validation receipt checksum mismatch; run audit")
-        if saved["binding"] == binding:
-            metadata = dict(connection.execute("SELECT key,value FROM metadata"))
-            latest = connection.execute(
-                "SELECT revision,revision_hash FROM revisions ORDER BY revision DESC LIMIT 1").fetchone()
-            count = connection.execute("SELECT count(*) FROM current_records").fetchone()[0]
-            state = make_state(metadata, latest["revision"] if latest else 0,
-                               latest["revision_hash"] if latest else "", count)
-            require(state == saved["state"], "Read-validation state mismatch; run audit")
-            return state
-    state = inspect(connection)[0]
     record = {"binding": binding, "state": state}
     record["checksum"] = fingerprint(record)
     private_directory(cache_home)
@@ -514,6 +507,37 @@ def validated_state(connection, home, *, audit=False):
     finally:
         if partial.exists():
             partial.unlink()
+
+
+def _trusted_state(connection, home, binding):
+    """The state a receipt vouches for when it covers exactly this snapshot, else None."""
+    cache_home = safe_path(home / ".local")
+    receipt = safe_path(cache_home / "read-validation.json")
+    if cache_home.exists():
+        require(cache_home.is_dir() and stat.S_IMODE(cache_home.stat().st_mode) == 0o700,
+                "Read-validation directory must be private (0700)")
+    if not receipt.exists():
+        return None
+    require(receipt.stat().st_size <= 4096, "Invalid read-validation receipt; run audit")
+    with private_file(receipt).open("rb") as stream:
+        saved = decode(stream.read())
+    exact(saved, {"binding", "state", "checksum"}, "read-validation receipt; run audit")
+    require(saved["checksum"] == fingerprint({"binding": saved["binding"], "state": saved["state"]}),
+            "Read-validation receipt checksum mismatch; run audit")
+    if saved["binding"] != binding:
+        return None
+    state = _head_state(connection)
+    require(state == saved["state"], "Read-validation state mismatch; run audit")
+    return state
+
+
+def validated_state(connection, home, *, audit=False):
+    """Reuse full inspection only for identical SQLite snapshot and validator bytes."""
+    binding = _binding(connection)
+    state = None if audit else _trusted_state(connection, home, binding)
+    if state is None:
+        state = inspect(connection)[0]
+        _write_receipt(home, binding, state)
     return state
 
 
@@ -548,39 +572,51 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
     private_file(db)
     with writer_lock(home), closing(connect(db, write=True)) as connection:
         connection.execute("BEGIN")
-        state, current, histories, batches, committed_states = inspect(connection)
-        prior = next((batch for batch in batches if batch["request_id"] == request_id), None)
+        binding = _binding(connection)
+        # A receipt for these exact bytes (a prior full inspection, or this writer's own
+        # validated commit) stands in for the O(history) replay; any other bytes get the full one.
+        try:
+            trusted = _trusted_state(connection, home, binding)
+        except (CatalogError, OSError):
+            trusted = None  # an unusable receipt only costs the full replay; it never blocks a write
+        if trusted is None:
+            state, current, _, _, _ = inspect(connection)
+        else:
+            state, current = trusted, None
+        committed = _CommittedStates(connection, state)
+        prior = committed.prior(request_id)
         if prior is not None:
             require(prior["input_hash"] == input_hash, "Request ID reused with different actor, reason, or records")
             if precommit_check is not None:
                 precommit_check()
             return {"command": "submit", "idempotent": True, **state, "state": state,
                     "request_id": request_id, "committed_revision": prior["revision"],
-                    "committed_at": prior["committed_at"], "committed_state": committed_states[prior["revision"]],
+                    "committed_at": prior["committed_at"], "committed_state": committed.state(prior["revision"]),
                     "backup": None, "retention": None}
         rebased_from = None
         if expected_state != state["state_token"]:
-            pinned = {committed["state_token"]: number for number, committed in committed_states.items()}
-            pinned[make_state(state, 0, "", 0)["state_token"]] = 0
             if not rebase:
                 raise StaleState("Stale expected state; re-read before writing")
-            if expected_state not in pinned:
+            rebased_from = committed.revision_of(expected_state)
+            if rebased_from is None:
                 raise ConflictingWrite("Pinned state is not in this catalog's history")
-            rebased_from = pinned[expected_state]
-            later = {record_id for record_id, versions in histories.items()
-                     if any(version["revision"] > rebased_from for version in versions)}
-            if later & {record["id"] for record in incoming}:
+            if committed.written_after(rebased_from, [record["id"] for record in incoming]):
                 raise ConflictingWrite("A later revision rewrote a record in this request")
-        resulting = dict(current)
-        resulting.update((record["id"], record) for record in incoming)
-        validate_graph(resulting)
+        old = _CurrentRecords(connection)
+        added = sum(1 for record in incoming if old.get(record["id"]) is None)
+        if current is not None:
+            resulting = dict(current)
+            resulting.update((record["id"], record) for record in incoming)
+            validate_graph(resulting)
+        else:
+            validate_delta(incoming, get=old.get, referrers=old.referrers, claimants=old.claimants)
         taken, retention = _daily_snapshot(root, connection, backups, state)
         connection.execute("COMMIT")
-        committed = False
+        committed_flag = False
         revision = state["revision"] + 1
         try:
             connection.execute("BEGIN IMMEDIATE")
-            require(inspect(connection)[0] == state, "Store changed outside the writer lock")
+            require(_binding(connection) == binding, "Store changed outside the writer lock")
             batch = {"revision": revision, "request_id": request_id, "actor": actor, "reason": reason,
                      "committed_at": now(), "input_hash": input_hash, "record_count": len(incoming),
                      "previous_hash": state["head_hash"]}
@@ -595,21 +631,127 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             if precommit_check is not None:
                 precommit_check()
             connection.execute("COMMIT")
-            committed = True
+            committed_flag = True
             seal(db)
-            written = make_state(state, revision, batch["revision_hash"], len(resulting))
+            written = make_state(state, revision, batch["revision_hash"], state["records"] + added)
         except (OSError, sqlite3.Error, CatalogError) as error:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
-            if committed:
+            if committed_flag:
                 raise CatalogError(
                     f"Write committed at revision {revision}, but durability/backup failed; retry the same request"
                 ) from error
             raise
+        _attest_commit(connection, home, written)
         return {"command": "submit", "idempotent": False, **written, "state": written,
                 "request_id": request_id, "committed_revision": revision, "committed_at": batch["committed_at"],
                 "committed_state": written, "backup": taken, "retention": retention,
                 "rebased_from": rebased_from}
+
+
+def _attest_commit(connection, home, written):
+    """Vouch for the bytes this writer just committed after validating only its delta.
+
+    The receipt binds the new file's SHA-256 to the state derived from the database itself, so
+    the next writer or reader skips the full replay only for exactly these bytes. Best effort:
+    without a receipt the next reader or writer simply validates in full.
+    """
+    try:
+        connection.execute("BEGIN")
+        try:
+            binding = _binding(connection)
+            if _head_state(connection) == written:
+                _write_receipt(home, binding, written)
+        finally:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+    except (OSError, sqlite3.Error, CatalogError):
+        pass
+
+
+class _CurrentRecords:
+    """Indexed lookups into the committed current records, without replaying history."""
+
+    SQL = ("SELECT v.payload FROM current_records c JOIN versions v "
+           "ON v.revision=c.revision AND v.ordinal=c.ordinal WHERE ")
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def get(self, record_id):
+        row = self.connection.execute(self.SQL + "c.record_id=?", (record_id,)).fetchone()
+        return None if row is None else decode(row[0])
+
+    def _matching(self, needles, keep):
+        # Canonical payloads quote every identifier and path exactly as json.dumps does, so a
+        # substring probe finds a superset of the matches and the decoded record confirms them.
+        needles = [canonical(value) for value in needles]
+        found = []
+        for start in range(0, len(needles), 200):
+            chunk = needles[start:start + 200]
+            rows = self.connection.execute(
+                self.SQL + " OR ".join("instr(v.payload,?)>0" for _ in chunk), chunk)
+            found += [record for record in (decode(row[0]) for row in rows) if keep(record)]
+        return found
+
+    def referrers(self, ids):
+        ids = set(ids)
+        return self._matching(ids, lambda record: bool(ids.intersection(_references(record))))
+
+    def claimants(self, paths):
+        paths = set(paths)
+        return self._matching(paths, lambda record: record["kind"] == "artifact"
+                              and record["data"]["path"] in paths)
+
+
+class _CommittedStates:
+    """Revision-level facts the writer needs, read with SQL instead of a full replay.
+
+    A state's record count is the number of distinct records first written at or before its
+    revision, which is what ``inspect`` accumulates while replaying.
+    """
+
+    def __init__(self, connection, head):
+        self.connection, self.head = connection, head
+        self._added = None
+
+    def prior(self, request_id):
+        row = self.connection.execute("SELECT * FROM revisions WHERE request_id=?", (request_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def _first_writes(self):
+        if self._added is None:
+            self._added = dict(self.connection.execute(
+                "SELECT first,count(*) FROM (SELECT min(revision) AS first FROM versions GROUP BY record_id) "
+                "GROUP BY first"))
+        return self._added
+
+    def state(self, revision):
+        row = self.connection.execute("SELECT revision_hash FROM revisions WHERE revision=?", (revision,)).fetchone()
+        later = sum(count for number, count in self._first_writes().items() if number > revision)
+        return make_state(self.head, revision, row[0], self.head["records"] - later)
+
+    def revision_of(self, token):
+        """The revision whose committed state carries ``token`` (0 for the empty catalog).
+
+        Searches newest first, so the cost follows how far behind the pin is.
+        """
+        hashes = dict(self.connection.execute("SELECT revision,revision_hash FROM revisions"))
+        records = self.head["records"]
+        for number in range(self.head["revision"], 0, -1):
+            if make_state(self.head, number, hashes[number], records)["state_token"] == token:
+                return number
+            records -= self._first_writes().get(number, 0)
+        return 0 if token == make_state(self.head, 0, "", 0)["state_token"] else None
+
+    def written_after(self, revision, ids):
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            if self.connection.execute(
+                    f"SELECT 1 FROM versions WHERE revision>? AND record_id IN ({','.join('?' * len(chunk))}) LIMIT 1",
+                    (revision, *chunk)).fetchone():
+                return True
+        return False
 
 
 def rebase_index(root):

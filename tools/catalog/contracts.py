@@ -254,6 +254,83 @@ def validate_graph(records):
         visited.update(active)
 
 
+class _Overlay:
+    """The state after a batch: the batch's records over lookups of the committed records."""
+
+    def __init__(self, batch, get):
+        self.batch, self.get, self.memo = batch, get, {}
+
+    def lookup(self, record_id):
+        if record_id in self.batch:
+            return self.batch[record_id]
+        if record_id not in self.memo:
+            self.memo[record_id] = self.get(record_id)
+        return self.memo[record_id]
+
+    def __contains__(self, record_id):
+        return self.lookup(record_id) is not None
+
+    def __getitem__(self, record_id):
+        record = self.lookup(record_id)
+        if record is None:
+            raise KeyError(record_id)
+        return record
+
+
+def validate_delta(batch, *, get, referrers, claimants):
+    """Refuse a batch that would make the committed state fail ``validate_graph``.
+
+    Equivalent to ``validate_graph`` on the committed records overlaid with ``batch``,
+    provided the committed records already satisfy it, with work bounded by the batch's
+    neighbourhood: the batch's own records, the committed records that reference a record
+    the batch rewrites, the path claims it moves and parent chains from its artifacts.
+
+    ``get(id)`` returns a committed record or None. ``referrers(ids)`` returns committed
+    records that may reference any of ``ids`` (a superset is fine). ``claimants(paths)``
+    returns committed artifacts that may hold any of ``paths`` (a superset is fine).
+    """
+    changed = {record["id"]: record for record in batch}
+    view = _Overlay(changed, get)
+    committed = {}
+
+    def old_of(record_id):
+        if record_id not in committed:
+            committed[record_id] = get(record_id)
+        return committed[record_id]
+    rewritten = [record_id for record_id in changed if old_of(record_id) is not None]
+    affected = dict.fromkeys(changed)
+    if rewritten:
+        for record in referrers(rewritten):
+            if record["id"] not in changed:
+                affected[record["id"]] = None
+    for record_id in affected:
+        _links(view, record_id, view[record_id])
+    claims = {}
+    for record_id, record in changed.items():
+        if record["kind"] == "artifact" and record["data"]["path"] is not None:
+            path = record["data"]["path"]
+            require(path not in claims, f"Distinct artifacts share path: {path}")
+            claims[path] = record_id
+    moved = []
+    for path, record_id in claims.items():
+        old = old_of(record_id)
+        if old is None or old["data"]["path"] != path:
+            moved.append(path)
+    if moved:
+        for record in claimants(moved):
+            if record["id"] not in changed and record["data"]["path"] in claims:
+                raise CatalogError(f"Distinct artifacts share path: {record['data']['path']}")
+    for record_id, record in changed.items():
+        if record["kind"] != "artifact":
+            continue
+        active, cursor = set(), record_id
+        while cursor is not None:
+            require(cursor not in active, "Cyclic artifact parent relationship")
+            active.add(cursor)
+            current = view.lookup(cursor)
+            cursor = current["data"]["parent_id"] if current is not None and current["kind"] == "artifact" else None
+
+
 class GraphValidator:
     """Replays revisions with work bounded by each revision's neighbourhood, not by history.
 
