@@ -73,7 +73,10 @@ Ingest cost still grows with history; measure it on synthetic cohorts with
 [decision 0012](docs/decisions/0012-bounded-validation-cost.md). Catalog writes
 validate only their delta when the database bytes match a prior full validation
 ([decision 0015](docs/decisions/0015-trusted-head-catalog-commit.md)); profile the
-lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`.
+lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`. The first write of each
+UTC day replays the history once for its daily snapshot
+([decision 0016](docs/decisions/0016-single-replay-daily-snapshot.md); profile it with
+`tools/diagnostics/catalog_daily_replay_benchmark.py`).
 
 ## Ingesting files (current manual method)
 
