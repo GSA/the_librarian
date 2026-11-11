@@ -180,6 +180,14 @@ python3 tools/diagnostics/catalog_commit_ceiling.py --size 1600 --workers 1,2,4
 python3 tools/diagnostics/ledger_scale_benchmark.py --ledger 36000 --catalog 25600 --files 40
 ```
 
+Planning a submission (`upload.records_for`) no longer scans history ([0020](../docs/decisions/0020-constant-cost-upload-planning.md)):
+the next `S`/`D` numbers come from the highest current ID per prefix in the catalog's primary-key index plus
+the highest promised by any `upload-*` request in the ledger, decoded once per process by request digest;
+staged, retrying, blocked and dead-letter requests keep their IDs reserved. Profile it with
+`python3 tools/diagnostics/upload_planning_benchmark.py --catalog 1600,6400,25600 --ledger 36000`, and use
+`ledger_scale_benchmark.py --matched --warm` (a ledger with one committed upload request per registration, and
+the one-off daily replay excluded) for per-file figures.
+
 `ledger_scale_benchmark.py` reports `full_ledger_validations`; it should be about 1 per
 process, not about 2 per file. Timings come from a shared host: compare shapes, CPU and
 counts rather than third digits.

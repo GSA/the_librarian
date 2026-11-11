@@ -76,7 +76,7 @@ validation, judged by file identity with a full check each UTC day
 ([decision 0015](docs/decisions/0015-trusted-head-catalog-commit.md),
 [0017](docs/decisions/0017-attested-file-identity-for-catalog-receipts.md)); profile the
 lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`, and a production-sized
-ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py`. The
+ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py` (per-file planning cost with `upload_planning_benchmark.py`, [decision 0020](docs/decisions/0020-constant-cost-upload-planning.md)). The
 throughput target and its derivation are in
 [context/intake.md](context/intake.md#throughput-target-and-measurement).
 The first write of each UTC day replays the history once for its daily snapshot

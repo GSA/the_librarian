@@ -315,7 +315,7 @@ class RecoveryTests(UploadCase):
         catalog.submit(self.root, [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}],
                        actor="test-runner", request_id="other", reason="Advance state",
                        expected_state=catalog.status(self.root)["state_token"])
-        with patch.object(upload, "catalog_view", return_value=({"state_token": "0" * 64}, {"S1"})):
+        with patch.object(upload, "catalog_view", return_value=({"state_token": "0" * 64}, upload.Taken(highest={"S": 1, "D": 0}))):
             ack = upload.submit(self.root, self.file(), value())
         self.assertEqual(ack["receipt"]["state"], "blocked")
         self.assertIn("code", ack["receipt"])

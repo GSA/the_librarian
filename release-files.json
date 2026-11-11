@@ -76,6 +76,7 @@
   "tools/diagnostics/catalog_lock_benchmark.py",
   "tools/diagnostics/ingest_benchmark.py",
   "tools/diagnostics/ledger_scale_benchmark.py",
+  "tools/diagnostics/upload_planning_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
   "tools/extraction/extract.py",
@@ -114,5 +115,7 @@
   "tests/test_catalog_daily_snapshot.py",
   "docs/decisions/0017-attested-file-identity-for-catalog-receipts.md",
   "tests/test_catalog_identity_binding.py",
-  "tests/test_validation_cost.py"
+  "tests/test_validation_cost.py",
+  "docs/decisions/0020-constant-cost-upload-planning.md",
+  "tests/test_upload_planning.py"
 ]
