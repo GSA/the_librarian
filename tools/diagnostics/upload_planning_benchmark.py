@@ -38,6 +38,7 @@ def profile(catalog_size, ledger_size, samples, work):
     catalog.initialize(root)
     seed(root, catalog_size)
     seed_uploads(root, catalog_size, ledger_size)
+    getattr(upload, "PROMISES", {}).clear()  # each size's first call starts like a fresh process
     catalog.status(root, audit=True)  # one full validation: leaves a same-day receipt for the identity path
     cold = None
     rows = {key: [] for key in ("validated_state", "current_view", "id_scan", "catalog_view", "reserved_ids",
