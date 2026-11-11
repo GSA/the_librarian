@@ -4,7 +4,8 @@
 **Date:** November 2, 2026.
 **Status:** Implemented. Follows [0010](0010-daily-snapshots-and-retention.md).
 Amended by [0014](0014-intake-ledger-handoff-and-bounded-waits.md) (ledger) and
-[0015](0015-trusted-head-catalog-commit.md) (catalog); the *Result and remaining
+[0015](0015-trusted-head-catalog-commit.md) (catalog) and
+[0019](0019-cheaper-catalog-inspect.md) (cheaper `inspect`); the *Result and remaining
 cost* section describes the state before them.
 
 ## Context
@@ -71,6 +72,21 @@ every check:
    root and identity, and verifies every stage, artifact, attempt and replay
    row; it only skips re-parsing bytes already proven valid. A rewritten
    request is a different key and is refused. Failures are never cached.
+
+   *Amendment (Kata 2vfn):* the fixed-size LRU caches (16,384 / 32,768 /
+   65,536 entries) were smaller than a production ledger (36,309 requests,
+   72,895 artifacts), so the in-order walk of `store.verify` never hit them
+   (about 0.9 s per pass). `verify` now keeps one memo of the previous
+   successful pass, keyed by the exact request bytes and artifact text and
+   recording the digest they were proven to have, and replaces it with the rows
+   it has just verified. A hit needs identical bytes and an identical stored
+   digest, so a rewritten row, or a forged digest on unchanged bytes, is
+   re-hashed, re-decoded and refused as before. Failures are never cached, the
+   memo follows the live ledger rather than history, and it retains at most
+   128 MiB of keys (`store.MEMO_BYTES`); rows beyond that are re-verified. A
+   repeat pass at 36,309 requests takes about 0.14 s
+   (`tools/diagnostics/ledger_verify_benchmark.py`). Attestation and trust
+   model are unchanged.
 
 Snapshots, writer locks, the post-snapshot `BEGIN IMMEDIATE` re-inspection,
 append-only history, idempotent request identities and daily-backup loss-window

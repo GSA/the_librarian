@@ -326,13 +326,46 @@ def make_state(metadata, revision, head, count):
 
 
 # Payloads proven valid by validate_record. Validation is a pure function of the
-# exact payload text, so re-inspecting immutable history need not repeat it.
+# exact payload text, so re-inspecting immutable history need not repeat it. Keyed by the
+# SHA-256 of the payload text (32 bytes each, not the text), so the memo stays small.
 _VALID_PAYLOADS = set()
 _VALID_PAYLOADS_LIMIT = 500_000
 
 
-def inspect(connection):
-    """Verify physical integrity, every historical payload/graph, chain, and current projection."""
+def _member_record(member):
+    """Decode and check one stored payload; returns (record, payload text).
+
+    The fast path decodes once, validates, encodes the canonical text once and compares both the
+    text and its digest with what is stored. Any failure at all falls back to the original
+    step-by-step checks, which raise the refusal for that input.
+    """
+    payload = member["payload"]
+    try:
+        record = json.loads(payload)
+        digest = hashlib.sha256(payload.encode("utf-8")).digest()
+        if digest not in _VALID_PAYLOADS:
+            validate_record(record)
+        if canonical(record) == payload and member["payload_hash"] == digest.hex():
+            if len(_VALID_PAYLOADS) >= _VALID_PAYLOADS_LIMIT:
+                _VALID_PAYLOADS.clear()
+            _VALID_PAYLOADS.add(digest)
+            return record, payload
+    except (ValueError, TypeError, RecursionError, KeyError, AttributeError, UnicodeError):
+        pass
+    record = decode(payload)
+    validate_record(record)
+    require(payload == canonical(record) and member["payload_hash"] == fingerprint(record),
+            "Payload integrity mismatch")
+    return record, payload
+
+
+def inspect(connection, detail=True):
+    """Verify physical integrity, every historical payload/graph, chain, and current projection.
+
+    Returns ``(state, current, histories, batches, committed_states)``. History is streamed, so
+    with ``detail=False`` nothing is retained beyond the checks and only ``state`` is filled in
+    (the other four are None); callers that need the records or revisions ask for the detail.
+    """
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     require(application_id != SUPERSEDED_APPLICATION_ID,
             "Superseded FCAT catalog identity; explicit migration or re-initialization is required")
@@ -355,56 +388,64 @@ def inspect(connection):
             row = connection.execute("SELECT sql FROM sqlite_master WHERE name=? AND type='trigger'",
                                      (f"immutable_{table}_{action}",)).fetchone()
             require(row is not None and row[0] == trigger_sql(table, action), "Immutable trigger changed")
-    batches = [dict(row) for row in connection.execute("SELECT * FROM revisions ORDER BY revision")]
-    by_revision = {}
-    for row in connection.execute("SELECT * FROM versions ORDER BY revision,ordinal"):
-        by_revision.setdefault(row["revision"], []).append(dict(row))
-    require(set(by_revision) == {batch["revision"] for batch in batches}, "Invalid revision membership")
-    current, projection, histories, committed_states = {}, {}, {}, {}
+    require({row[0] for row in connection.execute("SELECT DISTINCT revision FROM versions")}
+            == {row[0] for row in connection.execute("SELECT revision FROM revisions")},
+            "Invalid revision membership")
+    batches = [] if detail else None
+    current, projection, histories, committed_states = ({}, {}, {}, {}) if detail else (None, {}, None, None)
     graph = GraphValidator()  # same refusals as validate_graph(current), without re-walking history
-    previous = ""
-    for revision, batch in enumerate(batches, 1):
+    previous, revision = "", 0
+    members_cursor = connection.execute("SELECT * FROM versions ORDER BY revision,ordinal")
+    ahead = members_cursor.fetchone()
+    for revision, batch in enumerate(connection.execute("SELECT * FROM revisions ORDER BY revision"), 1):
+        batch = dict(batch)
         require(batch["revision"] == revision and batch["previous_hash"] == previous, "Broken revision chain")
         text(batch["actor"], "Actor", 200)
         text(batch["request_id"], "Request ID", 200)
         text(batch["reason"], "Revision reason")
         timestamp(batch["committed_at"])
-        members = by_revision[revision]
+        members = []
+        while ahead is not None and ahead["revision"] == revision:
+            members.append(ahead)
+            ahead = members_cursor.fetchone()
         require(batch["record_count"] == len(members) and members, "Revision count mismatch")
-        records = []
+        records, payloads = [], []
         for ordinal, member in enumerate(members):
             require(member["ordinal"] == ordinal, "Broken revision ordinal")
-            record = decode(member["payload"])
-            if member["payload"] not in _VALID_PAYLOADS:
-                validate_record(record)
-                if len(_VALID_PAYLOADS) >= _VALID_PAYLOADS_LIMIT:
-                    _VALID_PAYLOADS.clear()
-                _VALID_PAYLOADS.add(member["payload"])
-            require(member["payload"] == canonical(record) and member["payload_hash"] == fingerprint(record),
-                    "Payload integrity mismatch")
+            record, payload = _member_record(member)
             require(member["record_id"] == record["id"], "Record identity mismatch")
             records.append(record)
-            current[record["id"]] = record
+            payloads.append(payload)
             projection[record["id"]] = (revision, ordinal)
-            histories.setdefault(record["id"], []).append({
-                "revision": revision, "request_id": batch["request_id"], "actor": batch["actor"],
-                "reason": batch["reason"], "committed_at": batch["committed_at"], "record": record,
-            })
+            if detail:
+                current[record["id"]] = record
+                histories.setdefault(record["id"], []).append({
+                    "revision": revision, "request_id": batch["request_id"], "actor": batch["actor"],
+                    "reason": batch["reason"], "committed_at": batch["committed_at"], "record": record,
+                })
         # Each record was validated above; only validate_records' list checks remain.
         require(bool(records), "records must be a nonempty list")
         require(len({record["id"] for record in records}) == len(records), "Duplicate IDs in submission")
         graph.apply(records)
-        require(batch["input_hash"] == fingerprint({
-            "actor": batch["actor"], "reason": batch["reason"], "records": records,
-        }), "Revision input hash mismatch")
+        # The canonical text of {"actor","reason","records"} with the (verified canonical) payloads in place.
+        require(batch["input_hash"] == hashlib.sha256((
+            f'{{"actor":{canonical(batch["actor"])},"reason":{canonical(batch["reason"])},'
+            f'"records":[{",".join(payloads)}]}}').encode("utf-8")).hexdigest(),
+            "Revision input hash mismatch")
         require(batch["revision_hash"] == fingerprint({k: v for k, v in batch.items() if k != "revision_hash"}),
                 "Revision chain hash mismatch")
         previous = batch["revision_hash"]
-        committed_states[revision] = make_state(metadata, revision, previous, len(current))
-    actual = {row["record_id"]: (row["revision"], row["ordinal"])
-              for row in connection.execute("SELECT * FROM current_records")}
-    require(actual == projection, "Current records differ from immutable revision history")
-    state = make_state(metadata, len(batches), previous, len(current))
+        if detail:
+            batches.append(batch)
+            committed_states[revision] = make_state(metadata, revision, previous, len(projection))
+    count = len(projection)
+    rows = 0
+    for row in connection.execute("SELECT * FROM current_records"):
+        rows += 1
+        require(projection.get(row["record_id"]) == (row["revision"], row["ordinal"]),
+                "Current records differ from immutable revision history")
+    require(rows == count, "Current records differ from immutable revision history")
+    state = make_state(metadata, revision, previous, count)
     return state, current, histories, batches, committed_states
 
 
@@ -441,7 +482,7 @@ def prune(root, *, apply=False):
     private_file(db)
     with writer_lock(home), closing(connect(db)) as connection:
         connection.execute("BEGIN")
-        store_id = inspect(connection)[0]["store_id"]
+        store_id = inspect(connection, detail=False)[0]["store_id"]
         # Hold the writer lock so prune cannot overlap a write's retention or a restore.
         return snapshots.prune(backups, store_id=store_id, verify=verify_backup, errors=(CatalogError,),
                                days=policy.backup_retention_days(root), apply=apply, thin=True)
@@ -469,7 +510,7 @@ def _snapshot_in_transaction(connection, backups, reason, image=False, inspected
     ``image`` the open transaction (inspected here, unless ``inspected``) is written as its
     serialized image and the written bytes must hash to that image; the copy is not replayed again.
     """
-    state = inspect(connection)[0] if not (image and inspected) else _head_state(connection)
+    state = inspect(connection, detail=False)[0] if not (image and inspected) else _head_state(connection)
     private_directory(backups)
     name = f"{state['store_id']}-r{state['revision']:08d}-{reason}-{uuid.uuid4().hex}"
     partial, final, receipt = (backups / (name + suffix) for suffix in (".partial", ".sqlite3", ".json"))
@@ -490,7 +531,7 @@ def _snapshot_in_transaction(connection, backups, reason, image=False, inspected
             with closing(sqlite3.connect(partial)) as target:
                 connection.backup(target)
             with closing(connect(partial)) as target:
-                require(inspect(target)[0] == state, "Backup state mismatch")
+                require(inspect(target, detail=False)[0] == state, "Backup state mismatch")
             seal(partial)
             written = _partial_hash(partial)
         record = {"backup_version": VERSION, "created_at": snapshots.utcnow().isoformat(), "reason": reason, "database": final.name,
@@ -528,7 +569,7 @@ def initialize(root):
                 metadata = {"store_id": str(uuid.uuid4()), "created_at": now(),
                             "authority": AUTHORITY, "contract_version": str(VERSION)}
                 connection.executemany("INSERT INTO metadata VALUES (?,?)", metadata.items())
-                state = inspect(connection)[0]
+                state = inspect(connection, detail=False)[0]
                 initial = _snapshot(connection, backups, "init")
             seal(partial)
             os.link(partial, db, follow_symlinks=False)
@@ -645,7 +686,7 @@ def validated_state(connection, home, *, audit=False):
     trusted = None if audit else _trusted_state(connection, home, binding)
     if trusted is not None:
         return trusted[0]
-    state = inspect(connection)[0]
+    state = inspect(connection, detail=False)[0]
     _write_receipt(home, binding, state)
     return state
 
@@ -876,15 +917,23 @@ def rebase_index(root):
     """Map every committed state token to its revision and each record to its last writer.
 
     Lets a caller check offline, without a write, whether ``submit(..., rebase=True)``
-    would accept a request pinned at an older state.
+    would accept a request pinned at an older state. The history is fully inspected first;
+    the maps then come from indexed queries instead of materialized history.
     """
     home, db, _ = locations(root)
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
-        state, _, histories, _, committed_states = inspect(connection)
-    tokens = {committed["state_token"]: number for number, committed in committed_states.items()}
+        state = inspect(connection, detail=False)[0]
+        committed = _CommittedStates(connection, state)
+        records = state["records"]
+        tokens = {}
+        for number, revision_hash in reversed(list(connection.execute(
+                "SELECT revision,revision_hash FROM revisions ORDER BY revision"))):
+            tokens[make_state(state, number, revision_hash, records)["state_token"]] = number
+            records -= committed._first_writes().get(number, 0)
+        last_writer = dict(connection.execute("SELECT record_id,revision FROM current_records"))
     tokens[make_state(state, 0, "", 0)["state_token"]] = 0
-    return tokens, {record_id: versions[-1]["revision"] for record_id, versions in histories.items()}
+    return tokens, last_writer
 
 
 def read_records(root, *, kind=None, receipt=None, source=None, path=None, coverage=None,
@@ -1131,7 +1180,7 @@ def verify_backup(path, replay=True):
     if replay:
         with closing(connect(path)) as connection:
             connection.execute("BEGIN")
-            state = inspect(connection)[0]
+            state = inspect(connection, detail=False)[0]
         require(state == record["state"], "Snapshot state differs from receipt")
         require(file_hash(path) == record["sha256"], "Snapshot changed while verifying")
     return record["state"]
@@ -1147,7 +1196,7 @@ def restore(root, snapshot, expected_state=None):
         if db.exists():
             with closing(connect(db)) as connection:
                 connection.execute("BEGIN")
-                current = inspect(connection)[0]
+                current = inspect(connection, detail=False)[0]
                 require(expected_state == current["state_token"], "Restore requires current expected_state")
                 require(source_state["store_id"] == current["store_id"], "Cannot replace a different store lineage")
                 safety = _snapshot(connection, backups, "pre-restore")
@@ -1164,7 +1213,7 @@ def restore(root, snapshot, expected_state=None):
             with closing(connect(source)) as original, closing(sqlite3.connect(partial)) as target:
                 original.backup(target)
             with closing(connect(partial)) as restored:
-                require(inspect(restored)[0] == source_state, "Restored state mismatch")
+                require(inspect(restored, detail=False)[0] == source_state, "Restored state mismatch")
             require(verify_backup(source) == source_state, "Restore source changed")
             seal(partial)
             for suffix in ("-journal", "-wal", "-shm"):
@@ -1181,7 +1230,7 @@ def restore(root, snapshot, expected_state=None):
             fsync_directory(home)
             with closing(connect(db)) as restored:
                 restored.execute("BEGIN")
-                require(inspect(restored)[0] == source_state, "Published restore state mismatch")
+                require(inspect(restored, detail=False)[0] == source_state, "Published restore state mismatch")
                 recovery = _snapshot(restored, backups, "post-restore")
             return {"command": "restore", **source_state, "state": source_state,
                     "pre_backup": safety, "backup": recovery}
