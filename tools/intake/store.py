@@ -155,7 +155,7 @@ def verify(rows, root):
 
     def remember(into, key, value):
         nonlocal held
-        if held + len(key) + _MEMO_ENTRY_OVERHEAD <= MEMO_BYTES:
+        if key not in into and held + len(key) + _MEMO_ENTRY_OVERHEAD <= MEMO_BYTES:
             held += len(key) + _MEMO_ENTRY_OVERHEAD
             into[key] = value
 

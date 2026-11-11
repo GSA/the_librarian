@@ -390,6 +390,18 @@ class MemoTests(Case):
         with mock.patch.object(store, "MEMO_BYTES", 1):
             self.refused("corrupt_request")
 
+    def test_shared_artifact_text_is_charged_to_the_memo_budget_once(self):
+        self.seed(6)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update stages set intent='{}', intent_sha256=?, evidence='{}', evidence_sha256=?",
+                      (contracts.digest(b"{}"),) * 2)
+        store.verify(self.snapshot(), self.root)
+        full = store.verified_bytes()
+        with mock.patch.object(store, "MEMO_BYTES", full):
+            store.forget_verified()
+            store.verify(self.snapshot(), self.root)
+            self.assertEqual(store.verified_bytes(), full)
+
     def test_memo_follows_the_live_ledger_and_does_not_accumulate_history(self):
         self.seed(3)
         store.verify(self.snapshot(), self.root)
