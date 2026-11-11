@@ -183,7 +183,7 @@ def read_catalog(root):
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
             # Full inspection, not validated_state(): its cache would write files.
-            state = catalog.inspect(connection)[0]
+            state = catalog.inspect(connection, detail=False)[0]
             catalog.current_view(connection)
             kinds = dict(connection.execute("SELECT kind,count(*) FROM catalog_current GROUP BY kind"))
             coverage = dict(connection.execute(

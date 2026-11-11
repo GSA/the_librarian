@@ -4,6 +4,7 @@
 **Date:** November 11, 2026.
 **Status:** Implemented. Amends [0010](0010-daily-snapshots-and-retention.md) and
 [0015](0015-trusted-head-catalog-commit.md); leaves [0013](0013-concurrent-intake-writers.md)'s linear chain unchanged.
+Amended by [0018](0018-cheaper-catalog-inspect.md) (the replay it relies on is cheaper).
 
 ## Context
 

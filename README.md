@@ -79,7 +79,8 @@ throughput target and its derivation are in
 [context/intake.md](context/intake.md#throughput-target-and-measurement).
 The first write of each UTC day replays the history once for its daily snapshot
 ([decision 0016](docs/decisions/0016-single-replay-daily-snapshot.md); profile it with
-`tools/diagnostics/catalog_daily_replay_benchmark.py`).
+`tools/diagnostics/catalog_daily_replay_benchmark.py`); [decision 0018](docs/decisions/0018-cheaper-catalog-inspect.md)
+made that replay about half the CPU and a quarter of the memory.
 
 ## Ingesting files (current manual method)
 

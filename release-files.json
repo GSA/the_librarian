@@ -107,7 +107,10 @@
   "docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md",
   "docs/decisions/0015-trusted-head-catalog-commit.md",
   "docs/decisions/0016-single-replay-daily-snapshot.md",
+  "docs/decisions/0018-cheaper-catalog-inspect.md",
   "tests/test_catalog_delta_commit.py",
   "tests/test_catalog_daily_snapshot.py",
+  "tests/test_catalog_inspect_equivalence.py",
+  "tests/reference_inspect.py",
   "tests/test_validation_cost.py"
 ]

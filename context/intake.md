@@ -29,8 +29,8 @@ named stage. The ledger is operational recovery state, never corpus authority.
   validation, and replays all history otherwise, on the first write of each UTC
   day and under `status --audit` ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md)); that
   first write replays the history once, holding the writer lock about as long as one `inspect`
-  plus writing the snapshot (about 5 s at 25k registrations, 20 s at 100k;
-  [0016](../docs/decisions/0016-single-replay-daily-snapshot.md)). A lost race is a
+  plus writing the snapshot (about 3 s at 25k registrations, 11 s at 100k;
+  [0016](../docs/decisions/0016-single-replay-daily-snapshot.md), [0018](../docs/decisions/0018-cheaper-catalog-inspect.md)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
   `catalog-busy` (lock wait exceeded) attempt, never `native-input`.
   `catalog-submit`, `extract-register` and `docling-register` rebase an outdated

@@ -9,6 +9,9 @@ registrations once (``seed``), copies it for every trial and reports body-free J
 * ``profile``: lock hold of a first-of-day write split into the snapshot copy, every full
   ``inspect`` (labelled by its caller), snapshot hashing, retention and the rest; then the hold of
   a second same-day write, which still checks today's snapshot.
+* ``inspect``: one full ``inspect`` of the seeded catalog in a fresh process (wall, CPU, peak RSS),
+  with the detail the writers and ``verify`` skip (``--detail false``, the default) or with the
+  records and history that ``rebase_index``-style callers once got (``--detail true``).
 * ``contend``: several writer processes start together; one is the first writer of the day. Reports
   how long each writer waited, how many ``WriterBusy`` refusals it saw, and when it committed.
 
@@ -17,6 +20,7 @@ waiting is needed. Synthetic fixtures only; never point it at a real instance.
 
     python3 tools/diagnostics/catalog_daily_replay_benchmark.py seed --dir D --size 6400
     python3 tools/diagnostics/catalog_daily_replay_benchmark.py profile --dir D --samples 3
+    python3 tools/diagnostics/catalog_daily_replay_benchmark.py inspect --dir D --samples 3
     python3 tools/diagnostics/catalog_daily_replay_benchmark.py contend --dir D --writers 3
 """
 import argparse
@@ -261,15 +265,50 @@ def contend(args):
                      indent=1, sort_keys=True))
 
 
+def _inspect_once(tree, db, detail, queue):
+    sys.path.insert(0, tree)
+    os.chdir(tree)
+    import resource
+    from contextlib import closing
+    from tools.catalog import catalog_store as cs
+    kwargs = {} if detail or "detail" not in cs.inspect.__code__.co_varnames else {"detail": False}
+    with closing(cs.connect(db)) as connection:
+        connection.execute("BEGIN")
+        wall, cpu = time.perf_counter(), time.process_time()
+        cs.inspect(connection, **kwargs)
+        queue.put({"wall_s": round(time.perf_counter() - wall, 2), "cpu_s": round(time.process_time() - cpu, 2),
+                   "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024})
+
+
+def inspect_profile(args):
+    """Each sample is a fresh process, so peak RSS belongs to that one replay."""
+    from tools.catalog import catalog_store as cs
+    tree = str(args.tree.resolve())
+    db = cs.locations(Path(args.dir) / "instance")[1]
+    context = multiprocessing.get_context("spawn")
+    rows = []
+    for _ in range(args.samples):
+        queue = context.Queue()
+        proc = context.Process(target=_inspect_once, args=(tree, db, args.detail == "true", queue))
+        proc.start()
+        rows.append(queue.get())
+        proc.join()
+    print(json.dumps({"seed": json.loads((Path(args.dir) / "seed.json").read_text()), "detail": args.detail,
+                      "samples": rows, "median_wall_s": statistics.median(r["wall_s"] for r in rows),
+                      "peak_rss_mb": max(r["peak_rss_mb"] for r in rows)}, indent=1, sort_keys=True))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tree", type=Path, default=Path(__file__).resolve().parents[2])
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("seed", "profile", "contend"):
+    for name in ("seed", "profile", "inspect", "contend"):
         sub = commands.add_parser(name)
         sub.add_argument("--dir", required=True, type=Path)
     commands.choices["seed"].add_argument("--size", type=int, required=True)
     commands.choices["profile"].add_argument("--samples", type=int, default=3)
+    commands.choices["inspect"].add_argument("--samples", type=int, default=3)
+    commands.choices["inspect"].add_argument("--detail", choices=("true", "false"), default="false")
     commands.choices["contend"].add_argument("--writers", type=int, default=3)
     commands.choices["contend"].add_argument("--per-writer", type=int, default=3)
     args = parser.parse_args(argv)
@@ -278,6 +317,8 @@ def main(argv=None):
         seed(args.dir, args.size)
     elif args.command == "profile":
         profile(args)
+    elif args.command == "inspect":
+        inspect_profile(args)
     else:
         contend(args)
 
