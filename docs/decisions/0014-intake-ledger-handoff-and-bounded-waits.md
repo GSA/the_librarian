@@ -1,7 +1,8 @@
 # 0014 - Intake ledger writers hand off without re-validation and never wait unbounded
 
 **Audience:** maintainers and operators.
-**Status:** Accepted. Amends [0012](0012-bounded-validation-cost.md) and
+**Date:** November 10, 2026.
+**Status:** Implemented. Amends [0012](0012-bounded-validation-cost.md) and
 [0013](0013-concurrent-intake-writers.md).
 
 ## Context
@@ -30,8 +31,9 @@ and a repair job running together collapsed: the ingest blocked in `flock` for
   or fails leaves the file truncated, and any commit not followed by a fresh
   attestation changes the identity, so those cases validate in full. Validation
   cost per hand-off no longer depends on ledger size. Tamper detection is the
-  same as before for every change that moves the identity; like 0012's
-  per-process shortcut, the attestation does not defend against an actor who
+  same as before for every change that moves the identity; like the earlier
+  per-process shortcut (added after 0012 without a decision record of its own), the
+  attestation does not defend against an actor who
   rewrites the file and restores size, timestamps and change counter.
 - **Bounded waits.** The writer lock is polled non-blocking with jitter for at
   most `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values

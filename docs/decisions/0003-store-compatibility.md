@@ -5,7 +5,9 @@
 **Status:** Accepted and implemented. The store-home configuration, logical
 corpus-root binding, per-instance policy evaluation, and explicit migration and
 recovery paths described below are active in `tools/policy.py` and
-`tools/initialize.py`.
+`tools/initialize.py`. The backup-retention bullet is superseded by
+[0010](0010-daily-snapshots-and-retention.md). The Context, Consequences and
+Not decided sections describe the state before that work.
 
 ## Context
 

@@ -2,7 +2,7 @@
 
 **Audience:** maintainers and operators.
 **Date:** November 2, 2026.
-**Status:** Accepted. Supersedes the retention bullet in [0003](0003-store-compatibility.md).
+**Status:** Implemented. Supersedes the retention bullet in [0003](0003-store-compatibility.md).
 
 ## Context
 

@@ -2,8 +2,9 @@
 
 **Audience:** maintainers and operators.
 **Date:** October 21, 2026.
-**Status:** Accepted. The inbox-to-catalog path is manual today; the connectors
-and scheduling described here are planned, not installed.
+**Status:** Accepted. Manual upload and read-only cohort intake
+([0009](0009-read-only-cohort-intake.md)) implement the inbox-to-catalog path; the
+connectors and scheduling described here are planned, not installed.
 
 ## Context
 
