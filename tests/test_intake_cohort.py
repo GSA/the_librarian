@@ -778,6 +778,24 @@ class SharedManifestTests(QualifyCase):
         for marker in ("markera0", "markera2", "markerb0", "markerb1"):
             self.assertEqual(len(self.search(marker)), 1, marker)
 
+    def test_a_cohort_pruned_by_an_earlier_toolkit_is_restored_from_saved_reviews(self):
+        first, second = self.qualify("a"), self.qualify("b")
+        # What the toolkit before decision 0021 left behind after qualifying B: only B's selections.
+        raw = json.loads(self.manifest.read_text())
+        raw["renditions"] = [r for r in raw["renditions"]
+                             if r["receipt_id"] in {e["receipt_id"] for e in second["entries"]
+                                                    if "receipt_id" in e}]
+        self.manifest.write_text(json.dumps(raw))
+        self.assertEqual(len(self.selections()), 2)
+        self.calls.clear()
+        restored = self.qualify("a")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(restored["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+        self.assertEqual(self.owners(("a", first), ("b", second)), {"a": 3, "b": 2})
+        self.assertEqual(restored["counts"]["published"], 1)
+        for marker in ("markera0", "markera2", "markerb0"):
+            self.assertEqual(len(self.search(marker)), 1, marker)
+
     def test_qualifying_one_cohort_leaves_the_other_cohorts_entries_byte_identical(self):
         self.qualify("a")
         before = self.manifest.read_bytes()
