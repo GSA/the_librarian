@@ -10,6 +10,7 @@ from tools import backups as snapshots
 from tools.catalog import catalog_store as catalog
 from tools.catalog.contracts import CatalogError
 from tests.test_catalog_delta_commit import Case
+from tests.test_file_identity_locks import needs_dbpage
 from tools.diagnostics.catalog_lock_benchmark import registration as catalog_records
 
 
@@ -43,6 +44,7 @@ class IdentityBinding(Case):
         later = snapshots.utcnow() + datetime.timedelta(days=1)
         return patch.object(snapshots, "utcnow", lambda: later)
 
+    @needs_dbpage
     def test_receipt_is_identity_bound_and_a_hit_replays_nothing(self):
         self.assertEqual(self.saved()["binding"]["version"], 2)
         calls, patched = self.writes_inspect()
@@ -63,6 +65,7 @@ class IdentityBinding(Case):
         self.mutate("UPDATE versions SET payload_hash='0' WHERE record_id='S0'")
         self.refused()
 
+    @needs_dbpage
     def test_residual_identity_restoring_edit_is_served_until_the_next_utc_day(self):
         """Documented class: an edit that restores size, mtime, ctime and counter is not seen by
         the identity, only by the first full check of the next UTC day or an audit."""
@@ -75,6 +78,7 @@ class IdentityBinding(Case):
             with self.day_after(), self.assertRaises(CatalogError):
                 catalog.status(self.root)
 
+    @needs_dbpage
     def test_new_utc_day_forces_one_full_validation_then_reuses(self):
         calls, patched = self.writes_inspect()
         with patched, self.day_after():
@@ -84,6 +88,7 @@ class IdentityBinding(Case):
             catalog.status(self.root)
             self.assertEqual(len(calls), 1)
 
+    @needs_dbpage
     def test_delta_commit_does_not_advance_the_full_check_date(self):
         stale = self.saved()
         yesterday = (snapshots.utcnow() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -106,6 +111,7 @@ class IdentityBinding(Case):
             catalog.status(self.root, audit=True)
         self.assertEqual(len(calls), 2)
 
+    @needs_dbpage
     def test_old_format_receipt_is_a_miss_not_a_refusal(self):
         legacy = {"binding": self.saved()["binding"], "state": self.saved()["state"]}
         legacy["checksum"] = catalog.fingerprint(legacy)
@@ -124,6 +130,7 @@ class IdentityBinding(Case):
         self.assertEqual(binding["version"], 1)
         self.assertIn("snapshot_sha256", binding)
 
+    @needs_dbpage
     def test_binding_changes_with_every_commit_and_is_stable_without_one(self):
         def identity():
             with closing(catalog.connect(self.db)) as connection:
@@ -141,6 +148,7 @@ class ReviewRegressions(Case):
         for n in range(3):
             self.write(n)
 
+    @needs_dbpage
     def test_idempotent_retry_on_a_new_utc_day_replays_once(self):
         later = snapshots.utcnow() + datetime.timedelta(days=1)
         records = catalog_records(1)
