@@ -40,8 +40,12 @@ them.
   stays atomic (temporary file, fsync, rename), so an interrupted run leaves the manifest from
   before or after it.
 - **Capacity is shared.** The manifest holds at most `renditions.MAX_SELECTIONS` entries. A
-  cohort may use what other cohorts leave; a qualified rendition that does not fit stays
-  `pending-review` with `selection-capacity` instead of producing an invalid manifest.
+  cohort may use what other cohorts leave. A qualified rendition that does not fit stays
+  `pending-review` with `selection-capacity`, and its saved review is kept: `standing-select`
+  now refuses a full manifest with the retryable-by-replay code `selection-capacity` (it was
+  `selection-conflict`, which still means a different selection of the same rendition), and
+  `qualify` replays only that code, and only when the manifest has room, so the rendition is
+  selected from its saved review, with no model call, once another cohort frees space.
 - **Reported, body-free.** When other cohorts' entries exist, `counts.other_cohorts` gives
   `selections` left alone, `unattributed` among them, and `orphaned` entries dropped.
 

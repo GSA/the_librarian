@@ -607,6 +607,12 @@ def _reconcile(root, manifest, system, current, cache, compose):
             "orphaned": sum(orphan(r) for r in listed)}
 
 
+def _selection_room(root, manifest, rendition):
+    """True when the manifest already selects ``rendition`` or has room for one more selection."""
+    selected = _manifest_renditions(root, manifest)
+    return len(selected) < renditions.MAX_SELECTIONS or any(r["path"] == rendition for r in selected)
+
+
 def _standing_token(entry, policy_sha):
     return "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
 
@@ -682,8 +688,20 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
         # conflicted with is now supersedable); re-pin it under a correction request.
         active = _stage_correction(root, corr, active)
         current = runner.run(root, active, "review")
-    if (current["stages"][0]["status"] == "succeeded"
-            and current["stages"][1]["status"] in {"staged", "running", "retryable"}):
+    select = current["stages"][1]
+    if (select["status"] == "blocked" and select["attempts"]
+            and select["attempts"][-1]["code"] == "selection-capacity"
+            and _selection_room(root, manifest, entry["rendition"])):
+        # The manifest was full when this was selected and has room now: resume it.
+        current = runner.replay(root, active, "select")
+        select = current["stages"][1]
+    if current["stages"][0]["status"] == "succeeded" and select["status"] in {
+            "staged", "running", "retryable"}:
+        if not _selection_room(root, manifest, entry["rendition"]):
+            # Shared with other cohorts, the manifest is full: leave the saved review's select
+            # stage unrun so a later qualify selects it once room appears, without a model call.
+            entry.update(qualification="pending-review", review_code="selection-capacity")
+            return
         current = runner.run(root, active, "select")
     if all(s["status"] == "succeeded" for s in current["stages"]):
         selection = current["stages"][1]["evidence"]["selection"]

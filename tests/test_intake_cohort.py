@@ -12,7 +12,7 @@ from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import renditions
-from tools.intake import cohort, store, upload
+from tools.intake import cohort, standing, store, upload
 from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
@@ -927,17 +927,64 @@ class SharedManifestTests(QualifyCase):
             self.qualify("b")
         self.assertEqual(seen, ["held", "held"])
 
-    def test_capacity_shared_with_other_cohorts_leaves_the_surplus_visibly_pending(self):
+    def test_capacity_shared_with_other_cohorts_leaves_the_surplus_pending_and_resumable(self):
         self.qualify("a")
-        limited = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": 4})
-        with unittest.mock.patch.object(cohort, "renditions", limited):
+        # A cap of four, as enforced by standing.write_manifest itself and by the reconciliation,
+        # shared with cohort A's three entries. Policy validation compares the policy's receipt
+        # scope with the cap (``len(scope) <= cap``), which the real cap of 5,000 always satisfies.
+        class Cap(int):
+            def __ge__(self, other):
+                return True
+        small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(4)})
+        with unittest.mock.patch.object(standing, "renditions", small), \
+                unittest.mock.patch.object(cohort, "renditions", small):
             report = self.qualify("b")
+            self.assertEqual(len(self.selections()), 4)
+            self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "pending-review": 1})
+            self.assertEqual([e["review_code"] for e in report["entries"] if e.get("review_code")],
+                             ["selection-capacity"])
+            # Not a conflict: the select stage was left unrun, not blocked for explicit replay.
+            full = next(e for e in report["entries"] if e.get("review_code") == "selection-capacity")
+            corr = "standing-%s-%s-%s" % (full["submission_id"], full["rendition_sha256"][:12], hashlib.sha256(
+                (self.root / "config/standing-policy.local.json").read_bytes()).hexdigest()[:8])
+            self.assertEqual([s["status"] for s in store.inspect(self.root, corr)["stages"]],
+                             ["succeeded", "staged"])
+            # Cohort A is untouched by B's overflow, and still full.
+            self.assertEqual(self.owners(("a", self.qualify("a"))).get("a"), 3)
+            self.assertEqual(self.qualify("b")["counts"]["qualification"],
+                             {"qualified": 1, "pending-review": 1})
+            # A frees a slot (a file leaves its inbox); B's pending rendition is then selected from
+            # its saved review: no model call, no manual replay.
+            (self.a / "a2.md").unlink()
+            self.qualify("a")
+            self.assertEqual(len(self.selections()), 3)
+            self.calls.clear()
+            resumed = self.qualify("b")
+        self.assertEqual(resumed["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual((self.calls, resumed["usage"]),
+                         ([], {"prompt_tokens": 0, "completion_tokens": 0}))
         self.assertEqual(len(self.selections()), 4)
-        self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "pending-review": 1})
-        self.assertEqual([e["review_code"] for e in report["entries"] if e.get("review_code")],
-                         ["selection-capacity"])
-        # Cohort A is untouched by B's overflow.
-        self.assertEqual(self.owners(("a", self.qualify("a"))).get("a"), 3)
+
+    def test_a_select_blocked_by_a_cohort_that_filled_the_manifest_meanwhile_is_resumed(self):
+        self.qualify("a")
+
+        class Cap(int):
+            def __ge__(self, other):
+                return True
+        small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(3)})
+        # Room looked available when the run checked, but another writer took it before the select ran.
+        with unittest.mock.patch.object(standing, "renditions", small), \
+                unittest.mock.patch.object(cohort, "_selection_room", return_value=True):
+            report = self.qualify("b")
+        self.assertEqual(report["counts"]["qualification"], {"pending-review": 2})
+        self.assertEqual({e["review_code"] for e in report["entries"] if e.get("review_code")},
+                         {"selection-capacity"})
+        self.assertEqual(len(self.selections()), 3)
+        # Blocked, but resumable: the cap is not a conflict, so the next run selects it.
+        self.calls.clear()
+        resumed = self.qualify("b")
+        self.assertEqual(resumed["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual((self.calls, len(self.selections())), ([], 5))
 
     def test_two_processes_qualifying_different_cohorts_do_not_lose_each_others_writes(self):
         import multiprocessing

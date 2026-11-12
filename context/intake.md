@@ -293,7 +293,7 @@ Only an orphan (receipt missing from the catalog, or retained rendition file gon
 read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
 processes keep each other's writes, and replacement is atomic. The manifest holds at most 5,000
 selections across all cohorts; a qualified rendition that does not fit stays `pending-review`
-(`selection-capacity`). `counts.other_cohorts` (`selections`, `unattributed`, `orphaned`) is
+(`selection-capacity`, resumed from its saved review once room appears). `counts.other_cohorts` (`selections`, `unattributed`, `orphaned`) is
 present when other entries exist. Policy, manifest and context paths are validated (instance-relative, no
 symlinks, existing maintained sections) before anything is ingested or written;
 manifest and policy files are replaced atomically.  `qualify` always processes the whole inbox
