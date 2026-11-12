@@ -532,8 +532,11 @@ def write_manifest(root, name, entry, replaces=()):
                        for item in current):
         selected[:] = [item for item in selected if item["path"] != entry["path"]]
         current = []
-    if current or len(selected) >= renditions.MAX_SELECTIONS:
+    if current:
         raise Refusal("blocked", "selection-conflict")
+    if len(selected) >= renditions.MAX_SELECTIONS:
+        # Not a conflict: the manifest is full, and room may appear when another cohort frees some.
+        raise Refusal("blocked", "selection-capacity")
     selected.append(entry)
     data = (json.dumps(raw, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
     mode = stat.S_IMODE(path.stat().st_mode)

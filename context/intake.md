@@ -283,8 +283,18 @@ runs `model_review.review` then stages `standing-review` + `standing-select`
 (`standing-<submission-id>-<rendition-hash>-<policy-hash>`) for each extracted rendition that
 has no saved review. A changed rendition gets a new review; an unchanged one
 reuses its ledger stages with no model call. The
-manifest is first pruned to the cohort's current renditions, then reconciled
-to exactly the qualified ones, adding any that are missing. Policy, manifest and context paths are validated (instance-relative, no
+cohort's manifest entries are first pruned to its current renditions, then reconciled
+to exactly the qualified ones, adding any that are missing. The cohort is the `--system` label: an
+entry is the cohort's when its rendition was extracted by this run or its receipt's pinned
+`local-path` submission sidecar names that system. Every other entry (another cohort's, an
+operator's, or one whose submission cannot be proven) is left byte-identical and in place, so
+several inboxes can share one catalog, manifest and index ([0021](../docs/decisions/0021-cohort-scoped-selection-reconciliation.md)).
+Only an orphan (receipt missing from the catalog, or retained rendition file gone) is dropped. The
+read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
+processes keep each other's writes, and replacement is atomic. The manifest holds at most 5,000
+selections across all cohorts; a qualified rendition that does not fit stays `pending-review`
+(`selection-capacity`, resumed from its saved review once room appears). `counts.other_cohorts` (`selections`, `unattributed`, `orphaned`) is
+present when other entries exist. Policy, manifest and context paths are validated (instance-relative, no
 symlinks, existing maintained sections) before anything is ingested or written;
 manifest and policy files are replaced atomically.  `qualify` always processes the whole inbox
 (`--limit` exists only on `ingest`). Changing an active policy's content does not
@@ -296,6 +306,13 @@ Bumping the standing policy version re-reviews every rendition; a new-version re
 A standing review blocked as `changed-standing-inputs` (its saved intent no longer matches current inputs, e.g. after a replay) is restaged as a correction request `<correlation>-c<n>` with the same review arguments and event and fresh request IDs; later runs follow the `correction_of` chain to its newest request.
 The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
 `pending-review`, `rejected`, `deferred` or `exception` without indexing.
+**Restoring cohorts an earlier toolkit pruned.** Before decision 0021, `qualify` for one cohort
+removed every other cohort's selections from a shared manifest. The reviews are still in the
+ledger and review store, so re-run `qualify` once per cohort with its own `--system`, `--inbox`
+and the same policy, manifest and index; saved reviews are reused (0 model calls, 0 tokens) and
+each cohort's selections return, while the others stay. After a standing-policy version bump,
+requalify every cohort before expecting a publication: a selection citing an older version's
+review is refused until its cohort is requalified.
 `--concurrency N` (default 6) keeps up to N model calls in flight, each for a
 rendition with no saved `standing-<...>` request; staging, runs, selection,
 manifest writes and usage accounting stay on one thread in inbox order, so

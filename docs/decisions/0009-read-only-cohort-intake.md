@@ -4,6 +4,8 @@
 **Date:** November 1, 2026.
 **Status:** Implemented (classification, local-path intake, ledger extraction,
 model findings and sample evaluation); bulk review remains gated per instance.
+`qualify`'s manifest reconciliation is amended by
+[0021](0021-cohort-scoped-selection-reconciliation.md).
 
 ## Context
 

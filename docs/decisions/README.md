@@ -31,6 +31,7 @@ but not agreed; `Open` means the question is deliberately unresolved.
 | [0018](0018-catalog-contention-outside-the-fault-budget.md) | Lost catalog races do not spend an intake stage's fault budget | Implemented; amends 0013 and 0014 |
 | [0019](0019-cheaper-catalog-inspect.md) | Catalog `inspect` is cheaper and streams its history | Implemented; amends 0012 and 0016 |
 | [0020](0020-constant-cost-upload-planning.md) | Upload planning reads the highest ID per prefix, not every ID | Implemented; amends 0012 |
+| [0021](0021-cohort-scoped-selection-reconciliation.md) | `qualify` reconciles only its own cohort's selections in a shared manifest | Implemented; amends 0009 |
 
 Planning sequence, completion gates and acceptance cases live in the
 [development and ingestion roadmap](../../ROADMAP.md). Working rules live in

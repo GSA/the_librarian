@@ -63,6 +63,28 @@ class LedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
             self.assertEqual(connection.execute("select raw from requests where correlation_id='req-one'").fetchone()[0], raw)
 
+    def test_heads_index_matches_head_and_follows_requests_added_later(self):
+        store.stage(self.root, request("req-one"))
+        heads = store.Heads()
+        self.assertEqual(heads.head(self.root, "req-one"), store.head(self.root, "req-one"))
+        # A correction staged after the index was first used is found, through a chain.
+        store.stage(self.root, request("req-two", correction_of="req-one"))
+        store.stage(self.root, request("req-three", correction_of="req-two"))
+        for corr in ("req-one", "req-two", "req-three"):
+            self.assertEqual(heads.head(self.root, corr), store.head(self.root, corr))
+        self.assertEqual(heads.head(self.root, "req-one")["correlation_id"], "req-three")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            heads.head(self.root, "missing")
+        self.assertEqual(caught.exception.code, "unknown_request")
+        # Two corrections of one request are ambiguous, exactly as for ``store.head``.
+        store.stage(self.root, request("req-four", correction_of="req-three"))
+        store.stage(self.root, request("req-five", correction_of="req-three"))
+        with self.assertRaises(contracts.IntakeError) as caught:
+            heads.head(self.root, "req-one")
+        self.assertEqual(caught.exception.code, "ambiguous_correction")
+        self.assertEqual(store.correlation_ids(self.root),
+                         {"req-one", "req-two", "req-three", "req-four", "req-five"})
+
     def test_reserved_uri_characters_in_root(self):
         for name in ("instance?query", "instance#fragment"):
             with self.subTest(name=name):

@@ -5,12 +5,15 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import types
 import unittest
+import unittest.mock
 from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
-from tools.intake import cohort, store
-from tools.intake.contracts import IntakeError
+from tools.context_index import renditions
+from tools.intake import cohort, standing, store, upload
+from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
               b"------=_Part_1\r\nContent-Type: text/html; charset=utf-8\r\n"
@@ -229,7 +232,7 @@ class IngestTests(CohortCase):
         self.assertEqual([e["code"] for e in failed], ["native-input"])
 
 
-class QualifyTests(CohortCase):
+class QualifyCase(CohortCase):
     def setUp(self):
         super().setUp()
         from tools.review_events import event_store as events
@@ -262,6 +265,17 @@ class QualifyTests(CohortCase):
 
         return fake, calls
 
+    def _qualify(self, transport, **extra):
+        args = dict(system="inbox", actor="cohort-runner",
+                    policy_path="config/standing-policy.local.json",
+                    manifest="config/selection.local.json", model="gpt-5.6-terra",
+                    transport=transport, context=["documents/context.md"])
+        inbox = extra.pop("inbox", self.inbox)
+        args.update(extra)
+        return cohort.qualify(self.root, inbox, **args)
+
+
+class QualifyTests(QualifyCase):
     def test_qualify_reviews_selects_and_publishes_cohort_and_leaves_incomplete_visibly_pending(self):
         from tools.context_index import context_index as index
         transport, calls = self._transport(incomplete_text="Just text")
@@ -373,14 +387,6 @@ class QualifyTests(CohortCase):
                 len(index.search(db, "Fresh cohort item", 10, None, root=self.root)["hits"]), 1)
             notes_hits = index.search(db, "Notes", 10, None, root=self.root)["hits"]
             self.assertEqual([h["path"] for h in notes_hits], [new_notes["rendition"]])
-
-    def _qualify(self, transport, **extra):
-        args = dict(system="inbox", actor="cohort-runner",
-                    policy_path="config/standing-policy.local.json",
-                    manifest="config/selection.local.json", model="gpt-5.6-terra",
-                    transport=transport, context=["documents/context.md"])
-        args.update(extra)
-        return cohort.qualify(self.root, self.inbox, **args)
 
     def test_qualify_requires_a_maintained_context_before_touching_anything(self):
         transport, calls = self._transport()
@@ -617,7 +623,7 @@ class QualifyTests(CohortCase):
         from tools.review_events import event_store
         self.root = Path(self.temp.name) / "instance-6"
         state = event_store.status(self.root)["state_token"]
-        with patch.object(cohort.store, "list_requests", return_value=[]):
+        with patch.object(cohort.store, "correlation_ids", return_value=set()):
             again = self._qualify(base, concurrency=6)
         self.assertEqual(again["counts"], serial[0]["counts"])
         self.assertEqual(again["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
@@ -692,6 +698,326 @@ class QualifyTests(CohortCase):
         with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
             self.assertEqual(
                 len(index.search(db, "Fund codes", 10, None, root=self.root)["hits"]), 1)
+
+
+def _cohort_files(inbox, prefix, count):
+    inbox.mkdir(parents=True, exist_ok=True)
+    for number in range(count):
+        (inbox / f"{prefix}{number}.md").write_text(
+            f"# {prefix.upper()} {number}\nSynthetic {prefix} cohort line {number} marker{prefix}{number}\n")
+    return inbox
+
+
+def _qualify_in_process(root, inbox, system):
+    """Qualify one cohort in its own process, with a stub transport that always accepts."""
+    def transport(model, messages):
+        payload = json.loads(messages[-1]["content"])
+        return {"content": json.dumps({
+            "decision": "accept", "inspected_records": [r["i"] for r in payload["records"]],
+            "inspected_warnings": [w["ref"] for w in payload["warnings"]],
+            "contradictions": [], "missing_evidence": [], "explanation": "Inspected all records."}),
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    return cohort.qualify(
+        Path(root), Path(inbox), system=system, actor="cohort-runner",
+        policy_path="config/standing-policy.local.json", manifest="config/selection.local.json",
+        model="gpt-5.6-terra", transport=transport, context=["documents/context.md"],
+        concurrency=2)["counts"]["qualification"]
+
+
+class SharedManifestTests(QualifyCase):
+    """Several inboxes, one catalog, one selection manifest and one published index."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = _cohort_files(Path(self.temp.name) / "inbox-a", "a", 3)
+        self.b = _cohort_files(Path(self.temp.name) / "inbox-b", "b", 2)
+        self.manifest = self.root / "config/selection.local.json"
+        self.transport, self.calls = self._transport()
+
+    def qualify(self, name, **extra):
+        inbox, system = {"a": (self.a, "system-a"), "b": (self.b, "system-b")}[name]
+        return self._qualify(self.transport, inbox=inbox, system=system, **extra)
+
+    def selections(self):
+        return json.loads(self.manifest.read_text())["renditions"]
+
+    def owners(self, *reports):
+        """Manifest paths by cohort label, from the reports' extracted renditions."""
+        owner = {e["rendition"]: label for label, report in reports
+                 for e in report["entries"] if "rendition" in e}
+        counts = {}
+        for item in self.selections():
+            counts[owner.get(item["path"], "?")] = counts.get(owner.get(item["path"], "?"), 0) + 1
+        return counts
+
+    def search(self, text):
+        from tools.context_index import context_index as index
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            return index.search(db, text, 10, None, root=self.root)["hits"]
+
+    def test_a_b_a_b_keeps_every_cohorts_selections_and_publishes_them_all(self):
+        seen = []
+        first = self.qualify("a")
+        second = self.qualify("b")
+        reports = [("a", first), ("b", second)]
+        self.assertEqual(self.owners(*reports), {"a": 3, "b": 2})
+        self.assertEqual(len(self.calls), 5)
+        self.calls.clear()
+        # Re-qualifying a cohort finds its saved reviews: no model calls, no tokens.
+        for name in ("a", "b"):
+            report = self.qualify(name)
+            reports.append((name, report))
+            self.assertEqual(self.calls, [])
+            self.assertEqual(report["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+            self.assertEqual(self.owners(*reports), {"a": 3, "b": 2})
+            self.assertEqual(report["counts"]["published"], 1)
+            self.assertEqual(report["counts"]["other_cohorts"],
+                             {"selections": 2 if name == "a" else 3, "unattributed": 0, "orphaned": 0})
+            seen.append(report["counts"]["qualification"])
+        self.assertEqual(seen, [{"qualified": 3}, {"qualified": 2}])
+        for marker in ("markera0", "markera2", "markerb0", "markerb1"):
+            self.assertEqual(len(self.search(marker)), 1, marker)
+
+    def test_a_cohort_pruned_by_an_earlier_toolkit_is_restored_from_saved_reviews(self):
+        first, second = self.qualify("a"), self.qualify("b")
+        # What the toolkit before decision 0021 left behind after qualifying B: only B's selections.
+        raw = json.loads(self.manifest.read_text())
+        raw["renditions"] = [r for r in raw["renditions"]
+                             if r["receipt_id"] in {e["receipt_id"] for e in second["entries"]
+                                                    if "receipt_id" in e}]
+        self.manifest.write_text(json.dumps(raw))
+        self.assertEqual(len(self.selections()), 2)
+        self.calls.clear()
+        restored = self.qualify("a")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(restored["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+        self.assertEqual(self.owners(("a", first), ("b", second)), {"a": 3, "b": 2})
+        self.assertEqual(restored["counts"]["published"], 1)
+        for marker in ("markera0", "markera2", "markerb0"):
+            self.assertEqual(len(self.search(marker)), 1, marker)
+
+    def test_qualifying_one_cohort_leaves_the_other_cohorts_entries_byte_identical(self):
+        self.qualify("a")
+        before = self.manifest.read_bytes()
+        a_entries = self.selections()
+        self.qualify("b")
+        raw = json.loads(self.manifest.read_text())
+        # Cohort A's entries are the same objects, in the same places, ahead of B's additions.
+        self.assertEqual(raw["renditions"][:3], a_entries)
+        self.assertEqual({k: v for k, v in raw.items() if k != "renditions"},
+                         {k: v for k, v in json.loads(before).items() if k != "renditions"})
+        mid = self.manifest.read_bytes()
+        # Requalifying A changes nothing at all: same bytes, so the published index digest is stable too.
+        self.qualify("a")
+        self.assertEqual(self.manifest.read_bytes(), mid)
+        self.qualify("b")
+        self.assertEqual(self.manifest.read_bytes(), mid)
+
+    def test_a_cohort_that_dropped_a_file_loses_only_its_own_selection(self):
+        self.qualify("a")
+        self.qualify("b")
+        (self.b / "b1.md").unlink()
+        report = self.qualify("b")
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 1})
+        self.assertEqual(len(self.selections()), 4)
+        self.assertEqual(self.search("markerb1"), [])
+        self.assertEqual(len(self.search("markera1")), 1)
+        self.assertEqual(len(self.search("markerb0")), 1)
+
+    def test_identical_bytes_under_two_systems_are_two_selections(self):
+        (self.b / "same.md").write_bytes((self.a / "a0.md").read_bytes())
+        first, second = self.qualify("a"), self.qualify("b")
+        a0 = next(e for e in first["entries"] if e["relative"] == "a0.md")
+        same = next(e for e in second["entries"] if e["relative"] == "same.md")
+        self.assertEqual(a0["sha256"], same["sha256"])
+        self.assertNotEqual(a0["rendition"], same["rendition"])
+        self.assertEqual(len(self.selections()), 6)
+        # Each system's receipt holds its own rendition: B dropping its copy never prunes A's.
+        (self.b / "same.md").unlink()
+        self.qualify("b")
+        paths = {r["path"] for r in self.selections()}
+        self.assertIn(a0["rendition"], paths)
+        self.assertNotIn(same["rendition"], paths)
+
+    def test_an_entry_that_cannot_be_attributed_to_a_cohort_is_never_removed(self):
+        first = self.qualify("a")
+        self.qualify("b")
+        a0 = next(e for e in first["entries"] if e["relative"] == "a0.md")
+        sidecar = self.root / Path(a0["original"]).parent / "submission.json"
+        sidecar.write_bytes(sidecar.read_bytes() + b" ")
+        report = self.qualify("b")
+        # Cohort A's entry, whose submission record no longer matches the catalog pin, is kept and reported.
+        self.assertEqual(len(self.selections()), 5)
+        self.assertIn(a0["rendition"], {r["path"] for r in self.selections()})
+        self.assertEqual(report["counts"]["other_cohorts"],
+                         {"selections": 3, "unattributed": 1, "orphaned": 0})
+
+    def test_only_a_declared_local_path_submission_names_a_cohort(self):
+        first = self.qualify("a")
+        a0 = next(e for e in first["entries"] if e["relative"] == "a0.md")
+        records = catalog.read_records_by_receipt(self.root, [a0["receipt_id"]], limit=100)
+        scoped = records[a0["receipt_id"]]
+        self.assertEqual(cohort._submission_system(self.root, scoped), "system-a")
+        manual = Path(self.temp.name) / "manual.txt"
+        manual.write_text("Operator supplied\n")
+        ack = upload.submit(self.root, manual, upload.descriptor(
+            submission_id="manual-one", format_name="text", name="manual.txt",
+            actor="operator", reason="Manual upload"))
+        scoped = catalog.read_records_by_receipt(
+            self.root, [ack["records"]["receipt_id"]], limit=100)[ack["records"]["receipt_id"]]
+        self.assertIsNone(cohort._submission_system(self.root, scoped))
+
+    def test_a_selection_whose_receipt_or_rendition_is_gone_is_dropped_and_counted(self):
+        self.qualify("a")
+        self.qualify("b")
+        raw = json.loads(self.manifest.read_text())
+        ghost = dict(raw["renditions"][0])
+        ghost.update(receipt_id="D90", path=ghost["path"].replace(ghost["receipt_id"], "D90"))
+        raw["renditions"].append(ghost)
+        self.manifest.write_text(json.dumps(raw))
+        report = self.qualify("b")
+        self.assertEqual(report["counts"]["other_cohorts"],
+                         {"selections": 3, "unattributed": 0, "orphaned": 1})
+        self.assertEqual(len(self.selections()), 5)
+        self.assertEqual(report["counts"]["published"], 1)
+
+    def test_an_unreadable_catalog_stops_before_the_manifest_is_touched(self):
+        self.qualify("a")
+        before = self.manifest.read_bytes()
+        with unittest.mock.patch.object(
+                cohort.catalog, "read_records_by_receipt",
+                side_effect=catalog.CatalogError("unavailable")), self.assertRaises(IntakeError) as caught:
+            self.qualify("b")
+        self.assertEqual(caught.exception.code, "selection_attribution_unavailable")
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_an_interrupted_manifest_write_leaves_the_manifest_as_it_was(self):
+        self.qualify("a")
+        before = self.manifest.read_bytes()
+        real = os.replace
+
+        def fail(source, target, *args, **kwargs):
+            if Path(target) == self.manifest:
+                raise OSError(5, "simulated crash")
+            return real(source, target, *args, **kwargs)
+        with unittest.mock.patch.object(os, "replace", fail):
+            crashed = self.qualify("b")
+        # Never a partial or mixed manifest, and no temporary file left behind: A's entries stay.
+        self.assertEqual(crashed["counts"]["qualification"], {"pending-review": 2})
+        self.assertEqual(self.manifest.read_bytes(), before)
+        self.assertEqual([p.name for p in self.manifest.parent.iterdir()
+                          if p.name.startswith(".")], [])
+        self.calls.clear()
+        self.assertEqual(self.qualify("b")["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual((len(self.selections()), self.calls), (5, []))
+
+    def test_the_manifest_is_rewritten_while_holding_the_ledger_writer_lock(self):
+        self.qualify("a")
+        seen = []
+        real = cohort._set_manifest_renditions
+
+        def probe(root, manifest, renditions_):
+            try:
+                with store.locked(root, wait=0):
+                    seen.append("free")
+            except LedgerBusy:
+                seen.append("held")
+            return real(root, manifest, renditions_)
+        with unittest.mock.patch.object(cohort, "_set_manifest_renditions", probe):
+            self.qualify("b")
+        self.assertEqual(seen, ["held", "held"])
+
+    def test_capacity_shared_with_other_cohorts_leaves_the_surplus_pending_and_resumable(self):
+        self.qualify("a")
+        # A cap of four, as enforced by standing.write_manifest itself and by the reconciliation,
+        # shared with cohort A's three entries. Policy validation compares the policy's receipt
+        # scope with the cap (``len(scope) <= cap``), which the real cap of 5,000 always satisfies.
+        class Cap(int):
+            def __ge__(self, other):
+                return True
+        small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(4)})
+        with unittest.mock.patch.object(standing, "renditions", small), \
+                unittest.mock.patch.object(cohort, "renditions", small):
+            report = self.qualify("b")
+            self.assertEqual(len(self.selections()), 4)
+            self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "pending-review": 1})
+            self.assertEqual([e["review_code"] for e in report["entries"] if e.get("review_code")],
+                             ["selection-capacity"])
+            # Not a conflict: the select stage was left unrun, not blocked for explicit replay.
+            full = next(e for e in report["entries"] if e.get("review_code") == "selection-capacity")
+            corr = "standing-%s-%s-%s" % (full["submission_id"], full["rendition_sha256"][:12], hashlib.sha256(
+                (self.root / "config/standing-policy.local.json").read_bytes()).hexdigest()[:8])
+            self.assertEqual([s["status"] for s in store.inspect(self.root, corr)["stages"]],
+                             ["succeeded", "staged"])
+            # Cohort A is untouched by B's overflow, and still full.
+            self.assertEqual(self.owners(("a", self.qualify("a"))).get("a"), 3)
+            self.assertEqual(self.qualify("b")["counts"]["qualification"],
+                             {"qualified": 1, "pending-review": 1})
+            # A frees a slot (a file leaves its inbox); B's pending rendition is then selected from
+            # its saved review: no model call, no manual replay.
+            (self.a / "a2.md").unlink()
+            self.qualify("a")
+            self.assertEqual(len(self.selections()), 3)
+            self.calls.clear()
+            resumed = self.qualify("b")
+        self.assertEqual(resumed["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual((self.calls, resumed["usage"]),
+                         ([], {"prompt_tokens": 0, "completion_tokens": 0}))
+        self.assertEqual(len(self.selections()), 4)
+
+    def test_a_select_blocked_by_a_cohort_that_filled_the_manifest_meanwhile_is_resumed(self):
+        self.qualify("a")
+
+        class Cap(int):
+            def __ge__(self, other):
+                return True
+        small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(3)})
+        # Room looked available when the run checked, but another writer took it before the select ran.
+        with unittest.mock.patch.object(standing, "renditions", small), \
+                unittest.mock.patch.object(cohort, "_selection_room", return_value=True):
+            report = self.qualify("b")
+        self.assertEqual(report["counts"]["qualification"], {"pending-review": 2})
+        self.assertEqual({e["review_code"] for e in report["entries"] if e.get("review_code")},
+                         {"selection-capacity"})
+        self.assertEqual(len(self.selections()), 3)
+        # Blocked, but resumable: the cap is not a conflict, so the next run selects it.
+        self.calls.clear()
+        resumed = self.qualify("b")
+        self.assertEqual(resumed["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual((self.calls, len(self.selections())), ([], 5))
+
+    def test_two_processes_qualifying_different_cohorts_do_not_lose_each_others_writes(self):
+        import multiprocessing
+        context = multiprocessing.get_context("spawn")
+        jobs = [(str(self.root), str(self.a), "system-a"), (str(self.root), str(self.b), "system-b")]
+        with context.Pool(2) as pool:
+            counts = pool.starmap(_qualify_in_process, jobs)
+        self.assertEqual(counts, [{"qualified": 3}, {"qualified": 2}])
+        self.assertEqual(len(self.selections()), 5)
+        # A final pass in this process changes nothing: the interleaved writes were all kept.
+        before = self.manifest.read_bytes()
+        self.qualify("a"), self.qualify("b")
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_after_a_policy_bump_the_other_cohorts_old_review_blocks_publication_until_requalified(self):
+        self.qualify("a")
+        self.qualify("b")
+        self._bump_policy_version()
+        report = self.qualify("a")
+        # Fail closed: B's selections still cite the older policy's reviews, so nothing is published.
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 3})
+        self.assertEqual(report["counts"]["published"], 0)
+        self.assertEqual(len(self.selections()), 5)
+        self.assertEqual(self.qualify("b")["counts"]["published"], 1)
+        self.assertEqual(len(self.selections()), 5)
+        for marker in ("markera0", "markerb1"):
+            self.assertEqual(len(self.search(marker)), 1, marker)
+
+    def _bump_policy_version(self):
+        policy_file = self.root / "config/standing-policy.local.json"
+        raw = json.loads(policy_file.read_text())
+        raw["version"] += 1
+        policy_file.write_text(json.dumps(raw))
 
 
 class CliTests(CohortCase):
