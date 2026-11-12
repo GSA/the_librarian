@@ -396,23 +396,25 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
     policy_sha = hashlib.sha256(policy_file.read_bytes()).hexdigest()
     standing_policy = standing.load_policy(root, policy_path, policy_sha)
     manifest_file = root / manifest
-    raw = (json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.is_file() else {
-        "schema_version": 1,
-        "audience": policy.for_root(root)[0]["audience"],
-        "documents": [],
-        "context_rules": {},
-        "renditions": [],
-    })
-    docs = {d["path"] for d in raw.setdefault("documents", [])}
-    changed = not manifest_file.is_file()
-    for locator in standing_policy["selection"]["context"]:
-        doc = locator.split("#", 1)[0]
-        if doc not in docs:
-            raw["documents"].append({"path": doc, "role": "context", "context": []})
-            docs.add(doc)
-            changed = True
-    if changed:
-        _replace_json(manifest_file, raw)
+    # Another cohort's run may be selecting into this manifest: read and write under the ledger lock.
+    with store.locked(root):
+        raw = (json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.is_file() else {
+            "schema_version": 1,
+            "audience": policy.for_root(root)[0]["audience"],
+            "documents": [],
+            "context_rules": {},
+            "renditions": [],
+        })
+        docs = {d["path"] for d in raw.setdefault("documents", [])}
+        changed = not manifest_file.is_file()
+        for locator in standing_policy["selection"]["context"]:
+            doc = locator.split("#", 1)[0]
+            if doc not in docs:
+                raw["documents"].append({"path": doc, "role": "context", "context": []})
+                docs.add(doc)
+                changed = True
+        if changed:
+            _replace_json(manifest_file, raw)
     return standing_policy, policy_sha
 
 
@@ -433,9 +435,9 @@ def _stage_request(root, corr, stages, correction_of=None):
     }).encode())
 
 
-def _head(root, corr):
+def _head(root, corr, heads=None):
     try:
-        return store.head(root, corr)
+        return (heads.head if heads is not None else store.head)(root, corr)
     except IntakeError as error:
         if error.code != "unknown_request":
             raise
@@ -492,16 +494,137 @@ def _set_manifest_renditions(root, manifest, renditions_):
         _replace_json(root / manifest, raw)
 
 
+# Records of one receipt read to find its submission sidecar (a receipt holds a few per extraction).
+ATTRIBUTION_RECORDS = 1000
+
+
+def _submission_system(root, receipt):
+    """The cohort label a receipt was submitted under, from validated catalog evidence.
+
+    ``receipt`` is one receipt's scoped catalog records. The label is the ``origin.system`` of
+    the ``local-path`` submission sidecar whose SHA-256 the catalog pins on the receipt's
+    ``preserved-metadata`` artifact, so a changed or swapped sidecar attributes nothing.
+    ``None`` when any link is missing or inconsistent.
+    """
+    by_id = {record["id"]: record for record in receipt["records"]}
+    try:
+        (head,) = (r for r in receipt["records"] if r["kind"] == "receipt")
+        original = by_id[head["data"]["artifact_id"]]
+        prefix, _, sid = original["id"].partition("A-upload-")
+        sid = sid.removesuffix("-original")
+        meta = by_id["A-upload-%s-submission" % sid]
+        if (prefix or not sid or original["data"]["role"] != "original"
+                or meta["data"]["role"] != "preserved-metadata"
+                or meta["data"]["parent_id"] != original["id"]
+                or meta["data"]["receipt_id"] != head["id"]
+                or original["data"]["receipt_id"] != head["id"]):
+            return None
+        contracts.relative(meta["data"]["path"])
+        raw = upload.read_file(Path(store.safe(root)) / meta["data"]["path"], upload.MIB)
+        sidecar = contracts.decode(raw)
+        if (contracts.digest(raw) != meta["data"]["sha256"] or sidecar["submission_id"] != sid
+                or sidecar["original"]["sha256"] != original["data"]["sha256"]):
+            return None
+        origin = sidecar["origin"]
+        return origin["system"] if origin["kind"] == "local-path" else None
+    except (KeyError, TypeError, ValueError, OSError, IntakeError):
+        return None
+
+
+ABSENT = "\0absent"
+
+
+def _attribute(root, cache, entries):
+    """Record in ``cache`` the cohort label of each manifest entry's receipt not yet attributed.
+
+    The value is the label, ``None`` when the receipt exists but no cohort is proven for it, or
+    ``ABSENT`` when the catalog holds no such receipt. A catalog that cannot be read raises, before
+    the manifest is touched: nothing is dropped on a guess.
+    """
+    wanted = sorted({e["receipt_id"] for e in entries} - cache.keys())
+    if not wanted:
+        return
+    try:
+        found = catalog.read_records_by_receipt(root, wanted, limit=ATTRIBUTION_RECORDS)
+    except catalog.CatalogError as error:
+        raise IntakeError("selection_attribution_unavailable") from error
+    for receipt, scoped in found.items():
+        if not scoped["records"]:
+            cache[receipt] = ABSENT
+        else:
+            # A receipt too large to show its sidecar record is unproven, so it is kept.
+            cache[receipt] = (None if scoped["next_after"] is not None
+                              else _submission_system(root, scoped))
+
+
+def _merge_cohort(listed, own, mine):
+    """Replace this cohort's slots in ``listed`` with ``mine``; other entries stay where they are.
+
+    ``own`` flags the entries of ``listed`` that belong to the cohort. Slots are refilled in
+    order and any surplus is appended, so a manifest holding only this cohort becomes exactly
+    ``mine``, and an unchanged cohort leaves the manifest unchanged.
+    """
+    fill, merged = iter(mine), []
+    for item, mine_ in zip(listed, own):
+        if not mine_:
+            merged.append(item)
+        elif (replacement := next(fill, None)) is not None:
+            merged.append(replacement)
+    merged.extend(fill)
+    return merged
+
+
+def _reconcile(root, manifest, system, current, cache, compose):
+    """Rewrite only this cohort's manifest entries, atomically, under the ledger writer lock.
+
+    An entry is the cohort's when its rendition is one the run extracted or its receipt was
+    submitted under ``system``. Every other entry (another cohort's, an operator's, or one whose
+    submission cannot be proven) is kept as it is, in its place. The exception is an orphan: an
+    entry whose receipt is not in the catalog or whose retained rendition file is gone belongs to
+    no cohort and nothing can publish it, so it is dropped, as before. ``compose(own, room)``
+    returns the cohort's new entries, at most ``room`` of them. The read-modify-write holds the
+    lock that ``standing-select`` holds when it adds an entry, so a concurrent run for another
+    cohort cannot lose either write. Returns the counts of entries left alone and dropped.
+    """
+    _attribute(root, cache, [r for r in _manifest_renditions(root, manifest)
+                             if r["path"] not in current])
+    with store.locked(root):
+        listed = _manifest_renditions(root, manifest)
+        # Entries another run added since the read above.
+        _attribute(root, cache, [r for r in listed if r["path"] not in current])
+
+        def orphan(r):
+            return r["path"] not in current and (
+                cache[r["receipt_id"]] == ABSENT or not os.path.isfile(root / r["path"]))
+        own = [r["path"] in current or orphan(r) or cache[r["receipt_id"]] == system
+               for r in listed]
+        foreign = [r for r, mine in zip(listed, own) if not mine]
+        merged = _merge_cohort(listed, own, compose(
+            [r for r, mine in zip(listed, own) if mine], renditions.MAX_SELECTIONS - len(foreign)))
+        _set_manifest_renditions(root, manifest, merged)
+    return {"selections": len(foreign),
+            "unattributed": sum(cache[r["receipt_id"]] is None for r in foreign),
+            "orphaned": sum(orphan(r) for r in listed)}
+
+
 def _standing_token(entry, policy_sha):
     return "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
 
 
+def _live_events(snapshot):
+    """Event IDs in ``snapshot`` that no later event supersedes."""
+    return {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
+
+
 def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                       model, transport, usage, snapshot=None, prefetched=None):
+                       model, transport, usage, snapshot=None, prefetched=None,
+                       heads=None, live=None):
     """Review and select one extracted rendition; identity is bound to the exact rendition.
 
     ``prefetched`` optionally returns the model review already started for this entry
     on a worker thread; every ledger step still runs here, on the calling thread.
+    ``heads`` shares one correction-chain index across the run and ``live`` the live event
+    IDs of ``snapshot``, so a settled entry costs neither a ledger scan nor an event scan.
     """
     token = _standing_token(entry, policy_sha)
     corr, event_id = "standing-" + token, "rev-" + token
@@ -513,7 +636,7 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
             reviewed = prefetched()
         except Exception as error:
             failure = error
-    current = _head(root, corr)
+    current = _head(root, corr, heads)
     if current is None:
         if failure is not None:
             raise failure
@@ -542,11 +665,11 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
         usage.update(reviewed["usage"])
     settled = all(st["status"] == "succeeded" for st in current["stages"])
     if settled and snapshot is not None:
-        def live(snap):
-            return {e["event_id"] for e in snap.events if e["event_id"] not in snap.successors}
+        if live is None:
+            live = _live_events(snapshot)
         # An event absent from the run-start snapshot may come from another writer during
         # this run; only a fresh read can show that it was superseded.
-        if event_id not in live(snapshot) and event_id not in live(event_reader.read_snapshot(root)):
+        if event_id not in live and event_id not in _live_events(event_reader.read_snapshot(root)):
             # An operator superseded this review; never resurrect its selection.
             entry.update(qualification="pending-review", review_code="review-superseded",
                          superseded_event=event_id)
@@ -586,15 +709,17 @@ def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manif
     def review(entry):
         return model_review.review(root, entry["rendition"], standing_policy, model, transport)
 
+    # One correction-chain index and one live-event set serve every entry of the run.
+    shared = {"heads": store.Heads(), "live": _live_events(snapshot)}
     if concurrency == 1:
         for entry in extracted:
             _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                               model, transport, usage, snapshot)
+                               model, transport, usage, snapshot, **shared)
         return
     # Requests saved before this run need no model call; one read covers the run.
     # A request another writer stages later is still found by the fresh per-entry
     # read in _review_and_select, which then discards the unused review.
-    existing = {r["correlation_id"] for r in store.list_requests(root)}
+    existing = store.correlation_ids(root)
     window = deque()
     upcoming = iter(extracted)
     with ThreadPoolExecutor(max_workers=concurrency,
@@ -615,7 +740,7 @@ def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manif
                 entry, future = window.popleft()
                 _review_and_select(root, entry, standing_policy, policy_path, policy_sha,
                                    manifest, model, transport, usage, snapshot,
-                                   future.result if future is not None else None)
+                                   future.result if future is not None else None, **shared)
         except BaseException:
             for _, future in window:
                 if future is not None:
@@ -670,29 +795,45 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
     extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
-    # Drop selections for renditions the cohort no longer has before selecting replacements,
-    # so replacing a rendition never needs spare manifest capacity.
+    # Only this cohort's selections are pruned and reconciled: those of renditions it extracted
+    # and those whose receipt was submitted under ``system``. Every other entry is kept as it is.
+    # Dropping the cohort's selections for renditions it no longer has comes before selecting
+    # replacements, so replacing a rendition never needs spare manifest capacity.
     current = {e["rendition"] for e in extracted}
-    _set_manifest_renditions(root, manifest, [
-        r for r in _manifest_renditions(root, manifest) if r["path"] in current])
+    cohorts = {}
+    pruned = _reconcile(root, manifest, system, current, cohorts,
+                        lambda own, room: [r for r in own if r["path"] in current])
     usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
     snapshot = event_reader.read_snapshot(root)
     retries = getattr(transport, "retries", None)
     retried = Counter(retries) if retries is not None else None
     _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
                 model, transport, usage, snapshot, concurrency)
-    selected = _manifest_renditions(root, manifest)
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
-    # Reconcile the manifest to exactly the qualified renditions from validated review
-    # evidence, keeping an operator's explicit selection whose saved review was superseded.
+    # Reconcile the cohort's manifest entries to exactly its qualified renditions from validated
+    # review evidence, keeping an operator's explicit selection whose saved review was superseded.
     stale = {e["superseded_event"] for e in extracted if "superseded_event" in e}
     kept = {e["rendition"] for e in extracted if e.get("review_code") == "review-superseded"}
-    selected = [r for r in selected if not stale & set(r.get("review_event_ids") or [])]
-    _set_manifest_renditions(root, manifest, [r for r in selected if r["path"] in kept]
-                             + [e["selection"] for e in qualified])
+
+    def reconciled(own, room):
+        own = [r for r in own if not stale & set(r.get("review_event_ids") or [])]
+        chosen = [r for r in own if r["path"] in kept] + [e["selection"] for e in qualified]
+        # A selection restored from saved evidence cannot exceed what the manifest can hold
+        # next to other cohorts' entries; the surplus stays visibly pending, never invalid.
+        surplus = {r["path"] for r in chosen[room:]}
+        for entry in qualified:
+            if entry["rendition"] in surplus:
+                entry.update(qualification="pending-review", review_code="selection-capacity")
+        return chosen[:room]
+    others = _reconcile(root, manifest, system, current, cohorts, reconciled)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     report["counts"]["qualification"] = dict(
         Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
+    others["orphaned"] = pruned["orphaned"]
+    if others["selections"] or others["orphaned"]:
+        # ``selections`` belong to other cohorts or to none provable (``unattributed``) and were
+        # left as they were; ``orphaned`` named a receipt the catalog does not hold and were dropped.
+        report["counts"]["other_cohorts"] = others
     report["counts"]["published"] = int(
         pub["status"] == "succeeded"
         and bool(inspected.get("availability", {}).get("available")))

@@ -373,6 +373,49 @@ def head(root, correlation_id):
             seen.add(current)
 
 
+class Heads:
+    """Newest request of a correction chain, without scanning the ledger for every lookup.
+
+    ``head`` answers exactly like ``store.head``. Correction links are read once and then
+    extended, under the ledger lock, with only the requests added since (by row id: requests
+    are never deleted, so a smaller highest row id means a different ledger and resets the
+    index). A run that follows thousands of chains therefore reads the links once, not once
+    per chain.
+    """
+
+    def __init__(self):
+        self._top, self._children = 0, {}
+
+    def _extend(self, c):
+        top = c.execute("SELECT max(rowid) FROM requests").fetchone()[0] or 0
+        if top < self._top:
+            self._top, self._children = 0, {}
+        for child, parent in c.execute("SELECT correlation_id, correction_of FROM requests "
+                                       "WHERE rowid>? AND correction_of IS NOT NULL", (self._top,)):
+            self._children.setdefault(parent, []).append(child)
+        self._top = top
+
+    def head(self, root, correlation_id):
+        with locked(root) as c:
+            self._extend(c)
+            current, seen = correlation_id, {correlation_id}
+            require(c.execute("SELECT 1 FROM requests WHERE correlation_id=?", (current,)).fetchone()
+                    is not None, "unknown_request")
+            while True:
+                children = self._children.get(current, [])
+                if not children:
+                    return summary(c, current)
+                require(len(children) == 1 and children[0] not in seen, "ambiguous_correction")
+                current = children[0]
+                seen.add(current)
+
+
+def correlation_ids(root):
+    """Every staged correlation ID, without building a summary of each request."""
+    with locked(root) as c:
+        return {r[0] for r in c.execute("SELECT correlation_id FROM requests")}
+
+
 def request(root, correlation_id):
     """The exact staged request, decoded."""
     with locked(root) as c:
