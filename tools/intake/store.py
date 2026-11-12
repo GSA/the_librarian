@@ -241,9 +241,6 @@ def _acquire(fd, wait):
             time.sleep(random.uniform(0.02, 0.1))
 
 
-_identity = file_identity
-
-
 def _take_attestation(fd, root):
     """The identity the previous clean writer left in the lock file, consumed on read.
 
@@ -292,9 +289,9 @@ def locked(root, wait=None):
             foreign = c.execute("PRAGMA data_version").fetchone()[0]
             # Another writer's clean hand-off left its attestation; a file that still matches
             # it was last written by a validated writer, so the O(ledger) pass is skipped.
-            if known is None or known != _identity(db):
+            if known is None or known != file_identity(db, c):
                 validate(c, root)
-            entered = _identity(db)
+            entered = file_identity(db, c)
         except sqlite3.Error as error:
             raise (LedgerBusy() if _busy(error) else IntakeError("corrupt_store")) from error
         try:
@@ -308,7 +305,7 @@ def locked(root, wait=None):
             # Recorded while still holding the writer lock, after this process's own commits,
             # and only when no other connection committed since validation.
             if c is not None:
-                identity = _identity(db)
+                identity = file_identity(db, c)
                 # A block that raised is attested only when the file is exactly as it was when
                 # validated (a read-only refusal such as ``unknown_request``): nothing was
                 # written, so a partial write can never be handed off as validated.

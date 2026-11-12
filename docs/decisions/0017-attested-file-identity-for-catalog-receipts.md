@@ -21,7 +21,8 @@ the intake ledger hand-off to file identity.
 - **Identity binding.** `_binding` is now `{version: 2, identity: [device, inode, size,
   mtime_ns, ctime_ns, SQLite change counter], validator_sha256, runtime}`, taken after
   the connection holds its read snapshot. The identity code is `tools/file_identity.py`,
-  moved unchanged from the ledger (`tools/intake/store.py` imports it). When a journal
+  moved from the ledger (`tools/intake/store.py` imports it); it takes the open connection and
+  never opens a descriptor on the database (see below). When a journal
   or WAL exists or the header is not rollback-journal, the binding is the previous
   byte hash (`version: 1`).
 - **Daily full check.** The receipt records `validated_on`, the UTC date of the last
@@ -32,6 +33,19 @@ the intake ledger hand-off to file identity.
 - **Unchanged.** `status --audit`, the daily snapshot, `verify_backup`, `restore`,
   backups, the schema and every refusal stay byte-exact and full. A receipt written
   before this decision has no date and is a miss (one full validation), never a refusal.
+
+## Never close a descriptor on the open database
+
+On POSIX, closing any descriptor for a file drops all of the process's fcntl locks on it,
+including the SQLite lock the connection holds. The first form of the helper opened the
+database, read its header and closed the descriptor inside the reader's snapshot, so a
+reader doing a full validation lost its shared lock mid-replay, a writer committed, and the
+reader saw torn views (spurious `Current records differ from immutable revision history`
+or `database disk image is malformed` errors, Kata kkmv). `file_identity(db, connection)`
+now takes the stat fields from the path and the change counter from page 1 as the
+connection itself reads it (`sqlite_dbpage`); a SQLite build without that table yields no
+identity and so the byte-hash binding. Any code that touches a database file while a
+connection to it is open in the process must do the same.
 
 ## Accepted residual
 
