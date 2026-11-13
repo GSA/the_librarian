@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic first-write-of-the-day profile: what the daily snapshot costs inside the catalog writer lock.
 
-After decision 0015 a normal catalog write validates only its delta, but the first write of each
+A normal catalog write validates only its delta, but the first write of each
 UTC day still takes the daily snapshot, whose copy, verification and retention replay the whole
 history while the writer lock is held. This tool seeds a synthetic catalog of N upload-shaped
 registrations once (``seed``), copies it for every trial and reports body-free JSON:

@@ -57,7 +57,7 @@ required re-initializing the then-empty local review store.
 
 It also adds an observation capability unlike the ingestion sources: **body-free
 retrieval diagnostics** covering coverage gaps, plus bare search and read counts,
-specified under
+described under
 [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution).
 Agent execution traces as durable agent memory were not built; see the design doc
 for the reasoning. The coverage-gap half is implemented: an empty search returns an
@@ -89,11 +89,11 @@ to exist in this distribution.
 | Bounded ingestion cohorts | No cohort driver or operation-local catalog snapshot API | Adapt `cohort.py` and `ReceiptMetadataSnapshot`; retain source/state checks, serialized writes, saved requests, explicit partial failures and backups |
 | Read-only remote discovery | No remote connector; local explicit-root inventory exists | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
 | Continuous copy and intake | Private exact-request intake ledger, explicit native writer stages, bounded attempts/DLQ/replay, acknowledgment recording, and explicit manual file upload / marked local-drop intake; no acquisition or scheduler | Add separately authorized connectors, scheduling and return transport; a read-only mount is not a local copy or ingestion service |
-| MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); opt-in full-text per-agent MCP audit log (`--audit-log`, [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)); no cohort metrics | Adapt the remaining opt-in audit/`metrics.py` and cohort metrics; private modes, explicit logging failures and no telemetry-as-job-authority. Dead weight is withdrawn, not pending, per [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
+| MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); opt-in full-text per-agent MCP audit log (`--audit-log`, [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)); no cohort metrics | Add cohort metrics if wanted; keep private modes, explicit logging failures and no telemetry-as-job-authority. The audit log is implemented (`tests/test_mcp_audit.py`); see [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
 | Retrieval refinements | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
 | Reader diagnostics and regressions | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
 | Explicit relationship traversal | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in the [design](docs/design/current-state.md#7-relationship-traversal) (no real failed question has been recorded) |
-| Agent execution traces | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free retrieval diagnostics only - coverage gaps (implemented); dead weight withdrawn; no retrieval-quality figure is derived, because the available counts cannot support one. Traces as durable agent memory are declined in [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics); agent findings route through the contribution contract instead |
+| Agent execution traces | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free coverage-gap diagnostics (implemented); reads are not attributed to documents and no retrieval-quality figure is derived. Agent findings route through the contribution contract; see the [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) |
 | Discovery-card experiments | Not shipped | Retain the lesson: skims can miss relevant material; evaluate candidate recall with deferred controls, never use cards as proof of absence |
 | Operating guidance | Generic role/feedback contracts now included; private corpus procedures intentionally omitted | Keep task-triggered loading and source fidelity/authority boundaries; add generic format/recovery guides alongside each future port |
 
@@ -237,219 +237,45 @@ Define pause, clean shutdown and explicit resume before enabling scheduling.
 ## Retrieval diagnostics from agent execution
 
 **Status: Partly implemented.** Search absence classification and an opt-in
-body-free diagnostics log are implemented and tested; see
-[What is implemented](#what-is-implemented) below. The dead-weight requirement is
-withdrawn and no retrieval-quality figure is derived (see
-[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)). This
-supersedes an earlier, broader proposal to ingest agent execution traces as
-durable memory. That broader version is declined; the reasoning is recorded in
-[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics).
-
-### What is wanted, and what is declined
-
-This corpus exists to supply other agents with business context gathered from
-users, Google Drive and Confluence. The question is whether recording what
-those agents did with returned context pays its way.
-
-**Declined: traces as agent memory.** Letting an agent read its own prior
-conclusions back as context inverts the corpus's purpose. The value here is
-that every answer is traceable to a Drive file or a Confluence page with a
-locator, a hash and a review record. An agent's recollection has no author, no
-version and no upstream owner, and it is wrong the moment the underlying page
-changes. Stored at the same retrieval surface, unverified recollection
-competes with sourced material - and the model cannot reliably tell them
-apart. A corpus whose authority is provenance should not also store content
-whose only provenance is that an agent once said it.
-
-An agent finding that genuinely deserves to persist already has a route: the
-[contribution and disposition contract](agents/contributions.md), which
-requires evidence, basis, affected context, handling and attribution, and
-which ends in review. That path is deliberately slower than writing a trace.
-The friction is the feature.
-
-**Kept: body-free retrieval diagnostics.** What this corpus cannot currently
-see is its own performance. One question matters and it was not answerable
-before this work:
-
-- **Coverage gaps.** Which questions produced no usable result? That is the
-  prioritized ingestion backlog, and it is the highest-value signal available.
-  Right now a question the corpus cannot answer leaves no trace at all.
-
-Search and read counts are also recorded, as bare facts about observed traffic.
-No retrieval-quality figure is derived from them.
-
-**Not reported: retrieval quality.** Reads per answered search looks like a
-quality signal and is not one. It cannot distinguish an unconvincing search
-excerpt from an agent that read enough from the search result and never needed
-the full record - two cases calling for opposite responses. The counts are
-kept; the ratio is not published until something can tell those cases apart.
-The [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) records why.
-
-**Withdrawn: dead weight.** An earlier version of this section asked which
-selected documents are never returned or never read, so selection could be
-pruned. That requirement is withdrawn in
-[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics). Less data is not
-assumed to be better: removing a selected document is only an improvement if
-keeping it demonstrably costs something, and nothing here demonstrates that,
-while a wrongly pruned document is unavailable the first time it is needed and
-leaves a gap indistinguishable from a source never collected. The measurement
-is also weakest where it would be used - at observed traffic volumes "never
-returned" and "not yet asked about" are the same observation - and it is the
-only proposed signal that requires attributing reads, which would
-make the log a usage profile of the corpus and of the asking agent.
-
-These are observations about the corpus's behavior, not claims about the
-world, and they answer operator questions rather than feeding agent context.
-
-### Shape
-
-Follow the existing body-free metrics precedent rather than inventing a trace
-format. The originating installation has a 247-line `metrics.py` that already
-enforces the hard part: a closed field set that rejects bodies and queries
-outright, a fixed operation vocabulary, exception class names instead of error
-messages, a per-record byte budget, private file modes and locked appends. It
-is explicitly "never a catalog or review authority." That is the model.
-
-Required, beyond what `metrics.py` already does:
-
-- **Record the question's outcome, not the question.** A zero-result or
-  unusable-result event needs enough shape to drive ingestion priority without
-  storing the query text, which carries the asking agent's task content.
-  Finding a formulation that is useful and still body-free is the real design
-  problem and is unsolved.
-- **Record use, not just return.** Not shipped as a quality measure. Reads are
-  counted as bare events with no locator; no ratio is derived, because the
-  observable counts cannot separate a weak search result from a question the
-  search result already answered. Distinguishing returned from actually used
-  would require cooperation from the calling agent and is not implemented.
-- **Reference records by locator, hash and state token.** Deliberately not
-  done. Recording a locator is what would turn the log into a usage profile;
-  see the withdrawn dead-weight signal above.
-
-### Boundaries
-
-- **Diagnostics are never retrieval context.** They are not indexed, not
-  searchable alongside corpus records, and not returned by read tools. They
-  answer operator questions about the corpus, and nothing else.
-- **Not an authority.** Not in the catalog store, not in the review-event
-  store, never countable as a review, never support for a qualified answer.
-- **Body-free is a hard constraint, not a default.** Queries, prompts, model
-  output and source excerpts are all excluded. This is what keeps the log from
-  becoming an unclassified copy of restricted source text and the likeliest
-  place for a credential to land. If a diagnostic needs a body to be useful,
-  it does not ship.
-- **Bounded and prunable from the first version.** Diagnostics accumulate with
-  no upstream owner, so they need a stated size and retention policy with
-  deliberate verified pruning. The no-automatic-deletion rule protects
-  authority stores and retained originals; a diagnostic log needs its own
-  answer rather than inheriting unbounded growth.
-- **Opt-in, per-instance, and explicit about failure.** Off by default. A
-  logging failure is reported, never silently swallowed, and never becomes job
-  authority.
-- **No silent learning.** Nothing derived from diagnostics changes selection,
-  ranking or qualification automatically. A gap report is input to an operator
-  decision about what to ingest next. Any automatic use is a separate,
-  versioned, tested policy with its own tests.
-- **The distribution stays empty.** Diagnostics are instance data; no log
-  content or example session ships in the package.
-
-### Classifying an unanswered question without storing it
-
-The hard part of the coverage-gap signal is that "this question had no usable
-answer" seems to require the question, and the question carries the asking
-agent's task content. It does not, because the index already holds enough to
-classify the failure.
-
-The reader normalizes every search into literal terms and conjoins them, so a
-zero-result search can be classified by probing each term against the
-full-text index on the same read-only connection, before the result is
-returned. Three outcomes are distinguishable:
-
-| Classification | Meaning | Action it implies |
-|---|---|---|
-| `absent-corpus` | No query term appears anywhere in the selected corpus | Ingestion gap: this subject matter has never been collected |
-| `absent-partial` | Some terms are known, others are absent from the vocabulary | Partial coverage: the count of unknown terms is the priority signal |
-| `present-uncombined` | Every term exists, but no section contains them together | Findability or selection problem, not a collection problem |
-
-The recorded fields are the classification, the number of query terms, the
-number absent from the index vocabulary, and the number of sections matching
-any single term. No term, no query string and no excerpt is stored. This is
-the distinction the roadmap most needs - "we never collected this" versus "we
-have it and search could not surface it" - and it survives the body-free rule
-intact.
-
-The mechanism requires no schema change: single-term `MATCH` probes run on the
-existing read-only connection, so there is no new table, no index schema bump,
-no engine-fingerprint change and no rebuild. It runs on the server side of the
-adapter and needs no cooperation from the calling agent, so the signal is
-observed rather than self-reported.
-
-What this does not solve is recurrence: without storing terms, two different
-agents asking the same unanswerable question are two anonymous counts rather
-than one ranked gap. Hashing the normalized term set would cluster them, but
-the index vocabulary is itself the dictionary needed to reverse such a hash
-for short term sets, so that is not a privacy-preserving shortcut and is left
-open. A counted classification histogram is weaker than a ranked list of
-missing subjects and is still decision-grade: a rising `absent-corpus` count
-means connect another source, while a rising `present-uncombined` count means
-fix retrieval or selection.
+body-free diagnostics log exist and are tested. How they behave, and the tests
+that back each claim, are in the
+[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics);
+usage is in the [README](README.md) and [`tools/context-mcp/README.md`](tools/context-mcp/README.md). Agent findings persist through
+the [contribution and disposition contract](agents/contributions.md), not through
+a trace store, and no trace endpoint exists (`tests/test_mcp.py` asserts the
+read-only tool set).
 
 ### What is implemented
 
-The coverage-gap signal described above now exists. Two pieces:
-
-**Absence classification in the reader.** `context_index.search` returns an
-`absence` object only when a search produced no hits. It contains the
-classification, the number of query terms, the number absent from the index,
-the number of sections matching any single term, whether the scope was the
-whole selection or one path, and a caveat stating that the report describes
-what is indexed and is never evidence that a fact does not exist. The
-classification is computed with single-term `MATCH` probes on the same
-read-only connection, so there is no new table, no schema bump, no
-engine-fingerprint change beyond the reader's own content hash, and no
-rebuild. The object never contains a query term, a locator or an excerpt, and
-a successful search carries no `absence` key at all.
-
-**An opt-in body-free diagnostics log.** `tools/diagnostics/retrieval_log.py`
-is a standalone writer and reporter, off unless the operator passes
-`--diagnostics-log <path>.jsonl` to the MCP adapter. It follows the
-`metrics.py` precedent: a closed field set, a fixed operation vocabulary
-(`search` and an unattributed `read`), exception class names instead of
-messages, a per-record byte
-budget, a log byte budget, private file modes and locked appends. Beyond that
-precedent it enforces internal consistency - a classification must agree with
-its own term counts, an empty outcome cannot report hits, an error type cannot
-accompany a successful outcome, and a read record cannot carry a count,
-classification or scope - so a malformed or over-reporting record is
-refused rather than stored. `search` is recorded in full and `get`/`get-many`
-only as a bare count; `status`, `catalog` and `review_events` write nothing. A
-logging failure raises instead of returning the result, so diagnostics cannot
-silently degrade into a no-op.
-
-`retrieval_log.py report` summarizes the separation the roadmap wanted: a
-collection-gap rate from `absent-corpus` against a findability-gap rate from
-`present-uncombined`, with raw search and read counts and the limits of the
-signal stated in the output itself - including that a read count is not a basis
-for pruning selection and that no search-to-read ratio is
-reported. `retrieval_log.py prune --keep N` is explicit, never
-automatic, and reports the before and after counts. Nothing derived from the
-log changes selection, ranking or qualification.
-
-What is deliberately absent: any attribution of a read to a document, and
-therefore any dead-weight signal; and any derived retrieval-quality figure,
-because the available counts cannot support one. What is still not implemented:
-clustering of recurring gaps, and any distinction between a record being
-returned and a record being used.
+- **Absence classification.** `context_index.search` returns an `absence` object
+  only when a search produced no hits: `absent-corpus`, `absent-partial` or
+  `present-uncombined`, with term counts and a caveat, never a term, locator or
+  excerpt. It uses single-term `MATCH` probes on the existing read-only
+  connection, so there is no schema change or rebuild.
+- **An opt-in body-free log.** `tools/diagnostics/retrieval_log.py`, enabled by
+  `--diagnostics-log <path>.jsonl` on the MCP adapter, records search outcomes and
+  a bare, unattributed read count. Its field set is closed, records that
+  contradict themselves are refused, and a logging failure raises instead of
+  returning the result. `retrieval_log.py report` separates a collection-gap rate
+  (`absent-corpus`) from a findability-gap rate (`present-uncombined`);
+  `retrieval_log.py prune --keep N` is explicit and never automatic.
+- **Not derived.** Reads are not attributed to documents and no search-to-read
+  ratio or retrieval-quality figure is reported; the counts cannot separate an
+  unconvincing excerpt from an agent that needed nothing more
+  (`test_reads_are_counted_but_never_attributed`,
+  `test_report_counts_reads_without_deriving_a_ratio`).
+- **Boundaries.** The log is never indexed, searched or returned by a read tool,
+  is never a review or catalog authority, and nothing derived from it changes
+  selection, ranking or qualification. No log content ships in the package.
 
 ### Open questions
 
-- Whether recurrence of the same unanswerable question can be clustered
-  without storing or reversibly hashing its terms. Left open above.
-- Whether use-versus-return can be observed at all from a stdio adapter beyond
-  a bare read count, or whether it requires cooperation from the calling agent -
-  which would make the signal self-reported and weaker.
-- Whether gap reporting belongs in this log or in the existing intake
-  tracking, which already owns ingestion backlog.
+- Whether recurrence of the same unanswerable question can be clustered without
+  storing or reversibly hashing its terms.
+- Whether a record being returned versus used can be observed from a stdio
+  adapter beyond a bare read count, or needs the calling agent's cooperation.
+- Whether gap reporting belongs in this log or in the existing intake tracking,
+  which already owns ingestion backlog.
 
 
 ## Delivery sequence and completion gates
@@ -461,7 +287,7 @@ returned and a record being used.
 | C: local continuous inbox | One allowlisted local inbox; scheduled discovery/copy/register/extract; explicit review/publication boundaries | Restart, duplicate, mutation, failure and committed-retry cases below pass without duplicate authoritative records |
 | D: remote discovery/copy | One approved read-only provider/folder scope, then additional scopes | Complete paginated reconciliation, binary/native identity behavior and authorization failures demonstrated; no destructive synchronization |
 | E: agent-driven maintenance | Bounded review/incorporation and approved publication policy | Evidence fidelity, independent-review triggers, recoverability and qualified-answer preservation shown under ongoing intake |
-| F: retrieval diagnostics | Body-free coverage-gap observation plus bare search and read counts; dead weight is withdrawn, not pending, and no retrieval-quality figure is derived | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
+| F: retrieval diagnostics | Body-free coverage-gap observation plus bare search and read counts; reads are not attributed to documents and no retrieval-quality figure is derived | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
 | Later, only if justified | Graph, richer discovery, hosted/multi-user services | Demonstrated use case and explicit handling, authorization, concurrency and recovery design; not prerequisites for the local demo. Graph evaluation notes are in the [design](docs/design/current-state.md#7-relationship-traversal) |
 
 These are proposed dependencies, not assignments or dates. The full automation
