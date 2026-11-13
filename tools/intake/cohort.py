@@ -25,7 +25,7 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import cli, model_review, runner, standing, store, upload
+from . import adapters, cli, model_review, runner, standing, store, upload
 from . import contracts
 from .contracts import IntakeError, LedgerBusy
 
@@ -145,12 +145,22 @@ def classify(root, inbox):
     return sorted(entries, key=lambda e: e["relative"])
 
 
-def _request(root, correlation_id, stage_id, operation, arguments):
-    """Stage one single-stage request unless it already exists; return its stage summary.
+def _request(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
+    """Stage one single-stage request unless it exists; return its chain head's stage summary.
 
-    ``arguments`` may be a callable, evaluated only when the request must be staged.
+    A request that was corrected is represented by the newest request of its validated
+    ``correction_of`` chain, whatever it is named (``heads`` shares one chain index across a
+    run). The head is settled and reported like any other request: succeeded, blocked, or still
+    staged. It must repeat this request's operation and the ``identity`` arguments (receipt and
+    format), or ``correction_mismatch`` refuses it. ``arguments`` may be a callable, evaluated
+    only when the request must be staged.
     """
-    current = _inspect(root, correlation_id)
+    current = _head(root, correlation_id, heads)
+    if current is not None and current["correlation_id"] != correlation_id:
+        saved = store.request(root, current["correlation_id"])["stages"]
+        if (len(saved) != 1 or saved[0]["operation"] != operation
+                or any(saved[0]["arguments"].get(k) != v for k, v in (identity or {}).items())):
+            raise IntakeError("correction_mismatch")
     if current is None:
         current = store.stage(root, json.dumps({
             "version": 1, "correlation_id": correlation_id, "correction_of": None,
@@ -160,25 +170,34 @@ def _request(root, correlation_id, stage_id, operation, arguments):
                         "arguments": arguments() if callable(arguments) else arguments}]}).encode())
     stage = current["stages"][0]
     if stage["status"] in {"staged", "running", "retryable"}:
-        stage = runner.settle(root, correlation_id, stage_id)["stages"][0]
+        stage = runner.settle(root, current["correlation_id"], stage["id"])["stages"][0]
     return stage
 
 
-def _extract(root, entry, actor):
+def _extract(root, entry, actor, heads=None):
     base = {"receipt": entry["receipt_id"], "format_name": entry["format"]}
     # The reader version is part of the request identity: a new MIME reader version extracts again.
     version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
-    stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare", "extract-prepare", base)
-    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
-    if stage["status"] == "succeeded":
-        # Registration pins the catalog state when staged, immediately before it runs;
-        # a repeated registration is idempotent by its saved request.
-        # The catalog state is read only when a new registration is staged.
-        stage = _request(root, "register-" + entry["submission_id"] + version, "register",
-                         "extract-register", lambda: {
-                             **base, "actor": actor,
-                             "expected_state": catalog.status(root)["state_token"]})
-        entry["conflicts"] += runner.conflicts(stage)
+    step = "prepare"
+    try:
+        stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare",
+                         "extract-prepare", base, base, heads)
+        entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
+        if stage["status"] == "succeeded":
+            step = "register"
+            # Registration pins the catalog state when staged, immediately before it runs;
+            # a repeated registration is idempotent by its saved request.
+            # The catalog state is read only when a new registration is staged.
+            stage = _request(root, "register-" + entry["submission_id"] + version, "register",
+                             "extract-register", lambda: {
+                                 **base, "actor": actor,
+                                 "expected_state": catalog.status(root)["state_token"]}, base, heads)
+            entry["conflicts"] += runner.conflicts(stage)
+    except IntakeError as error:
+        if error.code not in {"ambiguous_correction", "correction_mismatch"}:
+            raise
+        # A chain the store cannot follow to one valid head fails its entry, not the run.
+        return {"outcome": "failed", "stage": step, "code": error.code}
     if stage["status"] != "succeeded":
         return _failure(stage["id"], stage)
     evidence = stage["evidence"]
@@ -194,7 +213,7 @@ def _failure(stage_id, stage):
             "attempts": len(stage["attempts"])}
 
 
-def _process(root, inbox, entry, system, actor):
+def _process(root, inbox, entry, system, actor, heads=None):
     identity = submission(entry["relative"], system, entry["format"])
     superseded = None
     prior = upload.ledger_request(root, upload.correlation(identity["submission_id"]))
@@ -231,10 +250,10 @@ def _process(root, inbox, entry, system, actor):
     if ack["receipt"]["state"] != "committed":
         return _failure("receipt", receipt)
     entry["received"] = True
-    return _extract(root, entry, actor)
+    return _extract(root, entry, actor, heads)
 
 
-def _settled(root, inbox, entry, system, actor):
+def _settled(root, inbox, entry, system, actor, heads=None):
     """Process one entry, retrying a busy ledger within the entry's attempt budget.
 
     Every step is idempotent by request identity, so repeating the entry is safe. An
@@ -243,7 +262,7 @@ def _settled(root, inbox, entry, system, actor):
     """
     for attempt in range(runner.BUSY_RETRIES):
         try:
-            return _process(root, inbox, entry, system, actor)
+            return _process(root, inbox, entry, system, actor, heads)
         except LedgerBusy:
             entry["conflicts"] = entry.get("conflicts", 0) + 1
     return {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
@@ -255,12 +274,14 @@ def ingest(root, inbox, *, system, actor, limit=None):
     entries = classify(root, inbox)
     admitted = [e for e in entries if e["disposition"] == "admit"]
     outcome = Counter({name: 0 for name in OUTCOMES})
+    # One correction-chain index serves every entry, so following chains never rescans the ledger.
+    heads = store.Heads()
     for number, entry in enumerate(admitted):
         if limit is not None and number >= limit:
             entry["outcome"] = "not-processed"
             outcome["not-processed"] += 1
             continue
-        entry.update(_settled(root, inbox, entry, system, actor))
+        entry.update(_settled(root, inbox, entry, system, actor, heads))
         outcome["received"] += bool(entry.get("received"))
         outcome[entry["outcome"]] += 1
     retried = [e for e in admitted if e.get("conflicts")]
@@ -442,6 +463,118 @@ def _head(root, corr, heads=None):
         if error.code != "unknown_request":
             raise
         return None
+
+
+def _root_of(root, corr):
+    """The first request of ``corr``'s correction chain (its own name when it corrects nothing)."""
+    seen = {corr}
+    while (parent := store.request(root, corr)["correction_of"]) is not None and parent not in seen:
+        corr = parent
+        seen.add(corr)
+    return corr
+
+
+def _identity_blocked(root):
+    """Chain heads that are blocked ``extract-register`` stages refused as a changed identity."""
+    found = []
+    with store.locked(root) as c:
+        rows = c.execute("SELECT s.correlation_id, s.ordinal, r.raw FROM stages s "
+                         "JOIN requests r USING(correlation_id) WHERE s.status='blocked' "
+                         "ORDER BY s.correlation_id").fetchall()
+        for row in rows:
+            stage = contracts.decode_request(row["raw"])["stages"][row["ordinal"]]
+            if stage["operation"] != "extract-register":
+                continue
+            if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
+                continue  # not the head: a correction follows it
+            last = c.execute("SELECT code FROM attempts WHERE correlation_id=? AND stage_id=? "
+                             "ORDER BY cycle DESC, ordinal DESC LIMIT 1",
+                             (row["correlation_id"], stage["id"])).fetchone()
+            if last is not None and last[0] == "changed-extraction-identity":
+                found.append((row["correlation_id"], stage))
+    return found
+
+
+def recover_identity(root, *, apply=False):
+    """Report, and with ``apply`` correct, registrations blocked as ``changed-extraction-identity``.
+
+    The extractor identity (its code and policy) is pinned when a stage first prepares, and a
+    replay keeps that pin, so the stage can never register after the toolkit changed. The supported
+    repair is the one the store already validates: a correction request with a fresh pin. For each
+    chain whose head is such a blocked ``extract-register``, ``apply`` stages a correction of the
+    paired ``extract-prepare`` chain (unless its head already prepared under today's extractor)
+    and then of the registration (a fresh catalog pin), and settles both. Both corrections repeat
+    the original operation and arguments, so ``prepare == intent``, the catalog pin and the
+    source-hash checks all apply to them unchanged; a source or extractor that moves again blocks
+    again. ``ingest`` finds the result by following ``correction_of``, never by name. The pairing
+    uses the ingest's own ``extract-``/``register-`` names only to find the prepare chain, and
+    checks the receipt and format against it. A chain not recoverable is counted in ``skipped``.
+    """
+    root = Path(root).resolve()
+    heads = store.Heads()
+    found, skipped, work = [], Counter(), []
+    for corr, stage in _identity_blocked(root):
+        base = _root_of(root, corr)
+        args = stage["arguments"]
+        prefix = "register-"
+        prepare = _head(root, "extract-" + base[len(prefix):], heads) if base.startswith(prefix) else None
+        saved = store.request(root, prepare["correlation_id"])["stages"] if prepare else []
+        if (len(saved) != 1 or saved[0]["operation"] != "extract-prepare"
+                or any(saved[0]["arguments"].get(k) != args[k] for k in ("receipt", "format_name"))):
+            skipped["prepare-mismatch"] += 1
+            continue
+        reuse = None
+        if prepare["stages"][0]["status"] == "succeeded":
+            try:
+                fresh = adapters.prepare(store.safe(root), saved[0])
+            except adapters.StageFailure:
+                skipped["source-unavailable"] += 1
+                continue
+            reuse = prepare["stages"][0]["evidence"]["run_id"] == fresh["run_id"]
+        elif prepare["stages"][0]["status"] not in {"staged", "running", "retryable"}:
+            skipped["prepare-blocked"] += 1
+            continue
+        found.append(corr)
+        work.append((corr, base, prepare, reuse))
+    counts = {"extract-register/changed-extraction-identity": len(found)} if found else {}
+    report = {"apply": apply, "candidates": len(found), "by_operation_code": counts,
+              "skipped": dict(skipped)}
+    if not apply:
+        return report
+    results = Counter()
+    for corr, base, prepare, reuse in work:
+        try:
+            if reuse is not True:
+                if reuse is False:
+                    prepare_id = _correct(root, prepare)
+                else:
+                    prepare_id = prepare["correlation_id"]
+                done = runner.settle(root, prepare_id, "prepare")["stages"][0]
+                if done["status"] != "succeeded":
+                    results["prepare-" + done["status"]] += 1
+                    continue
+            fixed = _correct(root, store.inspect(root, corr), lambda a: {
+                **a, "expected_state": catalog.status(root)["state_token"]})
+            done = runner.settle(root, fixed, "register")["stages"][0]
+            results[done["status"]] += 1
+        except IntakeError as error:
+            results[error.code] += 1
+    report["results"] = dict(results)
+    return report
+
+
+def _correct(root, head, rewrite=lambda arguments: arguments):
+    """Stage, and return the ID of, a correction of ``head`` repeating its single stage."""
+    request = store.request(root, head["correlation_id"])
+    base = _root_of(root, head["correlation_id"])
+    number = 1
+    while _exists(root, f"{base}-c{number}"):
+        number += 1
+    corrected = f"{base}-c{number}"
+    (stage,) = request["stages"]
+    _stage_request(root, corrected, [{**stage, "arguments": rewrite(stage["arguments"])}],
+                   correction_of=head["correlation_id"])
+    return corrected
 
 
 def _exists(root, corr):
@@ -867,6 +1000,11 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
+    recover = commands.add_parser(
+        "recover-identity", allow_abbrev=False,
+        help="Report (or with --apply correct) registrations blocked as changed-extraction-identity")
+    recover.add_argument("--root", required=True, type=Path)
+    recover.add_argument("--apply", action="store_true")
     for name in ("classify", "ingest", "qualify"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--root", required=True, type=Path)
@@ -889,6 +1027,9 @@ def main(argv=None):
                                  help="model review calls in flight (default 6; 1 is serial)")
     args = parser.parse_args(argv)
     try:
+        if args.command == "recover-identity":
+            print(json.dumps(recover_identity(args.root, apply=args.apply), sort_keys=True))
+            return 0
         if args.command == "qualify":
             report = qualify(
                 args.root, args.inbox, system=args.system, actor=args.actor,

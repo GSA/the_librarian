@@ -113,6 +113,18 @@ restated here.
   `tests/test_intake_cohort.py::test_every_file_gets_one_explicit_disposition`,
   `::test_missing_or_unlistable_inbox_fails_instead_of_counting_nothing`,
   `::test_over_limit_is_counted_not_dropped`.
+- **Ingest follows correction-chain heads.** `ingest` and `qualify` report an
+  extraction or registration through the head of its validated `correction_of`
+  chain, never by request name: a repaired entry is `extracted` with the head's
+  evidence, a blocked or ambiguous head is `failed` with its own code, and an
+  entry with no correction reports and writes as before. A head must repeat the
+  entry's operation, receipt and format (`correction_mismatch`). A registration
+  blocked as `changed-extraction-identity` (the extractor code changed after the
+  stage pinned it, and replay keeps the pin) is repaired by
+  `cohort recover-identity`, which stages validated corrections with a fresh
+  pin; the identity, source-hash and catalog-pin checks are not relaxed.
+  Evidence: `tests/test_intake_cohort.py::CorrectionChainTests`,
+  `::RecoverIdentityTests`, `::QualifyRepairedTests`.
 - **Standing review.** A model reply is recorded as findings exactly as
   reported; the standing policy, not the model, decides qualification. Missing
   inspection, internal contradictions and out-of-scope receipts block; references

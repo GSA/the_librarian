@@ -12,7 +12,7 @@ from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import renditions
-from tools.intake import cohort, standing, store, upload
+from tools.intake import cohort, runner, standing, store, upload
 from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
@@ -230,6 +230,256 @@ class IngestTests(CohortCase):
         self.assertEqual(report["counts"]["outcome"]["extracted"], 5)
         failed = [e for e in report["entries"] if e.get("outcome") == "failed"]
         self.assertEqual([e["code"] for e in failed], ["native-input"])
+
+
+class BlockedCase(CohortCase):
+    """Registrations blocked as a changed extraction identity, as in Kata ap0b."""
+
+    def setUp(self):
+        super().setUp()
+        self.real = catalog.submit
+
+    def run_ingest(self):
+        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+
+    def block_registrations(self):
+        """A lost catalog race recorded as blocked native-input, as before decision 0013, then a
+        toolkit change that moves the extractor identity: the replay blocks as changed identity."""
+        def race(root, records, **kwargs):
+            if kwargs["request_id"].startswith("extract-"):
+                raise catalog.CatalogError("Stale expected state; re-read before writing")
+            return self.real(root, records, **kwargs)
+        with unittest.mock.patch.object(catalog, "submit", side_effect=race):
+            first = self.run_ingest()
+        self.assertEqual(first["counts"]["failed_by_code"], {"register/native-input": 6})
+        self.upgrade = unittest.mock.patch.object(
+            cohort.extract, "fingerprint", lambda root, fmt: "f" * 64)
+        self.upgrade.start()
+        self.addCleanup(self.upgrade.stop)
+        for request in store.list_requests(self.root):
+            if request["correlation_id"].startswith("register-"):
+                runner.replay(self.root, request["correlation_id"], "register")
+                runner.settle(self.root, request["correlation_id"], "register")
+
+    def registers(self):
+        return sorted(r["correlation_id"] for r in store.list_requests(self.root)
+                      if r["correlation_id"].startswith("register-"))
+
+    def correct(self, parent, name, extra=None):
+        """Stage a correction the way an operator script did: same stages, a new name."""
+        request = store.request(self.root, parent)
+        (stage,) = request["stages"]
+        if stage["operation"] == "extract-register":
+            stage["arguments"]["expected_state"] = catalog.status(self.root)["state_token"]
+        cohort._stage_request(self.root, name, [stage], correction_of=parent)
+        return name
+
+    def repair(self, sid_register, suffix="-fix"):
+        sid = sid_register.removeprefix("register-")
+        self.correct("extract-" + sid, "extract-" + sid + suffix)
+        runner.settle(self.root, "extract-" + sid + suffix, "prepare")
+        self.correct(sid_register, sid_register + suffix)
+        return runner.settle(self.root, sid_register + suffix, "register")
+
+
+class CorrectionChainTests(BlockedCase):
+    """Ingest follows the store's validated correction chain to its head (Kata ap0b)."""
+
+    def test_repaired_registration_is_extracted_with_the_heads_evidence(self):
+        self.block_registrations()
+        blocked = self.run_ingest()
+        self.assertEqual(blocked["counts"]["failed_by_code"],
+                         {"register/changed-extraction-identity": 6})
+        repaired, left = self.registers()[:-1], self.registers()[-1]
+        for register in repaired:
+            self.assertEqual(self.repair(register)["stages"][0]["status"], "succeeded")
+        report = self.run_ingest()
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 5)
+        self.assertEqual(report["counts"]["failed_by_code"],
+                         {"register/changed-extraction-identity": 1})
+        head = store.head(self.root, repaired[0])["stages"][0]["evidence"]
+        done = [e for e in report["entries"] if e.get("outcome") == "extracted"]
+        self.assertIn((head["rendition"], head["rendition_sha256"]),
+                      {(e["rendition"], e["rendition_sha256"]) for e in done})
+        (failed,) = [e for e in report["entries"] if e.get("outcome") == "failed"]
+        self.assertEqual((failed["status"], failed["category"], failed["code"], failed["attempts"]),
+                         ("blocked", "blocked", "changed-extraction-identity", 2))
+        self.assertEqual(store.inspect(self.root, left)["stages"][0]["status"], "blocked")
+
+    def test_rerun_after_repair_adds_no_extraction_work(self):
+        self.block_registrations()
+        for register in self.registers():
+            self.repair(register)
+        self.run_ingest()
+        requests, state = len(store.correlation_ids(self.root)), catalog.status(self.root)["state_token"]
+        with unittest.mock.patch.object(runner, "run", wraps=runner.run) as ran:
+            again = self.run_ingest()
+        self.assertEqual(again["counts"]["outcome"]["extracted"], 6)
+        self.assertEqual((len(store.correlation_ids(self.root)), ran.call_count), (requests, 0))
+        self.assertEqual(catalog.status(self.root)["state_token"], state)
+
+    def test_a_correction_is_followed_by_the_store_chain_not_by_name(self):
+        self.block_registrations()
+        register = self.registers()[0]
+        self.repair(register, suffix="-whatever-the-operator-chose")
+        report = self.run_ingest()
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 1)
+        # A look-alike request that is not linked by correction_of changes nothing.
+        other = self.registers()[1]
+        stage = store.request(self.root, other)["stages"][0]
+        cohort._stage_request(self.root, other + "-reid1", [stage])
+        self.assertEqual(self.run_ingest()["counts"]["outcome"]["extracted"], 1)
+
+    def test_a_blocked_head_is_reported_with_its_own_code_and_a_staged_head_is_settled(self):
+        self.block_registrations()
+        first, second = self.registers()[:2]
+        self.repair(first)
+        # A correction that is itself blocked is the head: reported failed, with its own attempts.
+        with unittest.mock.patch.object(cohort.extract, "fingerprint", lambda r, f: "e" * 64):
+            self.correct(first + "-fix", first + "-again")
+            self.assertEqual(runner.settle(self.root, first + "-again", "register")
+                             ["stages"][0]["status"], "blocked")
+        report = self.run_ingest()
+        self.assertEqual(report["counts"]["outcome"]["failed"], 6)
+        self.assertEqual(sorted(e["attempts"] for e in report["entries"]
+                                if e.get("outcome") == "failed"), [1] + [2] * 5)
+        # A staged, never-run correction is settled by ingest and reported as what it became.
+        sid = second.removeprefix("register-")
+        self.correct("extract-" + sid, "extract-" + sid + "-fix")
+        runner.settle(self.root, "extract-" + sid + "-fix", "prepare")
+        self.correct(second, second + "-fix")
+        self.assertEqual(store.inspect(self.root, second + "-fix")["stages"][0]["status"], "staged")
+        report = self.run_ingest()
+        self.assertEqual(store.inspect(self.root, second + "-fix")["stages"][0]["status"], "succeeded")
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 1)
+
+    def test_a_correction_must_repeat_the_operation_and_receipt(self):
+        self.block_registrations()
+        register = self.registers()[0]
+        other = self.registers()[1]
+        stage = store.request(self.root, other)["stages"][0]
+        cohort._stage_request(self.root, register + "-wrong", [stage], correction_of=register)
+        report = self.run_ingest()
+        mismatched = [e for e in report["entries"] if e.get("code") == "correction_mismatch"]
+        self.assertEqual(len(mismatched), 1)
+        self.assertEqual(report["counts"]["outcome"]["failed"], 6)
+        self.assertEqual(report["counts"]["failed_by_code"],
+                         {"register/changed-extraction-identity": 5, "register/correction_mismatch": 1})
+
+    def test_an_ambiguous_chain_fails_that_entry_without_aborting_the_run(self):
+        self.block_registrations()
+        register = self.registers()[0]
+        self.correct(register, register + "-one")
+        self.correct(register, register + "-two")
+        report = self.run_ingest()
+        self.assertEqual(report["counts"]["outcome"]["failed"], 6)
+        self.assertEqual(report["counts"]["failed_by_code"], {
+            "register/changed-extraction-identity": 5, "register/ambiguous_correction": 1})
+
+    def test_single_chain_reports_and_ledger_effects_are_unchanged(self):
+        report = self.run_ingest()
+        ledger = [(r["correlation_id"], r["request_sha256"], r["correction_of"])
+                  for r in store.list_requests(self.root)]
+        again = self.run_ingest()
+        self.assertEqual(report["counts"], again["counts"])
+        self.assertEqual(ledger, [(r["correlation_id"], r["request_sha256"], r["correction_of"])
+                                  for r in store.list_requests(self.root)])
+        self.assertTrue(all(r["correction_of"] is None for r in store.list_requests(self.root)
+                            if r["correlation_id"].startswith(("extract-", "register-"))))
+
+
+class RecoverIdentityTests(BlockedCase):
+    """A supported recovery for registrations blocked as changed extraction identity."""
+
+    def test_dry_run_reports_candidates_and_writes_nothing(self):
+        self.block_registrations()
+        before = store.correlation_ids(self.root)
+        report = cohort.recover_identity(self.root)
+        self.assertEqual((report["apply"], report["candidates"]), (False, 6))
+        self.assertEqual(report["by_operation_code"], {"extract-register/changed-extraction-identity": 6})
+        self.assertEqual(store.correlation_ids(self.root), before)
+        self.assertNotIn("results", report)
+
+    def test_apply_corrects_the_pair_and_ingest_then_reports_extracted(self):
+        self.block_registrations()
+        roots = self.registers()
+        applied = cohort.recover_identity(self.root, apply=True)
+        self.assertEqual((applied["candidates"], applied["results"]), (6, {"succeeded": 6}))
+        report = self.run_ingest()
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 6)
+        self.assertEqual(report["counts"]["failed_by_code"], {})
+        for register in roots:
+            head = store.head(self.root, register)
+            self.assertEqual((head["correlation_id"], head["correction_of"], head["complete"]),
+                             (register + "-c1", register, True))
+            self.assertEqual(store.inspect(self.root, register)["stages"][0]["status"], "blocked")
+            self.assertEqual(store.head(self.root, "extract-" + register.removeprefix("register-"))
+                             ["stages"][0]["status"], "succeeded")
+        # Idempotent: nothing is left to recover and a second apply stages nothing.
+        count = len(store.correlation_ids(self.root))
+        again = cohort.recover_identity(self.root, apply=True)
+        self.assertEqual((again["candidates"], len(store.correlation_ids(self.root))), (0, count))
+
+    def test_an_already_repaired_chain_is_not_a_candidate(self):
+        self.block_registrations()
+        self.repair(self.registers()[0])
+        self.assertEqual(cohort.recover_identity(self.root)["candidates"], 5)
+
+    def test_other_blocked_registrations_are_not_candidates(self):
+        self.block_registrations()
+        sid = self.registers()[0].removeprefix("register-")
+        # A registration blocked for another reason (a native-input fault) is left alone.
+        with unittest.mock.patch.object(runner, "classify", wraps=runner.classify):
+            self.assertEqual(cohort.recover_identity(self.root)["by_operation_code"],
+                             {"extract-register/changed-extraction-identity": 6})
+        with store.locked(self.root) as c, c:
+            c.execute("UPDATE attempts SET code='native-input' WHERE correlation_id=?",
+                      ("register-" + sid,))
+        self.assertEqual(cohort.recover_identity(self.root)["candidates"], 5)
+
+    def test_a_changed_source_still_blocks_the_corrected_pair(self):
+        self.block_registrations()
+        register = self.registers()[0]
+        receipt = store.request(self.root, register)["stages"][0]["arguments"]["receipt"]
+        original = catalog.receipt_metadata(self.root, [receipt])["registrations"][receipt]["artifact"]
+        path = self.root / original["data"]["path"]
+        path.chmod(0o644)
+        path.write_bytes(path.read_bytes() + b"tampered\n")
+        applied = cohort.recover_identity(self.root, apply=True)
+        self.assertEqual((applied["results"], applied["skipped"]),
+                         ({"succeeded": 5}, {"source-unavailable": 1}))
+        report = self.run_ingest()
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 5)
+        self.assertEqual(sum(report["counts"]["failed_by_code"].values()), 1)
+        # The tampered source is refused (still blocked, never corrected, never re-staged).
+        self.assertEqual(store.head(self.root, register)["correlation_id"], register)
+        count = len(store.correlation_ids(self.root))
+        cohort.recover_identity(self.root, apply=True)
+        self.assertEqual(len(store.correlation_ids(self.root)), count)
+
+    def test_a_register_without_a_matching_prepare_is_skipped_not_guessed(self):
+        self.block_registrations()
+        register = self.registers()[0]
+        sid = register.removeprefix("register-")
+        stage = store.request(self.root, "extract-" + sid)["stages"][0]
+        cohort._stage_request(self.root, "extract-" + sid + "-bad", [
+            {**stage, "arguments": {**stage["arguments"], "format_name": "odt"}}],
+            correction_of="extract-" + sid)
+        report = cohort.recover_identity(self.root)
+        self.assertEqual((report["candidates"], report["skipped"]), (5, {"prepare-mismatch": 1}))
+
+    def test_cli_entry_point_reports_body_free_counts(self):
+        self.block_registrations()
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cohort.main(["recover-identity", "--root", str(self.root)]), 0)
+        self.assertEqual(json.loads(out.getvalue())["candidates"], 6)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cohort.main(["recover-identity", "--root", str(self.root), "--apply"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["results"], {"succeeded": 6})
 
 
 class QualifyCase(CohortCase):
@@ -1083,6 +1333,20 @@ class CliTests(CohortCase):
         self.assertEqual(printed["counts"]["qualification"], {"qualified": 6})
         self.assertEqual(printed["usage"], {"prompt_tokens": 30, "completion_tokens": 12})
         self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+
+
+class QualifyRepairedTests(BlockedCase, QualifyCase):
+    def test_qualify_reviews_repaired_registrations_once_and_reuses_them_afterwards(self):
+        self.block_registrations()
+        cohort.recover_identity(self.root, apply=True)
+        transport, calls = self._transport()
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 6)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(calls), 6)
+        requests = len(store.correlation_ids(self.root))
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual((len(calls), len(store.correlation_ids(self.root))), (6, requests))
 
 
 if __name__ == "__main__":
