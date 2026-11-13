@@ -236,7 +236,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             result = events.append(root, **args)
             # The current store revision is not the original request revision.
             with events.writer_lock(events.locations(root)[0]), closing(events.connect(events.locations(root)[1])) as c:
-                events.inspect(c, root)
+                events.inspect(c, root, reuse=True)
                 batch = c.execute("SELECT revision FROM batches WHERE request_id=?", (args["request_id"],)).fetchone()
                 revision = batch[0]
             return {"boundary": "review-committed", "committed_revision": revision,
