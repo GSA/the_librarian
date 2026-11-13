@@ -62,7 +62,7 @@ restated here.
   `query`/`export`, `submit`/`append`, `get`), the context-index catalog
   command and the review-event reader refuse and leave every file of the
   instance byte-identical. `init` refuses an existing store before opening it;
-  a refused recovery keeps its journal and does not move or repair a store; the
+  an interrupted-migration recovery rolls store files back to their old location before it refuses, keeps its journal and leaves the database bytes unchanged (it never repairs a store); the
   intake progress view reports the catalog as unavailable; and a derived-index
   build never rewrites an authority store. Not pinned by a test:
   `synchronous=FULL` on the three stores (Kata 0dz3).
