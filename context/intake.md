@@ -435,12 +435,13 @@ The run is adaptive (AIMD, `tools/intake/throttle.py`): it starts at
 provider answers 429 or 503 (including a call the transport then retries), and adds one back
 per window of clean replies (a window is as many clean replies as the current limit), never
 above N. A burst of simultaneous 429s from one overload costs one halving. Other errors (500,
-network, 4xx) do not change it. `--no-adaptive` holds N fixed. Every call of the run passes the
-limiter, so N bounds the provider load whatever the retry behavior; the limiter decides only how
+network, 4xx) do not change it. `--no-adaptive` holds N fixed. Every HTTP attempt of the run, including each retry after a
+backoff wait (no slot is held while waiting), takes a slot under the current limit, so N bounds the
+provider load whatever the retry behavior; the limiter decides only how
 many calls overlap, never what is reviewed, so counts, entries, findings, events, selections,
 ledger and token usage match a serial run. Stdout and the report carry `throughput`:
-`cap`, `initial`, `final`, `lowest`, `backoffs`, `throttle_signals`, `max_in_flight`, `calls`,
-`seconds`, `mean_in_flight` and `calls_per_minute` (the effective rate of this run's model calls;
+`cap`, `initial` (always N for `--no-adaptive`), `final`, `lowest`, `backoffs`, `throttle_signals`, `max_in_flight`, `calls`,
+`seconds`, `mean_in_flight` and `calls_per_minute` (`calls` counts HTTP attempts, retries included; the effective rate of this run's model traffic;
 it varies with timing and is kept out of `counts`). A restarted run reuses every saved review
 without a call. Start below N with `--initial-concurrency 1` against a provider whose limits are
 unknown and watch `lowest` and `retries`; set N to what the operator will allow.

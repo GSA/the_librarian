@@ -351,9 +351,10 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
     Retry-After or exponential backoff with jitter, each wait capped at
     ``max_wait_seconds`` and all waits within ``max_retry_seconds``. Other HTTP
     errors, redirects and invalid replies fail at once. ``call.retries`` counts
-    retries per body-free code. Each callable in ``call.observers`` is told the
-    body-free code of a failed attempt, on the calling thread before it waits to retry
-    (the adaptive concurrency limiter uses this to back off on 429/503 at once).
+    retries per body-free code. When ``call.gate`` is set, every HTTP attempt (not
+    the whole call) runs as ``gate(fn)``, where ``fn()`` returns ``(reply, failure)``: the
+    adaptive concurrency limiter uses it so a retry waits for a free slot under the current
+    limit, and no slot is held while the transport sleeps before that retry.
     """
     if type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer")
@@ -361,7 +362,7 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
     allowed = {m["id"] for m in config.get("models", [])}
     url = config["baseUrl"].rstrip("/") + "/chat/completions"
     opener = urllib.request.build_opener(_NoRedirect)
-    retries, lock, observers = Counter(), threading.Lock(), []
+    retries, lock = Counter(), threading.Lock()
 
     def attempt(model, messages):
         """One request; returns the reply or (code, retryable, Retry-After seconds)."""
@@ -387,7 +388,9 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
             raise TransportError("model-not-configured")
         started = clock()
         for number in range(1, max_attempts + 1):
-            value, failure = attempt(model, messages)
+            gate = call.gate
+            value, failure = (gate(lambda: attempt(model, messages)) if gate is not None
+                              else attempt(model, messages))
             if failure is None:
                 break
             code, retryable, after = failure
@@ -400,8 +403,6 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
                 raise TransportError(code)
             with lock:
                 retries[code] += 1
-            for observe in tuple(observers):
-                observe(code)
             sleep(delay)
         try:
             content = value["choices"][0]["message"]["content"]
@@ -409,7 +410,7 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
             raise TransportError("invalid-response") from None
         return {"content": content, "usage": value.get("usage") or {}}
     call.retries = retries
-    call.observers = observers
+    call.gate = None
     return call
 
 

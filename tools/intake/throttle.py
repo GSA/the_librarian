@@ -1,7 +1,7 @@
 """Adaptive model-call concurrency: AIMD below an operator-configured cap.
 
 ``qualify --concurrency N`` is a ceiling, never a target to exceed: the limiter starts at
-``initial`` (default N), halves its limit when a call meets a rate limit (HTTP 429) or
+``initial`` (default N; a non-adaptive run always holds N), halves its limit when a call meets a rate limit (HTTP 429) or
 overload (HTTP 503), and adds one back after a window of clean replies, always staying
 within ``[1, N]``. Every model call of a run, on any thread, passes through it, so at most
 ``limit`` calls are in flight. It decides only how many calls overlap: what is reviewed, the
@@ -17,7 +17,7 @@ THROTTLE_CODES = frozenset({"http-429", "http-503"})
 
 class Limiter:
     def __init__(self, cap, *, initial=None, adaptive=True, decrease=0.5, clock=time.monotonic):
-        initial = cap if initial is None else initial
+        initial = cap if initial is None or not adaptive else initial
         if (type(cap) is not int or cap < 1 or type(initial) is not int
                 or not 1 <= initial <= cap or not 0 < decrease < 1):
             raise ValueError("invalid concurrency limits")
@@ -99,14 +99,42 @@ class Limiter:
         if code in THROTTLE_CODES:
             self.throttled(code)
 
+    def attempt(self, fn):
+        """Run one HTTP attempt ``fn() -> (reply, failure)`` in a slot, then free it.
+
+        ``failure`` is None or ``(code, retryable, retry_after)``. A 429/503 lowers the limit
+        while the slot is still held; the slot is released before the transport waits to retry,
+        and the retry takes a slot again under the then-current limit.
+        """
+        self.acquire()
+        clean = False
+        try:
+            result = fn()
+            failure = result[1]
+            if failure is not None:
+                self._observe(failure[0])
+            clean = failure is None
+            return result
+        finally:
+            self.release(clean)
+
     @contextlib.contextmanager
     def gating(self, transport):
         """Yield ``transport`` gated by this limiter.
 
-        A transport with an ``observers`` list (``usai_transport``) reports each retried
-        429/503 while it waits, so the limit falls before the call finishes; a raised
-        ``TransportError`` carrying a throttle code does the same for any transport.
+        A transport with a ``gate`` attribute (``usai_transport``) is gated per HTTP attempt
+        through ``attempt``, so retries after a decrease respect the lowered limit. Any other
+        transport is gated per call; a raised ``TransportError`` carrying a throttle code lowers
+        the limit.
         """
+        if hasattr(transport, "gate"):
+            transport.gate = self.attempt
+            try:
+                yield transport
+            finally:
+                transport.gate = None
+            return
+
         def gated(model, messages):
             self.acquire()
             clean = False
@@ -119,14 +147,7 @@ class Limiter:
                 raise
             finally:
                 self.release(clean)
-        observers = getattr(transport, "observers", None)
-        if observers is not None:
-            observers.append(self._observe)
-        try:
-            yield gated
-        finally:
-            if observers is not None:
-                observers.remove(self._observe)
+        yield gated
 
     def report(self):
         """Body-free effective rate of this run's model calls."""

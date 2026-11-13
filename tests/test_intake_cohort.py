@@ -1491,7 +1491,7 @@ class ThroughputTests(QualifyCase):
         import threading
         import time
         from collections import Counter
-        lock, state = threading.Lock(), {"calls": 0, "completion": 0, "in_flight": 0, "peak": 0}
+        lock, state = threading.Lock(), {"calls": 0, "attempts": 0, "completion": 0, "in_flight": 0, "peak": 0}
 
         def encode(records):
             if not ranges:
@@ -1505,33 +1505,45 @@ class ThroughputTests(QualifyCase):
                     start = None
             return out
 
+        def attempt(fn):
+            """One simulated HTTP attempt, counted while it runs (so overlap is measured)."""
+            with lock:
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+                state["attempts"] += 1
+            try:
+                time.sleep(delay)
+                return fn()
+            finally:
+                with lock:
+                    state["in_flight"] -= 1
+
         def transport(model, messages):
             with lock:
                 state["calls"] += 1
                 number = state["calls"]
-                state["in_flight"] += 1
-                state["peak"] = max(state["peak"], state["in_flight"])
+            gate = transport.gate or (lambda fn: fn())
             payload = json.loads(messages[-1]["content"])
             records = [r["i"] for r in payload["records"]]
             if "Just text" in messages[-1]["content"]:
                 records = records[:0]
             if throttle_every and number % throttle_every == 0:
-                for observe in tuple(transport.observers):
-                    observe("http-429" if number % 2 else "http-503")
+                # The provider throttles this call's first attempt; the transport retries it.
+                code = "http-429" if number % 2 else "http-503"
+                gate(lambda: attempt(lambda: (None, (code, True, None))))
                 with lock:
-                    transport.retries["http-429"] += 1
-            time.sleep(delay)
+                    transport.retries[code] += 1
             content = json.dumps({
                 "decision": "accept", "inspected_records": encode(records),
                 "inspected_warnings": [w["ref"] for w in payload["warnings"]],
                 "contradictions": [], "missing_evidence": [],
                 "explanation": "Inspected all rendition records against standing policy."})
+            gate(lambda: attempt(lambda: (content, None)))
             with lock:
-                state["in_flight"] -= 1
                 state["completion"] += len(content) // 4
             return {"content": content, "usage": {"prompt_tokens": len(messages[-1]["content"]) // 4,
                                                   "completion_tokens": len(content) // 4}}
-        transport.retries, transport.observers = Counter(), []
+        transport.retries, transport.gate = Counter(), None
         return transport, state
 
     def run_copy(self, name, transport, **extra):
@@ -1571,11 +1583,12 @@ class ThroughputTests(QualifyCase):
         self.assertEqual((fixed["calls"], adaptive["calls"]), (6, 6))
         self.assertLessEqual(adaptive["peak"], 4)
         throughput = adaptive_report[0]["throughput"]
-        self.assertEqual((throughput["cap"], throughput["calls"]), (4, 6))
+        self.assertEqual((throughput["cap"], throughput["calls"]), (4, 9))
         self.assertLessEqual(throughput["max_in_flight"], 4)
         self.assertGreater(throughput["backoffs"], 0)
         self.assertLess(throughput["lowest"], 4)
-        self.assertEqual(adaptive_report[0]["retries"], {"http-429": 3})
+        self.assertEqual(adaptive["attempts"], 9)
+        self.assertEqual(adaptive_report[0]["retries"], {"http-503": 3})
 
     def test_an_adaptive_run_with_no_throttling_stays_at_the_configured_cap(self):
         transport, state = self.stub(delay=0.02)
@@ -1597,6 +1610,25 @@ class ThroughputTests(QualifyCase):
                 self._qualify(transport, concurrency=4, initial_concurrency=bad)
         with self.assertRaises(IntakeError):
             self._qualify(transport, inspected_form="sparse")
+
+    def test_no_adaptive_holds_the_cap_even_with_a_lower_initial_concurrency(self):
+        transport, state = self.stub(delay=0.05)
+        report = self._qualify(transport, concurrency=4, initial_concurrency=1, adaptive=False)
+        throughput = report["throughput"]
+        self.assertEqual((throughput["initial"], throughput["final"], throughput["adaptive"]),
+                         (4, 4, False))
+        self.assertGreater(state["peak"], 1)
+
+    def test_retries_after_a_decrease_respect_the_lowered_limit(self):
+        # Every call's first attempt is throttled; attempts, not calls, are what the provider sees.
+        transport, state = self.stub(throttle_every=1, delay=0.03)
+        report = self._qualify(transport, concurrency=6)
+        throughput = report["throughput"]
+        self.assertGreater(throughput["backoffs"], 0)
+        self.assertEqual(state["attempts"], 12)
+        self.assertLessEqual(state["peak"], 6)
+        self.assertLess(throughput["lowest"], 6)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 5, "pending-review": 1})
 
     def test_range_form_has_identical_entries_findings_events_and_selection_with_fewer_tokens(self):
         listed_t, listed = self.stub()

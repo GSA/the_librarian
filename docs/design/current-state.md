@@ -153,7 +153,8 @@ restated here.
   (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
 - **Review throughput is bounded by the operator's cap and changes no outcome.** `qualify
-  --concurrency N` is the most model calls ever in flight. Every call of a run passes one
+  --concurrency N` is the most model calls (HTTP attempts: a retry takes a slot again after its backoff wait and
+  none is held while waiting) ever in flight. Every attempt of a run passes one
   `throttle.Limiter` (AIMD): it starts at `--initial-concurrency` (default N), halves on a 429
   or 503 (a burst of simultaneous signals costs one halving), and adds one back per window of
   clean replies, never above N or below 1; other errors do not move it. The limiter only

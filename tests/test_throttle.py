@@ -147,13 +147,50 @@ class LimiterTests(unittest.TestCase):
         self.assertEqual((report["calls"], report["seconds"], report["calls_per_minute"],
                           report["mean_in_flight"]), (2, 60.0, 2.0, 1.0))
 
-    def test_observer_is_attached_to_a_usai_transport_only_while_gating(self):
+    def test_a_usai_style_transport_is_gated_per_attempt_only_while_gating(self):
         transport = lambda model, messages: {"content": "{}", "usage": {}}  # noqa: E731
-        transport.observers = []
+        transport.gate = None
         limiter = throttle.Limiter(4)
-        with limiter.gating(transport):
-            self.assertEqual(len(transport.observers), 1)
-        self.assertEqual(transport.observers, [])
+        with limiter.gating(transport) as gated:
+            self.assertIs(gated, transport)
+            self.assertEqual(transport.gate, limiter.attempt)
+        self.assertIsNone(transport.gate)
+
+    def test_attempts_after_a_decrease_wait_for_a_slot_under_the_lowered_limit(self):
+        limiter = throttle.Limiter(6)
+        barrier, lock, running, peak = threading.Barrier(6), threading.Lock(), [0], [0]
+        after_decrease = []
+
+        def first():
+            barrier.wait(timeout=10)
+            return None, ("http-429", True, None)
+
+        def retry():
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            time.sleep(0.03)
+            with lock:
+                running[0] -= 1
+            return {"content": "{}"}, None
+
+        def worker():
+            limiter.attempt(first)
+            after_decrease.append(limiter.limit)
+            limiter.attempt(retry)
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(limiter.report()["backoffs"], 1)
+        self.assertEqual(set(after_decrease), {3})
+        self.assertLessEqual(peak[0], 3)
+        self.assertEqual(limiter.report()["calls"], 12)
+
+    def test_non_adaptive_limiter_ignores_a_lower_initial_limit(self):
+        limiter = throttle.Limiter(5, initial=1, adaptive=False)
+        self.assertEqual((limiter.limit, limiter.report()["initial"]), (5, 5))
 
 
 class RangeFormTests(unittest.TestCase):

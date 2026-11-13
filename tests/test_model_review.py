@@ -400,12 +400,20 @@ class RetryTests(unittest.TestCase):
         self.assertEqual((len(self.urls), len(self.waits)), (3, 2))
         self.assertEqual(dict(call.retries), {"http-503": 2})
 
-    def test_observers_hear_each_retried_code_before_the_wait(self):
+    def test_each_http_attempt_runs_through_the_gate_and_waits_outside_it(self):
         call = self.transport(429, 503, 200)
-        heard = []
-        call.observers.append(lambda code: heard.append((code, len(self.waits))))
+        events = []
+
+        def gate(fn):
+            events.append(("enter", len(self.waits)))
+            result = fn()
+            events.append(("exit", len(self.waits)))
+            return result
+        call.gate = gate
         call("model-a", [])
-        self.assertEqual(heard, [("http-429", 0), ("http-503", 1)])
+        # Each retry's backoff sleep happens between gated attempts, never inside one.
+        self.assertEqual(events, [("enter", 0), ("exit", 0), ("enter", 1), ("exit", 1),
+                                  ("enter", 2), ("exit", 2)])
 
     def test_redirects_are_refused(self):
         handler = model_review._NoRedirect()
