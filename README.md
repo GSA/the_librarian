@@ -107,7 +107,11 @@ files through upload and extraction (see
 
 Every file gets a counted disposition; nothing in the inbox is changed, and
 extracted renditions stay unselected until a standing-policy review qualifies
-them.
+them. If a registration reports `register/changed-extraction-identity` (the
+extractor changed after it was first prepared), `python -m tools.intake.cohort
+recover-identity --root .` lists the recoverable ones and `--apply` repairs
+them through validated correction requests
+([context/intake.md](context/intake.md#read-only-cohort-intake)).
 
 To review, select and publish the extracted cohort in one rerunnable step
 (model traffic stays within the configured USAi provider):

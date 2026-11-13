@@ -269,7 +269,14 @@ counted as `received`, `extracted`, `failed`, `changed-since-intake` and
 `not-processed`; reruns are idempotent. `retried_after_conflict` counts entries
 (and attempts) that lost a writer race and were retried, separately from
 failures; `failed_by_code` groups failures by `stage/code`, and each failed
-entry carries body-free `stage`, `status`, `category`, `code` and `attempts`. The inbox is never written. The
+entry carries body-free `stage`, `status`, `category`, `code` and `attempts`. The inbox is never written.
+Extraction and registration are read through the head of their `correction_of` chain, resolved by
+the store (`store.Heads`), never by request name: a registration repaired by a correction is
+`extracted` with the head's rendition and hash, a blocked, dead-lettered or still staged head is
+settled and reported as itself, and an entry with no correction produces the report and ledger
+effects it always did. A head must be a single stage with the entry's operation, receipt and
+format, else the entry fails as `correction_mismatch` (`ambiguous_correction` for a chain with
+two children); neither aborts the run. The
 optional `--report` (0600) lists per-file paths, hashes and outcomes and is
 private instance data. Extraction never reviews, selects or qualifies.
 
@@ -346,3 +353,28 @@ body-free report with the selected model and rule. `estimate()` extrapolates
 sample token usage to the admitted count and bytes. Record the chosen model,
 rationale and estimate privately before any bulk review (and a budget ceiling, if
 the owner sets one), and actual usage after it.
+
+**Recovering a registration blocked as `changed-extraction-identity`.** The extractor's identity
+is a hash of its code (`tools/extraction/extract.py`, plus `mhtml.py` for MIME HTML, and the
+instance policy) and is pinned in the stage's saved intent when the stage first prepares. A
+toolkit upgrade that edits those files, between a stage's first attempt and its replay, makes
+`prepare != intent`: the stage blocks as `changed-extraction-identity`, and `replay` and
+`recover-conflicts` cannot clear it because replay keeps the saved pin (an example is a
+registration that lost a writer race recorded as `native-input` before concurrent writers were retried, replayed by
+`recover-conflicts` after the upgrade). Do not edit the ledger or stage corrections by hand. Run
+
+    python -m tools.intake.cohort recover-identity --root ROOT           # dry run
+    python -m tools.intake.cohort recover-identity --root ROOT --apply
+
+The dry run prints body-free counts: `candidates` (chains whose head is a blocked `extract-register`
+whose last attempt was `changed-extraction-identity`) and `skipped`: `prepare-mismatch` (the paired
+`extract-` request is missing or does not match the receipt and format), `prepare-blocked`, or
+`source-unavailable` (the source no longer prepares, for example a changed or removed original).
+`--apply` stages a correction request `<root>-c<n>` of the paired `extract-prepare` (when its head
+prepared under a different extractor) and of the registration (with a fresh catalog pin), and settles
+both. A correction goes through the store's validation like any request, so the identity check, the
+source-hash check, catalog pinning and `rebase` apply to it unchanged, and a source or extractor that
+moves again blocks it again. The next `ingest` or `qualify` follows the chain to the corrected
+registration and reports the entry `extracted` with no new extraction work; it is then reviewed and
+selected like any other rendition. Repaired chains are not candidates again. Run it while no ingest is
+writing, as with `recover-conflicts`.
