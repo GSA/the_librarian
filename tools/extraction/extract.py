@@ -426,6 +426,62 @@ def registration_records(root, original, path, value):
     return [parent, child, relation]
 
 
+def registration_marker(value):
+    """The record a registration creates and no other registration does: its idempotency key in a batch."""
+    return "A-extract-" + value["run_id"]
+
+
+def registration_recipe(root, original, path, value, state, actor, registered=lambda: False):
+    """The registration to submit: freshly built, or the one an earlier attempt saved beside the rendition.
+
+    ``registered()`` says whether the catalog already holds this registration (a batch committed it), which
+    is what the saved-metadata drift check otherwise reads from the original's version history.
+    """
+    recipe = {
+        "actor": actor, "request_id": "extract-" + value["source"]["receipt_id"] + "-" + value["run_id"],
+        "reason": "Explicit machine-extraction registration; no review, index or intake-stage change.",
+        "records": registration_records(root, original, path, value),
+    }
+    catalog.validate_records(recipe["records"])
+    saved_path = path.parent / "registration.json"
+    if saved_path.exists():
+        saved = catalog.decode(catalog.private_file(saved_path).read_text())
+        require(set(saved) == set(recipe) and all(
+            saved[key] == recipe[key] for key in ("actor", "request_id", "reason")),
+            "Saved registration differs in actor, request or reason")
+        catalog.validate_records(saved["records"])
+        if saved != recipe:
+            history = catalog.read_records(
+                root, kind="artifact", path=value["source"]["path"],
+                include_history=True, limit=1, expected_state=state["state_token"])
+            require(registered() or any(version["request_id"] == recipe["request_id"]
+                                        for record in history["records"] if record["id"] == original["id"]
+                                        for version in record["versions"]),
+                    "Uncommitted registration metadata drift; preserve the saved request and reconcile")
+            # The writer checks the saved input hash and returns without overwriting newer metadata.
+            recipe = saved
+    else:
+        publish(saved_path, encoded(recipe))
+    return recipe
+
+
+def finish_registration(root, path, value, recipe, outcome):
+    """Record (or check) the completion file of a committed registration, then re-check the source."""
+    try:
+        completion = path.parent / "completion.json"
+        if not completion.exists():
+            publish(completion, encoded(outcome))
+        else:
+            saved = catalog.decode(catalog.private_file(completion).read_text())
+            require(saved["request_id"] == recipe["request_id"]
+                    and saved["committed_state"] == outcome["committed_state"],
+                    "Committed registration differs from saved completion")
+        unchanged(root, value)
+    except (ExtractionError, catalog.CatalogError, OSError, ValueError, KeyError) as error:
+        raise ExtractionError("Catalog registration committed, but completion/final check failed; "
+                              "preserve registration.json and retry the same request: " + str(error)) from error
+
+
 def run(root, command, receipt, format_name, actor=None, expected_state=None, rebase=False,
         prepared=None):
     """Run one lifecycle command.
@@ -464,46 +520,10 @@ def run(root, command, receipt, format_name, actor=None, expected_state=None, re
         if command == "register":
             require(actor is not None and expected_state is not None,
                     "Registration requires actor and explicit expected catalog state")
-            recipe = {
-                "actor": actor, "request_id": "extract-" + receipt + "-" + value["run_id"],
-                "reason": "Explicit machine-extraction registration; no review, index or intake-stage change.",
-                "records": registration_records(root, original, path, value),
-            }
-            catalog.validate_records(recipe["records"])
-            saved_path = path.parent / "registration.json"
-            if saved_path.exists():
-                saved = catalog.decode(catalog.private_file(saved_path).read_text())
-                require(set(saved) == set(recipe) and all(
-                    saved[key] == recipe[key] for key in ("actor", "request_id", "reason")),
-                    "Saved registration differs in actor, request or reason")
-                catalog.validate_records(saved["records"])
-                if saved != recipe:
-                    history = catalog.read_records(
-                        root, kind="artifact", path=value["source"]["path"],
-                        include_history=True, limit=1, expected_state=state["state_token"])
-                    require(any(version["request_id"] == recipe["request_id"]
-                                for record in history["records"] if record["id"] == original["id"]
-                                for version in record["versions"]),
-                            "Uncommitted registration metadata drift; preserve the saved request and reconcile")
-                    # The writer checks the saved input hash and returns without overwriting newer metadata.
-                    recipe = saved
-            else:
-                publish(saved_path, encoded(recipe))
+            recipe = registration_recipe(root, original, path, value, state, actor)
             unchanged(root, value)
             outcome = catalog.submit(root, expected_state=expected_state, rebase=rebase, **recipe)
-            try:
-                completion = path.parent / "completion.json"
-                if not completion.exists():
-                    publish(completion, encoded(outcome))
-                else:
-                    saved = catalog.decode(catalog.private_file(completion).read_text())
-                    require(saved["request_id"] == recipe["request_id"]
-                            and saved["committed_state"] == outcome["committed_state"],
-                            "Committed registration differs from saved completion")
-                unchanged(root, value)
-            except (ExtractionError, catalog.CatalogError, OSError, ValueError, KeyError) as error:
-                raise ExtractionError("Catalog registration committed, but completion/final check failed; "
-                                      "preserve registration.json and retry the same request: " + str(error)) from error
+            finish_registration(root, path, value, recipe, outcome)
             result.update(catalog_state=outcome["state"], registered=True,
                           idempotent=outcome["idempotent"], request_id=recipe["request_id"])
         return result
