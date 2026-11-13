@@ -140,6 +140,19 @@ restated here.
   the code requires an approved budget ceiling and the current instance runs
   without one. (An earlier record said a ceiling was required before bulk review;
   the owner decided otherwise and the code never enforced it.)
+- **Replaying an unchanged inbox** (`ingest`, and the `ingest` inside every
+  `qualify`) re-checks every file and trusts no cache file or earlier report: it is
+  read and hashed once to classify it, checked again against the ledger's saved
+  original at submission, and its stages are looked up, so a file changed since
+  intake is still found (a content-salted submission that supersedes the old one, or
+  `changed-since-intake`). The cost is kept to three ledger opens per entry: one read of the
+  entry's receipt request with its summary, reused for its acknowledgment only when the stage has
+  `succeeded` (a terminal status), then the chain heads of the extraction and registration. The storage-root validation is reused for an identical policy, with
+  the symlink walk done once per path component. Hashing is about 1% of a replay;
+  the MIME HTML and transcript parsers in `classify` are the floor. Measured with
+  `ingest_benchmark.py --replay`: 11 to 5 ms per file, identical report digest.
+  Evidence: `tests/test_intake_cohort.py::ReplayTests`,
+  `tests/test_policy_isolation.py::StorageRootChecksAreCheapButNotWeaker`.
 - **`qualify` and shared manifests.** An instance may ingest several inboxes
   (one `--system` label each) into one catalog, manifest and index. A manifest
   entry belongs to a cohort when its rendition was extracted by the current run

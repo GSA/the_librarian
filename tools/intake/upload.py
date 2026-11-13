@@ -471,9 +471,11 @@ def status_of(root, correlation_id):
     return store.inspect(root, correlation_id)["stages"][0]["status"]
 
 
-def acknowledgment(root, correlation_id, existing):
-    summary = store.inspect(root, correlation_id)
-    request = ledger_request(root, correlation_id)
+def acknowledgment(root, correlation_id, existing, cached=None):
+    request, summary = cached if cached else (None, None)
+    if cached is None:
+        summary = store.inspect(root, correlation_id)
+        request = ledger_request(root, correlation_id)
     records = {r["id"]: r for r in submit_records(request)}
     receipt = next(r for r in records.values() if r["kind"] == "receipt")
     original = records[receipt["data"]["artifact_id"]]
@@ -505,7 +507,33 @@ def acknowledgment(root, correlation_id, existing):
     }
 
 
-def submit(root, path, value):
+def settled(known, correlation_id):
+    """``(request, summary)`` read earlier by ``known_requests`` when the only stage had succeeded, else None.
+
+    A succeeded stage never changes again, so it is safe to use without another ledger read; any
+    other status may have moved since and is read afresh.
+    """
+    cached = (known or {}).get(correlation_id)
+    return cached if cached and cached[1]["stages"][0]["status"] == "succeeded" else None
+
+
+def settled_summary(known, correlation_id):
+    cached = settled(known, correlation_id)
+    return cached and cached[1]
+
+
+def known_requests(root, correlation_ids):
+    """One ledger lock: ``{id: (decoded request, summary)}`` for each saved request among ``correlation_ids``."""
+    found = {}
+    with store.locked(root) as c:
+        for correlation_id in correlation_ids:
+            row = c.execute("SELECT raw FROM requests WHERE correlation_id=?", (correlation_id,)).fetchone()
+            if row is not None:
+                found[correlation_id] = (decode(row[0]), store.summary(c, correlation_id))
+    return found
+
+
+def submit(root, path, value, *, known=None):
     """Stage, publish and register one explicitly supplied file; return its acknowledgment."""
     root = store.safe(root)
     value = validate_descriptor(value)
@@ -516,7 +544,7 @@ def submit(root, path, value):
     correlation_id = correlation(value["submission_id"])
     with upload_lock(root):
         directory, original_path, sidecar_path, sidecar = plan(root, value, raw)
-        prior = ledger_request(root, correlation_id)
+        prior = known[correlation_id][0] if known and correlation_id in known else ledger_request(root, correlation_id)
         existing = prior is not None
         if existing:
             saved = {r["data"]["path"]: r["data"]["sha256"] for r in submit_records(prior) if r["kind"] == "artifact"}
@@ -538,6 +566,9 @@ def submit(root, path, value):
         publish(target, SIDECAR, sidecar)
         if not existing:
             store.stage(root, canonical(request).encode())
+        cached = settled(known, correlation_id)
+        if cached:
+            return acknowledgment(root, correlation_id, existing, cached)
         if status_of(root, correlation_id) in {"staged", "running", "retryable"}:
             # Blocked and dead-letter receipts stay visible; recovery is explicit replay.
             runner.settle(root, correlation_id, "receipt")

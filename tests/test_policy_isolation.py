@@ -64,3 +64,44 @@ class ToolkitLocalOverrideIsolation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StorageRootChecksAreCheapButNotWeaker(unittest.TestCase):
+    """Repeated root validation is reused for an identical policy; refusals and symlinks still refuse."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name) / "workspace"
+        self.workspace.mkdir()
+
+    def test_a_repeat_returns_an_equal_but_independent_result(self):
+        first = policy.validate_instance_roots(self.workspace)
+        first["catalog_home"] = "tampered"
+        self.assertEqual(policy.validate_instance_roots(self.workspace), policy.DEFAULT_STORAGE_ROOTS)
+
+    def test_a_symlinked_storage_root_component_refuses_every_time(self):
+        real = self.workspace / "elsewhere"
+        real.mkdir()
+        (self.workspace / ".local").symlink_to(real, target_is_directory=True)
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                policy.validate_instance_roots(self.workspace)
+
+    def test_a_refused_policy_is_not_remembered_as_valid(self):
+        (self.workspace / "config").mkdir()
+        local = self.workspace / "config/policy.local.json"
+        local.write_text(json.dumps({"storage_roots": {"catalog_home": "../outside"}}))
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                policy.validate_instance_roots(self.workspace)
+        local.write_text(json.dumps({"storage_roots": {"catalog_home": "own/catalog"}}))
+        self.assertEqual(policy.validate_instance_roots(self.workspace)["catalog_home"], "own/catalog")
+
+    def test_a_changed_policy_is_validated_afresh(self):
+        (self.workspace / "config").mkdir()
+        local = self.workspace / "config/policy.local.json"
+        local.write_text(json.dumps({"storage_roots": {"catalog_home": "one/catalog"}}))
+        self.assertEqual(policy.validate_instance_roots(self.workspace)["catalog_home"], "one/catalog")
+        local.write_text(json.dumps({"storage_roots": {"catalog_home": "two/catalog"}}))
+        self.assertEqual(policy.validate_instance_roots(self.workspace)["catalog_home"], "two/catalog")
