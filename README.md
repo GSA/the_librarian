@@ -135,6 +135,21 @@ ledger writes stay serial and in inbox order. Rate limits (429), transient
 server errors (500/502/503/504) and network errors are retried with backoff,
 honouring `Retry-After`.
 
+A `qualify` that stops early (interrupted, host restart) keeps every saved review and
+selection, but publishes only at the end of a run, so the served index goes stale. Publish what
+the manifest holds now, without ingesting or reviewing anything and without a model call:
+
+```sh
+.venv/bin/python -m tools.intake.cohort publish --root . \
+  --policy config/standing-policy.local.json --manifest config/selection.local.json
+```
+
+It runs the same `standing-publish` stage as the end of `qualify` (same checks, same ledger
+evidence), is idempotent (an unchanged manifest with a fresh index is reused), prints body-free
+`counts` (`published`, `selections`) and a `publication` status, and exits 1 when nothing was
+published (for example `standing-selection-unauthorized` after a standing-policy version bump
+that has not been requalified). Run `qualify` again afterwards to resume reviewing.
+
 To watch a run, use the read-only, body-free progress view (CLI or a
 loopback-only page that refreshes itself; see
 [context/intake.md](context/intake.md#progress-view)):

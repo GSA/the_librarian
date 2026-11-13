@@ -1378,6 +1378,134 @@ class SharedManifestTests(QualifyCase):
         policy_file.write_text(json.dumps(raw))
 
 
+class PublishTests(QualifyCase):
+    """The standalone ``publish`` command: the end-of-run publication, without a re-run."""
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = self.root / "config/selection.local.json"
+        self.transport, self.calls = self._transport()
+
+    def publish(self, **extra):
+        args = dict(policy_path="config/standing-policy.local.json",
+                    manifest="config/selection.local.json")
+        args.update(extra)
+        return cohort.publish(self.root, **args)
+
+    def _bump_policy_version(self):
+        policy_file = self.root / "config/standing-policy.local.json"
+        raw = json.loads(policy_file.read_text())
+        raw["version"] += 1
+        policy_file.write_text(json.dumps(raw))
+
+    def interrupted_qualify(self):
+        """A qualify that was killed after its reviews and selections, before its publish."""
+        with unittest.mock.patch.object(cohort, "_publish", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._qualify(self.transport)
+
+    def hits(self, text):
+        from tools.context_index import context_index as index
+        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+            return index.search(db, text, 10, None, root=self.root)["hits"]
+
+    def publish_requests(self):
+        return [c for c in store.correlation_ids(self.root) if c.startswith("publish-")]
+
+    def test_publish_serves_an_interrupted_runs_selections_without_a_model_call(self):
+        self.interrupted_qualify()
+        self.assertEqual(len(json.loads(self.manifest.read_text())["renditions"]), 6)
+        self.assertFalse((self.root / cohort.DEFAULT_INDEX).exists())
+        self.calls.clear()
+        report = self.publish()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(report["counts"], {"published": 1, "selections": 6})
+        self.assertEqual(report["publication"], {"status": "succeeded", "available": True})
+        self.assertEqual(len(self.hits("Fund codes")), 1)
+
+    def test_publish_matches_the_publication_a_full_qualify_makes(self):
+        self.interrupted_qualify()
+        self.publish()
+        manifest_bytes = self.manifest.read_bytes()
+        requests = self.publish_requests()
+        # A re-run finds the same manifest and the same published request: nothing is rebuilt.
+        report = self._qualify(self.transport)
+        self.assertEqual(report["counts"]["published"], 1)
+        self.assertEqual(self.manifest.read_bytes(), manifest_bytes)
+        self.assertEqual(self.publish_requests(), requests)
+        self.assertEqual(len(self.calls), 6)
+
+    def test_publish_is_idempotent_and_restages_only_when_the_index_goes_stale(self):
+        self._qualify(self.transport)
+        requests = self.publish_requests()
+        self.assertEqual(len(requests), 1)
+        first = self.publish()
+        second = self.publish()
+        self.assertEqual((first["counts"]["published"], second["counts"]["published"]), (1, 1))
+        self.assertEqual(self.publish_requests(), requests)
+        # An index that is no longer fresh is rebuilt under a new revision of the same request.
+        (self.root / cohort.DEFAULT_INDEX).unlink()
+        self.assertEqual(self.publish()["counts"]["published"], 1)
+        self.assertEqual(len(self.publish_requests()), 2)
+        self.assertEqual(len(self.hits("Fund codes")), 1)
+
+    def test_publish_keeps_the_standing_checks(self):
+        self._qualify(self.transport)
+        self._bump_policy_version()
+        report = self.publish()
+        # The manifest still cites the older policy version's reviews: refused, nothing new served.
+        self.assertEqual(report["counts"]["published"], 0)
+        self.assertEqual(report["publication"]["status"], "blocked")
+        self.assertEqual(report["publication"]["code"], "standing-selection-unauthorized")
+
+    def test_publish_refuses_missing_or_unsafe_inputs_before_staging_anything(self):
+        for extra in ({"policy_path": "config/missing.json"}, {"manifest": "config/missing.json"},
+                      {"manifest": "../selection.json"}, {"index_path": "../index.sqlite3"}):
+            with self.subTest(extra), self.assertRaises(IntakeError):
+                self.publish(**extra)
+        self.assertEqual(self.publish_requests(), [])
+
+    def test_publish_refuses_a_malformed_manifest_with_a_body_free_error(self):
+        self._qualify(self.transport)
+        self.manifest.write_text("{not json")
+        before = self.publish_requests()
+        with self.assertRaises(IntakeError) as caught:
+            self.publish()
+        self.assertEqual(caught.exception.code, "preflight_invalid")
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(cohort.main(["publish", "--root", str(self.root), "--policy",
+                                          "config/standing-policy.local.json",
+                                          "--manifest", "config/selection.local.json"]), 2)
+        self.assertEqual(json.loads(err.getvalue()), {"error": "preflight_invalid"})
+        self.assertEqual(self.publish_requests(), before)
+
+    def test_cli_publish_prints_body_free_counts_and_needs_no_model(self):
+        import contextlib
+        self.interrupted_qualify()
+        out = io.StringIO()
+        argv = ["publish", "--root", str(self.root), "--policy", "config/standing-policy.local.json",
+                "--manifest", "config/selection.local.json"]
+        with contextlib.redirect_stdout(out):
+            code = cohort.main(argv)
+        self.assertEqual(code, 0)
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed["counts"], {"published": 1, "selections": 6})
+        for body in ("Fund codes", "Line", "Decided", "hello there"):
+            self.assertNotIn(body, out.getvalue())
+        self._bump_policy_version()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cohort.main(argv), 1)
+        self.assertEqual(json.loads(out.getvalue())["publication"]["code"],
+                         "standing-selection-unauthorized")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cohort.main(argv[:-1] + ["config/missing.json"]), 2)
+        self.assertIn("error", json.loads(err.getvalue()))
+
+
 class CliTests(CohortCase):
     def test_cli_prints_body_free_counts_and_writes_private_report(self):
         import contextlib

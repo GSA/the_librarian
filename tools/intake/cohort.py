@@ -1003,6 +1003,40 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     return report
 
 
+def publish(root, *, policy_path, manifest, index_path=DEFAULT_INDEX):
+    """Publish the current manifest under the current standing policy; return a body-free report.
+
+    The same ``standing-publish`` stage ``qualify`` ends with (its pinning, freshness, availability
+    and selection-authorization checks, and its ledger evidence), without ingesting or reviewing
+    anything: it recovers an interrupted ``qualify``, whose reviews and selections are saved, at
+    the cost of one publication. Idempotent: an unchanged manifest with a fresh index is reused.
+    """
+    root = Path(root).resolve()
+    try:
+        for name in (policy_path, manifest):
+            _instance_file(root, name)
+            contracts.relative(name)
+            name.encode("ascii")
+        contracts.relative(index_path)
+        index.validate_db_path(root, root / index_path)
+        if not (root / policy_path).is_file() or not (root / manifest).is_file():
+            raise IntakeError("publish_input_missing")
+        policy_sha = hashlib.sha256((root / policy_path).read_bytes()).hexdigest()
+        standing.load_policy(root, policy_path, policy_sha)
+        selections = len(index.load_manifest(index.no_symlinks(root / manifest), root)[0]
+                         .get("renditions", []))
+    except (index.IndexError_, standing.Refusal, OSError, UnicodeError, ValueError) as error:
+        raise IntakeError("preflight_invalid") from error
+    stage, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
+    available = bool(inspected.get("availability", {}).get("available"))
+    published = stage["status"] == "succeeded" and available
+    publication = {"status": stage["status"], "available": available}
+    if stage["status"] != "succeeded" and stage["attempts"]:
+        publication["code"] = stage["attempts"][-1]["code"]
+    return {"counts": {"published": int(published), "selections": selections},
+            "publication": publication}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1011,6 +1045,11 @@ def main(argv=None):
         help="Report (or with --apply correct) registrations blocked as changed-extraction-identity")
     recover.add_argument("--root", required=True, type=Path)
     recover.add_argument("--apply", action="store_true")
+    command = commands.add_parser("publish", allow_abbrev=False, help=publish.__doc__.split("\n")[0])
+    command.add_argument("--root", required=True, type=Path)
+    command.add_argument("--policy", required=True, dest="policy_path")
+    command.add_argument("--manifest", required=True)
+    command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
     for name in ("classify", "ingest", "qualify"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--root", required=True, type=Path)
@@ -1036,6 +1075,11 @@ def main(argv=None):
         if args.command == "recover-identity":
             print(json.dumps(recover_identity(args.root, apply=args.apply), sort_keys=True))
             return 0
+        if args.command == "publish":
+            report = publish(args.root, policy_path=args.policy_path, manifest=args.manifest,
+                             index_path=args.index_path)
+            print(json.dumps(report, sort_keys=True))
+            return 0 if report["counts"]["published"] else 1
         if args.command == "qualify":
             report = qualify(
                 args.root, args.inbox, system=args.system, actor=args.actor,
