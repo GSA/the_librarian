@@ -2,6 +2,7 @@
 import json
 import os
 import unittest
+import urllib.error
 from pathlib import Path
 import stat
 from unittest.mock import patch
@@ -284,6 +285,44 @@ class TransportTests(ReviewCase):
         self.assertEqual(sent["body"]["model"], "model-a")
         self.assertEqual(value, {"content": "{}", "usage": {"prompt_tokens": 3,
                                                             "completion_tokens": 1}})
+
+    def test_usai_transport_records_successful_replies_only(self):
+        models = Path(self.directory.name) / "models.json"
+        models.write_text(json.dumps({"providers": {"usai": {
+            "baseUrl": "https://api.example.invalid/v1", "apiKey": "k",
+            "models": [{"id": "model-a"}]}}}))
+        usage = {"prompt_tokens": 3, "completion_tokens": 1}
+        failing = False
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "{}"}}],
+                                   "usage": usage}).encode()
+
+        def urlopen(request, timeout):
+            if failing:
+                raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, None)
+            return Response()
+
+        class Recorder:
+            calls = []
+
+            def record(self, model, usage):
+                self.calls.append((model, usage))
+        recorder = Recorder()
+        transport = model_review.usai_transport(models, urlopen=urlopen, recorder=recorder)
+        transport("model-a", [])
+        self.assertEqual(recorder.calls, [("model-a", usage)])
+        failing = True
+        with self.assertRaises(model_review.TransportError):
+            transport("model-a", [])
+        self.assertEqual(len(recorder.calls), 1)
 
 
 class RetryTests(unittest.TestCase):

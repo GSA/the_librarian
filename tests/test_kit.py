@@ -169,6 +169,14 @@ class DoclingCleanCopy(unittest.TestCase):
             if name not in excluded:
                 self.assertEqual((self.kit / name).read_bytes(), source.read_bytes(), name)
 
+    def test_packaged_intake_modules_import(self):
+        for name in ("tools.intake.model_review", "tools.intake.cohort"):
+            with self.subTest(module=name):
+                process = subprocess.run(
+                    [sys.executable, "-c", f"import {name}"],
+                    cwd=self.kit, capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+
     def test_clean_copy_runs_docling_lifecycle_under_its_own_policy(self):
         local = self.kit / "config/policy.local.json"
         local.write_text(json.dumps({"original_roots": ["clone-sources"]}))

@@ -485,3 +485,8 @@ moves again blocks it again. The next `ingest` or `qualify` follows the chain to
 registration and reports the entry `extracted` with no new extraction work; it is then reviewed and
 selected like any other rendition. Repaired chains are not candidates again. Run it while no ingest is
 writing, as with `recover-conflicts`.
+
+Model calls made by `qualify` and `model_review evaluate` are recorded body-free (model and token
+counts only, never prompts, documents or replies) as one session file per run in
+`$AGENTSVIEW_DIRECT_API_DIR`, default `~/.agentsview/direct-api`, for AgentsView's Direct API agent.
+A failure to write them never affects the run.
