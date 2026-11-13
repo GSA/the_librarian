@@ -6,7 +6,7 @@ single-stage requests and whose catalog holds ``--catalog`` upload-shaped regist
 directly, without per-write validation, so large sizes build quickly), then ingests ``--files`` new
 synthetic markdown files through ``tools.intake.cohort.ingest``. Reports body-free JSON: wall and CPU
 seconds, seconds per file, how many times the whole ledger was validated and what share of the wall
-time that took. With a healthy hand-off (decision 0014) the ledger is validated about once per
+time that took. With a healthy hand-off ("Intake ledger" in docs/design/current-state.md) the ledger is validated about once per
 process, not once per lock acquisition. Synthetic fixtures only; never point it at a real instance.
 
     python3 tools/diagnostics/ledger_scale_benchmark.py --ledger 36000 --catalog 25600 --files 40
@@ -105,7 +105,7 @@ def main(argv=None):
                              "uploads leave), so the per-file upload planning cost is representative")
     parser.add_argument("--warm", action="store_true",
                         help="validate the catalog once before timing, so the one-off first-of-day replay "
-                             "(decision 0016) is not counted in the per-file figures")
+                             "(see docs/design/current-state.md, Concurrent writers) is not counted in the per-file figures")
     parser.add_argument("--profile", action="store_true", help="also report per-function wall and CPU totals")
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)

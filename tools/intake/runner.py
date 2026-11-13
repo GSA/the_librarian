@@ -34,7 +34,7 @@ CONTENTION_CODES = {"catalog-busy", "catalog-stale-state"}
 CONTENTION_BUDGET = 30
 # Consecutive lost catalog races one ``settle`` call retries before it leaves the stage retryable.
 # Each already waited the catalog's bounded wait, so a call spends at most this many waits (60 s,
-# which covers the 58 s first-of-day hold measured at 100k registrations before decision 0016).
+# which covers the 58 s first-of-day hold measured at 100k registrations before the first-write-of-day replay was made cheaper; see "Concurrent writers" in docs/design/current-state.md).
 CONTENTION_RETRIES = 6
 
 

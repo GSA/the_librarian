@@ -27,7 +27,7 @@ import urllib.request
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from . import standing
+from . import standing, usage_log
 
 PROVIDER = "usai"
 MAX_PROMPT_CHARS = 400_000
@@ -343,7 +343,8 @@ def _retry_after(error):
 
 def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=5,
                    backoff_seconds=2.0, max_wait_seconds=60.0, max_retry_seconds=600.0,
-                   sleep=time.sleep, clock=time.monotonic, jitter=random.random, urlopen=None):
+                   sleep=time.sleep, clock=time.monotonic, jitter=random.random,
+                   urlopen=None, recorder=None):
     """OpenAI-compatible chat transport restricted to one configured provider's models.
 
     Rate limits (429), transient server errors (500, 502, 503, 504) and network
@@ -355,6 +356,7 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
     the whole call) runs as ``gate(fn)``, where ``fn()`` returns ``(reply, failure)``: the
     adaptive concurrency limiter uses it so a retry waits for a free slot under the current
     limit, and no slot is held while the transport sleeps before that retry.
+    Each successful reply's usage goes to ``recorder``.
     """
     if type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer")
@@ -408,6 +410,8 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
             content = value["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             raise TransportError("invalid-response") from None
+        if recorder is not None:
+            recorder.record(model, value.get("usage"))
         return {"content": content, "usage": value.get("usage") or {}}
     call.retries = retries
     call.gate = None
@@ -426,7 +430,8 @@ def main(argv=None):
     sample.add_argument("--controls", action="store_true")
     args = parser.parse_args(argv)
     report = evaluate_models(args.root, args.renditions, args.models,
-                             usai_transport(args.models_config), controls=args.controls)
+                             usai_transport(args.models_config, recorder=usage_log.Recorder(
+                                 "librarian intake", PROVIDER)), controls=args.controls)
     print(json.dumps(report, sort_keys=True))
     return 0
 

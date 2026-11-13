@@ -30,7 +30,7 @@ restated here.
 
   | Kind | Stores | Rule of thumb |
   |---|---|---|
-  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step **(untested)**. |
+  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step (`tests/test_authority_store_upgrade_paths.py`). |
   | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
@@ -53,6 +53,18 @@ restated here.
   not invalidate earlier snapshots (not tested as a recovery path). `init`
   never overwrites, so the tested way forward is an empty re-initialization
   beside the refused store.
+  `tests/test_authority_store_upgrade_paths.py` builds populated catalog and
+  review-event stores in temporary release copies, bumps `user_version` or
+  changes the contract marker (catalog `contract_version`, review-event
+  `contract_hash`), and asserts that `initialize` (plain, `--relocate`,
+  `--migrate-storage`, `--recover-migration` with and without an interrupted
+  migration), each store CLI (`init`, `status`, `audit`, `backup`, `restore`,
+  `query`/`export`, `submit`/`append`, `get`), the context-index catalog
+  command and the review-event reader refuse and leave every file of the
+  instance byte-identical. `init` refuses an existing store before opening it;
+  an interrupted-migration recovery rolls store files back to their old location before it refuses, keeps its journal and leaves the database bytes unchanged (it never repairs a store); the
+  intake progress view reports the catalog as unavailable; and a derived-index
+  build never rewrites an authority store.
   Durability: every write connection the catalog, review-event and intake stores
   open (init, write, backup-init, intake `locked` and `relocate`) runs with
   `synchronous=FULL` on a rollback journal (`journal_mode=delete`), pinned by
@@ -101,9 +113,13 @@ restated here.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
-  (`tests/test_mcp.py`). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
+  (`tests/test_mcp.py`). The runtime probe refuses, with a non-zero exit and an
+  explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
+  and missing FTS5, and reports the Python, SQLite and `mcp` versions and
+  `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
+  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
   are ranges and transitive dependencies are unpinned. There is no lock file,
-  image or installer, and no failing-probe test (Kata vckd). Whether those are
+  image or installer. Whether those are
   wanted is an open product question, not a commitment (Kata 7jkt).
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
@@ -431,7 +447,7 @@ synthetic documents the two scans were about half of the time per document).
   `test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt`,
   `test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot`).
   The ledger's equivalent residual (a file rewrite that preserves identity and
-  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k. "Never migrated or rebuilt" for authority stores is likewise only partly tested (Kata 5jjd).
+  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k.
 - **Never close a descriptor on a database file while a connection to it is open
   in this process.** On POSIX, closing any descriptor drops all of the process's
   fcntl locks on that file, including SQLite's, which let a concurrent commit tear a

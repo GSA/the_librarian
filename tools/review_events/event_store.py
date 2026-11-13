@@ -199,7 +199,7 @@ def seal(path):
 
 
 # Validated results kept in memory, one per database file (Kata r71k). The trust model is that of
-# the catalog's read receipt (decision 0017) without a file: a result is reused only for the
+# the catalog's read receipt (docs/design/current-state.md, "What a catalog write validates") without a file: a result is reused only for the
 # identical file (device, inode, size, mtime, ctime and SQLite change counter), the same contract
 # and the same UTC day, after the chain heads re-derived from the file still equal the remembered
 # state; it is stored only when the identity is the same before and after the pass; it is never

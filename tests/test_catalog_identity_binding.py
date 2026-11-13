@@ -1,4 +1,4 @@
-"""Catalog receipts bind to file identity with a daily full check (decision 0017)."""
+"""Catalog receipts bind to file identity with a daily full check (docs/design/current-state.md, "What a catalog write validates")."""
 from contextlib import closing
 import datetime
 import json

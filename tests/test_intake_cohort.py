@@ -55,9 +55,9 @@ class CohortCase(unittest.TestCase):
         self.inbox = Path(self.temp.name) / "inbox"
         files = {
             "a/notes.md": b"# Notes\nLine\n",
-            "a/FALCON+\u2014+ORR Checklist.doc": CONFLUENCE,
+            "a/SAMPLE+\u2014+Review Checklist.doc": CONFLUENCE,
             "a/broken.doc": b"MIME-Version: 1.0\r\nbody\r\n",
-            "a/FALCON+\u2014+ORR Checklist.doc:Zone.Identifier": b"[ZoneTransfer]\n",
+            "a/SAMPLE+\u2014+Review Checklist.doc:Zone.Identifier": b"[ZoneTransfer]\n",
             "m/Sync - Notes by Gemini.txt": GEMINI,
             "m/plain.txt": b"Just text\n",
             "plan.odt": odt(),
@@ -91,9 +91,9 @@ class ClassifyTests(CohortCase):
         entries = {e["relative"]: e for e in cohort.classify(self.root, self.inbox)}
         expected = {
             "a/notes.md": ("admit", "text"),
-            "a/FALCON+\u2014+ORR Checklist.doc": ("admit", "mhtml"),
+            "a/SAMPLE+\u2014+Review Checklist.doc": ("admit", "mhtml"),
             "a/broken.doc": ("needs-reader", None),
-            "a/FALCON+\u2014+ORR Checklist.doc:Zone.Identifier": ("skipped-artifact", None),
+            "a/SAMPLE+\u2014+Review Checklist.doc:Zone.Identifier": ("skipped-artifact", None),
             "m/Sync - Notes by Gemini.txt": ("admit", "gemini-txt"),
             "m/plain.txt": ("admit", "text"),
             "plan.odt": ("admit", "odt"),
@@ -130,19 +130,19 @@ class ClassifyTests(CohortCase):
         self.assertEqual(entries["a/notes.md"]["disposition"], "over-limit")
 
     def test_submission_names_and_locators_are_ascii_safe_and_stable(self):
-        entry = cohort.submission("a/FALCON+\u2014+ORR Checklist.doc", "inbox")
+        entry = cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox")
         self.assertRegex(entry["name"], r"\A[A-Za-z0-9][A-Za-z0-9._-]*\.doc\Z")
-        self.assertEqual(entry["locator"], "a/FALCON%2B%E2%80%94%2BORR%20Checklist.doc")
+        self.assertEqual(entry["locator"], "a/SAMPLE%2B%E2%80%94%2BReview%20Checklist.doc")
         self.assertRegex(entry["submission_id"], r"\Ainbox-[a-f0-9]{24}\Z")
-        self.assertEqual(entry, cohort.submission("a/FALCON+\u2014+ORR Checklist.doc", "inbox"))
-        for other in (cohort.submission("a/FALCON+-+ORR Checklist.doc", "inbox"),
-                      cohort.submission("a/FALCON+\u2014+ORR Checklist.doc", "other")):
+        self.assertEqual(entry, cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox"))
+        for other in (cohort.submission("a/SAMPLE+-+Review Checklist.doc", "inbox"),
+                      cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "other")):
             self.assertNotEqual(entry["submission_id"], other["submission_id"])
 
 
 class IngestTests(CohortCase):
     def test_ingest_submits_and_extracts_admitted_files_with_body_free_counts(self):
-        report = cohort.ingest(self.root, self.inbox, system="falcon-docs-inbox",
+        report = cohort.ingest(self.root, self.inbox, system="example-docs-inbox",
                                actor="cohort-runner")
         self.assertEqual(tree(self.inbox), self.before)
         self.assertEqual(report["counts"]["files"], 15)
@@ -164,10 +164,10 @@ class IngestTests(CohortCase):
         self.assertEqual(len(renditions), 6)
         self.assertTrue(all(r["data"]["coverage"] == "deferred" for r in renditions))
         entry = next(e for e in report["entries"]
-                     if e["relative"] == "a/FALCON+\u2014+ORR Checklist.doc")
+                     if e["relative"] == "a/SAMPLE+\u2014+Review Checklist.doc")
         sidecar = json.loads((self.root / Path(entry["original"]).parent / "submission.json")
                              .read_text())
-        self.assertEqual(sidecar["origin"], {"kind": "local-path", "system": "falcon-docs-inbox",
+        self.assertEqual(sidecar["origin"], {"kind": "local-path", "system": "example-docs-inbox",
                                              "locator": entry["locator"], "version": None})
         self.assertEqual(sidecar["original"]["sha256"],
                          hashlib.sha256((self.inbox / entry["relative"]).read_bytes()).hexdigest())
@@ -177,7 +177,7 @@ class IngestTests(CohortCase):
         broken = next(e for e in report["entries"] if e["relative"] == "a/broken.doc")
         self.assertEqual((broken["disposition"], broken["code"]), ("needs-reader", "mime-malformed"))
         self.assertNotIn("outcome", broken)
-        entry = next(e for e in report["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        entry = next(e for e in report["entries"] if e["relative"].endswith("Review Checklist.doc"))
         payload = json.loads((self.root / entry["rendition"]).read_text())["payload"]
         self.assertEqual(payload["format"], "mhtml")
         self.assertEqual(payload["method"]["name"], "mhtml-html-text")
@@ -185,19 +185,19 @@ class IngestTests(CohortCase):
 
     def test_text_entry_from_before_mime_recognition_is_corrected_not_kept(self):
         from tools.intake import upload
-        old = cohort.submission("a/FALCON+\u2014+ORR Checklist.doc", "inbox")
-        upload.submit(self.root, self.inbox / "a/FALCON+\u2014+ORR Checklist.doc", upload.descriptor(
+        old = cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox")
+        upload.submit(self.root, self.inbox / "a/SAMPLE+\u2014+Review Checklist.doc", upload.descriptor(
             submission_id=old["submission_id"], format_name="text", name=old["name"],
             actor="cohort-runner", reason="earlier toolkit", origin_kind="local-path",
             origin_system="inbox", origin_locator=old["locator"]))
         report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
-        entry = next(e for e in report["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        entry = next(e for e in report["entries"] if e["relative"].endswith("Review Checklist.doc"))
         self.assertEqual(entry["outcome"], "extracted")
         self.assertNotEqual(entry["submission_id"], old["submission_id"])
         sidecar = json.loads((self.root / Path(entry["original"]).parent / "submission.json").read_text())
         self.assertEqual(sidecar["correction_of"], old["submission_id"])
         again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
-        entry = next(e for e in again["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        entry = next(e for e in again["entries"] if e["relative"].endswith("Review Checklist.doc"))
         self.assertEqual(entry["outcome"], "extracted")
 
     def test_rerun_is_idempotent(self):
@@ -601,7 +601,7 @@ class QualifyCase(CohortCase):
             json.dumps({"audience": "authorized-local"}))
         (self.root / "documents").mkdir(parents=True, exist_ok=True)
         (self.root / "documents/context.md").write_text(
-            "# Cohort Context\nQualified Falcon cohort context.\n")
+            "# Cohort Context\nQualified sample cohort context.\n")
 
     def _transport(self, incomplete_text=None):
         calls = []
@@ -639,7 +639,7 @@ class QualifyTests(QualifyCase):
         from tools.context_index import context_index as index
         transport, calls = self._transport(incomplete_text="Just text")
         report = cohort.qualify(
-            self.root, self.inbox, system="falcon-docs-inbox", actor="cohort-runner",
+            self.root, self.inbox, system="example-docs-inbox", actor="cohort-runner",
             policy_path="config/standing-policy.local.json",
             manifest="config/selection.local.json",
             model="gpt-5.6-terra", transport=transport,
@@ -914,14 +914,14 @@ class QualifyTests(QualifyCase):
         from tools.extraction import mhtml
         transport, calls = self._transport()
         first = self._qualify(transport)
-        old = next(e for e in first["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        old = next(e for e in first["entries"] if e["relative"].endswith("Review Checklist.doc"))
         calls.clear()
         from tools.extraction import extract
         real = extract.fingerprint
         with patch.object(mhtml, "METHOD_VERSION", mhtml.METHOD_VERSION + 1), \
                 patch.object(extract, "fingerprint", lambda r, f: real(r, f)[::-1]):
             second = self._qualify(transport)
-        new = next(e for e in second["entries"] if e["relative"].endswith("ORR Checklist.doc"))
+        new = next(e for e in second["entries"] if e["relative"].endswith("Review Checklist.doc"))
         self.assertNotEqual(new["rendition"], old["rendition"])
         self.assertEqual(len(calls), 1)
         paths = [r["path"] for r in
@@ -1141,7 +1141,7 @@ class SharedManifestTests(QualifyCase):
 
     def test_a_cohort_pruned_by_an_earlier_toolkit_is_restored_from_saved_reviews(self):
         first, second = self.qualify("a"), self.qualify("b")
-        # What the toolkit before decision 0021 left behind after qualifying B: only B's selections.
+        # What the toolkit before cohort-scoped reconciliation (Kata xc2j) left behind after qualifying B: only B's selections.
         raw = json.loads(self.manifest.read_text())
         raw["renditions"] = [r for r in raw["renditions"]
                              if r["receipt_id"] in {e["receipt_id"] for e in second["entries"]
@@ -1342,7 +1342,7 @@ class SharedManifestTests(QualifyCase):
         catalog.initialize(root)
         events.initialize(root)
         (root / "config/policy.local.json").write_text(json.dumps({"audience": "authorized-local"}))
-        (root / "documents/context.md").write_text("# Cohort Context\nQualified Falcon cohort context.\n")
+        (root / "documents/context.md").write_text("# Cohort Context\nQualified sample cohort context.\n")
         self.root, self.manifest = root, root / "config/selection.local.json"
         self.transport, self.calls = self._transport()
 
@@ -1818,7 +1818,7 @@ class ScopePrecheckTests(QualifyCase):
         catalog.initialize(root)
         events.initialize(root)
         (root / "config/policy.local.json").write_text(json.dumps({"audience": "authorized-local"}))
-        (root / "documents/context.md").write_text("# Cohort Context\nQualified Falcon cohort context.\n")
+        (root / "documents/context.md").write_text("# Cohort Context\nQualified sample cohort context.\n")
         self.root, self.policy_file = root, root / "config/standing-policy.local.json"
         self.transport, self.calls = self._transport()
 

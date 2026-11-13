@@ -734,8 +734,8 @@ def _migrate_locked(home, db, backups, rebuild):
 def _binding(connection):
     """What a validation covers: the database file, the validator bytes and the runtime.
 
-    The file is bound by its identity (device, inode, size, mtime, ctime, SQLite change counter,
-    decision 0017) when it is a plain rollback-journal file; otherwise by the SHA-256 of its exact
+    The file is bound by its identity (device, inode, size, mtime, ctime, SQLite change counter;
+    docs/design/current-state.md, "What a catalog write validates") when it is a plain rollback-journal file; otherwise by the SHA-256 of its exact
     bytes. Either way it is taken once this connection holds the read snapshot, so no commit can
     land between the check and the validation it vouches for.
     """

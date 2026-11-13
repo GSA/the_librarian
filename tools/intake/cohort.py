@@ -25,7 +25,7 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import adapters, cli, model_review, runner, standing, store, throttle, upload
+from . import adapters, cli, model_review, runner, standing, store, throttle, upload, usage_log
 from . import contracts
 from .contracts import IntakeError, LedgerBusy
 
@@ -1160,7 +1160,9 @@ def main(argv=None):
             report = qualify(
                 args.root, args.inbox, system=args.system, actor=args.actor,
                 policy_path=args.policy_path, manifest=args.manifest, model=args.model,
-                transport=model_review.usai_transport(args.models_config),
+                transport=model_review.usai_transport(
+                    args.models_config,
+                    recorder=usage_log.Recorder("librarian intake", model_review.PROVIDER)),
                 context=args.context, index_path=args.index_path,
                 concurrency=args.concurrency, adaptive=not args.no_adaptive,
                 initial_concurrency=args.initial_concurrency,

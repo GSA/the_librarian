@@ -93,9 +93,9 @@ class SubmitTests(UploadCase):
 
     def test_local_path_origin_records_relative_locator_without_remote_identity(self):
         ack = upload.submit(self.root, self.file("Report_v2.md"), value(
-            name="Report_v2.md", origin_kind="local-path", origin_system="falcon-docs-inbox",
+            name="Report_v2.md", origin_kind="local-path", origin_system="example-docs-inbox",
             origin_locator="03-CONSUMED/2026 notes/Report v2.md"))
-        self.assertEqual(ack["origin"], {"kind": "local-path", "system": "falcon-docs-inbox",
+        self.assertEqual(ack["origin"], {"kind": "local-path", "system": "example-docs-inbox",
                                          "locator": "03-CONSUMED/2026 notes/Report v2.md",
                                          "version": None})
         self.assertEqual(ack["identity_basis"], "local-path-copy")
@@ -104,9 +104,9 @@ class SubmitTests(UploadCase):
         for locator in ("/abs/path.md", "../up.md", "a/./b.md", "a//b.md", "a\\b.md", None):
             with self.subTest(locator=locator):
                 self.assertCode("invalid_origin", value, origin_kind="local-path",
-                                origin_system="falcon-docs-inbox", origin_locator=locator)
+                                origin_system="example-docs-inbox", origin_locator=locator)
         self.assertCode("invalid_origin", value, origin_kind="local-path",
-                        origin_system="falcon-docs-inbox", origin_locator="a.md", origin_version="1")
+                        origin_system="example-docs-inbox", origin_locator="a.md", origin_version="1")
         self.assertCode("invalid_origin", value, origin_kind="local-path", origin_locator="a.md")
         self.assertCode("invalid_origin", value, origin_kind="remote-guess",
                         origin_system="x", origin_locator="a.md")
