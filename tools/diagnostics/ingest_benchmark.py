@@ -218,14 +218,24 @@ def run_replay(size, work, repeats, padding, kind):
     from tools.catalog import catalog_store as catalog
     from tools.intake import cohort, store
     root, inbox = work / "instance", work / "inbox"
-    built = root.exists()
-    if not built:
+    marker = work / "built.json"
+    wanted = {"files": size, "padding": padding, "fixture": kind}
+    built = marker.exists()
+    if built:
+        # Only a fully ingested fixture with exactly these parameters may be replayed.
+        if json.loads(marker.read_text()) != wanted:
+            raise SystemExit(f"{work} holds a different fixture ({marker.read_text().strip()}); "
+                             "use another --reuse directory")
+    else:
+        if work.exists() and any(work.iterdir()):
+            raise SystemExit(f"{work} holds an unfinished fixture; remove it or use another --reuse directory")
         root.mkdir(parents=True)
         store.initialize(root)
         catalog.initialize(root)
         fixture(inbox, size, padding=padding, mixed=None if kind == "text" else kind)
         first = cohort.ingest(root, inbox, system="bench", actor="bench")
         assert first["counts"]["outcome"]["extracted"] == size, first["counts"]["outcome"]
+        marker.write_text(json.dumps(wanted, sort_keys=True))
     inbox_bytes = sum(path.stat().st_size for path in inbox.rglob("*") if path.is_file())
     result = {"files": size, "reused": built, "inbox_bytes": inbox_bytes,
               "replay": replay(cohort, root, inbox, size, repeats)}
