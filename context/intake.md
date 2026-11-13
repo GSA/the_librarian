@@ -391,7 +391,7 @@ per entry, including entries already qualified under the old version, and the fi
 entries previously refused. Entries still refused cost nothing. A later re-run with the policy
 unchanged costs 0 calls. Do not edit the scope without raising `version`: the new-hash reviews
 then block as `conflicting-review`. Requalify every cohort afterwards, since publication refuses a
-selection citing an older version (0021). Estimate the cost first from `counts.out_of_scope.entries`
+selection citing an older version. Estimate the cost first from `counts.out_of_scope.entries`
 plus the already-qualified count times the sample's tokens per document.
 `--concurrency N` (default 6) keeps up to N model calls in flight, each for a
 rendition with no saved `standing-<...>` request; staging, runs, selection,
