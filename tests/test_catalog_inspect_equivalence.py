@@ -129,11 +129,21 @@ class Case(unittest.TestCase):
                 for action in ("update", "delete"):
                     connection.execute(f"DROP TRIGGER IF EXISTS immutable_{table}_{action}")
             connection.execute("PRAGMA foreign_keys=OFF")
+            # With the lookup indexes present SQLite itself refuses a malformed-JSON payload edit, so the
+            # edit is made on the legacy shape and the lookup structures are rebuilt from the edited
+            # payloads where SQLite accepts them: inspect is compared on both shapes with the reference.
+            catalog.drop_lookup(connection)
             for sql, *params in statements:
                 try:
                     connection.execute(sql, params)
                 except sqlite3.IntegrityError:
                     pass  # SQLite's own constraint refused this edit; the database is unchanged
+            try:
+                connection.execute("BEGIN")
+                catalog.create_lookup(connection)
+                connection.execute("COMMIT")
+            except sqlite3.Error:
+                connection.execute("ROLLBACK")  # malformed JSON cannot be indexed: stays the legacy shape
             if triggers:  # leave only the intended edit, so the refusal is not the dropped trigger's
                 for table in ("metadata", "revisions", "versions"):
                     for action in ("update", "delete"):

@@ -32,6 +32,8 @@ def parser():
                       help="Transactionally relocate initialized stores to configured storage_roots")
     mode.add_argument("--recover-migration", action="store_true",
                       help="Roll back an interrupted storage_roots migration")
+    mode.add_argument("--migrate-catalog-indexes", action="store_true",
+                      help="Add the lookup indexes to an existing catalog that lacks them (idempotent)")
     mode.add_argument("--relocate", action="store_true",
                       help="Rebind operational recovery ledgers after an approved host-path relocation")
     return p
@@ -44,6 +46,9 @@ def main(argv=None):
         if args.recover_migration:
             report = policy.recover_migration(root)
             print(json.dumps(report))
+            return 0
+        if args.migrate_catalog_indexes:
+            print(json.dumps(command(root, "tools.catalog.catalog_store", "migrate-indexes")))
             return 0
         if args.migrate_storage:
             report = policy.migrate_storage(root)
