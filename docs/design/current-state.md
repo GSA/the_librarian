@@ -336,7 +336,7 @@ synthetic documents the two scans were about half of the time per document).
   rows the replayed payloads imply). Anything between, a changed definition or a missing,
   extra, altered or moved `refs` row is refused ("Catalog lookup structures are incomplete or
   differ ..."). `PRAGMA integrity_check` already covers the index pages. A forged receipt cannot hide this
-  past the daily replay or `status --audit`, like any other edit.
+  past the daily replay or `audit`, like any other edit.
 - **Schema version unchanged.** The authority data, the hash chain, every state token and the
   `contract_version` metadata are the same, so `VERSION` stays 1. Bumping it would refuse every existing
   catalog and invalidate every backup receipt (`backup_version == VERSION`) for a change that
@@ -348,13 +348,14 @@ synthetic documents the two scans were about half of the time per document).
   `python -m tools.catalog.catalog_store migrate-indexes [--check|--rebuild]`). Under the writer lock and one
   `BEGIN IMMEDIATE` transaction it fully inspects, publishes a verified `pre-index-migration` snapshot,
   creates the indexes, fills `refs`, inspects again and requires the identical state, then commits and
-  attests the new bytes. Any failure rolls back, a killed process leaves SQLite's rollback journal
-  (restored when the file is next opened, leaving a working `legacy` catalog), and a second run only
-  verifies. `--rebuild` drops damaged or half-present structures in the same transaction and recreates them,
+  attests the new bytes. Any failure rolls back. A killed process leaves SQLite's rollback journal, which
+  `connect` refuses like any other unsupported sidecar; `migrate-indexes --recover` (writer lock held; WAL and
+  shared-memory sidecars still refused) lets SQLite roll it back to the earlier, `legacy` file, fully verifies it and
+  migrates. A second run only verifies. `--rebuild` drops damaged or half-present structures in the same transaction and recreates them,
   and succeeds only if the rest of the catalog verifies. `--check` writes nothing.
 - **Restore.** A snapshot taken after the migration carries the structures and restores as `indexed`; a
   snapshot from before it restores as `legacy` and works unchanged (slower) until `migrate-indexes` is run
-  again. `status --audit` and `verify-backup` verify whichever shape they find.
+  again. `audit` and `verify-backup` verify whichever shape they find.
 - Measured on synthetic production-shaped catalogs (4 and 3 records per document; shared host, CPU time
   per document of a first ingest into a catalog already holding N documents): 130 to 103 ms at 2,000,
   296 to 126 ms at 10,000, 977 to 260 ms at 40,000; the catalog grows 10% at 40,000 (291 to 311 MB) and the migration

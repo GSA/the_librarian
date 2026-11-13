@@ -650,7 +650,27 @@ def initialize(root):
                 partial.unlink()
 
 
-def migrate_indexes(root, *, rebuild=False, check=False):
+def _recover_journal(db):
+    """Let SQLite roll back the rollback journal an interrupted writer left; nothing else is touched.
+
+    Called only with the writer lock held, so no live writer can own the journal. Any other sidecar
+    (WAL, shared memory) is still refused. The caller verifies the recovered catalog in full.
+    """
+    for suffix in ("-wal", "-shm"):
+        require(not safe_path(str(db) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+    journal = safe_path(str(db) + "-journal")
+    if not journal.exists():
+        return False
+    require(journal.is_file() and stat.S_IMODE(journal.stat().st_mode) == 0o600,
+            "SQLite sidecar present; explicit recovery required")
+    with closing(sqlite3.connect(private_file(db).as_uri() + "?mode=rw", uri=True, isolation_level=None,
+                                 timeout=BUSY_TIMEOUT_SECONDS)) as connection:
+        connection.execute("SELECT count(*) FROM sqlite_master").fetchone()  # opening rolls a hot journal back
+    require(not journal.exists(), "SQLite sidecar present; explicit recovery required")
+    return True
+
+
+def migrate_indexes(root, *, rebuild=False, check=False, recover=False):
     """Add the lookup structures to a catalog that lacks them (Kata 1h7h); idempotent and crash-safe.
 
     One writer transaction under the writer lock: fully inspect the catalog, publish a verified
@@ -660,7 +680,9 @@ def migrate_indexes(root, *, rebuild=False, check=False):
     and every state token are unchanged. A catalog that already has the structures is only verified.
     ``rebuild`` first drops whatever lookup structures exist (damaged or incomplete) in the same
     transaction, so it succeeds only when everything else in the catalog verifies. ``check``
-    reports the shape and verifies without writing.
+    reports the shape and verifies without writing. A process killed mid-migration leaves SQLite's
+    rollback journal, which every other command refuses; ``recover`` (writer lock held) lets SQLite roll
+    it back, then migrates as usual, so the catalog returns to a verified state before anything is written.
     """
     home, db, backups = locations(root)
     private_file(db)
@@ -670,7 +692,17 @@ def migrate_indexes(root, *, rebuild=False, check=False):
             shape = lookup_shape(connection)
             state = None if shape == "partial" else inspect(connection, detail=False)[0]
             return {"command": "migrate-indexes", "migrated": False, "lookup": shape, "state": state}
-    with writer_lock(home), closing(connect(db, write=True)) as connection:
+    with writer_lock(home):
+        if recover:
+            _recover_journal(db)
+        elif safe_path(str(db) + "-journal").exists():
+            raise CatalogError("SQLite sidecar present; explicit recovery required: "
+                               "run migrate-indexes --recover after confirming no other process is migrating")
+        return _migrate_locked(home, db, backups, rebuild)
+
+
+def _migrate_locked(home, db, backups, rebuild):
+    with closing(connect(db, write=True)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             shape = lookup_shape(connection)
@@ -1412,6 +1444,8 @@ def main(argv=None):
     migrate = commands.add_parser("migrate-indexes", help="Add the lookup indexes to a catalog that lacks them")
     migrate.add_argument("--check", action="store_true", help="Report the lookup shape and verify; write nothing")
     migrate.add_argument("--rebuild", action="store_true", help="Drop and recreate damaged or incomplete lookup structures")
+    migrate.add_argument("--recover", action="store_true",
+                         help="Let SQLite roll back the journal of a migration that was killed, then verify and migrate")
     verify = commands.add_parser("verify-backup")
     verify.add_argument("snapshot", type=Path)
     recover = commands.add_parser("restore")
@@ -1441,8 +1475,8 @@ def main(argv=None):
         elif args.command == "backup":
             result = backup(args.root)
         elif args.command == "migrate-indexes":
-            require(not (args.check and args.rebuild), "--check writes nothing, so it cannot rebuild")
-            result = migrate_indexes(args.root, rebuild=args.rebuild, check=args.check)
+            require(not (args.check and (args.rebuild or args.recover)), "--check writes nothing, so it cannot rebuild or recover")
+            result = migrate_indexes(args.root, rebuild=args.rebuild, check=args.check, recover=args.recover)
         elif args.command == "verify-backup":
             result = verify_backup(args.snapshot)
         elif args.command == "restore":

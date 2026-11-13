@@ -411,14 +411,28 @@ class Migration(Case):
             "c.migrate_indexes(Path(%r))\n" % (str(ROOT), str(root)))
         self.assertEqual(subprocess.run([sys.executable, "-c", script], cwd=ROOT).returncode, 9)
         db = catalog.locations(root)[1]
-        # SQLite rolls a hot journal back when the file is next opened; that is the documented recovery.
-        with closing(sqlite3.connect(db)) as connection:
-            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
-        self.assertFalse(Path(str(db) + "-journal").exists())
-        self.assertEqual(lookup_names(root), set())
+        journal = Path(str(db) + "-journal")
+        self.assertTrue(journal.exists())  # the kill left SQLite's rollback journal behind
+        for action in (lambda: catalog.status(root), lambda: catalog.migrate_indexes(root)):
+            with self.assertRaisesRegex(CatalogError, "sidecar present"):
+                action()
+        with self.assertRaisesRegex(CatalogError, "migrate-indexes --recover"):
+            catalog.migrate_indexes(root)
+        result = catalog.migrate_indexes(root, recover=True)  # explicit, under the writer lock, fully verified
+        self.assertTrue(result["migrated"])
+        self.assertFalse(journal.exists())
         self.assertEqual(self.audit(root)["revision"], 5)
-        self.assertTrue(catalog.migrate_indexes(root)["migrated"])
-        self.assertEqual(self.audit(root)["revision"], 5)
+        self.assertEqual(catalog.migrate_indexes(root, check=True)["lookup"], "indexed")
+
+    def test_recovery_is_refused_for_other_sidecars_and_when_there_is_nothing_to_recover(self):
+        root = self.legacy_with_history(2)
+        db = catalog.locations(root)[1]
+        self.assertTrue(catalog.migrate_indexes(root, recover=True)["migrated"])  # no journal: nothing special
+        wal = Path(str(db) + "-wal")
+        wal.write_bytes(b"")
+        wal.chmod(0o600)
+        with self.assertRaisesRegex(CatalogError, "sidecar present"):
+            catalog.migrate_indexes(root, recover=True)
 
     def test_a_tampered_legacy_catalog_is_refused_not_indexed(self):
         root = self.legacy_with_history()

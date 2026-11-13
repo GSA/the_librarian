@@ -213,9 +213,12 @@ python -m tools.initialize --migrate-catalog-indexes      # idempotent; verifies
 python -m tools.catalog.catalog_store migrate-indexes --check   # report "legacy" or "indexed"; writes nothing
 ```
 
-If `status --audit` reports "Catalog lookup structures are incomplete or differ", run
+If `audit` reports "Catalog lookup structures are incomplete or differ", run
 `python -m tools.catalog.catalog_store migrate-indexes --rebuild`: it recreates them only when the rest of the catalog
 verifies. Restoring a snapshot taken before the migration yields a working catalog without them; run the migration again.
+If a migration process was killed it can leave SQLite's rollback journal, which every command refuses as an unsupported
+sidecar: confirm no catalog process is running, then run `migrate-indexes --recover`, which (under the writer lock) lets
+SQLite roll the journal back, verifies the catalog in full and migrates.
 
 `ledger_scale_benchmark.py` reports `full_ledger_validations`; it should be about 1 per
 process, not about 2 per file. Timings come from a shared host: compare shapes, CPU and
