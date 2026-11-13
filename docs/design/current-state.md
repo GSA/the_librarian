@@ -42,8 +42,15 @@ restated here.
   `tests/test_kit.py::test_native_review_correction_retry_and_restore`
   (`DELETE FROM events` aborts), `tests/test_intake.py::test_wrong_identity_modes_and_missing_store_refuse`,
   `tests/test_kit.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
-  Not pinned by a test: the review-event `contract_hash` refusal
-  (`event_store.py`), `synchronous=FULL` on the three stores (Katas dp9y, 0dz3).
+  The review-event `contract_hash` refusal is pinned by
+  `tests/test_review_event_contract.py`: an out-of-band edit of the stored hash
+  and a change to the installed schema each make `status`, `audit`, `append`,
+  `backup`, `restore`, snapshot verification and the reader refuse with the
+  explicit-migration message and leave the file unchanged, including when the
+  edit preserves inode, size and mtime (so a validation cache keyed on file
+  identity cannot bypass it). `init` never overwrites, so the only way forward
+  is an empty re-initialization beside the refused store. Not pinned by a test:
+  `synchronous=FULL` on the three stores (Kata 0dz3).
 - **Upgrade behavior.** Code never migrates an authority store implicitly: a
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
