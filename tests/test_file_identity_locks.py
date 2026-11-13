@@ -1,4 +1,4 @@
-"""file_identity() must never drop the SQLite locks this process holds (Kata kkmv, decision 0017)."""
+"""file_identity() must never drop the SQLite locks this process holds (Kata kkmv; docs/design/current-state.md, "What a catalog write validates")."""
 from contextlib import closing
 import os
 from pathlib import Path

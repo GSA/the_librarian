@@ -30,8 +30,8 @@ restated here.
 
   | Kind | Stores | Rule of thumb |
   |---|---|---|
-  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step **(untested)**. |
-  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`) | Private work intent. Cannot reconstruct authority. |
+  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step (`tests/test_authority_store_upgrade_paths.py`). |
+  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
   Evidence: `tests/test_kit.py::test_new_application_ids_and_superseded_refusal`
@@ -42,8 +42,37 @@ restated here.
   `tests/test_kit.py::test_native_review_correction_retry_and_restore`
   (`DELETE FROM events` aborts), `tests/test_intake.py::test_wrong_identity_modes_and_missing_store_refuse`,
   `tests/test_kit.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
-  Not pinned by a test: the review-event `contract_hash` refusal
-  (`event_store.py`), `synchronous=FULL` on the three stores (Katas dp9y, 0dz3).
+  The review-event `contract_hash` refusal is pinned by
+  `tests/test_review_event_contract.py`: an out-of-band edit of the stored hash
+  and a change to the installed schema each make `status`, `audit`, `append`,
+  `backup` and the reader refuse with the explicit-migration message and leave
+  the file unchanged, including when the edit preserves inode, size and mtime
+  (so a validation cache keyed on file identity cannot bypass it). After a
+  schema change, snapshots taken under the old contract also refuse in
+  `verified_snapshot` and `restore`; an edit of only the live store's hash does
+  not invalidate earlier snapshots (not tested as a recovery path). `init`
+  never overwrites, so the tested way forward is an empty re-initialization
+  beside the refused store.
+  `tests/test_authority_store_upgrade_paths.py` builds populated catalog and
+  review-event stores in temporary release copies, bumps `user_version` or
+  changes the contract marker (catalog `contract_version`, review-event
+  `contract_hash`), and asserts that `initialize` (plain, `--relocate`,
+  `--migrate-storage`, `--recover-migration` with and without an interrupted
+  migration), each store CLI (`init`, `status`, `audit`, `backup`, `restore`,
+  `query`/`export`, `submit`/`append`, `get`), the context-index catalog
+  command and the review-event reader refuse and leave every file of the
+  instance byte-identical. `init` refuses an existing store before opening it;
+  an interrupted-migration recovery rolls store files back to their old location before it refuses, keeps its journal and leaves the database bytes unchanged (it never repairs a store); the
+  intake progress view reports the catalog as unavailable; and a derived-index
+  build never rewrites an authority store.
+  Durability: every write connection the catalog, review-event and intake stores
+  open (init, write, backup-init, intake `locked` and `relocate`) runs with
+  `synchronous=FULL` on a rollback journal (`journal_mode=delete`), pinned by
+  `tests/test_store_durability.py` (Kata 0dz3). `synchronous` is per connection and
+  not stored in the file, so the tests read it on each connection that executed a
+  write, after starting it at `OFF`; weakening or dropping any of the seven pragma
+  sites fails them. `Connection.backup` copy targets are not covered: they are
+  fsynced and hash-verified before use rather than relying on the pragma.
 - **Upgrade behavior.** Code never migrates an authority store implicitly: a
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
@@ -84,9 +113,13 @@ restated here.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
-  (`tests/test_mcp.py`). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
+  (`tests/test_mcp.py`). The runtime probe refuses, with a non-zero exit and an
+  explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
+  and missing FTS5, and reports the Python, SQLite and `mcp` versions and
+  `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
+  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
   are ranges and transitive dependencies are unpinned. There is no lock file,
-  image or installer, and no failing-probe test (Kata vckd). Whether those are
+  image or installer. Whether those are
   wanted is an open product question, not a commitment (Kata 7jkt).
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
@@ -260,7 +293,7 @@ restated here.
   removed after the new snapshot verifies; nothing is deleted unless a verified
   snapshot remains in the window; a retention failure never fails the write.
   `python3 -m tools.backups prune` is a dry run unless `--apply`.
-- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` and
+- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` (`tests/test_store_durability.py`) and
   the hash-chained history: the worst case restores the day's first snapshot and
   replays that day's requests by their original request ids. This is a deliberate
   trade against per-write snapshots, which in one measured cohort produced 5,815
@@ -336,6 +369,61 @@ rebase, daily snapshot on the fast path), `tests/test_catalog_identity_binding.p
 valid history and about 100 tamperings: same result or same refusal message),
 `tests/test_validation_cost.py`.
 
+### Lookup indexes and the `refs` table
+
+A write needs two lookups into the committed state: the current records that reference a
+record the batch rewrites (`referrers`), and the current artifacts that already hold a path
+the batch moves (`claimants`). They used to be `instr(payload, ?)` scans over every current
+record, so each write cost O(catalog) and a first ingest grew quadratically (at 40,000
+synthetic documents the two scans were about half of the time per document).
+
+- **Structures** (`LOOKUP_OBJECTS` in `catalog_store.py`, mirrored in `tools/schemas/catalog.sql`):
+  partial expression indexes on `versions` for `$.data.path`, `receipt_id`, `parent_id`,
+  `artifact_id`, `from_id` and `to_id`, and `refs(ref, revision, ordinal)`, one row per
+  `source_ids` entry of every *receipt version*, kept by an `AFTER INSERT` trigger on `versions`.
+  `source_ids` is an array, which an expression index cannot cover. `refs` is keyed by version,
+  not record, so it is append-only like `versions` (a rewritten receipt adds rows and deletes none)
+  and the lookup keeps only versions that are still current. The probe is one `IN (...)` query per
+  field joined to `current_records` by `EXISTS`, not `JOIN`: a join made SQLite scan.
+  Nothing in them is authority; they are derived from `versions`.
+- **Two valid shapes.** `inspect` accepts a catalog with none of the structures (`legacy`, the
+  scans, slower and decision-identical) or with all of them exactly as specified (`indexed`; the
+  `sqlite_master` SQL of every object is compared with the code's text, and `refs` must equal the
+  rows the replayed payloads imply). Anything between, a changed definition or a missing,
+  extra, altered or moved `refs` row is refused ("Catalog lookup structures are incomplete or
+  differ ..."). `PRAGMA integrity_check` already covers the index pages. A forged receipt cannot hide this
+  past the daily replay or `audit`, like any other edit.
+- **Schema version unchanged.** The authority data, the hash chain, every state token and the
+  `contract_version` metadata are the same, so `VERSION` stays 1. Bumping it would refuse every existing
+  catalog and invalidate every backup receipt (`backup_version == VERSION`) for a change that
+  adds no authority data. The cost of this choice is that two binaries disagree about shape only in speed:
+  a catalog written by older code keeps working (the trigger keeps `refs` current for any writer, including
+  an older binary), and older `inspect` ignores the extra objects.
+- **Migration.** New catalogs get the structures at `init`. An existing catalog is migrated explicitly
+  and never implicitly: `python -m tools.initialize --migrate-catalog-indexes` (or
+  `python -m tools.catalog.catalog_store migrate-indexes [--check|--rebuild]`). Under the writer lock and one
+  `BEGIN IMMEDIATE` transaction it fully inspects, publishes a verified `pre-index-migration` snapshot,
+  creates the indexes, fills `refs`, inspects again and requires the identical state, then commits and
+  attests the new bytes. Any failure rolls back. A killed process leaves SQLite's rollback journal, which
+  `connect` refuses like any other unsupported sidecar; `migrate-indexes --recover` (writer lock held; WAL and
+  shared-memory sidecars still refused) lets SQLite roll it back to the earlier, `legacy` file, fully verifies it and
+  migrates. A second run only verifies. `--rebuild` drops damaged or half-present structures in the same transaction and recreates them,
+  and succeeds only if the rest of the catalog verifies. `--check` writes nothing.
+- **Restore.** A snapshot taken after the migration carries the structures and restores as `indexed`; a
+  snapshot from before it restores as `legacy` and works unchanged (slower) until `migrate-indexes` is run
+  again. `audit` and `verify-backup` verify whichever shape they find.
+- Measured on synthetic production-shaped catalogs (4 and 3 records per document; shared host, CPU time
+  per document of a first ingest into a catalog already holding N documents): 130 to 103 ms at 2,000,
+  296 to 126 ms at 10,000, 977 to 260 ms at 40,000; the catalog grows 10% at 40,000 (291 to 311 MB) and the migration
+  takes about 20 s there. Rerun with `tools/diagnostics/ingest_benchmark.py` on a seeded instance.
+- Evidence: `tests/test_catalog_lookup_indexes.py` (randomized decisions equal with and without the
+  indexes and equal to `validate_graph`; referrer and claimant results equal brute force on every step; a
+  receipt whose `source_ids` reference an existing source; only current receipt versions count;
+  query plans use indexes, no scan; tamper tests for each dropped or altered index, `refs` table, trigger
+  and row; a corrupted index page; migration idempotency, snapshot, failed and killed migration,
+  rebuild, restore of an older snapshot, command line), and `tests/test_catalog_inspect_equivalence.py`
+  (`inspect` equals the reference on both shapes).
+
 ### Trust model and residual risk (kept)
 
 - The catalog receipt and the ledger hand-off attestation are **unkeyed**. For the
@@ -363,7 +451,7 @@ valid history and about 100 tamperings: same result or same refusal message),
   `test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt`,
   `test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot`).
   The ledger's equivalent residual (a file rewrite that preserves identity and
-  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k. "Never migrated or rebuilt" for authority stores is likewise only partly tested (Kata 5jjd).
+  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k.
 - **Never close a descriptor on a database file while a connection to it is open
   in this process.** On POSIX, closing any descriptor drops all of the process's
   fcntl locks on that file, including SQLite's, which let a concurrent commit tear a
@@ -371,6 +459,49 @@ valid history and about 100 tamperings: same result or same refusal message),
   "database disk image is malformed"). `tools/file_identity.py` therefore reads
   stat fields from the path and the change counter from page 1 through the open
   connection. Evidence: `tests/test_file_identity_locks.py`.
+
+### Review-event validation
+
+Every read of the review-event history (`event_reader.read_snapshot`, `event_store.status`,
+`append`) used to validate all of it: SQLite integrity, hash chains, schema, correction
+index. `qualify` did that about nine times per entry, so its serial toolkit cost grew about
+1.1 ms per prior event (Kata r71k, from efz3).
+
+- **Memo.** `event_store.inspect(..., reuse=True)` keeps the last validated result per
+  database file **in process memory** (never written to disk, at most eight files). It is
+  reused only when the file's identity (device, inode, size, mtime_ns, ctime_ns, SQLite
+  change counter, from `tools/file_identity.py`), the installed contract hash and the UTC
+  date all equal those of the validation, the connection was opened by
+  `event_store.connect` on that same device and inode, and the chain heads and correction
+  count re-read from the file equal the remembered state. A journal or WAL beside the
+  file, a build without `sqlite_dbpage`, or any other connection validates in full and
+  stores nothing. A result is stored only when the identity is the same before and after
+  the pass, so a commit that lands during validation is never remembered; a failed
+  validation is never stored. Callers receive fresh state and event-list containers (the
+  event dictionaries are shared and read-only by contract).
+- **Invalidation.** Any commit (by this or another process), restore, swapped file,
+  same-size edit (even with a restored mtime, because `utime` moves ctime), changed
+  contract or new UTC day misses and revalidates everything with the unchanged
+  refusals. `event_store.py audit` (and `status(audit=True)`) always replays
+  and first forgets the file, so a refusing audit leaves nothing to serve.
+- **Cost.** Synthetic, zero-latency stub, concurrency 1, `nice`d on a shared host
+  (`qualify` per-entry serial ms, first decile to last decile): 400 documents 89 to 432
+  before, 66 to 149 after (mean 257 to 104); 1,200 documents 168 to 1,425 before, 120 to 388
+  after (mean 770 to 242; qualify total 937 s to 303 s). Results, event ids and the manifest are unchanged (the `qualify` tests
+  are the same). What remains is what the memo does not touch: each event append still
+  validates `existing + incoming` once, each new commit costs one full validation at the
+  next read, and `qualify` still reads a snapshot per entry, so the cost still grows with
+  event count (about 0.25 ms per prior event after, against about 1.1 ms before). Removing
+  that term needs an O(delta) check (Kata m0tg).
+- **Residual** (the catalog receipt's, 0017). The memo is unkeyed. An edit that restores
+  size, mtime, ctime and the change counter *and* leaves the last event and batch hashes
+  and the correction count unchanged is served from the memo until this process's first
+  validation of the next UTC day, a restart of the process, or an audit, which replay
+  everything and refuse. It is not a defense against an actor who can write the file.
+  Evidence: `tests/test_review_event_memo.py` (reuse, same-size edit with and without
+  restored mtime, swapped and swapped-tampered file, a connection opened before a swap,
+  a concurrent writer process's commit, an overlapping commit, the stated residual and its
+  expiry, contract change, audit).
 
 ### Concurrent writers
 

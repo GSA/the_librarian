@@ -309,7 +309,7 @@ def catalog_view(root, probe=()):
     """The validated catalog state and a ``Taken`` for the current records, from one snapshot.
 
     Only the highest ``S``/``D`` numbers and which ``probe`` IDs exist are read; the current
-    records are never materialized (decision 0020).
+    records are never materialized (see "Intake ledger" in docs/design/current-state.md).
     """
     probe = sorted(set(probe))
     try:
@@ -330,7 +330,7 @@ def catalog_view(root, probe=()):
 # Promised IDs of a saved request, by the SHA-256 the ledger stores for its exact bytes. The key is
 # the content, so a hit is correct for any row carrying that digest; a rewritten request has a
 # different digest and is decoded afresh. Each fresh entry is checked against its own bytes, and
-# the ledger's validation (or its attested hand-off, decision 0014) is what ties every other
+# the ledger's validation (or its attested hand-off, see "Intake ledger" in docs/design/current-state.md) is what ties every other
 # stored digest to its row. The memo is per process, bounded, and never persisted.
 PROMISES = {}
 PROMISES_LIMIT = 65536

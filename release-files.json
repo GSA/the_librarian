@@ -23,6 +23,7 @@
   "tests/test_intake_ledger_scaling.py",
   "tests/test_mhtml.py",
   "tests/test_model_review.py",
+  "tests/test_usage_log.py",
   "tests/test_intake_progress.py",
   "tests/test_progress_scale.py",
   "tools/intake/__init__.py",
@@ -35,6 +36,7 @@
   "tools/intake/upload.py",
   "tools/intake/cohort.py",
   "tools/intake/model_review.py",
+  "tools/intake/usage_log.py",
   "tools/intake/progress.py",
   "tools/schemas/intake.sql",
   "tests/support.py",
@@ -100,7 +102,9 @@
   "tests/test_catalog_daily_snapshot.py",
   "tests/test_catalog_identity_binding.py",
   "tests/test_catalog_inspect_equivalence.py",
+  "tests/test_catalog_lookup_indexes.py",
   "tests/reference_inspect.py",
   "tests/test_validation_cost.py",
-  "tests/test_upload_planning.py"
+  "tests/test_upload_planning.py",
+  "tests/test_store_durability.py"
 ]

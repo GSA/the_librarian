@@ -11,9 +11,11 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import threading
 import uuid
 
 from tools import backups as snapshots
+from tools.file_identity import file_identity
 from tools.review_events import review_events as contract
 
 
@@ -152,17 +154,36 @@ def writer_lock(home):
         os.close(descriptor)
 
 
+class _Connection(sqlite3.Connection):
+    """Remembers the (device, inode) it opened, so a memoized validation is never bound to a
+    different file that was moved into the path afterwards."""
+    opened = None
+
+
+def _file_key(path):
+    info = os.stat(path)
+    return (info.st_dev, info.st_ino)
+
+
 def connect(path, write=False):
     private_file(path)
+    before = _file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=0, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA trusted_schema=OFF")
-    if write:
-        connection.execute("PRAGMA synchronous=FULL")
-        require(connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete",
-                "Unsupported journal mode; do not change storage pragmas")
+                                 uri=True, timeout=0, isolation_level=None, factory=_Connection)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        if write:
+            connection.execute("PRAGMA synchronous=FULL")
+            require(connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete",
+                    "Unsupported journal mode; do not change storage pragmas")
+        # The statements above opened the file; the path must still be the same file.
+        require(_file_key(path) == before, "Review-event file replaced while opening; retry")
+        connection.opened = before
+    except (contract.ReviewError, OSError, sqlite3.Error):
+        connection.close()
+        raise
     return connection
 
 
@@ -177,7 +198,103 @@ def seal(path):
     fsync_directory(path.parent)
 
 
-def inspect(connection, root=None):
+# Validated results kept in memory, one per database file (Kata r71k). The trust model is that of
+# the catalog's read receipt (docs/design/current-state.md, "What a catalog write validates") without a file: a result is reused only for the
+# identical file (device, inode, size, mtime, ctime and SQLite change counter), the same contract
+# and the same UTC day, after the chain heads re-derived from the file still equal the remembered
+# state; it is stored only when the identity is the same before and after the pass; it is never
+# written to disk, and a failed or partial validation is never stored. Callers get copies.
+_MEMO = {}
+_MEMO_LOCK = threading.Lock()
+_MEMO_LIMIT = 8
+
+
+def clear_memo():
+    """Forget every remembered validation (tests, and any caller that wants a full pass next)."""
+    with _MEMO_LOCK:
+        _MEMO.clear()
+
+
+def forget(path):
+    with _MEMO_LOCK:
+        _MEMO.pop(path, None)
+
+
+def _today():
+    return snapshots.utcnow().strftime("%Y-%m-%d")
+
+
+def _heads(connection):
+    """Chain heads and counts straight from the file: two index probes and the corrections count."""
+    event = connection.execute("SELECT sequence,entry_hash FROM events ORDER BY sequence DESC LIMIT 1").fetchone()
+    batch = connection.execute("SELECT revision,batch_hash FROM batches ORDER BY revision DESC LIMIT 1").fetchone()
+    return (event[0] if event else 0, event[1] if event else "", batch[0] if batch else 0,
+            batch[1] if batch else "", connection.execute("SELECT count(*) FROM corrections").fetchone()[0])
+
+
+def _state_heads(state):
+    return (state["events"], state["head_hash"], state["revision"], state["batch_head_hash"],
+            state["events"] - state["active_events"])
+
+
+def _binding(connection):
+    """``(path, identity)`` the memo may be keyed by, or None when this connection cannot be bound."""
+    path = connection.execute("PRAGMA database_list").fetchone()["file"]
+    if not path:
+        return None
+    try:
+        identity = file_identity(path, connection)
+    except OSError:
+        return None
+    opened = getattr(connection, "opened", None)
+    if identity is None or opened is None or opened != (identity[0], identity[1]):
+        return None
+    return path, identity
+
+
+def inspect(connection, root=None, *, reuse=False):
+    """Validate the whole history; with ``reuse`` an identical, unchanged file is served from memory.
+
+    ``reuse`` applies only to connections opened by ``connect``; any other connection, a journal
+    beside the file or a build without ``sqlite_dbpage`` validates in full and stores nothing.
+    The returned state and event list are fresh containers; the event dictionaries are shared with
+    the memo and are read-only by contract (no caller changes a validated event).
+    """
+    if not reuse:
+        return _inspect(connection, root)
+    own = not connection.in_transaction
+    if own:
+        connection.execute("BEGIN")
+    try:
+        # Take the read snapshot before looking at the file; no commit can land inside it.
+        connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        binding = _binding(connection)
+        if binding is None:
+            return _inspect(connection, root)
+        path, identity = binding
+        key = (identity, fingerprint(store_schema(root)), _today())
+        with _MEMO_LOCK:
+            entry = _MEMO.get(path)
+        if entry is not None and entry[0] == key:
+            _, state, history = entry
+            if (connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
+                    and connection.execute("PRAGMA user_version").fetchone()[0] == VERSION
+                    and _heads(connection) == _state_heads(state)):
+                return dict(state), list(history)
+            forget(path)
+        result = _inspect(connection, root)
+        if _binding(connection) == binding:
+            with _MEMO_LOCK:
+                if path not in _MEMO and len(_MEMO) >= _MEMO_LIMIT:
+                    _MEMO.clear()
+                _MEMO[path] = (key, dict(result[0]), list(result[1]))
+        return result
+    finally:
+        if own and connection.in_transaction:
+            connection.execute("COMMIT")
+
+
+def _inspect(connection, root=None):
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     require(application_id != SUPERSEDED_APPLICATION_ID,
             "Superseded FREV review-event identity; explicit migration or re-initialization is required")
@@ -349,7 +466,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
     input_hash = fingerprint(incoming)
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db, write=True)) as connection:
-        state, existing = inspect(connection, root)
+        state, existing = inspect(connection, root, reuse=True)
         prior = connection.execute("SELECT * FROM batches WHERE request_id=?", (request_id,)).fetchone()
         if prior is not None:
             require(prior["actor"] == actor and prior["input_hash"] == input_hash,
@@ -405,7 +522,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
                     "Do not resubmit as a new request; retry the same request or run backup."
                 ) from error
             raise
-        return {"command": "append", "idempotent": False, **inspect(connection, root)[0],
+        return {"command": "append", "idempotent": False, **inspect(connection, root, reuse=True)[0],
                 "backup": taken, "retention": retention}
 
 
@@ -497,11 +614,14 @@ def restore(root, source, expected_state=None):
 
 
 
-def status(root, event_id=None):
+def status(root, event_id=None, audit=False):
+    """Validated state; ``audit`` always replays the whole history and forgets what was remembered."""
     _, db, _ = locations(root)
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
-        state, events = inspect(connection, root)
+        if audit:
+            forget(str(db))
+        state, events = inspect(connection, root, reuse=not audit)
         if event_id is None:
             return {"command": "status", **state}
         matches = [e for e in events if e["event_id"] == event_id]
@@ -542,7 +662,7 @@ def main(argv=None):
         elif args.command == "init":
             result = initialize(args.root)
         elif args.command in ("status", "audit"):
-            result = status(args.root)
+            result = status(args.root, audit=args.command == "audit")
             result["command"] = args.command
             if args.command == "audit":
                 result["boundary"] = "Integrity/contract audit only; not independent semantic review."
