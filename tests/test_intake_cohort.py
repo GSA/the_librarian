@@ -243,7 +243,7 @@ class BlockedCase(CohortCase):
         return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
 
     def block_registrations(self):
-        """A lost catalog race recorded as blocked native-input, as before decision 0013, then a
+        """A lost catalog race recorded as blocked native-input, as before concurrent-writer retries, then a
         toolkit change that moves the extractor identity: the replay blocks as changed identity."""
         def race(root, records, **kwargs):
             if kwargs["request_id"].startswith("extract-"):
