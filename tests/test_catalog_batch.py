@@ -167,6 +167,40 @@ class Idempotency(Case):
         self.assertEqual(len(self.revisions()), 2)
 
 
+class SingleSubmitMarker(Case):
+    """The one-at-a-time path stays valid beside batches: a marker already committed by a batch is idempotent."""
+
+    def test_a_document_committed_by_a_batch_is_idempotent_for_the_single_path_under_a_stale_pin(self):
+        old = self.pin()
+        first = self.batch([0, 1])
+        again = catalog.submit(self.root, registration(1), actor="a", request_id="upload-one", reason="t",
+                               expected_state=old, rebase=True, marker="A-upload-1-original")
+        self.assertTrue(again["idempotent"])
+        self.assertEqual(again["committed_revision"], 1)
+        self.assertEqual(again["committed_state"], first["members"][1]["committed_state"])
+        self.assertEqual(len(self.revisions()), 1)
+
+    def test_without_the_marker_the_same_retry_is_the_conflict_the_marker_exists_to_avoid(self):
+        old = self.pin()
+        self.batch([0, 1])
+        with self.assertRaises(catalog.ConflictingWrite):
+            catalog.submit(self.root, registration(1), actor="a", request_id="upload-one", reason="t",
+                           expected_state=old, rebase=True)
+
+    def test_a_marker_with_other_content_is_refused_not_treated_as_present(self):
+        self.batch([0])
+        other = registration(0)
+        other[2]["data"]["bytes"] = 5
+        with self.assertRaisesRegex(CatalogError, "different content"):
+            catalog.submit(self.root, other, actor="a", request_id="x", reason="t",
+                           expected_state=self.pin(), marker="A-upload-0-original")
+
+    def test_an_absent_marker_commits_normally(self):
+        result = catalog.submit(self.root, registration(0), actor="a", request_id="x", reason="t",
+                                expected_state=self.pin(), marker="A-upload-0-original")
+        self.assertFalse(result["idempotent"])
+
+
 class RebaseAndRefusal(Case):
     def test_each_member_rebases_over_unrelated_later_revisions_with_its_own_pin(self):
         old = self.pin()

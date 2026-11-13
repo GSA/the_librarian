@@ -920,13 +920,31 @@ def _commit_revision(writer, incoming, *, request_id, actor, reason, input_hash,
     return written, batch["committed_at"], taken, retention
 
 
+def _present(committed, connection, marker, incoming):
+    """``(revision, state)`` when ``marker``'s first version equals this request's record, else None.
+
+    Raises ConflictingWrite when the marker exists with other content.
+    """
+    first = _first_version(connection, marker)
+    if first is None:
+        return None
+    mine = canonical(next(record for record in incoming if record["id"] == marker))
+    if first[1] != mine:
+        raise ConflictingWrite("The marker record already exists with different content")
+    return first[0], committed.state(first[0])
+
+
 def submit(root, records, *, actor, request_id, expected_state, reason,
-           precommit_check=None, rebase=False):
+           precommit_check=None, rebase=False, marker=None):
     """Submit metadata; an optional local guard runs inside the final transaction.
 
     With ``rebase``, an outdated ``expected_state`` is accepted when no later
     revision wrote any record this request writes; the full graph is still
     validated against the current state. Overlap raises ConflictingWrite.
+
+    ``marker`` (the ID of a record this request creates) makes the request idempotent by that record
+    as well as by ``request_id``: a catalog whose first version of the marker equals this request's is
+    reported as already committed at that revision, whichever revision (a batch's, say) wrote it.
 
     Guards must raise CatalogError on failure and must not write this catalog.
     They are invocation-only checks, never part of a persisted request recipe.
@@ -938,6 +956,8 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
     validate_records(records)
     incoming = decode(canonical(records))
     validate_records(incoming)
+    require(marker is None or marker in {record["id"] for record in incoming},
+            "The marker must be one of the request's record IDs")
     input_hash = fingerprint({"actor": actor, "reason": reason, "records": incoming})
     with _writer(root) as writer:
         connection, state, current, committed = writer.connection, writer.state, writer.current, writer.committed
@@ -956,6 +976,16 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
                     "request_id": request_id, "committed_revision": prior["revision"],
                     "committed_at": prior["committed_at"], "committed_state": committed.state(prior["revision"]),
                     "backup": None, "retention": None}
+        if marker is not None:
+            found = _present(committed, connection, marker, incoming)
+            if found is not None:
+                if precommit_check is not None:
+                    precommit_check()
+                return {"command": "submit", "idempotent": True, **state, "state": state,
+                        "request_id": request_id, "committed_revision": found[0],
+                        "committed_at": connection.execute("SELECT committed_at FROM revisions WHERE revision=?",
+                                                           (found[0],)).fetchone()[0],
+                        "committed_state": found[1], "backup": None, "retention": None}
         rebased_from = None
         if expected_state != state["state_token"]:
             if not rebase:
@@ -1061,13 +1091,9 @@ def submit_batch(root, members, *, actor, reason, rebase=True, precommit_check=N
                 validate_records(incoming)
                 ids = [record["id"] for record in incoming]
                 require(member["marker"] in ids, "The marker must be one of the member's record IDs")
-                first = _first_version(connection, member["marker"])
-                if first is not None:
-                    mine = canonical(next(r for r in incoming if r["id"] == member["marker"]))
-                    if first[1] != mine:
-                        raise ConflictingWrite("The marker record already exists with different content")
-                    result.update(status="present", committed_revision=first[0],
-                                  committed_state=committed.state(first[0]))
+                found = _present(committed, connection, member["marker"], incoming)
+                if found is not None:
+                    result.update(status="present", committed_revision=found[0], committed_state=found[1])
                     continue
                 clash = next((i for i in ids if i in taken_ids), None)
                 if clash is not None:
