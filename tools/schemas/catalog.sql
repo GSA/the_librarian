@@ -25,3 +25,11 @@ CREATE TRIGGER immutable_revisions_update BEFORE UPDATE ON revisions BEGIN SELEC
 CREATE TRIGGER immutable_revisions_delete BEFORE DELETE ON revisions BEGIN SELECT RAISE(ABORT,'immutable catalog history'); END;
 CREATE TRIGGER immutable_versions_update BEFORE UPDATE ON versions BEGIN SELECT RAISE(ABORT,'immutable catalog history'); END;
 CREATE TRIGGER immutable_versions_delete BEFORE DELETE ON versions BEGIN SELECT RAISE(ABORT,'immutable catalog history'); END;
+CREATE INDEX versions_lookup_path ON versions(json_extract(payload,'$.data.path')) WHERE json_extract(payload,'$.data.path') IS NOT NULL;
+CREATE INDEX versions_lookup_receipt_id ON versions(json_extract(payload,'$.data.receipt_id')) WHERE json_extract(payload,'$.data.receipt_id') IS NOT NULL;
+CREATE INDEX versions_lookup_parent_id ON versions(json_extract(payload,'$.data.parent_id')) WHERE json_extract(payload,'$.data.parent_id') IS NOT NULL;
+CREATE INDEX versions_lookup_artifact_id ON versions(json_extract(payload,'$.data.artifact_id')) WHERE json_extract(payload,'$.data.artifact_id') IS NOT NULL;
+CREATE INDEX versions_lookup_from_id ON versions(json_extract(payload,'$.data.from_id')) WHERE json_extract(payload,'$.data.from_id') IS NOT NULL;
+CREATE INDEX versions_lookup_to_id ON versions(json_extract(payload,'$.data.to_id')) WHERE json_extract(payload,'$.data.to_id') IS NOT NULL;
+CREATE TABLE refs(ref TEXT NOT NULL, revision INTEGER NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(ref,revision,ordinal)) WITHOUT ROWID;
+CREATE TRIGGER versions_lookup_refs AFTER INSERT ON versions WHEN json_extract(NEW.payload,'$.kind')='receipt' BEGIN INSERT OR IGNORE INTO refs SELECT j.value,NEW.revision,NEW.ordinal FROM json_each(NEW.payload,'$.data.source_ids') j; END;

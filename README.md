@@ -213,8 +213,8 @@ Run these from the clone root. Each supports `--help`.
 
 | Command | Purpose |
 | --- | --- |
-| `python -m tools.initialize` | Initialize stores/index, or `--migrate-storage`, `--recover-migration`, `--relocate` |
-| `python -m tools.catalog.catalog_store` | Catalog: `init`, `status`, `audit`, `submit`, `query`, `export`, `backup`, `verify-backup`, `restore` |
+| `python -m tools.initialize` | Initialize stores/index, or `--migrate-storage`, `--recover-migration`, `--relocate`, `--migrate-catalog-indexes` |
+| `python -m tools.catalog.catalog_store` | Catalog: `init`, `status`, `audit`, `submit`, `query`, `export`, `backup`, `verify-backup`, `restore`, `migrate-indexes` |
 | `python -m tools.catalog.inventory` | List files under a configured root (`--root`, `--limit`, `directory`; metadata only) |
 | `python -m tools.extraction.extract` | Text, Gemini transcript, and ODT extraction (`prepare`, `verify`, `register`) |
 | `python -m tools.extraction.docling_extract` | Optional PDF and image extraction (`inspect`, `prepare`, `verify`, `register`) |

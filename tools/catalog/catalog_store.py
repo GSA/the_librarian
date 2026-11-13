@@ -63,6 +63,31 @@ CREATE TABLE current_records(
 CREATE INDEX versions_record ON versions(record_id,revision);
 """
 
+# Derived lookup structures (Kata 1h7h). They replace the substring scans that referrer and path-claim
+# checks used, hold nothing that is not already in ``versions`` and are verified against it on every
+# replay. A catalog either has none of them (``legacy``, scans) or all of them exactly as written here.
+LOOKUP_FIELDS = ("path", "receipt_id", "parent_id", "artifact_id", "from_id", "to_id")
+REFERENCE_FIELDS = ("receipt_id", "parent_id", "artifact_id", "from_id", "to_id")
+
+
+def _lookup_expression(field):
+    return f"json_extract(payload,'$.data.{field}')"
+
+
+LOOKUP_OBJECTS = {
+    **{f"versions_lookup_{field}": (
+        "index", f"CREATE INDEX versions_lookup_{field} ON versions({_lookup_expression(field)}) "
+                 f"WHERE {_lookup_expression(field)} IS NOT NULL") for field in LOOKUP_FIELDS},
+    "refs": ("table", "CREATE TABLE refs(ref TEXT NOT NULL, revision INTEGER NOT NULL, ordinal INTEGER NOT NULL, "
+                      "PRIMARY KEY(ref,revision,ordinal)) WITHOUT ROWID"),
+    "versions_lookup_refs": ("trigger", "CREATE TRIGGER versions_lookup_refs AFTER INSERT ON versions "
+                             "WHEN json_extract(NEW.payload,'$.kind')='receipt' BEGIN "
+                             "INSERT OR IGNORE INTO refs SELECT j.value,NEW.revision,NEW.ordinal "
+                             "FROM json_each(NEW.payload,'$.data.source_ids') j; END"),
+}
+REFS_FROM_VERSIONS = ("INSERT OR IGNORE INTO refs SELECT j.value,v.revision,v.ordinal FROM versions v, "
+                      "json_each(v.payload,'$.data.source_ids') j WHERE json_extract(v.payload,'$.kind')='receipt'")
+
 
 
 def safe_path(path):
@@ -291,7 +316,38 @@ def schema_sql():
         for table in ("metadata", "revisions", "versions")
         for action in ("update", "delete")
     )
-    return f"PRAGMA application_id={APPLICATION_ID};\nPRAGMA user_version={VERSION};\n{SQL}\n{triggers}\n"
+    lookup = "\n".join(sql + ";" for _, sql in LOOKUP_OBJECTS.values())
+    return (f"PRAGMA application_id={APPLICATION_ID};\nPRAGMA user_version={VERSION};\n{SQL}\n{triggers}\n"
+            f"{lookup}\n")
+
+
+LOOKUP_REFUSAL = ("Catalog lookup structures are incomplete or differ from the revision history; "
+                  "run migrate-indexes --rebuild")
+
+
+def lookup_shape(connection):
+    """``legacy`` (no lookup structures), ``indexed`` (all, exactly as written) or ``partial`` (anything else)."""
+    names = list(LOOKUP_OBJECTS)
+    found = {row[0]: (row[1], row[2]) for row in connection.execute(
+        f"SELECT name,type,sql FROM sqlite_master WHERE name IN ({','.join('?' * len(names))})", names)}
+    if not found:
+        return "legacy"
+    return "indexed" if found == {name: LOOKUP_OBJECTS[name] for name in names} else "partial"
+
+
+def drop_lookup(connection):
+    """Remove every lookup structure (a catalog without them is the ``legacy`` shape)."""
+    for name, (kind, _) in reversed(list(LOOKUP_OBJECTS.items())):
+        connection.execute(f"DROP {kind.upper()} IF EXISTS {name}")
+
+
+def create_lookup(connection):
+    """Create the lookup structures and fill ``refs`` from ``versions``."""
+    for name, (kind, sql) in LOOKUP_OBJECTS.items():
+        if kind != "trigger":
+            connection.execute(sql)
+    connection.execute(REFS_FROM_VERSIONS)
+    connection.execute(LOOKUP_OBJECTS["versions_lookup_refs"][1])
 
 
 def pairs(items):
@@ -388,9 +444,12 @@ def inspect(connection, detail=True):
             row = connection.execute("SELECT sql FROM sqlite_master WHERE name=? AND type='trigger'",
                                      (f"immutable_{table}_{action}",)).fetchone()
             require(row is not None and row[0] == trigger_sql(table, action), "Immutable trigger changed")
+    shape = lookup_shape(connection)
+    require(shape != "partial", LOOKUP_REFUSAL)
     require({row[0] for row in connection.execute("SELECT DISTINCT revision FROM versions")}
             == {row[0] for row in connection.execute("SELECT revision FROM revisions")},
             "Invalid revision membership")
+    expected_refs = set()  # what the payloads imply for the lookup table, when the catalog has one
     batches = [] if detail else None
     current, projection, histories, committed_states = ({}, {}, {}, {}) if detail else (None, {}, None, None)
     graph = GraphValidator()  # same refusals as validate_graph(current), without re-walking history
@@ -417,6 +476,8 @@ def inspect(connection, detail=True):
             records.append(record)
             payloads.append(payload)
             projection[record["id"]] = (revision, ordinal)
+            if shape == "indexed" and record["kind"] == "receipt":
+                expected_refs.update((source_id, revision, ordinal) for source_id in record["data"]["source_ids"])
             if detail:
                 current[record["id"]] = record
                 histories.setdefault(record["id"], []).append({
@@ -445,6 +506,9 @@ def inspect(connection, detail=True):
         require(projection.get(row["record_id"]) == (row["revision"], row["ordinal"]),
                 "Current records differ from immutable revision history")
     require(rows == count, "Current records differ from immutable revision history")
+    if shape == "indexed":
+        require({tuple(row) for row in connection.execute("SELECT ref,revision,ordinal FROM refs")} == expected_refs,
+                LOOKUP_REFUSAL)
     state = make_state(metadata, revision, previous, count)
     return state, current, histories, batches, committed_states
 
@@ -584,6 +648,87 @@ def initialize(root):
         finally:
             if partial.exists():
                 partial.unlink()
+
+
+def _recover_journal(db):
+    """Let SQLite roll back the rollback journal an interrupted writer left; nothing else is touched.
+
+    Called only with the writer lock held, so no live writer can own the journal. Any other sidecar
+    (WAL, shared memory) is still refused. The caller verifies the recovered catalog in full.
+    """
+    for suffix in ("-wal", "-shm"):
+        require(not safe_path(str(db) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+    journal = safe_path(str(db) + "-journal")
+    if not journal.exists():
+        return False
+    require(journal.is_file() and stat.S_IMODE(journal.stat().st_mode) == 0o600,
+            "SQLite sidecar present; explicit recovery required")
+    with closing(sqlite3.connect(private_file(db).as_uri() + "?mode=rw", uri=True, isolation_level=None,
+                                 timeout=BUSY_TIMEOUT_SECONDS)) as connection:
+        connection.execute("SELECT count(*) FROM sqlite_master").fetchone()  # opening rolls a hot journal back
+    require(not journal.exists(), "SQLite sidecar present; explicit recovery required")
+    return True
+
+
+def migrate_indexes(root, *, rebuild=False, check=False, recover=False):
+    """Add the lookup structures to a catalog that lacks them (Kata 1h7h); idempotent and crash-safe.
+
+    One writer transaction under the writer lock: fully inspect the catalog, publish a verified
+    pre-migration snapshot, create the indexes and fill ``refs``, fully inspect again and require the
+    identical state, then commit. Any failure rolls back (a killed process leaves SQLite's rollback
+    journal, which restores the earlier file when next opened). Authority data, the schema version
+    and every state token are unchanged. A catalog that already has the structures is only verified.
+    ``rebuild`` first drops whatever lookup structures exist (damaged or incomplete) in the same
+    transaction, so it succeeds only when everything else in the catalog verifies. ``check``
+    reports the shape and verifies without writing. A process killed mid-migration leaves SQLite's
+    rollback journal, which every other command refuses; ``recover`` (writer lock held) lets SQLite roll
+    it back, then migrates as usual, so the catalog returns to a verified state before anything is written.
+    """
+    home, db, backups = locations(root)
+    private_file(db)
+    if check:
+        with closing(connect(db)) as connection:
+            connection.execute("BEGIN")
+            shape = lookup_shape(connection)
+            state = None if shape == "partial" else inspect(connection, detail=False)[0]
+            return {"command": "migrate-indexes", "migrated": False, "lookup": shape, "state": state}
+    with writer_lock(home):
+        if recover:
+            _recover_journal(db)
+        elif safe_path(str(db) + "-journal").exists():
+            raise CatalogError("SQLite sidecar present; explicit recovery required: "
+                               "run migrate-indexes --recover after confirming no other process is migrating")
+        return _migrate_locked(home, db, backups, rebuild)
+
+
+def _migrate_locked(home, db, backups, rebuild):
+    with closing(connect(db, write=True)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            shape = lookup_shape(connection)
+            if shape == "partial" and not rebuild:
+                raise CatalogError(LOOKUP_REFUSAL)
+            if shape == "indexed" and not rebuild:
+                state = inspect(connection, detail=False)[0]
+                connection.execute("ROLLBACK")
+                return {"command": "migrate-indexes", "migrated": False, "lookup": "indexed", "state": state,
+                        "backup": None}
+            if shape != "legacy":
+                drop_lookup(connection)
+            state = inspect(connection, detail=False)[0]
+            taken = _snapshot_in_transaction(connection, backups, "pre-index-migration", image=True, inspected=True)
+            verify_backup(Path(taken["snapshot"]), replay=False)
+            create_lookup(connection)
+            require(inspect(connection, detail=False)[0] == state, "Catalog changed during index migration")
+            require(lookup_shape(connection) == "indexed", "Lookup structures were not created as specified")
+            connection.execute("COMMIT")
+        finally:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+        seal(db)
+        _attest_commit(connection, home, state)
+        return {"command": "migrate-indexes", "migrated": True, "lookup": "indexed", "state": state,
+                "backup": taken}
 
 
 def _binding(connection):
@@ -829,19 +974,29 @@ def _attest_commit(connection, home, written, validated_on=None):
 
 
 class _CurrentRecords:
-    """Indexed lookups into the committed current records, without replaying history."""
+    """Indexed lookups into the committed current records, without replaying history.
+
+    A catalog with lookup structures (init creates them; ``migrate-indexes`` adds them to an older
+    one) answers referrer and path-claim probes from indexes. One without them answers the same
+    questions with substring scans, slower and identically; one with only some of them is refused.
+    """
 
     SQL = ("SELECT v.payload FROM current_records c JOIN versions v "
            "ON v.revision=c.revision AND v.ordinal=c.ordinal WHERE ")
+    # The EXISTS form (not a JOIN) lets SQLite drive the probe from the lookup index.
+    CURRENT = (" AND EXISTS(SELECT 1 FROM current_records c WHERE c.record_id=v.record_id "
+               "AND c.revision=v.revision AND c.ordinal=v.ordinal)")
 
     def __init__(self, connection):
         self.connection = connection
+        self.shape = lookup_shape(connection)
+        require(self.shape != "partial", LOOKUP_REFUSAL)
 
     def get(self, record_id):
         row = self.connection.execute(self.SQL + "c.record_id=?", (record_id,)).fetchone()
         return None if row is None else decode(row[0])
 
-    def _matching(self, needles, keep):
+    def _scan(self, needles, keep):
         # Canonical payloads quote every identifier and path exactly as json.dumps does, so a
         # substring probe finds a superset of the matches and the decoded record confirms them.
         needles = [canonical(value) for value in needles]
@@ -853,14 +1008,40 @@ class _CurrentRecords:
             found += [record for record in (decode(row[0]) for row in rows) if keep(record)]
         return found
 
+    def _probe(self, queries, values, keep):
+        """Run each ``(sql, ...)`` probe over chunks of ``values``; decoded, confirmed, one per record."""
+        found = {}
+        for sql in queries:
+            for start in range(0, len(values), 200):
+                chunk = values[start:start + 200]
+                for row in self.connection.execute(sql.format(",".join("?" * len(chunk))), chunk):
+                    record = decode(row[0])
+                    if keep(record):
+                        found[record["id"]] = record
+        return list(found.values())
+
     def referrers(self, ids):
         ids = set(ids)
-        return self._matching(ids, lambda record: bool(ids.intersection(_references(record))))
+
+        def keep(record):
+            return bool(ids.intersection(_references(record)))
+        if self.shape == "legacy":
+            return self._scan(ids, keep)
+        queries = [f"SELECT v.payload FROM versions v WHERE {_lookup_expression(field)} IN ({{}})" + self.CURRENT
+                   for field in REFERENCE_FIELDS]
+        queries.append("SELECT v.payload FROM refs r JOIN versions v ON v.revision=r.revision AND v.ordinal=r.ordinal "
+                       "WHERE r.ref IN ({})" + self.CURRENT)
+        return self._probe(queries, sorted(ids), keep)
 
     def claimants(self, paths):
         paths = set(paths)
-        return self._matching(paths, lambda record: record["kind"] == "artifact"
-                              and record["data"]["path"] in paths)
+
+        def keep(record):
+            return record["kind"] == "artifact" and record["data"]["path"] in paths
+        if self.shape == "legacy":
+            return self._scan(paths, keep)
+        return self._probe([f"SELECT v.payload FROM versions v WHERE {_lookup_expression('path')} IN ({{}})"
+                            + self.CURRENT], sorted(paths), keep)
 
 
 class _CommittedStates:
@@ -1260,6 +1441,11 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "status", "audit", "backup"):
         commands.add_parser(name)
+    migrate = commands.add_parser("migrate-indexes", help="Add the lookup indexes to a catalog that lacks them")
+    migrate.add_argument("--check", action="store_true", help="Report the lookup shape and verify; write nothing")
+    migrate.add_argument("--rebuild", action="store_true", help="Drop and recreate damaged or incomplete lookup structures")
+    migrate.add_argument("--recover", action="store_true",
+                         help="Let SQLite roll back the journal of a migration that was killed, then verify and migrate")
     verify = commands.add_parser("verify-backup")
     verify.add_argument("snapshot", type=Path)
     recover = commands.add_parser("restore")
@@ -1278,7 +1464,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         require(type(args.max_chars) is int and args.max_chars > 0, "Output budget must be positive")
-        if args.command in {"init", "submit", "backup", "restore"}:
+        if args.command in {"init", "submit", "backup", "restore", "migrate-indexes"}:
             require(args.max_chars >= 60000, "Mutations require max-chars >=60000")
         if args.command == "init":
             result = initialize(args.root)
@@ -1288,6 +1474,9 @@ def main(argv=None):
             result = status(args.root, audit=True)
         elif args.command == "backup":
             result = backup(args.root)
+        elif args.command == "migrate-indexes":
+            require(not (args.check and (args.rebuild or args.recover)), "--check writes nothing, so it cannot rebuild or recover")
+            result = migrate_indexes(args.root, rebuild=args.rebuild, check=args.check, recover=args.recover)
         elif args.command == "verify-backup":
             result = verify_backup(args.snapshot)
         elif args.command == "restore":
