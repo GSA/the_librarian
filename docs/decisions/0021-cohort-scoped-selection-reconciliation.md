@@ -1,6 +1,7 @@
 # 0021 - `qualify` reconciles only its own cohort's selections
 
 **Audience:** maintainers and operators.
+**Date:** November 12, 2026.
 **Status:** Implemented. Changes the documented `qualify` semantics of
 [0009](0009-read-only-cohort-intake.md); the pinning, evidence and freshness rules of
 [0009](0009-read-only-cohort-intake.md) and of the standing-policy stages are unchanged.

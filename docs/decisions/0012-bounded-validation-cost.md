@@ -3,9 +3,11 @@
 **Audience:** maintainers and operators.
 **Date:** November 2, 2026.
 **Status:** Implemented. Follows [0010](0010-daily-snapshots-and-retention.md).
-Amended by [0014](0014-intake-ledger-handoff-and-bounded-waits.md) (ledger) and
-[0015](0015-trusted-head-catalog-commit.md) (catalog) and
-[0019](0019-cheaper-catalog-inspect.md) (cheaper `inspect`); the *Result and remaining
+Amended by [0014](0014-intake-ledger-handoff-and-bounded-waits.md) (ledger),
+[0015](0015-trusted-head-catalog-commit.md) (catalog),
+[0017](0017-attested-file-identity-for-catalog-receipts.md) (receipt binding),
+[0019](0019-cheaper-catalog-inspect.md) (cheaper `inspect`) and
+[0020](0020-constant-cost-upload-planning.md) (upload planning); the *Result and remaining
 cost* section describes the state before them.
 
 ## Context

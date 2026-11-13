@@ -3,6 +3,8 @@
 **Audience:** maintainers and operators.
 **Date:** November 2, 2026.
 **Status:** Implemented. Supersedes the retention bullet in [0003](0003-store-compatibility.md).
+Amended by [0016](0016-single-replay-daily-snapshot.md) (the first write of a UTC day replays the
+history once).
 
 ## Context
 

@@ -4,7 +4,8 @@
 **Date:** November 10, 2026.
 **Status:** Implemented. Amends [0012](0012-bounded-validation-cost.md) and
 [0013](0013-concurrent-intake-writers.md); amended by
-[0018](0018-catalog-contention-outside-the-fault-budget.md).
+[0017](0017-attested-file-identity-for-catalog-receipts.md) (the file-identity code is shared with the
+catalog) and [0018](0018-catalog-contention-outside-the-fault-budget.md).
 
 ## Context
 

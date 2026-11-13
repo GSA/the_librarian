@@ -1,6 +1,7 @@
 # 0020 - Upload planning reads the highest ID per prefix, not every ID
 
 **Audience:** maintainers and operators.
+**Date:** November 11, 2026.
 **Status:** Implemented. Amends [0012](0012-bounded-validation-cost.md); the ledger trust model of
 [0014](0014-intake-ledger-handoff-and-bounded-waits.md) and the catalog receipts of
 [0015](0015-trusted-head-catalog-commit.md) and [0017](0017-attested-file-identity-for-catalog-receipts.md)

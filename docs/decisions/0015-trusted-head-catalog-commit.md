@@ -3,7 +3,10 @@
 **Audience:** maintainers and operators.
 **Date:** November 11, 2026.
 **Status:** Implemented. Amends [0012](0012-bounded-validation-cost.md) and
-[0013](0013-concurrent-intake-writers.md).
+[0013](0013-concurrent-intake-writers.md). Amended by [0016](0016-single-replay-daily-snapshot.md)
+(the first write of a UTC day) and [0017](0017-attested-file-identity-for-catalog-receipts.md), which
+replaces the whole-file SHA-256 binding described below with a file-identity binding and a daily
+full check.
 
 ## Context
 
