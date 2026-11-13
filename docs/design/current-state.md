@@ -155,6 +155,19 @@ restated here.
   Operator notes (restoring cohorts an older toolkit pruned; requalifying after a
   policy bump) are in `context/intake.md`. The default generated scope
   (`D1..D2500`) is a known limit tracked in Kata kc1k.
+- **Publication is one stage, run at the end of `qualify` or on demand.**
+  `qualify` publishes the context index once, after reconciling the manifest;
+  `cohort publish` runs the same `standing-publish` stage (policy pin, standing
+  authorization, freshness, availability, ledger evidence) for the current
+  manifest with no ingest, review or model call, so an interrupted run is
+  recovered at the cost of one publication. It is idempotent on the manifest
+  hash. There is deliberately no interim publication during a run: the index
+  pins the manifest bytes and the review-event store state, so it is stale again
+  at the next review a run appends and could not serve progress. Measured cost
+  of a first publish (synthetic): about 2.5 s plus 5 to 6 ms per selection at
+  1,000 to 2,000 review events, dominated by per-selection validation rather than
+  the index build, so an incremental build is not pursued. Evidence:
+  `tests/test_intake_cohort.py::PublishTests`.
 
 ## 4. Backups
 

@@ -312,6 +312,20 @@ Bumping the standing policy version re-reviews every rendition; a new-version re
 A standing review blocked as `changed-standing-inputs` (its saved intent no longer matches current inputs, e.g. after a replay) is restaged as a correction request `<correlation>-c<n>` with the same review arguments and event and fresh request IDs; later runs follow the `correction_of` chain to its newest request.
 The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
 `pending-review`, `rejected`, `deferred` or `exception` without indexing.
+`publish --root R --policy PATH --manifest PATH [--index DB]` runs only the `standing-publish`
+stage of `qualify` (same correlation scheme `publish-<policy>-<manifest-hash>-<destination>`,
+guards, checks, availability and ledger evidence) for the manifest as it is now, with no ingest,
+no review and no model call. `qualify` publishes once, after reconciling the manifest, so a run
+that stops early leaves its saved reviews and selections unpublished and the index stale (the
+index pins the manifest bytes and the review-event store state, so it stays stale from the first
+review a run appends until the next publish); `publish` recovers that at the cost of one
+publication instead of a re-run's whole ingest and entry walk. It is idempotent: a saved success
+is reused while the index is present and fresh, otherwise a new revision is staged. Output is
+body-free `counts` (`published`, `selections`) and `publication` (`status`, `available`, and the
+blocking `code` when refused); exit status 0 only when published. A run's entries not yet
+reviewed are not selected, so what is served is exactly the selections made so far. Qualification
+is not published during a run on purpose: while reviews are still being appended an interim index
+is stale again at the next review, so it could not serve progress.
 **Restoring cohorts an earlier toolkit pruned.** Before the cohort-scoped reconciliation change (Kata xc2j), `qualify` for one cohort
 removed every other cohort's selections from a shared manifest. The reviews are still in the
 ledger and review store, so re-run `qualify` once per cohort with its own `--system`, `--inbox`
