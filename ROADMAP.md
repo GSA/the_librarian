@@ -38,54 +38,36 @@ completion supersedes the unchanged-application-ID decision: catalog `LCAT`,
 review `LREV`, and derived index `LCTX` explicitly refuse `FCAT`, `FREV`, and
 `FCTX`. Authority stores need explicit migration or deliberate empty-store
 re-initialization; the derived index can be rebuilt from authority data.
-See [decision 0001](docs/decisions/0001-project-identity.md).
+See the [current-state design](docs/design/current-state.md).
 
-### Recorded design decisions - October 21
+### Design baseline - October 21 to November 12
 
-Deployment and storage direction is now recorded as numbered decisions under
-[docs/decisions](docs/decisions/README.md): an updateable distribution with a
-pinned, preflight-verified runtime; a store-compatibility contract that never
-migrates authority data implicitly and always rebuilds the derived index; one
-Librarian per project with its own data root; inbox-first source onboarding
-with read-only remote scopes; and an open evaluation that declines a graph
-database server in favor of a rebuildable derived projection if traversal is
-ever needed. These were design commitments and inventory when recorded. The
-configuration work they depend on - per-instance store homes, policy that follows the data root, and index identity that does not
-bind an absolute host path - was built afterwards and is now implemented (see
-[0003](docs/decisions/0003-store-compatibility.md) and
-[0004](docs/decisions/0004-instance-topology.md)); the pinned lock file, image and
-installer of [0002](docs/decisions/0002-updateable-distribution.md) are not.
+Identity, store compatibility, instance topology, backups, validation, concurrency
+and observation are described as they work today in the
+[current-state design](docs/design/current-state.md), with the test behind each
+claim. The numbered decision records that used to hold this are in git history. The
+configuration work they depended on (per-instance store homes, policy that follows
+the data root, index identity that does not bind an absolute host path) is
+implemented. The pinned lock file, image and installer, and a per-instance version
+record, are not built and are open product questions, not commitments.
 
-Decision 0006 is updated with a generic report that its first precondition -
-a recorded real question the existing reads, search and selection could not
-answer - is **not yet satisfied**, and with October 22 license, release and
-packaging facts for the two obvious embedded Cypher candidates. Neither is
-adoptable as written. Graph work remains "later, only if justified".
+The October 21 update also renamed the review-event schema `$id` to
+`urn:the-librarian:review-events:1`, which changed the store contract hash and
+required re-initializing the then-empty local review store.
 
-The same update renames the review-event schema `$id` to
-`urn:the-librarian:review-events:1`. This changed the store contract hash and
-required re-initializing the local review store, which was only acceptable
-because it was empty. Authority strings remain unchanged; application IDs
-were subsequently renamed with explicit superseded-ID refusal, as recorded in
-[decision 0008](docs/decisions/0008-proof-of-concept-closure.md).
-
-It also adds an observation capability that is unlike the ingestion
-sources: **body-free retrieval diagnostics** covering coverage gaps, plus bare
-search and read counts, specified under
+It also adds an observation capability unlike the ingestion sources: **body-free
+retrieval diagnostics** covering coverage gaps, plus bare search and read counts,
+specified under
 [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution).
-An earlier, broader proposal to ingest agent execution traces as durable agent
-memory is declined in [decision 0007](docs/decisions/0007-execution-traces.md),
-which also withdraws the dead-weight requirement rather than deferring it:
-pruning selection by traffic is not a goal, and attributing reads would turn
-the log into a usage profile. The coverage-gap half of the kept proposal is
-implemented: an empty search returns an absence classification, and an opt-in
-body-free log records that classification without the query.
+Agent execution traces as durable agent memory were not built; see the design doc
+for the reasoning. The coverage-gap half is implemented: an empty search returns an
+absence classification, and an opt-in body-free log records it without the query.
 
 ### Docling integration - October 20-26
 
 The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extraction/docling_extract.py`, `docling_adapter.py`, `docling_bridge.py`, `docling_worker.py`, and `tools/extraction/README.md`) is implemented and verified:
 - Prepare twice with independent offline conversions, verify identical rendition bytes, and register deferred renditions in the catalog with idempotent retry.
-- Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries (`docs/decisions/0008-proof-of-concept-closure.md`).
+- Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries.
 - Qualified retrieval can explicitly select exact-rendition, substantively reviewed Docling text and table records, with retained-byte, JSON-pointer, and page provenance. Unsupported content collections fail closed.
 - The later standing-policy intake stages implement authorized evidence-based review, qualification, selection, and publication through the existing atomic index (see [the intake contract](context/intake.md)). Parser success alone never qualifies content. Real-document OCR accuracy remains unmeasured.
 
@@ -107,11 +89,11 @@ to exist in this distribution.
 | Bounded ingestion cohorts | No cohort driver or operation-local catalog snapshot API | Adapt `cohort.py` and `ReceiptMetadataSnapshot`; retain source/state checks, serialized writes, saved requests, explicit partial failures and backups |
 | Read-only remote discovery | No remote connector; local explicit-root inventory exists | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
 | Continuous copy and intake | Private exact-request intake ledger, explicit native writer stages, bounded attempts/DLQ/replay, acknowledgment recording, and explicit manual file upload / marked local-drop intake; no acquisition or scheduler | Add separately authorized connectors, scheduling and return transport; a read-only mount is not a local copy or ingestion service |
-| MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); opt-in full-text per-agent MCP audit log (`--audit-log`, [decision 0011](docs/decisions/0011-full-text-mcp-audit-log.md)); no cohort metrics | Adapt the remaining opt-in audit/`metrics.py` and cohort metrics; private modes, explicit logging failures and no telemetry-as-job-authority. Dead weight is withdrawn, not pending, per [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
+| MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); opt-in full-text per-agent MCP audit log (`--audit-log`, [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)); no cohort metrics | Adapt the remaining opt-in audit/`metrics.py` and cohort metrics; private modes, explicit logging failures and no telemetry-as-job-authority. Dead weight is withdrawn, not pending, per [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
 | Retrieval refinements | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
 | Reader diagnostics and regressions | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
-| Explicit relationship traversal | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in [decision 0006](docs/decisions/0006-relationship-traversal.md), whose precondition 1 is reported unsatisfied as of October 21 |
-| Agent execution traces | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free retrieval diagnostics only - coverage gaps (implemented); dead weight withdrawn; no retrieval-quality figure is derived, because the available counts cannot support one. Traces as durable agent memory are declined in [decision 0007](docs/decisions/0007-execution-traces.md); agent findings route through the contribution contract instead |
+| Explicit relationship traversal | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in the [design](docs/design/current-state.md#7-relationship-traversal) (no real failed question has been recorded) |
+| Agent execution traces | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free retrieval diagnostics only - coverage gaps (implemented); dead weight withdrawn; no retrieval-quality figure is derived, because the available counts cannot support one. Traces as durable agent memory are declined in [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics); agent findings route through the contribution contract instead |
 | Discovery-card experiments | Not shipped | Retain the lesson: skims can miss relevant material; evaluate candidate recall with deferred controls, never use cards as proof of absence |
 | Operating guidance | Generic role/feedback contracts now included; private corpus procedures intentionally omitted | Keep task-triggered loading and source fidelity/authority boundaries; add generic format/recovery guides alongside each future port |
 
@@ -248,7 +230,7 @@ eligible work. Expose backlog age, blocked/error counts, last successful
 reconciliation and source-coverage limitations. Body-free metrics are useful
 diagnostics, not the durable recovery ledger or evidence of review.
 
-Preserve the verified daily store snapshots (decision 0010) and retained
+Preserve the verified daily store snapshots (see the [design](docs/design/current-state.md#4-backups)) and retained
 originals. Never rebuild authoritative stores as job recovery.
 Define pause, clean shutdown and explicit resume before enabling scheduling.
 
@@ -258,10 +240,10 @@ Define pause, clean shutdown and explicit resume before enabling scheduling.
 body-free diagnostics log are implemented and tested; see
 [What is implemented](#what-is-implemented) below. The dead-weight requirement is
 withdrawn and no retrieval-quality figure is derived (see
-[decision 0007](docs/decisions/0007-execution-traces.md)). This
+[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)). This
 supersedes an earlier, broader proposal to ingest agent execution traces as
 durable memory. That broader version is declined; the reasoning is recorded in
-[decision 0007](docs/decisions/0007-execution-traces.md).
+[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics).
 
 ### What is wanted, and what is declined
 
@@ -301,12 +283,12 @@ quality signal and is not one. It cannot distinguish an unconvincing search
 excerpt from an agent that read enough from the search result and never needed
 the full record - two cases calling for opposite responses. The counts are
 kept; the ratio is not published until something can tell those cases apart.
-[Decision 0007](docs/decisions/0007-execution-traces.md) records why.
+The [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) records why.
 
 **Withdrawn: dead weight.** An earlier version of this section asked which
 selected documents are never returned or never read, so selection could be
 pruned. That requirement is withdrawn in
-[decision 0007](docs/decisions/0007-execution-traces.md). Less data is not
+[design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics). Less data is not
 assumed to be better: removing a selected document is only an improvement if
 keeping it demonstrably costs something, and nothing here demonstrates that,
 while a wrongly pruned document is unavailable the first time it is needed and
@@ -367,7 +349,7 @@ Required, beyond what `metrics.py` already does:
 - **No silent learning.** Nothing derived from diagnostics changes selection,
   ranking or qualification automatically. A gap report is input to an operator
   decision about what to ingest next. Any automatic use is a separate,
-  versioned, tested policy with its own decision record.
+  versioned, tested policy with its own tests.
 - **The distribution stays empty.** Diagnostics are instance data; no log
   content or example session ships in the package.
 
@@ -480,7 +462,7 @@ returned and a record being used.
 | D: remote discovery/copy | One approved read-only provider/folder scope, then additional scopes | Complete paginated reconciliation, binary/native identity behavior and authorization failures demonstrated; no destructive synchronization |
 | E: agent-driven maintenance | Bounded review/incorporation and approved publication policy | Evidence fidelity, independent-review triggers, recoverability and qualified-answer preservation shown under ongoing intake |
 | F: retrieval diagnostics | Body-free coverage-gap observation plus bare search and read counts; dead weight is withdrawn, not pending, and no retrieval-quality figure is derived | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
-| Later, only if justified | Graph, richer discovery, hosted/multi-user services | Demonstrated use case and explicit handling, authorization, concurrency and recovery design; not prerequisites for the local demo. Graph preconditions are recorded in [decision 0006](docs/decisions/0006-relationship-traversal.md) |
+| Later, only if justified | Graph, richer discovery, hosted/multi-user services | Demonstrated use case and explicit handling, authorization, concurrency and recovery design; not prerequisites for the local demo. Graph evaluation notes are in the [design](docs/design/current-state.md#7-relationship-traversal) |
 
 These are proposed dependencies, not assignments or dates. The full automation
 roadmap is not a prerequisite for the first real business demonstration.

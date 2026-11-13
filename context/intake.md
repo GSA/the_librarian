@@ -23,19 +23,18 @@ named stage. The ledger is operational recovery state, never corpus authority.
   the pinned identity to the native lifecycle as `expected_identity`, so a
   source or runtime change refuses before any rendition or registration is
   published and each attempt converts once.
-- Concurrent intake agents may share one instance ([0013](../docs/decisions/0013-concurrent-intake-writers.md)).
+- Concurrent intake agents may share one instance ([design](../docs/design/current-state.md#concurrent-writers)).
   The catalog writer lock waits up to 10s across processes. A catalog write
   validates only its delta when the database file identity (device, inode, size,
   mtime, ctime, SQLite change counter) matches a prior full validation made the
-  same UTC day ([0015](../docs/decisions/0015-trusted-head-catalog-commit.md),
-  [0017](../docs/decisions/0017-attested-file-identity-for-catalog-receipts.md)), and replays all history otherwise,
+  same UTC day ([design](../docs/design/current-state.md#what-a-catalog-write-validates)), and replays all history otherwise,
   on the first read or write of each UTC day and under `status --audit`; that
   first write replays the history once, holding the writer lock about as long as one `inspect`
   plus writing the snapshot (about 3 s at 25k registrations, 11 s at 100k;
-  [0016](../docs/decisions/0016-single-replay-daily-snapshot.md), [0019](../docs/decisions/0019-cheaper-catalog-inspect.md)). A lost race is a
+  [design](../docs/design/current-state.md#what-a-catalog-write-validates)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
   `catalog-busy` (lock wait exceeded) attempt, never `native-input`. Such an attempt wrote
-  nothing, so it does not spend `max_attempts` ([0018](../docs/decisions/0018-catalog-contention-outside-the-fault-budget.md)):
+  nothing, so it does not spend `max_attempts` ([design](../docs/design/current-state.md#concurrent-writers)):
   it counts against a separate bound of 30 lost races per stage cycle, and one `settle`
   call retries at most 6 in a row (about 60 s at the 10 s catalog wait) before it returns
   the stage `retryable` for the next run to resume. Faults still spend `max_attempts`.
@@ -87,7 +86,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
   validation report an unavailable ledger rather than claiming corruption.
 - A writer fully validates the ledger (SQLite integrity, digests, stage and
   attempt shape) unless the previous clean writer attested the file
-  ([0014](../docs/decisions/0014-intake-ledger-handoff-and-bounded-waits.md)).
+  ([design](../docs/design/current-state.md#intake-ledger)).
   On clean unlock a writer records the file identity and SQLite change counter
   in `writer.lock` (any process, not just the same one); the next writer consumes
   and truncates it under the lock, and skips the O(ledger) pass only when the file
@@ -180,7 +179,7 @@ python3 tools/diagnostics/catalog_commit_ceiling.py --size 1600 --workers 1,2,4
 python3 tools/diagnostics/ledger_scale_benchmark.py --ledger 36000 --catalog 25600 --files 40
 ```
 
-Planning a submission (`upload.records_for`) no longer scans history ([0020](../docs/decisions/0020-constant-cost-upload-planning.md)):
+Planning a submission (`upload.records_for`) no longer scans history ([design](../docs/design/current-state.md#intake-ledger)):
 the next `S`/`D` numbers come from the highest current ID per prefix in the catalog's primary-key index plus
 the highest promised by any `upload-*` request in the ledger, decoded once per process by request digest;
 staged, retrying, blocked and dead-letter requests keep their IDs reserved. Profile it with
@@ -288,7 +287,7 @@ to exactly the qualified ones, adding any that are missing. The cohort is the `-
 entry is the cohort's when its rendition was extracted by this run or its receipt's pinned
 `local-path` submission sidecar names that system. Every other entry (another cohort's, an
 operator's, or one whose submission cannot be proven) is left byte-identical and in place, so
-several inboxes can share one catalog, manifest and index ([0021](../docs/decisions/0021-cohort-scoped-selection-reconciliation.md)).
+several inboxes can share one catalog, manifest and index ([design](../docs/design/current-state.md#3-intake-and-review)).
 Only an orphan (receipt missing from the catalog, or retained rendition file gone) is dropped. The
 read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
 processes keep each other's writes, and replacement is atomic. The manifest holds at most 5,000
@@ -306,7 +305,7 @@ Bumping the standing policy version re-reviews every rendition; a new-version re
 A standing review blocked as `changed-standing-inputs` (its saved intent no longer matches current inputs, e.g. after a replay) is restaged as a correction request `<correlation>-c<n>` with the same review arguments and event and fresh request IDs; later runs follow the `correction_of` chain to its newest request.
 The policy (permissions, reviewer match), manifest and index destination are preflighted before ingest. Incomplete or failing reviews remain visibly
 `pending-review`, `rejected`, `deferred` or `exception` without indexing.
-**Restoring cohorts an earlier toolkit pruned.** Before decision 0021, `qualify` for one cohort
+**Restoring cohorts an earlier toolkit pruned.** Before the cohort-scoped reconciliation change (Kata xc2j), `qualify` for one cohort
 removed every other cohort's selections from a shared manifest. The reviews are still in the
 ledger and review store, so re-run `qualify` once per cohort with its own `--system`, `--inbox`
 and the same policy, manifest and index; saved reviews are reused (0 model calls, 0 tokens) and
@@ -344,6 +343,6 @@ fail at once and the rendition stays `pending-review`.
 sample (complete inspections, failed replies, decisions, token usage, time, and
 whether a synthetic garbled/injection control was rejected) and prints a
 body-free report with the selected model and rule. `estimate()` extrapolates
-sample token usage to the admitted count and bytes for a budget ceiling. Record
-the chosen model, rationale, estimate and approved ceiling privately before any
-bulk review, and actual usage after it.
+sample token usage to the admitted count and bytes. Record the chosen model,
+rationale and estimate privately before any bulk review (and a budget ceiling, if
+the owner sets one), and actual usage after it.

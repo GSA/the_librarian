@@ -66,23 +66,21 @@ write only when the store has none for the current UTC day, then deletes
 snapshots older than seven days (set `backup_retention_days` in
 `config/policy.local.json` to change). `python3 -m tools.backups status` reports
 backup count and size; `python3 -m tools.backups prune` is a dry run and
-`--apply` keeps the newest verified snapshot per day. See
-[decision 0010](docs/decisions/0010-daily-snapshots-and-retention.md).
+`--apply` keeps the newest verified snapshot per day. See the
+[current-state design](docs/design/current-state.md) (backups).
 Ingest cost still grows with history; measure it on synthetic cohorts with
-`python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see
-[decision 0012](docs/decisions/0012-bounded-validation-cost.md). Catalog writes
+`python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see the
+[current-state design](docs/design/current-state.md) (catalog validation, writers and cost). Catalog writes
 validate only their delta when the database file is unchanged since a prior full
 validation, judged by file identity with a full check each UTC day
-([decision 0015](docs/decisions/0015-trusted-head-catalog-commit.md),
-[0017](docs/decisions/0017-attested-file-identity-for-catalog-receipts.md)); profile the
+(trust model and residual in the design doc); profile the
 lock with `python3 tools/diagnostics/catalog_lock_benchmark.py`, and a production-sized
-ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py` (per-file planning cost with `upload_planning_benchmark.py`, [decision 0020](docs/decisions/0020-constant-cost-upload-planning.md)). The
+ledger and catalog with `python3 tools/diagnostics/ledger_scale_benchmark.py` (per-file planning cost with `upload_planning_benchmark.py`). The
 throughput target and its derivation are in
 [context/intake.md](context/intake.md#throughput-target-and-measurement).
 The first write of each UTC day replays the history once for its daily snapshot
-([decision 0016](docs/decisions/0016-single-replay-daily-snapshot.md); profile it with
-`tools/diagnostics/catalog_daily_replay_benchmark.py`); [decision 0019](docs/decisions/0019-cheaper-catalog-inspect.md)
-made that replay about half the CPU and a quarter of the memory.
+(profile it with
+`tools/diagnostics/catalog_daily_replay_benchmark.py`).
 
 ## Ingesting files (current manual method)
 
@@ -242,8 +240,8 @@ full-text record of every call: the arguments and the exact text returned, in
 toolkit). It contains corpus text and agent queries, so treat it at the
 instance's audience. If a record cannot be written the call fails instead of
 returning unrecorded text. `.venv/bin/librarian-audit --root "$PWD"
-report` summarizes it without bodies. See
-[decision 0011](docs/decisions/0011-full-text-mcp-audit-log.md).
+report` summarizes it without bodies. See the
+[current-state design](docs/design/current-state.md) (observation).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
 the cited text. A search with no hits returns an `absence` reason: the indexed
@@ -270,4 +268,4 @@ listed in `release-files.json`.
 - Track work in Kata (`kata ready --agent`). roborev hooks review every 5 commits.
 
 More detail: [AGENTS.md](AGENTS.md), role contracts in `agents/`,
-[ROADMAP.md](ROADMAP.md), and [docs/decisions/](docs/decisions/README.md).
+[ROADMAP.md](ROADMAP.md), and the [current-state design](docs/design/current-state.md).
