@@ -33,6 +33,8 @@ class Case(unittest.TestCase):
         catalog.initialize(self.root)
         upload.PROMISES.clear()
         self.addCleanup(upload.PROMISES.clear)
+        upload.forget_reserved()
+        self.addCleanup(upload.forget_reserved)
 
     def file(self, name="notes.txt", raw=TEXT):
         path = self.outside / name
@@ -117,6 +119,7 @@ class MemoTests(Case):
         for number in range(4):
             upload.submit(self.root, self.file(f"n{number}.txt", b"n%d\n" % number), value(f"s{number}", f"n{number}.txt"))
         upload.PROMISES.clear()
+        upload.forget_reserved()
         upload.reserved_ids(self.root)
         with patch.object(upload, "decode", wraps=upload.decode) as decode:
             upload.reserved_ids(self.root)
@@ -131,6 +134,7 @@ class MemoTests(Case):
             upload.submit(self.root, self.file(f"m{number}.txt", b"m%d\n" % number), value(f"m{number}", f"m{number}.txt"))
         warm = upload.reserved_ids(self.root, {"A-upload-m2-original"})
         upload.PROMISES.clear()
+        upload.forget_reserved()
         cold = upload.reserved_ids(self.root, {"A-upload-m2-original"})
         self.assertEqual((warm.highest, warm.present), (cold.highest, cold.present))
         self.assertEqual(cold.highest, {"S": 5, "D": 5})
@@ -181,12 +185,135 @@ class MemoTests(Case):
         self.assertEqual((ids["source"], ids["receipt"]), ("S3", "D3"))
 
     def test_memo_is_bounded(self):
-        with patch.object(upload, "PROMISES_LIMIT", 2):
+        with patch.object(upload, "PROMISES_LIMIT", 2), patch.object(upload, "INDEX_LIMIT", 0):
             for number in range(5):
                 upload.submit(self.root, self.file(f"b{number}.txt", b"b%d\n" % number), value(f"b{number}", f"b{number}.txt"))
             result = upload.reserved_ids(self.root)
         self.assertLessEqual(len(upload.PROMISES), 2)
         self.assertEqual(result.highest, {"S": 5, "D": 5})
+
+
+class IncrementalTests(Case):
+    """``reserved_ids`` reads only the requests added since its last call (rowid high-water mark, Kata rqqq)."""
+
+    def upload_n(self, *names):
+        for name in names:
+            upload.submit(self.root, self.file(name + ".txt", name.encode() + b"\n"), value(name, name + ".txt"))
+
+    def statements(self, call):
+        seen = []
+        real = store.locked
+
+        def traced(root, wait=None):
+            manager = real(root, wait)
+
+            class Wrapper:
+                def __enter__(inner):
+                    connection = manager.__enter__()
+                    connection.set_trace_callback(seen.append)
+                    return connection
+
+                def __exit__(inner, *exc):
+                    return manager.__exit__(*exc)
+            return Wrapper()
+        with patch.object(upload.store, "locked", traced):
+            result = call()
+        return result, [s for s in seen if "FROM requests" in s]
+
+    def test_a_warm_call_reads_only_rows_after_the_high_water_mark(self):
+        self.upload_n("a", "b", "c")
+        upload.reserved_ids(self.root)
+        _, reads = self.statements(lambda: upload.reserved_ids(self.root))
+        self.assertTrue(reads)
+        self.assertTrue(all("rowid" in read for read in reads), reads)
+        self.assertFalse(any("correlation_id LIKE" in read and "rowid" not in read for read in reads))
+
+    def test_requests_added_after_a_warm_call_are_all_picked_up_in_order(self):
+        self.upload_n("a")
+        self.assertEqual(upload.reserved_ids(self.root).highest, {"S": 1, "D": 1})
+        self.upload_n("b", "c")
+        taken = upload.reserved_ids(self.root, {"A-upload-c-original", "A-upload-zz-original"})
+        self.assertEqual(taken.highest, {"S": 3, "D": 3})
+        self.assertEqual(taken.present, {"A-upload-c-original"})
+
+    def test_a_replaced_ledger_with_the_same_number_of_requests_resets_the_index(self):
+        self.upload_n("a", "b")
+        self.assertEqual(upload.reserved_ids(self.root).highest, {"S": 2, "D": 2})
+        db = self.root / ".local/intake/intake.sqlite3"
+        copy = db.with_name("copy.sqlite3")
+        with closing(sqlite3.connect(db)) as source, closing(sqlite3.connect(copy)) as target:
+            source.backup(target)
+        with closing(sqlite3.connect(copy)) as connection, connection:
+            raw = connection.execute("SELECT raw FROM requests WHERE correlation_id='upload-b'").fetchone()[0]
+            raw = raw.replace(b'"S2"', b'"S9"').replace(b'"D2"', b'"D9"')
+            connection.execute("UPDATE requests SET raw=?, request_sha256=? WHERE correlation_id='upload-b'",
+                               (raw, upload.digest(raw)))
+        copy.chmod(0o600)
+        copy.replace(db)  # a different file (inode) now holds the ledger
+        self.assertEqual(upload.reserved_ids(self.root).highest, {"S": 9, "D": 9})
+
+    def test_a_smaller_ledger_than_the_index_remembers_resets_it(self):
+        self.upload_n("a", "b")
+        upload.reserved_ids(self.root)
+        other = Path(self.temp.name) / "other"
+        other.mkdir()
+        store.initialize(other)
+        catalog.initialize(other)
+        upload.submit(other, self.file("o.txt", b"o\n"), value("o", "o.txt"))
+        self.assertEqual(upload.reserved_ids(other).highest, {"S": 1, "D": 1})
+        self.assertEqual(upload.reserved_ids(self.root).highest, {"S": 2, "D": 2})
+
+    def test_a_request_with_a_corrupt_digest_is_refused_when_first_read(self):
+        self.upload_n("a")
+        upload.reserved_ids(self.root)
+        store.stage(self.root, upload.canonical({
+            "version": 1, "correlation_id": "upload-late", "correction_of": None,
+            "policy": {"version": 1, "sha256": upload.policy.for_root(self.root)[1]},
+            "retry": {"max_attempts": 3, "backoff_seconds": 0},
+            "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit", "arguments": {
+                "records": [], "actor": "a", "request_id": "upload-late",
+                "expected_state": "0" * 64, "reason": "Manual upload: x"}}]}).encode())
+        db = self.root / ".local/intake/intake.sqlite3"
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute("UPDATE requests SET request_sha256=? WHERE correlation_id='upload-late'", ("0" * 64,))
+        with self.assertRaises(IntakeError):
+            upload.reserved_ids(self.root)
+
+    def test_over_the_index_bound_the_answer_is_the_same_scan(self):
+        self.upload_n("a", "b", "c")
+        warm = upload.reserved_ids(self.root, {"A-upload-b-original"})
+        upload.forget_reserved()
+        with patch.object(upload, "INDEX_LIMIT", 2):
+            bounded = upload.reserved_ids(self.root, {"A-upload-b-original"})
+            again = upload.reserved_ids(self.root, {"A-upload-b-original"})
+        for taken in (bounded, again):
+            self.assertEqual((taken.highest, taken.present), (warm.highest, warm.present))
+
+
+    def test_a_ledger_over_the_index_bound_is_not_decoded_again_by_later_calls(self):
+        self.upload_n("a", "b", "c")
+        with patch.object(upload, "INDEX_LIMIT", 2):
+            first = upload.reserved_ids(self.root)
+            with patch.object(upload, "decode", wraps=upload.decode) as decode:
+                second = upload.reserved_ids(self.root)
+            self.assertEqual(decode.call_count, 0)  # served by the warm digest memo alone
+            self.assertEqual(second.highest, first.highest)
+            # A ledger that is a different file starts over and may use the index again.
+            other = Path(self.temp.name) / "small"
+            other.mkdir()
+            store.initialize(other)
+            catalog.initialize(other)
+            self.assertEqual(upload.reserved_ids(other).highest, {"S": 0, "D": 0})
+        upload.submit(other, self.file("o.txt", b"o\n"), value("o", "o.txt"))
+        self.assertEqual(upload.reserved_ids(other).highest, {"S": 1, "D": 1})
+        self.assertEqual(upload.RESERVED.key[0], str(other))
+
+    def test_the_index_stops_reading_once_the_bound_is_passed(self):
+        self.upload_n("a", "b", "c", "d")
+        with patch.object(upload, "INDEX_LIMIT", 5), patch.object(upload, "promised", wraps=upload.promised) as read, \
+                patch.object(upload, "scanned_ids", return_value=upload.Taken()):
+            upload.reserved_ids(self.root)
+        self.assertLessEqual(read.call_count, 2)  # 4 IDs per request: the second passes the bound
 
 
 class EquivalenceTests(Case):
