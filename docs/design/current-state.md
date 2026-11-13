@@ -101,9 +101,13 @@ restated here.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
-  (`tests/test_mcp.py`). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
+  (`tests/test_mcp.py`). The runtime probe refuses, with a non-zero exit and an
+  explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
+  and missing FTS5, and reports the Python, SQLite and `mcp` versions and
+  `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
+  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
   are ranges and transitive dependencies are unpinned. There is no lock file,
-  image or installer, and no failing-probe test (Kata vckd). Whether those are
+  image or installer. Whether those are
   wanted is an open product question, not a commitment (Kata 7jkt).
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
