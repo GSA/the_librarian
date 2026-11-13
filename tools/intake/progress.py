@@ -16,8 +16,10 @@ import html
 import http.server
 import ipaddress
 import json
+import os
 import socket
 import sqlite3
+import stat
 import threading
 import time
 
@@ -100,6 +102,20 @@ def rates(c, now):
         outcome: dict(zip(map(str, WINDOWS), counts)) for outcome, *counts in sorted(rows)}}
 
 
+def header_identity(db):
+    """``file_identity`` for a SQLite build without ``sqlite_dbpage``: the same stat fields and the
+    change counter from the file's own header. Opens a descriptor on the database, so call it only
+    while this process holds no SQLite lock on it (closing any descriptor drops fcntl locks)."""
+    if os.path.lexists(f"{db}-journal") or os.path.lexists(f"{db}-wal"):
+        return None
+    with open(db, "rb") as stream:
+        header = stream.read(100)
+    info = os.stat(db, follow_symlinks=False)
+    if len(header) < 100 or header[18:20] != b"\x01\x01" or not stat.S_ISREG(info.st_mode):
+        return None
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, header[24:28].hex()]
+
+
 def open_ledger(root, timeout):
     root, home, db = store.locations(root)
     store.private(home, True)
@@ -136,6 +152,10 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
         try:
             c.execute("BEGIN")
             before = file_identity(db, c)
+            if before is None:
+                c.execute("COMMIT")  # no SQLite lock is held while the header is read directly
+                before = header_identity(db)
+                c.execute("BEGIN")
             key = (str(root), before, limit, tuple(sorted((runs or {}).items())),
                    datetime.now(timezone.utc).date().isoformat())
             if before is not None and _cached.get("key") == key:
@@ -210,6 +230,8 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
             after_identity = file_identity(db, c)
             moving = rates(c, time.time())
             c.execute("COMMIT")
+            if after_identity is None and before is not None:
+                after_identity = header_identity(db)
         except sqlite3.DatabaseError as error:
             raise IntakeError("ledger_unavailable") from error
     summary = {

@@ -254,6 +254,7 @@ def verify_page(rows, root, memo):
     requests, stages_of, attempts_of, replays_of = rows
 
     def artifact(raw, stored):
+        require(isinstance(raw, str), "corrupt_artifact")
         data = raw.encode()
         proven = digest(data)
         if proven != stored or stored not in memo.artifacts:
@@ -264,6 +265,9 @@ def verify_page(rows, root, memo):
     layouts = []
     for row in requests:
         raw, stored = row["raw"], row["request_sha256"]
+        # The byte contract of ``decode_request``, before the bytes are hashed: a TEXT or oversized
+        # value is a refusal, not a crash.
+        require(isinstance(raw, bytes) and 0 < len(raw) <= 1024 * 1024, "request_budget")
         proven = digest(raw)
         known = memo.requests.get(proven) if proven == stored else None
         if known is None:

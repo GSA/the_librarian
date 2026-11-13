@@ -213,6 +213,32 @@ class CachedResultTests(Case):
         self.assertEqual(again["overall"]["requests"], 21)
         self.assertTrue(progress.snapshot(self.root)["render"]["ledger_cached"])
 
+    def test_the_cache_works_without_sqlite_dbpage_and_still_sees_changes(self):
+        seed(self.root, 20)
+        with mock.patch.object(progress, "file_identity", return_value=None):
+            self.assertFalse(progress.snapshot(self.root)["render"]["ledger_cached"])
+            with mock.patch.object(store, "verify_page", side_effect=AssertionError("re-verified")):
+                self.assertTrue(progress.snapshot(self.root)["render"]["ledger_cached"])
+            store.stage(self.root, raw_request(999, LAYOUTS[0], prefix="late-"))
+            again = progress.snapshot(self.root)
+            self.assertFalse(again["render"]["ledger_cached"])
+            self.assertEqual(again["overall"]["requests"], 21)
+            with closing(sqlite3.connect(self.db)) as c, c:
+                c.execute("UPDATE requests SET request_sha256=? WHERE correlation_id='bulk-000003'", ("0" * 64,))
+            self.assertEqual(progress.snapshot(self.root)["ledger"]["error"], "corrupt_request")
+
+    def test_a_text_or_oversized_request_value_is_unavailable_not_a_crash(self):
+        for name, value in (("text", "{}"), ("oversized", b"x" * (1024 * 1024 + 1)), ("empty", b"")):
+            with self.subTest(name):
+                self.setUp()
+                seed(self.root, 6)
+                progress.snapshot(self.root)
+                with closing(sqlite3.connect(self.db)) as c, c:
+                    c.execute("UPDATE requests SET raw=? WHERE correlation_id='bulk-000002'", (value,))
+                report = progress.snapshot(self.root)
+                self.assertFalse(report["ledger"]["available"])
+                self.assertEqual(report["ledger"]["error"], "request_budget")
+
     def test_a_cached_result_is_not_served_after_the_ledger_is_tampered_with(self):
         edits = {
             "request digest": ("UPDATE requests SET request_sha256=? WHERE correlation_id='bulk-000003'",
