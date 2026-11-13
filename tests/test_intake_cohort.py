@@ -518,6 +518,78 @@ class RecoverIdentityTests(BlockedCase):
         self.assertEqual(json.loads(out.getvalue())["results"], {"succeeded": 6})
 
 
+class ReplayTests(CohortCase):
+    """Replaying an unchanged inbox reads the ledger once per entry and changes nothing (Kata wrwb)."""
+
+    def ingest(self):
+        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+
+    def test_unchanged_replay_reports_exactly_what_the_first_ingest_did(self):
+        first = self.ingest()
+        state = catalog.status(self.root)["state_token"]
+        self.assertEqual(self.ingest(), first)
+        self.assertEqual(catalog.status(self.root)["state_token"], state)
+
+    def test_replay_opens_the_ledger_three_times_per_admitted_entry_and_never_inspects(self):
+        # One read of the receipt request and its summary, plus the correction-chain head of the
+        # extraction and of the registration (kept: a corrected request must still be followed).
+        first = self.ingest()
+        admitted = first["counts"]["outcome"]["received"]
+        with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
+                unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
+            self.ingest()
+        self.assertEqual(locked.call_count, 3 * admitted)
+        inspected.assert_not_called()
+
+    def test_a_file_modified_between_runs_is_still_detected_and_corrected(self):
+        first = self.ingest()
+        old = next(e for e in first["entries"] if e["relative"] == "a/notes.md")
+        self.writable()
+        (self.inbox / "a/notes.md").write_bytes(b"# Notes\nA different line\n")
+        second = self.ingest()
+        new = next(e for e in second["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual(new["outcome"], "extracted")
+        self.assertNotEqual(new["submission_id"], old["submission_id"])
+        sidecar = json.loads((self.root / Path(new["original"]).parent / "submission.json").read_text())
+        self.assertEqual(sidecar["correction_of"], old["submission_id"])
+        self.assertEqual(second["counts"]["outcome"], first["counts"]["outcome"])
+        self.assertEqual(self.ingest(), second)
+
+    def test_a_file_modified_after_classification_is_changed_since_intake_on_replay(self):
+        self.ingest()
+        self.writable()
+        real = cohort.classify
+
+        def classify_then_change(*args):
+            entries = real(*args)
+            (self.inbox / "a/notes.md").write_bytes(b"# Notes\nChanged after classification\n")
+            return entries
+        with unittest.mock.patch.object(cohort, "classify", classify_then_change):
+            report = self.ingest()
+        entry = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual((entry["outcome"], entry["code"]), ("changed-since-intake", "changed_input"))
+        self.assertEqual(report["counts"]["outcome"]["changed-since-intake"], 1)
+
+    def test_a_retained_copy_that_no_longer_matches_still_refuses_on_replay(self):
+        first = self.ingest()
+        entry = next(e for e in first["entries"] if e["relative"] == "a/notes.md")
+        retained = self.root / entry["original"]
+        retained.chmod(0o600)
+        retained.write_bytes(b"# Notes\nTampered\n")
+        report = self.ingest()
+        again = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual((again["outcome"], again["code"]), ("failed", "destination_conflict"))
+
+    def test_only_a_succeeded_stage_is_reused_from_the_entrys_ledger_read(self):
+        summary = lambda status: {"stages": [{"status": status}]}
+        known = {"done": ({}, summary("succeeded")), "again": ({}, summary("retryable")),
+                 "stuck": ({}, summary("blocked")), "going": ({}, summary("running"))}
+        self.assertEqual(upload.settled_summary(known, "done"), summary("succeeded"))
+        for name in ("again", "stuck", "going", "absent"):
+            self.assertIsNone(upload.settled(known, name))
+        self.assertIsNone(upload.settled(None, "done"))
+
+
 class QualifyCase(CohortCase):
     def setUp(self):
         super().setUp()

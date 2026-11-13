@@ -192,13 +192,14 @@ the one-off daily replay excluded) for per-file figures.
 disposition, `submit` re-reads it against `expected_sha256` and the retained copy, and the ledger decides
 what is already received and extracted. Hashing is about 1% of the cost. The rest was repeated ledger opens
 (about nine per file, each re-validating the storage roots and walking the path for symlinks) and the same
-three requests read several times. A replay now opens the ledger once per entry for those requests and
-reuses only stages that have `succeeded`, and the storage-root check is reused for an identical policy,
+receipt request read several times. A replay now opens the ledger three times per entry (the receipt request
+with its summary, then the correction-chain head of the extraction and of the registration) and
+reuses only a receipt stage that has `succeeded`, and the storage-root check is reused for an identical policy,
 with the symlink walk done once per path component. A modified file is still detected (a new content-salted
 submission superseding the old, or `changed-since-intake`). Measure it with
 `python3 tools/diagnostics/ingest_benchmark.py --sizes 2000 --replay --fixture mixed --padding 1800 --reuse DIR`
 (wall and CPU seconds, bytes read from `/proc/self/io`, and a digest of the whole report so two `--tree`
-checkouts can be compared): about 11 to 4 ms per file at 2,000 and 10,000 synthetic files of about 133 KiB.
+checkouts can be compared): about 11 to 5 ms per file at 2,000 and 10,000 synthetic files of about 133 KiB.
 A MIME HTML file costs about 8 ms more in its parser during `classify`; that is the remaining floor.
 
 `ledger_scale_benchmark.py` reports `full_ledger_validations`; it should be about 1 per

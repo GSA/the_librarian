@@ -125,9 +125,9 @@ re-read, re-hashed and checked against the ledger) before the first review eithe
   --model MODEL --context documents/CONTEXT.md
 ```
 
-A replay of an unchanged inbox costs a few milliseconds per file, so rerunning or resuming
+A replay of an unchanged inbox costs about 5 milliseconds per file, so rerunning or resuming
 `qualify` on a large cohort starts reviewing after minutes, not hours; measure it with
-`tools/diagnostics/ingest_benchmark.py --replay` ([decision 0009](docs/decisions/0009-read-only-cohort-intake.md)).
+`tools/diagnostics/ingest_benchmark.py --replay` ([current-state design](docs/design/current-state.md#3-intake-and-review)).
 It prints body-free outcome counts, token usage and transport retry counts;
 incomplete reviews stay visibly `pending-review` and are not indexed. Up to
 `--concurrency N` (default 6; `1` is serial) model calls run at once, while all
