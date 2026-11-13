@@ -12,7 +12,7 @@ import time
 
 from tools import policy
 from tools.file_identity import file_identity
-from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, request_shape, require
+from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, request_layout, request_shape, require
 
 APPLICATION_ID = 0x4C494E54
 SCHEMA = 1
@@ -134,16 +134,64 @@ def check_identity(c):
             and not c.execute("PRAGMA foreign_key_check").fetchall(), "corrupt_store")
 
 
-def snapshot(c):
-    """Every ledger row, read in one pass so a caller can verify it without holding a read lock."""
+def snapshot(c, after=None, limit=None):
+    """Every ledger row, read in one pass so a caller can verify it without holding a read lock.
+
+    With ``limit`` only the next ``limit`` requests after correlation ID ``after`` (in ID order) and
+    their stage, attempt and replay rows are read, so a caller can walk a large ledger in short
+    read transactions without holding it all in memory.
+    """
     stages_of, attempts_of, replays_of = {}, {}, {}
-    for saved in c.execute("SELECT * FROM stages ORDER BY correlation_id, ordinal"):
+    where, args = "", ()
+    if limit is None:
+        requests = c.execute("SELECT * FROM requests").fetchall()
+    else:
+        requests = c.execute("SELECT * FROM requests WHERE correlation_id>? ORDER BY correlation_id LIMIT ?",
+                             (after or "", limit)).fetchall()
+        if not requests:
+            return requests, stages_of, attempts_of, replays_of
+        where, args = " WHERE correlation_id>? AND correlation_id<=?", (after or "", requests[-1]["correlation_id"])
+    for saved in c.execute("SELECT * FROM stages" + where + " ORDER BY correlation_id, ordinal", args):
         stages_of.setdefault(saved["correlation_id"], []).append(saved)
-    for attempt in c.execute("SELECT * FROM attempts ORDER BY correlation_id, stage_id, cycle, ordinal"):
+    for attempt in c.execute("SELECT * FROM attempts" + where + " ORDER BY correlation_id, stage_id, cycle, ordinal", args):
         attempts_of.setdefault((attempt["correlation_id"], attempt["stage_id"]), []).append(attempt)
-    for replay in c.execute("SELECT correlation_id, stage_id, cycle FROM replays ORDER BY correlation_id, stage_id, cycle"):
+    for replay in c.execute("SELECT correlation_id, stage_id, cycle FROM replays" + where
+                            + " ORDER BY correlation_id, stage_id, cycle", args):
         replays_of.setdefault((replay[0], replay[1]), []).append(replay[2])
-    return c.execute("SELECT * FROM requests").fetchall(), stages_of, attempts_of, replays_of
+    return requests, stages_of, attempts_of, replays_of
+
+
+STATUSES = {"staged", "running", "retryable", "blocked", "dead-letter", "succeeded", "return-pending"}
+
+
+def check_request(row, shape, root, stages_of, attempts_of, replays_of, artifact):
+    """Every check on one saved request's identity, stages, artifacts, attempts and replays.
+
+    ``shape`` is its validated (correlation ID, correction parent, stage IDs); ``artifact(text,
+    stored_sha256)`` proves one saved intent or evidence. Shared by ``verify`` and ``verify_page``,
+    so there is one copy of the rules.
+    """
+    correlation_id, correction_of, stage_ids = shape
+    require(row["root"] == str(root) and correlation_id == row["correlation_id"]
+            and correction_of == row["correction_of"], "corrupt_request")
+    stages = stages_of.get(row["correlation_id"], [])
+    require(len(stages) == len(stage_ids), "corrupt_stage")
+    for ordinal, (stage_id, saved) in enumerate(zip(stage_ids, stages)):
+        require(saved["ordinal"] == ordinal and saved["stage_id"] == stage_id
+                and saved["status"] in STATUSES
+                and type(saved["cycle"]) is int and saved["cycle"] >= 0, "corrupt_stage")
+        for key in ("intent", "evidence"):
+            raw = saved[key]
+            require((raw is None) == (saved[key + "_sha256"] is None), "corrupt_artifact")
+            if raw is not None:
+                artifact(raw, saved[key + "_sha256"])
+        require(saved["status"] not in {"succeeded", "return-pending"}
+                or (saved["intent"] is not None and saved["evidence"] is not None), "corrupt_stage")
+        for attempt in attempts_of.get((row["correlation_id"], stage_id), []):
+            require(0 <= attempt["cycle"] <= saved["cycle"] and attempt["ordinal"] >= 1
+                    and (attempt["outcome"] in {None, "succeeded", "failed", "return-pending"})
+                    and ((attempt["ended"] is None) == (attempt["outcome"] is None)), "corrupt_attempt")
+        require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
 
 
 def verify(rows, root):
@@ -159,6 +207,11 @@ def verify(rows, root):
             held += len(key) + _MEMO_ENTRY_OVERHEAD
             into[key] = value
 
+    def artifact(raw, stored):
+        if known_artifacts.get(raw) != stored:
+            require(digest(raw.encode()) == stored and isinstance(decode(raw.encode()), dict), "corrupt_artifact")
+        remember(remembered_artifacts, raw, stored)
+
     for row in requests:
         raw = row["raw"]
         known = known_requests.get(raw)
@@ -167,32 +220,68 @@ def verify(rows, root):
         else:
             shape = request_shape(raw)
             require(digest(raw) == row["request_sha256"], "corrupt_request")
-        correlation_id, correction_of, stage_ids = shape
-        require(row["root"] == str(root) and correlation_id == row["correlation_id"]
-                and correction_of == row["correction_of"], "corrupt_request")
         remember(remembered_requests, raw, (row["request_sha256"], shape))
-        stages = stages_of.get(row["correlation_id"], [])
-        require(len(stages) == len(stage_ids), "corrupt_stage")
-        for ordinal, (stage_id, saved) in enumerate(zip(stage_ids, stages)):
-            require(saved["ordinal"] == ordinal and saved["stage_id"] == stage_id
-                    and saved["status"] in {"staged", "running", "retryable", "blocked", "dead-letter", "succeeded", "return-pending"}
-                    and type(saved["cycle"]) is int and saved["cycle"] >= 0, "corrupt_stage")
-            for key in ("intent", "evidence"):
-                raw = saved[key]
-                require((raw is None) == (saved[key + "_sha256"] is None), "corrupt_artifact")
-                if raw is not None:
-                    if known_artifacts.get(raw) != saved[key + "_sha256"]:
-                        require(digest(raw.encode()) == saved[key + "_sha256"]
-                                and isinstance(decode(raw.encode()), dict), "corrupt_artifact")
-                    remember(remembered_artifacts, raw, saved[key + "_sha256"])
-            require(saved["status"] not in {"succeeded", "return-pending"}
-                    or (saved["intent"] is not None and saved["evidence"] is not None), "corrupt_stage")
-            for attempt in attempts_of.get((row["correlation_id"], stage_id), []):
-                require(0 <= attempt["cycle"] <= saved["cycle"] and attempt["ordinal"] >= 1
-                        and (attempt["outcome"] in {None, "succeeded", "failed", "return-pending"})
-                        and ((attempt["ended"] is None) == (attempt["outcome"] is None)), "corrupt_attempt")
-            require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
+        check_request(row, shape, root, stages_of, attempts_of, replays_of, artifact)
     _verified = (remembered_requests, remembered_artifacts)
+
+
+class PageMemo:
+    """What ``verify_page`` has already proven, keyed by SHA-256 digests (no raw bytes retained).
+
+    A digest names exactly one byte string, and ``verify_page`` always hashes the bytes in hand and
+    compares that with the stored digest before it consults the memo, so a rewritten row is a miss
+    or a refusal. Only bytes that matched their stored digest and decoded are recorded, and
+    nothing is recorded once ``limit`` entries are held (the rest are checked every pass).
+    """
+
+    def __init__(self, limit=1_000_000):
+        self.limit, self.requests, self.artifacts, self.layouts = limit, {}, set(), {}
+
+    def __len__(self):
+        return len(self.requests) + len(self.artifacts)
+
+    def clear(self):
+        self.requests, self.artifacts, self.layouts = {}, set(), {}
+
+
+def verify_page(rows, root, memo):
+    """``verify`` for one page of ``snapshot(c, after, limit)``; returns each request's stage layout.
+
+    The layout is a tuple of (stage ID, kind, operation) per stage, from the validated request.
+    Every check of ``verify`` runs, with the digest-keyed ``memo`` standing in for its
+    byte-keyed one; failures are never recorded.
+    """
+    requests, stages_of, attempts_of, replays_of = rows
+
+    def artifact(raw, stored):
+        require(isinstance(raw, str), "corrupt_artifact")
+        data = raw.encode()
+        proven = digest(data)
+        if proven != stored or stored not in memo.artifacts:
+            require(proven == stored and isinstance(decode(data), dict), "corrupt_artifact")
+            if len(memo) < memo.limit:
+                memo.artifacts.add(stored)
+
+    layouts = []
+    for row in requests:
+        raw, stored = row["raw"], row["request_sha256"]
+        # The byte contract of ``decode_request``, before the bytes are hashed: a TEXT or oversized
+        # value is a refusal, not a crash.
+        require(isinstance(raw, bytes) and 0 < len(raw) <= 1024 * 1024, "request_budget")
+        proven = digest(raw)
+        known = memo.requests.get(proven) if proven == stored else None
+        if known is None:
+            correlation_id, correction_of, layout = request_layout(raw)
+            require(proven == stored, "corrupt_request")
+            layout = memo.layouts.setdefault(layout, layout)
+            known = (correlation_id, correction_of, layout)
+            if len(memo) < memo.limit:
+                memo.requests[proven] = known
+        correlation_id, correction_of, layout = known
+        check_request(row, (correlation_id, correction_of, tuple(stage[0] for stage in layout)), root,
+                      stages_of, attempts_of, replays_of, artifact)
+        layouts.append(layout)
+    return layouts
 
 
 def validate(c, root):
