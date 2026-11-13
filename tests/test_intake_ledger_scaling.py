@@ -270,10 +270,11 @@ class ReaderTests(Case):
     def test_progress_reader_validating_does_not_block_a_writer_commit(self):
         self.seed(3)
         store.list_requests(self.root)  # attest the ledger so the writer does not validate
+        progress.forget()
         outcome = []
-        real = store.verify
+        real = store.verify_page
 
-        def verify_while_writer_commits(rows, root):
+        def verify_while_writer_commits(rows, root, memo):
             if not outcome:
                 outcome.append("running")
                 try:
@@ -281,13 +282,17 @@ class ReaderTests(Case):
                     outcome.append("committed")
                 except contracts.IntakeError as error:
                     outcome.append(error.code)
-            return real(rows, root)
+            return real(rows, root, memo)
         with mock.patch.dict(os.environ, {WAIT_ENV: "0.3"}), \
-                mock.patch.object(store, "verify", side_effect=verify_while_writer_commits):
-            requests, _, _ = progress.read_ledger(self.root, timeout=1)
+                mock.patch.object(store, "verify_page", side_effect=verify_while_writer_commits):
+            during = progress.read_ledger(self.root, timeout=1)
         self.assertEqual(outcome, ["running", "committed"])
-        self.assertIn("during-read", [r[0] for r in progress.read_ledger(self.root, timeout=1)[0]])
-        self.assertEqual(len(requests), 3)
+        self.assertFalse(during["cached"])
+        self.assertEqual(progress._cached, {}, "a pass that saw a commit must not be remembered")
+        after = progress.read_ledger(self.root, timeout=1)
+        self.assertEqual((during["overall"]["requests"], after["overall"]["requests"]), (3, 4))
+        self.assertIn("during-read", [r["correlation_id"] for r in after["recent"]])
+        self.assertFalse(after["cached"], "a pass that saw a commit must not be remembered")
 
     def test_progress_still_detects_a_tampered_ledger(self):
         self.seed(2)

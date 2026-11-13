@@ -57,8 +57,9 @@ def fields(value, names):
 
 
 def text(value, limit=200):
-    require(isinstance(value, str) and 0 < len(value) <= limit
-            and all(32 <= ord(c) < 127 for c in value))
+    # For a str, ``isascii() and isprintable()`` is exactly "every character is 0x20-0x7e": it only
+    # skips the per-character Python loop.
+    require(isinstance(value, str) and 0 < len(value) <= limit and value.isascii() and value.isprintable())
 
 
 def identifier(value):
@@ -152,3 +153,11 @@ def request_shape(raw):
     value = decode_request(raw)
     return (value["correlation_id"], value["correction_of"],
             tuple(stage["id"] for stage in value["stages"]))
+
+
+def request_layout(raw):
+    """``request_shape`` plus each stage's kind and operation: (correlation ID, correction parent,
+    ((stage ID, kind, operation), ...)) of a fully validated saved request."""
+    value = decode_request(raw)
+    return (value["correlation_id"], value["correction_of"],
+            tuple((stage["id"], stage["kind"], stage["operation"]) for stage in value["stages"]))

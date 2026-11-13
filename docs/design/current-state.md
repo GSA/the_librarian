@@ -244,7 +244,7 @@ before the last speedup. Reproduce with the tools in `tools/diagnostics/`
 (`catalog_lock_benchmark.py`, `catalog_commit_ceiling.py`,
 `catalog_daily_replay_benchmark.py`, `ingest_benchmark.py`,
 `ledger_scale_benchmark.py`, `upload_planning_benchmark.py`,
-`ledger_verify_benchmark.py`, `catalog_contention_budget.py`). Use synthetic
+`ledger_verify_benchmark.py`, `progress_benchmark.py`, `catalog_contention_budget.py`). Use synthetic
 fixtures only.
 
 Evidence: `tests/test_catalog_delta_commit.py` (randomized and named equivalence
@@ -331,9 +331,28 @@ valid history and about 100 tamperings: same result or same refusal message),
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values refuse)
   and the same value is the SQLite busy timeout. Exceeding it, or a transient SQLite
   BUSY/LOCKED during a stage, raises retryable `ledger_busy`; nothing was written.
-  `settle` and cohort ingest retry up to three times. `progress` reads inside a
-  short transaction and verifies digests afterwards, so it cannot hold a read lock
-  across O(ledger) work.
+  `settle` and cohort ingest retry up to three times. `progress` reads the ledger in
+  keyset pages of 5,000 requests, each in its own short read transaction, and
+  verifies each page afterwards (`store.verify_page`, sharing `store.check_request`
+  with `store.verify`), so it cannot hold a read lock across O(ledger) work and its
+  memory is a page plus counters. It reduces the ledger to counts per distinct
+  request signature and expands only the newest `--limit` items; each page is
+  consistent, the pass as a whole is not one global snapshot.
+- `progress` keeps its finished summary in memory keyed by the ledger's file identity
+  (the writer hand-off's `file_identity`), `--limit`, the run set and the UTC date,
+  stored only when the identity is unchanged from before the first to after the last
+  page. A commit, a tampered row or a new UTC day re-verifies in full; the residual
+  is that of the catalog receipt (an edit that restores size, times and change
+  counter is seen at the next UTC-day check). Digests of requests and artifacts
+  already proven are kept by SHA-256 (no raw bytes, no failures) and a hit still
+  hashes the bytes in hand and compares the stored digest. Its catalog read never
+  writes a receipt: it trusts a receipt covering this exact file or this process's
+  own full inspection today. `progress-serve` renders one page at a time, shares the
+  result with requests that arrive meanwhile and reuses one younger than a second;
+  the report adds finished-attempt rates (1/5/15 min) and attention grouped by
+  cause. A 125,000-request synthetic ledger rendered in 11 s and 1.5 GB before and
+  renders in 0.15 s unchanged, about 2 s after a commit and 4.5 s cold, at about
+  140 MB (`tools/diagnostics/progress_benchmark.py`).
 - `store.verify` keeps one memo of the previous successful pass keyed by exact
   request bytes and artifact text with the digest they were proven to have, capped
   at `store.MEMO_BYTES` (128 MiB of keys). A hit needs identical bytes and an
@@ -344,7 +363,8 @@ valid history and about 100 tamperings: same result or same refusal message),
   dead-letter requests keep their IDs reserved.
 - Evidence: `tests/test_intake_ledger_scaling.py` (alternating writers, tamper and
   replaced-ledger cases, bounded waits, progress, forged-digest memo cases, memo
-  cap), `tests/test_upload_planning.py`.
+  cap), `tests/test_progress_scale.py` (reference-equal counts across page sizes,
+  tamper after a cached render, digest-keyed memo, single-flight), `tests/test_upload_planning.py`.
 - A measured production-sized ledger (about 130 MB, 36k requests) made the
   original 16k/64k-entry caches useless for the in-order walk of `verify`; the
   memo above is the fix (about 0.9 s per pass down to about 0.14 s).

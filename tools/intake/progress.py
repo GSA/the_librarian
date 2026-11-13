@@ -6,6 +6,7 @@ anything, and it reports each unavailable or corrupt source instead of failing.
 The HTTP view binds loopback only unless non-loopback exposure is explicitly
 approved by the operator.
 """
+from bisect import insort
 from collections import Counter
 from contextlib import closing
 from datetime import datetime, timezone
@@ -18,8 +19,10 @@ import json
 import socket
 import sqlite3
 import threading
+import time
 
 from tools import policy
+from tools.file_identity import file_identity
 from . import store
 from .contracts import IntakeError, decode_request
 
@@ -58,7 +61,46 @@ def failure(error):
 
 # Ledger -----------------------------------------------------------------
 
-def read_ledger(root, timeout):
+PAGE = 5000  # requests per short read transaction
+WINDOWS = (60, 300, 900)  # seconds for the "is it moving" attempt rates
+CODED = {"blocked", "dead-letter", "retryable"}  # statuses whose last attempt code is reported
+ATTENTION = CODED
+
+# Verification state reused across renders in this process. ``_memo`` holds SHA-256 digests of
+# request and artifact bytes already proven (store.PageMemo); ``_cached`` holds the one finished
+# ledger summary, valid only for the exact file identity it was computed from (decision 0014/0017).
+_memo = store.PageMemo()
+_cached = {}
+
+
+def forget():
+    """Drop everything kept between renders (tests and long-lived callers)."""
+    _memo.clear()
+    _cached.clear()
+
+
+class Best:
+    """The ``limit`` smallest keys offered, each with a payload built only when it is kept."""
+
+    def __init__(self, limit):
+        self.limit, self.entries = limit, []
+
+    def offer(self, key, make):
+        if len(self.entries) < self.limit or key < self.entries[-1][0]:
+            insort(self.entries, (key, make()), key=lambda entry: entry[0])
+            del self.entries[self.limit:]
+
+
+def rates(c, now):
+    """Attempts that finished within each window, by outcome (the run is moving, or it is not)."""
+    rows = c.execute("SELECT outcome, " + ", ".join("coalesce(sum(ended>=?),0)" for _ in WINDOWS)
+                     + " FROM attempts WHERE ended>=? AND outcome IS NOT NULL GROUP BY outcome",
+                     [now - w for w in WINDOWS] + [now - max(WINDOWS)]).fetchall()
+    return {"windows_seconds": list(WINDOWS), "finished": {
+        outcome: dict(zip(map(str, WINDOWS), counts)) for outcome, *counts in sorted(rows)}}
+
+
+def open_ledger(root, timeout):
     root, home, db = store.locations(root)
     store.private(home, True)
     store.private(db)
@@ -67,32 +109,156 @@ def read_ledger(root, timeout):
                                      isolation_level=None)
     except sqlite3.Error as error:
         raise IntakeError("ledger_unavailable") from error
-    with closing(connection) as c:
-        c.row_factory = sqlite3.Row
+    connection.row_factory = sqlite3.Row
+    return root, db, connection
+
+
+def stage_signature(layout, statuses):
+    """Funnel state, current stage position and its status for one request shape and progress."""
+    steps = [({"kind": kind, "operation": operation}, {"status": status}, {"code": code})
+             for (_, kind, operation), (status, code) in zip(layout, statuses)]
+    funnel = classify(steps)
+    current = next((n for n, (status, _) in enumerate(statuses)
+                    if status not in {"succeeded", "return-pending"}), len(statuses) - 1)
+    return funnel, statuses[current][0], statuses[current][1]
+
+
+def read_ledger(root, timeout=2.0, limit=50, runs=None):
+    """Verify the whole ledger a page at a time and reduce it to counts and the few items shown.
+
+    Every page is read in its own short read transaction and verified after it ends (so, as in
+    decision 0014, no read lock is held across digest or shape work). Nothing but counters and
+    the ``limit`` newest items per list is kept, so memory follows the page, not the ledger.
+    """
+    started = time.perf_counter()
+    root, db, c = open_ledger(root, timeout)
+    with closing(c):
         try:
-            # The read transaction only copies rows: SQLite's own checks and one pass per
-            # table. Digest and shape verification runs after it ends, so a large ledger
-            # cannot hold a read lock long enough to starve a writer's commit.
             c.execute("BEGIN")
+            before = file_identity(db, c)
+            key = (str(root), before, limit, tuple(sorted((runs or {}).items())),
+                   datetime.now(timezone.utc).date().isoformat())
+            if before is not None and _cached.get("key") == key:
+                summary = _cached["summary"]
+                moving = rates(c, time.time())
+                c.execute("COMMIT")
+                return {**summary, "rates": moving, "cached": True,
+                        "seconds": round(time.perf_counter() - started, 3)}
             store.check_identity(c)
-            rows = store.snapshot(c)
             c.execute("COMMIT")
         except sqlite3.OperationalError as error:
             raise IntakeError("ledger_unavailable") from error
         except sqlite3.DatabaseError as error:
             raise IntakeError("corrupt_store") from error
-        store.verify(rows, root)
-        requests = [(row["correlation_id"], row["correction_of"], decode_request(row["raw"]))
-                    for row in rows[0]]
-        stages = {}
-        for correlation_id, saved in rows[1].items():
-            for row in saved:
-                stages.setdefault(correlation_id, {})[row["ordinal"]] = {
-                    key: row[key] for key in ("correlation_id", "stage_id", "ordinal", "status", "cycle")}
-        attempts = {key: [{name: row[name] for name in (
-            "correlation_id", "stage_id", "cycle", "ordinal", "started", "ended", "outcome",
-            "category", "code", "eligible_at")} for row in saved] for key, saved in rows[2].items()}
-    return requests, stages, attempts
+        counts, overall, per_run = Counter(), Counter(), {name: Counter() for name in runs or {}}
+        latest = {name: None for name in per_run}
+        newest = None
+        recent, groups = Best(limit), {}
+        info, after = {}, None
+        while True:
+            try:
+                c.execute("BEGIN")
+                rows = store.snapshot(c, after, PAGE)
+                c.execute("COMMIT")
+            except sqlite3.OperationalError as error:
+                raise IntakeError("ledger_unavailable") from error
+            except sqlite3.DatabaseError as error:
+                raise IntakeError("corrupt_store") from error
+            requests, stages_of, attempts_of, _ = rows
+            if not requests:
+                break
+            layouts = store.verify_page(rows, root, _memo)
+            for row, layout in zip(requests, layouts):
+                correlation_id = row["correlation_id"]
+                statuses, updated = [], None
+                for saved, (stage_id, _, _) in zip(stages_of[correlation_id], layout):
+                    history = attempts_of.get((correlation_id, stage_id), [])
+                    for attempt in history:
+                        for field in ("started", "ended"):
+                            if attempt[field] is not None and (updated is None or attempt[field] > updated):
+                                updated = attempt[field]
+                    code = None
+                    if saved["status"] in CODED:
+                        current = [a for a in history if a["cycle"] == saved["cycle"]]
+                        code = current[-1]["code"] if current else None
+                    statuses.append((saved["status"], code))
+                signature = (layout, tuple(statuses))
+                if signature not in info:
+                    info[signature] = stage_signature(layout, signature[1])
+                _, state, code = info[signature]
+                funnel = info[signature][0]
+                counts[signature] += 1
+                if updated is not None and (newest is None or updated > newest):
+                    newest = updated
+                for name, prefix in (runs or {}).items():
+                    if correlation_id.startswith(prefix):
+                        per_run[name][signature] += 1
+                        if updated is not None and (latest[name] is None or updated > latest[name]):
+                            latest[name] = updated
+                order = (-(updated or 0), correlation_id)
+
+                def build(row=row, layout=layout, correlation_id=correlation_id):
+                    return candidate(row, stages_of[correlation_id], attempts_of)
+                recent.offer(order, build)
+                if state in ATTENTION:
+                    group = groups.setdefault((state, funnel, code), [0, Best(limit)])
+                    group[0] += 1
+                    group[1].offer(order, build)
+            after = requests[-1]["correlation_id"]
+        try:
+            c.execute("BEGIN")
+            after_identity = file_identity(db, c)
+            moving = rates(c, time.time())
+            c.execute("COMMIT")
+        except sqlite3.DatabaseError as error:
+            raise IntakeError("ledger_unavailable") from error
+    summary = {
+        "overall": aggregate(counts, newest),
+        "runs": {name: aggregate(per_run[name], latest[name]) for name in per_run},
+        "recent": [public(make_item(c_)) for _, c_ in recent.entries],
+        "attention_groups": [
+            {"state": state, "funnel": funnel, "code": code, "count": count}
+            for (state, funnel, code), (count, _) in sorted(
+                groups.items(), key=lambda g: (-g[1][0], tuple(str(x) for x in g[0])))],
+        "attention_total": sum(count for count, _ in groups.values()),
+    }
+    summary["attention"] = [public(make_item(c_)) for c_ in spread(groups, limit)]
+    # Stored only when the file was exactly the same before the first and after the last page: no
+    # commit landed between pages, so the summary describes one verified file state.
+    if before is not None and after_identity == before:
+        _cached.clear()
+        _cached.update(key=key, summary=summary)
+    return {**summary, "rates": moving, "cached": False,
+            "seconds": round(time.perf_counter() - started, 3)}
+
+
+def candidate(row, stages, attempts_of):
+    """The rows one displayed request needs, copied so the page they came from can be freed."""
+    saved = {s["ordinal"]: {k: s[k] for k in ("correlation_id", "stage_id", "ordinal", "status", "cycle")}
+             for s in stages}
+    history = {(s["correlation_id"], s["stage_id"]): [
+        {n: a[n] for n in ("correlation_id", "stage_id", "cycle", "ordinal", "started", "ended",
+                           "outcome", "category", "code", "eligible_at")}
+        for a in attempts_of.get((s["correlation_id"], s["stage_id"]), [])] for s in stages}
+    return row["correlation_id"], row["correction_of"], row["raw"], saved, history
+
+
+def make_item(entry):
+    correlation_id, correction_of, raw, saved, history = entry
+    return item(correlation_id, correction_of, decode_request(raw), saved, history)
+
+
+def spread(groups, limit):
+    """Up to ``limit`` attention entries taken round-robin from each (state, funnel, code) group, so
+    one repeated code cannot use the whole list; newest first."""
+    ranked = [group[1].entries for _, group in sorted(groups.items(), key=lambda g: (-g[1][0], str(g[0])))]
+    chosen = []
+    for depth in range(limit):
+        for entries in ranked:
+            if depth < len(entries) and len(chosen) < limit:
+                chosen.append(entries[depth])
+    chosen.sort(key=lambda entry: entry[0])
+    return [payload for _, payload in chosen]
 
 
 def classify(steps):
@@ -151,20 +317,19 @@ def item(correlation, correction_of, request, saved, attempts):
     }
 
 
-def aggregate(items):
+def aggregate(counts, last_activity):
+    """Counts for a ``Counter`` of (layout, ((status, code), ...)) request signatures."""
     funnel = dict.fromkeys(FUNNEL, 0)
     matrix = {kind: dict.fromkeys(STATUSES, 0) for kind in KINDS}
-    for value in items:
-        funnel[value["funnel"]] += 1
-        for kind, status in value["kinds"]:
-            matrix[kind][status] += 1
-    exceptions = sum(any(status in {"blocked", "dead-letter"} for _, status in value["kinds"])
-                     for value in items)
-    retrying = sum(any(status == "retryable" for _, status in value["kinds"]) for value in items)
-    updated = [value["updated"] for value in items if value["updated"] is not None]
-    return {"requests": len(items), "funnel": funnel, "stages": matrix,
-            "exceptions": exceptions, "retrying": retrying,
-            "last_activity": max(updated) if updated else None}
+    exceptions = retrying = 0
+    for (layout, statuses), number in counts.items():
+        funnel[stage_signature(layout, statuses)[0]] += number
+        for (_, kind, _), (status, _) in zip(layout, statuses):
+            matrix[kind][status] += number
+        exceptions += number * any(status in {"blocked", "dead-letter"} for status, _ in statuses)
+        retrying += number * any(status == "retryable" for status, _ in statuses)
+    return {"requests": sum(counts.values()), "funnel": funnel, "stages": matrix,
+            "exceptions": exceptions, "retrying": retrying, "last_activity": last_activity}
 
 
 def public(value):
@@ -172,6 +337,35 @@ def public(value):
 
 
 # Other sources ------------------------------------------------------------
+
+_catalog_seen = {}  # canonical binding -> state of a full inspection this process has done today
+
+
+def catalog_state(catalog, connection, home):
+    """The catalog's validated state without writing anything (no receipt is ever written here).
+
+    A read-validation receipt that covers exactly this file (decision 0017) vouches for a state
+    that a writer or reader already validated in full today, and this process's own earlier full
+    inspection of the identical binding does the same; otherwise the whole history is inspected.
+    A receipt that cannot be read is ignored, never trusted.
+    """
+    try:
+        binding = catalog._binding(connection)
+        marker = json.dumps([binding, catalog._today()], sort_keys=True)
+        trusted = catalog._trusted_state(connection, home, binding)
+    except (catalog.CatalogError, OSError, ValueError):
+        binding = marker = trusted = None
+    if trusted is not None:
+        return trusted[0]
+    if marker is not None and _catalog_seen.get("marker") == marker \
+            and _catalog_seen["head"] == catalog._head_state(connection):
+        return _catalog_seen["state"]
+    state = catalog.inspect(connection, detail=False)[0]
+    if marker is not None and binding["version"] == 2:
+        _catalog_seen.clear()
+        _catalog_seen.update(marker=marker, head=catalog._head_state(connection), state=state)
+    return state
+
 
 def read_catalog(root):
     from tools.catalog import catalog_store as catalog, contracts
@@ -182,16 +376,18 @@ def read_catalog(root):
                         "Catalog home missing or not private")
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
-            # Full inspection, not validated_state(): its cache would write files.
-            state = catalog.inspect(connection, detail=False)[0]
+            state = catalog_state(catalog, connection, home)
             catalog.current_view(connection)
-            kinds = dict(connection.execute("SELECT kind,count(*) FROM catalog_current GROUP BY kind"))
-            coverage = dict(connection.execute(
-                "SELECT json_extract(payload,'$.data.coverage'),count(*) FROM catalog_current "
-                "WHERE kind='artifact' GROUP BY 1"))
-            extraction = dict(connection.execute(
-                "SELECT json_extract(payload,'$.data.extraction'),count(*) FROM catalog_current "
-                "WHERE kind='artifact' GROUP BY 1"))
+            # One scan of the current records for all three breakdowns.
+            kinds, coverage, extraction = Counter(), Counter(), Counter()
+            for kind, cover, extract, number in connection.execute(
+                    "SELECT kind, json_extract(payload,'$.data.coverage'), "
+                    "json_extract(payload,'$.data.extraction'), count(*) FROM catalog_current "
+                    "GROUP BY 1,2,3"):
+                kinds[kind] += number
+                if kind == "artifact":
+                    coverage[cover] += number
+                    extraction[extract] += number
     except (catalog.CatalogError, OSError, ValueError, sqlite3.Error) as error:
         return failure(error)
     return {"available": True, "revision": state["revision"], "records": state["records"],
@@ -241,22 +437,25 @@ def read_index(root):
 def snapshot(root, *, limit=50, runs=None, timeout=2.0):
     """One body-free progress report; each source fails independently."""
     try:
-        requests, saved, attempts = read_ledger(root, timeout)
-        items = [item(c, prior, request, saved[c], attempts) for c, prior, request in requests]
-        ledger = {"available": True}
+        ledger = read_ledger(root, timeout, limit, runs)
+        view, ledger_state = ledger, {"available": True}
     except (IntakeError, OSError, KeyError) as error:
-        items, ledger = [], failure(error)
-    items.sort(key=lambda v: (-(v["updated"] or 0), v["correlation_id"]))
-    attention = [v for v in items if v["state"] in {"blocked", "dead-letter", "retryable"}]
+        view, ledger_state = None, failure(error)
+    if view is None:
+        empty = aggregate(Counter(), None)
+        view = {"overall": empty, "runs": {name: aggregate(Counter(), None) for name in runs or {}},
+                "recent": [], "attention": [], "attention_groups": [], "attention_total": 0,
+                "rates": None, "cached": False, "seconds": None}
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "body_free": True, "read_only": True,
-        "ledger": ledger, "overall": aggregate(items),
-        "runs": {name: {"prefix": prefix,
-                        **aggregate([v for v in items if v["correlation_id"].startswith(prefix)])}
+        "ledger": ledger_state, "overall": view["overall"],
+        "runs": {name: {"prefix": prefix, **view["runs"][name]}
                  for name, prefix in sorted((runs or {}).items())},
-        "recent": [public(v) for v in items[:limit]],
-        "attention": [public(v) for v in attention[:limit]],
+        "recent": view["recent"], "attention": view["attention"],
+        "attention_groups": view["attention_groups"], "attention_total": view["attention_total"],
+        "rates": view["rates"],
+        "render": {"ledger_seconds": view["seconds"], "ledger_cached": view["cached"]},
         "catalog": read_catalog(root), "review_events": read_review_events(root),
         "index": read_index(root),
     }
@@ -301,12 +500,20 @@ def render_text(report):
         counts = ", ".join(f"{k}={v}" for k, v in data["funnel"].items() if v) or "none"
         lines.append(f"{label}: {data['requests']} requests, {data['exceptions']} exceptions, "
                      f"{data['retrying']} retrying; {counts}")
+    moving = report.get("rates")
+    if moving:
+        lines.append("finished attempts (last " + "/".join(f"{w // 60}" for w in moving["windows_seconds"])
+                     + " min): " + (", ".join(
+                         f"{outcome} " + "/".join(str(counts[str(w)]) for w in moving["windows_seconds"])
+                         for outcome, counts in moving["finished"].items()) or "none"))
     index = report["index"]
     if index.get("available"):
         lines.append(f"index: {'fresh' if index['fresh'] else 'STALE'}; documents="
                      f"{index['indexed']['documents']} sections={index['indexed']['sections']}; "
                      f"selected documents={index['selected']['documents']} "
                      f"renditions={index['selected']['renditions']}")
+    for group in report["attention_groups"]:
+        lines.append(f"  group: {group['count']} x {group['state']} {group['funnel']} {group['code'] or '-'}")
     for value in report["attention"]:
         attempt = value["last_attempt"] or {}
         lines.append(f"  ! {value['correlation_id']} {value['stage']} {value['state']} "
@@ -363,7 +570,8 @@ def render_html(report, *, refresh=5):
              f"<title>Intake progress</title><style>{STYLE}</style></head><body>",
              "<h1>Intake progress</h1>",
              f'<p class="muted">Read-only and body-free. Updated {time_tag(report["generated_at"])}; '
-             f"refreshes every {int(refresh)} s. Last ledger activity {time_tag(when(overall['last_activity']))}.</p>"]
+             f"refreshes every {int(refresh)} s. Ledger read {report['render']['ledger_seconds']} s"
+             f"{' (unchanged since last read)' if report['render']['ledger_cached'] else ''}. Last ledger activity {time_tag(when(overall['last_activity']))}.</p>"]
     sources = []
     for name in ("ledger", "catalog", "review_events", "index"):
         value = report[name]
@@ -401,7 +609,18 @@ def render_html(report, *, refresh=5):
             ("current events", *reviews["outcomes"]), [(reviews["current"], *reviews["outcomes"].values())]))
     headers = ("correlation", "stage", "operation", "state", "funnel", "last outcome",
                "category", "code", "updated")
-    parts.append("<h2>Needs attention</h2>" + table(headers, item_rows(report["attention"])))
+    moving = report.get("rates")
+    if moving:
+        windows = moving["windows_seconds"]
+        parts.append("<h2>Attempts finished (is it moving?)</h2>" + table(
+            ("outcome", *(f"last {w // 60} min" for w in windows)),
+            [(outcome, *(counts[str(w)] for w in windows)) for outcome, counts in moving["finished"].items()]))
+    if report["attention_groups"]:
+        parts.append("<h2>Needs attention by cause</h2>" + table(
+            ("count", "state", "funnel", "code"),
+            [(g["count"], g["state"], g["funnel"], g["code"]) for g in report["attention_groups"]]))
+    parts.append(f"<h2>Needs attention (showing {len(report['attention'])} of {report['attention_total']})</h2>"
+                 + table(headers, item_rows(report["attention"])))
     parts.append("<h2>Recent items</h2>" + table(headers, item_rows(report["recent"])))
     parts.append(f"<script>{LOCAL_TIME_SCRIPT}</script></body></html>")
     return "".join(parts)
@@ -424,10 +643,48 @@ def check_bind(host, allow_non_loopback=False):
     raise BindRefused()
 
 
+class Latest:
+    """At most one render at a time, shared by every request that arrives meanwhile.
+
+    A request that finds a render running waits for it and uses its result, and a result younger
+    than ``reuse`` seconds is served again, so any number of open tabs cost one render per
+    ``reuse`` seconds plus one render's time at most, never one render per tab.
+    """
+
+    def __init__(self, render, reuse=1.0, clock=time.monotonic):
+        self.render, self.reuse, self.clock = render, reuse, clock
+        self.lock, self.result, self.finished, self.running = threading.Condition(), None, None, False
+
+    def get(self):
+        with self.lock:
+            while True:
+                if self.result is not None and not self.running \
+                        and self.clock() - self.finished <= self.reuse:
+                    return self.result
+                if not self.running:
+                    break
+                joined = self.finished
+                self.lock.wait()
+                if self.result is not None and self.finished != joined:
+                    return self.result
+            self.running = True
+        try:
+            result = self.render()
+        except BaseException:
+            with self.lock:
+                self.running = False
+                self.lock.notify_all()
+            raise
+        with self.lock:
+            self.result, self.finished, self.running = result, self.clock(), False
+            self.lock.notify_all()
+        return result
+
+
 def make_server(root, *, host="127.0.0.1", port=8765, refresh=5, limit=50, runs=None,
-                allow_non_loopback=False):
+                allow_non_loopback=False, reuse=1.0):
     address = check_bind(host, allow_non_loopback)
-    reading = threading.Lock()
+    latest = Latest(lambda: snapshot(root, limit=limit, runs=runs), reuse)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "librarian-progress"
@@ -460,8 +717,7 @@ def make_server(root, *, host="127.0.0.1", port=8765, refresh=5, limit=50, runs=
             path = self.path.split("?", 1)[0]
             if path not in {"/", "/progress.json"}:
                 return self.send(404, "text/plain; charset=utf-8", "Not found\n")
-            with reading:
-                report = snapshot(root, limit=limit, runs=runs)
+            report = latest.get()
             if path == "/":
                 return self.send(200, "text/html; charset=utf-8", render_html(report, refresh=refresh))
             return self.send(200, "application/json", json.dumps(report, sort_keys=True))

@@ -218,13 +218,38 @@ reported as that source being unavailable with its error class, never a crash.
 .venv/bin/python -m tools.intake.cli --root . progress-serve [--port 8765] [--refresh 5]
 ```
 
-- The ledger is opened `mode=ro` without the writer lock. The read transaction
-  only runs SQLite's integrity checks and copies rows; digest and shape
-  verification runs after it ends, so a large ledger cannot starve a writer's
-  commit. Both paths verify the same rules. The page still reports
-  `ledger_unavailable` if a writer holds the database past its read timeout. The catalog and review events use their validated
-  read paths, and the index reports freshness, stale reasons, indexed
-  documents/sections and selected documents/renditions.
+- The ledger is opened `mode=ro` without the writer lock and walked in keyset pages of 5,000
+  requests, each in its own short read transaction (SQLite's identity, integrity and foreign-key
+  checks run first). Digest and shape verification of a page runs after its transaction ends, so a
+  large ledger cannot starve a writer's commit, and it applies the same rules as `store.verify`
+  (one shared `store.check_request`). Memory is a page plus counters, not the ledger: the
+  report is reduced to counts per distinct request signature (stage layout, statuses, last
+  attempt code) and only the newest `--limit` items per list are expanded. Each page is
+  consistent; the pass as a whole is not one global snapshot, so a request staged mid-pass is
+  counted or not, never torn. The page still reports `ledger_unavailable` if a writer holds the
+  database past its read timeout. The catalog uses its validated read path without writing a
+  receipt: a read-validation receipt that covers this exact file (0017) or this process's own
+  full inspection of the identical binding today vouches for it, otherwise the whole history is
+  inspected. Review events are fully validated each render; the index reports freshness, stale
+  reasons, indexed documents/sections and selected documents/renditions.
+- Nothing is re-verified while the ledger is unchanged. The finished summary is kept in
+  memory keyed by the ledger's file identity (device, inode, size, mtime, ctime, SQLite change
+  counter, as in 0014/0017), `--limit`, `--run` set and UTC date, and is stored only when the
+  identity is the same before the first and after the last page. Any commit, rewritten row or
+  new UTC day misses and verifies in full, so a tampered ledger is reported `unavailable` on the
+  next render; the same residual as 0017 applies (an edit that restores size, times and counter
+  is seen at the next UTC-day check). Digests of requests and artifacts already proven are kept
+  (32-byte keys, never raw bytes, never failures) and a hit still hashes the bytes in hand and
+  compares the stored digest. Nothing is written to disk.
+- The report says whether the run is moving: `rates` counts attempts finished in the last
+  1, 5 and 15 minutes by outcome, `attention_groups` counts blocked, dead-letter and retryable
+  requests by state and error code, and the attention list is filled round-robin across those
+  groups so one repeated code cannot use the whole limit. `render.ledger_seconds` and
+  `render.ledger_cached` show what the last read cost.
+- `progress-serve` runs at most one render at a time: requests that arrive while one is
+  running share its result, and a result younger than one second is served again, so any number
+  of open tabs cost one render per second at most. Measure with
+  `python3 tools/diagnostics/progress_benchmark.py` (synthetic fixtures only).
 - Each request maps to one funnel state from its ordered stage statuses and
   last attempt: `staged`, `received` (receipt committed), `extracting`,
   `extracted`, `pending-review`, `reviewed`, `qualified`, `selected`,
