@@ -22,16 +22,17 @@ class Recorder:
     def __init__(self, name, provider, *, directory=None, cwd=None):
         self.name, self.provider = name, provider
         self.directory, self.cwd = directory, cwd or os.getcwd()
-        self.session_id, self.path, self.last_id, self.lock = str(uuid.uuid4()), None, None, threading.Lock()
+        self.session_id, self.path, self.last_id = str(uuid.uuid4()), None, None
+        self.lock = threading.Lock()
 
     def record(self, model, usage):
-        usage = usage if isinstance(usage, dict) else {}
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-        fresh = max((usage.get("prompt_tokens") or 0) - cached, 0)
-        output = usage.get("completion_tokens") or 0
-        now = _now()
         with self.lock:
             try:
+                usage = usage if isinstance(usage, dict) else {}
+                cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                fresh = max((usage.get("prompt_tokens") or 0) - cached, 0)
+                output = usage.get("completion_tokens") or 0
+                now = _now()
                 lines, parent, path = [], self.last_id, self.path
                 if path is None:
                     parent = uuid.uuid4().hex[:8]
@@ -55,5 +56,5 @@ class Recorder:
                     out.write("".join(json.dumps(line, separators=(",", ":")) + "\n"
                                       for line in lines))
                 self.path, self.last_id = path, message_id
-            except (OSError, ValueError):
+            except Exception:  # usage logging must never break a model call
                 pass

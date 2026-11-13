@@ -2,8 +2,10 @@
 import json
 import tempfile
 import threading
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.intake.usage_log import Recorder
 
@@ -14,9 +16,12 @@ class RecorderTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
 
-    def lines(self):
+    def path(self):
         (path,) = self.root.glob("*.jsonl")
-        return [json.loads(line) for line in path.read_text().splitlines()]
+        return path
+
+    def lines(self):
+        return [json.loads(line) for line in self.path().read_text().splitlines()]
 
     def test_first_record_writes_header_name_and_mapped_usage(self):
         recorder = Recorder("librarian intake", "usai", directory=self.root, cwd="/work")
@@ -35,7 +40,7 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(message["message"]["content"], [])
         self.assertEqual(message["message"]["usage"], {
             "input": 800, "output": 50, "cacheRead": 200, "cacheWrite": 0, "totalTokens": 1050})
-        self.assertEqual(self.root.glob("*.jsonl").__next__().stem, session["id"])
+        self.assertEqual(self.path().stem, session["id"])
 
     def test_no_record_means_no_file(self):
         Recorder("n", "usai", directory=self.root)
@@ -69,6 +74,16 @@ class RecorderTests(unittest.TestCase):
         blocker = self.root / "file"
         blocker.write_text("x")
         self.assertIsNone(Recorder("n", "usai", directory=blocker).record("m", {}))
+
+    def test_malformed_usage_is_ignored(self):
+        recorder = Recorder("n", "usai", directory=self.root)
+        for usage in ({"prompt_tokens": "many"}, {"prompt_tokens_details": 5}):
+            self.assertIsNone(recorder.record("m", usage))
+
+    def test_environment_directory_is_used_without_explicit_directory(self):
+        with patch.dict(os.environ, {"AGENTSVIEW_DIRECT_API_DIR": str(self.root / "env")}):
+            Recorder("n", "usai").record("m", {})
+        self.assertEqual(len(list((self.root / "env").glob("*.jsonl"))), 1)
 
 
 if __name__ == "__main__":
