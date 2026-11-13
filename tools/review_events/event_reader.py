@@ -128,7 +128,7 @@ def read_snapshot(root):
         contract.require(db.exists(), "Review-event database is missing; no legacy fallback")
         with closing(store.connect(db)) as connection:
             connection.execute("BEGIN")
-            state, events = store.inspect(connection, root)
+            state, events = store.inspect(connection, root, reuse=True)
             successors = {predecessor: event["event_id"]
                           for event in events for predecessor in event["supersedes"]}
         return Snapshot(state, events, successors, root)

@@ -349,6 +349,49 @@ valid history and about 100 tamperings: same result or same refusal message),
   stat fields from the path and the change counter from page 1 through the open
   connection. Evidence: `tests/test_file_identity_locks.py`.
 
+### Review-event validation
+
+Every read of the review-event history (`event_reader.read_snapshot`, `event_store.status`,
+`append`) used to validate all of it: SQLite integrity, hash chains, schema, correction
+index. `qualify` did that about nine times per entry, so its serial toolkit cost grew about
+1.1 ms per prior event (Kata r71k, from efz3).
+
+- **Memo.** `event_store.inspect(..., reuse=True)` keeps the last validated result per
+  database file **in process memory** (never written to disk, at most eight files). It is
+  reused only when the file's identity (device, inode, size, mtime_ns, ctime_ns, SQLite
+  change counter, from `tools/file_identity.py`), the installed contract hash and the UTC
+  date all equal those of the validation, the connection was opened by
+  `event_store.connect` on that same device and inode, and the chain heads and correction
+  count re-read from the file equal the remembered state. A journal or WAL beside the
+  file, a build without `sqlite_dbpage`, or any other connection validates in full and
+  stores nothing. A result is stored only when the identity is the same before and after
+  the pass, so a commit that lands during validation is never remembered; a failed
+  validation is never stored. Callers receive fresh state and event-list containers (the
+  event dictionaries are shared and read-only by contract).
+- **Invalidation.** Any commit (by this or another process), restore, swapped file,
+  same-size edit (even with a restored mtime, because `utime` moves ctime), changed
+  contract or new UTC day misses and revalidates everything with the unchanged
+  refusals. `event_store.py audit` (and `status(audit=True)`) always replays
+  and first forgets the file, so a refusing audit leaves nothing to serve.
+- **Cost.** Synthetic, zero-latency stub, concurrency 1, `nice`d on a shared host
+  (`qualify` per-entry serial ms, first decile to last decile): 400 documents 89 to 432
+  before, 66 to 149 after (mean 257 to 104); 1,200 documents 168 to 1,425 before, 120 to 388
+  after (mean 770 to 242; qualify total 937 s to 303 s). Results, event ids and the manifest are unchanged (the `qualify` tests
+  are the same). What remains is what the memo does not touch: each event append still
+  validates `existing + incoming` once, each new commit costs one full validation at the
+  next read, and `qualify` still reads a snapshot per entry, so the cost still grows with
+  event count (about 0.25 ms per prior event after, against about 1.1 ms before). Removing
+  that term needs an O(delta) check (Kata m0tg).
+- **Residual** (the catalog receipt's, 0017). The memo is unkeyed. An edit that restores
+  size, mtime, ctime and the change counter *and* leaves the last event and batch hashes
+  and the correction count unchanged is served from the memo until this process's first
+  validation of the next UTC day, a restart of the process, or an audit, which replay
+  everything and refuse. It is not a defense against an actor who can write the file.
+  Evidence: `tests/test_review_event_memo.py` (reuse, same-size edit with and without
+  restored mtime, swapped and swapped-tampered file, a connection opened before a swap,
+  a concurrent writer process's commit, an overlapping commit, the stated residual and its
+  expiry, contract change, audit).
+
 ### Concurrent writers
 
 - The catalog raises typed errors: `StaleState` (pin outdated), `WriterBusy`
