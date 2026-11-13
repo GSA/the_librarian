@@ -844,6 +844,82 @@ def status(root, *, audit=False):
         return validated_state(connection, home, audit=audit)
 
 
+class _Writer:
+    """One writer-locked transaction's view: connection, trusted or fully validated head, history."""
+
+    def __init__(self, root, home, db, backups, connection, binding, trusted, state, current, validated_on):
+        self.root, self.home, self.db, self.backups = root, home, db, backups
+        self.connection, self.binding, self.trusted = connection, binding, trusted
+        self.state, self.current, self.validated_on = state, current, validated_on
+        self.committed = _CommittedStates(connection, state)
+
+
+@contextmanager
+def _writer(root):
+    """The writer lock and a read transaction on a validated head (the first step of every write)."""
+    home, db, backups = locations(root)
+    private_file(db)
+    with writer_lock(home), closing(connect(db, write=True)) as connection:
+        connection.execute("BEGIN")
+        binding = _binding(connection)
+        # A receipt for these exact bytes (a prior full inspection, or this writer's own
+        # validated commit) stands in for the O(history) replay; any other bytes get the full one.
+        try:
+            trusted = _trusted_state(connection, home, binding)
+        except (CatalogError, OSError):
+            trusted = None  # an unusable receipt only costs the full replay; it never blocks a write
+        validated_on = None  # a full replay below (or the daily snapshot's) starts a new day
+        if trusted is None:
+            state, current, _, _, _ = inspect(connection)
+        else:
+            (state, validated_on), current = trusted, None
+        yield _Writer(root, home, db, backups, connection, binding, trusted, state, current, validated_on)
+
+
+def _commit_revision(writer, incoming, *, request_id, actor, reason, input_hash, added,
+                     precommit_check=None):
+    """Snapshot if the UTC day has none, then write ``incoming`` as the next revision and attest it.
+
+    Returns ``(written state, committed_at, snapshot, retention)``.
+    """
+    connection, state = writer.connection, writer.state
+    taken, retention = _daily_snapshot(writer.root, connection, writer.backups, state, writer.trusted is None)
+    connection.execute("COMMIT")
+    committed_flag = False
+    revision = state["revision"] + 1
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        require(_binding(connection) == writer.binding, "Store changed outside the writer lock")
+        batch = {"revision": revision, "request_id": request_id, "actor": actor, "reason": reason,
+                 "committed_at": now(), "input_hash": input_hash, "record_count": len(incoming),
+                 "previous_hash": state["head_hash"]}
+        batch["revision_hash"] = fingerprint(batch)
+        connection.execute("INSERT INTO revisions VALUES (?,?,?,?,?,?,?,?,?)", tuple(batch.values()))
+        for ordinal, record in enumerate(incoming):
+            connection.execute("INSERT INTO versions VALUES (?,?,?,?,?)",
+                               (revision, ordinal, record["id"], canonical(record), fingerprint(record)))
+            connection.execute(
+                "INSERT INTO current_records VALUES (?,?,?) ON CONFLICT(record_id) DO UPDATE "
+                "SET revision=excluded.revision, ordinal=excluded.ordinal", (record["id"], revision, ordinal))
+        if precommit_check is not None:
+            precommit_check()
+        connection.execute("COMMIT")
+        committed_flag = True
+        seal(writer.db)
+        written = make_state(state, revision, batch["revision_hash"], state["records"] + added)
+    except (OSError, sqlite3.Error, CatalogError) as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        if committed_flag:
+            raise CatalogError(
+                f"Write committed at revision {revision}, but durability/backup failed; retry the same request"
+            ) from error
+        raise
+    # A snapshot verification replays everything, so only then does the full-check date advance.
+    _attest_commit(connection, writer.home, written, None if taken is not None else writer.validated_on)
+    return written, batch["committed_at"], taken, retention
+
+
 def submit(root, records, *, actor, request_id, expected_state, reason,
            precommit_check=None, rebase=False):
     """Submit metadata; an optional local guard runs inside the final transaction.
@@ -863,30 +939,15 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
     incoming = decode(canonical(records))
     validate_records(incoming)
     input_hash = fingerprint({"actor": actor, "reason": reason, "records": incoming})
-    home, db, backups = locations(root)
-    private_file(db)
-    with writer_lock(home), closing(connect(db, write=True)) as connection:
-        connection.execute("BEGIN")
-        binding = _binding(connection)
-        # A receipt for these exact bytes (a prior full inspection, or this writer's own
-        # validated commit) stands in for the O(history) replay; any other bytes get the full one.
-        try:
-            trusted = _trusted_state(connection, home, binding)
-        except (CatalogError, OSError):
-            trusted = None  # an unusable receipt only costs the full replay; it never blocks a write
-        validated_on = None  # a full replay below (or the daily snapshot's) starts a new day
-        if trusted is None:
-            state, current, _, _, _ = inspect(connection)
-        else:
-            (state, validated_on), current = trusted, None
-        committed = _CommittedStates(connection, state)
+    with _writer(root) as writer:
+        connection, state, current, committed = writer.connection, writer.state, writer.current, writer.committed
         prior = committed.prior(request_id)
         if prior is not None:
             require(prior["input_hash"] == input_hash, "Request ID reused with different actor, reason, or records")
-            if trusted is None:
+            if writer.trusted is None:
                 # The replay above fully validated this file; keep the next retry or read from repeating it.
                 try:
-                    _write_receipt(home, binding, state)
+                    _write_receipt(writer.home, writer.binding, state)
                 except (OSError, CatalogError):
                     pass
             if precommit_check is not None:
@@ -912,42 +973,11 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
             validate_graph(resulting)
         else:
             validate_delta(incoming, get=old.get, referrers=old.referrers, claimants=old.claimants)
-        taken, retention = _daily_snapshot(root, connection, backups, state, trusted is None)
-        connection.execute("COMMIT")
-        committed_flag = False
-        revision = state["revision"] + 1
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            require(_binding(connection) == binding, "Store changed outside the writer lock")
-            batch = {"revision": revision, "request_id": request_id, "actor": actor, "reason": reason,
-                     "committed_at": now(), "input_hash": input_hash, "record_count": len(incoming),
-                     "previous_hash": state["head_hash"]}
-            batch["revision_hash"] = fingerprint(batch)
-            connection.execute("INSERT INTO revisions VALUES (?,?,?,?,?,?,?,?,?)", tuple(batch.values()))
-            for ordinal, record in enumerate(incoming):
-                connection.execute("INSERT INTO versions VALUES (?,?,?,?,?)",
-                                   (revision, ordinal, record["id"], canonical(record), fingerprint(record)))
-                connection.execute(
-                    "INSERT INTO current_records VALUES (?,?,?) ON CONFLICT(record_id) DO UPDATE "
-                    "SET revision=excluded.revision, ordinal=excluded.ordinal", (record["id"], revision, ordinal))
-            if precommit_check is not None:
-                precommit_check()
-            connection.execute("COMMIT")
-            committed_flag = True
-            seal(db)
-            written = make_state(state, revision, batch["revision_hash"], state["records"] + added)
-        except (OSError, sqlite3.Error, CatalogError) as error:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            if committed_flag:
-                raise CatalogError(
-                    f"Write committed at revision {revision}, but durability/backup failed; retry the same request"
-                ) from error
-            raise
-        # A snapshot verification replays everything, so only then does the full-check date advance.
-        _attest_commit(connection, home, written, None if taken is not None else validated_on)
+        written, committed_at, taken, retention = _commit_revision(
+            writer, incoming, request_id=request_id, actor=actor, reason=reason, input_hash=input_hash,
+            added=added, precommit_check=precommit_check)
         return {"command": "submit", "idempotent": False, **written, "state": written,
-                "request_id": request_id, "committed_revision": revision, "committed_at": batch["committed_at"],
+                "request_id": request_id, "committed_revision": written["revision"], "committed_at": committed_at,
                 "committed_state": written, "backup": taken, "retention": retention,
                 "rebased_from": rebased_from}
 
