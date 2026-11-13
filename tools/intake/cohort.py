@@ -527,7 +527,8 @@ def recover_identity(root, *, apply=False):
         if prepare["stages"][0]["status"] == "succeeded":
             try:
                 fresh = adapters.prepare(store.safe(root), saved[0])
-            except adapters.StageFailure:
+            except (adapters.StageFailure, OSError):
+                # A removed, unreadable or no longer valid source: counted, not fatal to the rest.
                 skipped["source-unavailable"] += 1
                 continue
             reuse = prepare["stages"][0]["evidence"]["run_id"] == fresh["run_id"]
@@ -549,13 +550,13 @@ def recover_identity(root, *, apply=False):
                     prepare_id = _correct(root, prepare)
                 else:
                     prepare_id = prepare["correlation_id"]
-                done = runner.settle(root, prepare_id, "prepare")["stages"][0]
+                done = runner.settle(root, prepare_id, prepare["stages"][0]["id"])["stages"][0]
                 if done["status"] != "succeeded":
                     results["prepare-" + done["status"]] += 1
                     continue
             fixed = _correct(root, store.inspect(root, corr), lambda a: {
                 **a, "expected_state": catalog.status(root)["state_token"]})
-            done = runner.settle(root, fixed, "register")["stages"][0]
+            done = runner.settle(root, fixed, store.inspect(root, fixed)["stages"][0]["id"])["stages"][0]
             results[done["status"]] += 1
         except IntakeError as error:
             results[error.code] += 1

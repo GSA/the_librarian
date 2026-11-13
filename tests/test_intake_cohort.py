@@ -457,6 +457,42 @@ class RecoverIdentityTests(BlockedCase):
         cohort.recover_identity(self.root, apply=True)
         self.assertEqual(len(store.correlation_ids(self.root)), count)
 
+    def test_a_removed_original_is_skipped_and_the_rest_are_still_recovered(self):
+        self.block_registrations()
+        receipt = store.request(self.root, self.registers()[0])["stages"][0]["arguments"]["receipt"]
+        original = catalog.receipt_metadata(self.root, [receipt])["registrations"][receipt]["artifact"]
+        (self.root / original["data"]["path"]).unlink()
+        report = cohort.recover_identity(self.root)
+        self.assertEqual((report["candidates"], report["skipped"]), (5, {"source-unavailable": 1}))
+        self.assertEqual(cohort.recover_identity(self.root, apply=True)["results"], {"succeeded": 5})
+
+    def test_a_correction_with_differently_named_stages_is_recovered(self):
+        self.block_registrations()
+        register = self.registers()[0]
+        sid = register.removeprefix("register-")
+        fault = catalog.CatalogError("Invalid record")
+        renamed = {}
+        with unittest.mock.patch.object(cohort.extract, "fingerprint", lambda r, f: "d" * 64):
+            for name, parent in (("extract-" + sid + "-fix", "extract-" + sid),
+                                 (register + "-fix", register)):
+                (stage,) = store.request(self.root, parent)["stages"]
+                renamed[name] = {**stage, "id": "step-" + stage["id"]}
+                if stage["operation"] == "extract-register":
+                    renamed[name]["arguments"] = {
+                        **stage["arguments"], "expected_state": catalog.status(self.root)["state_token"]}
+                cohort._stage_request(self.root, name, [renamed[name]], correction_of=parent)
+                with unittest.mock.patch.object(cohort.adapters.extract.catalog, "submit", side_effect=fault):
+                    runner.settle(self.root, name, renamed[name]["id"])
+        # The renamed registration is blocked on a fault under one extractor; under today's it is
+        # refused as a changed identity (replay keeps the pin), and its stage is not called register.
+        runner.replay(self.root, register + "-fix", "step-register")
+        self.assertEqual(runner.settle(self.root, register + "-fix", "step-register")
+                         ["stages"][0]["attempts"][-1]["code"], "changed-extraction-identity")
+        self.assertEqual(cohort.recover_identity(self.root)["candidates"], 6)
+        result = cohort.recover_identity(self.root, apply=True)
+        self.assertEqual(result["results"], {"succeeded": 6})
+        self.assertEqual(self.run_ingest()["counts"]["outcome"]["extracted"], 6)
+
     def test_a_register_without_a_matching_prepare_is_skipped_not_guessed(self):
         self.block_registrations()
         register = self.registers()[0]
