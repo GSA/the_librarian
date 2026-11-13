@@ -232,12 +232,17 @@ valid history and about 100 tamperings: same result or same refusal message),
 
 ### Trust model and residual risk (kept)
 
-- The catalog receipt and the ledger hand-off attestation are **unkeyed**. An actor
-  who rewrites the database *and* the receipt so that they agree, or who rewrites
-  the file while restoring size, mtime, ctime and the change counter, can get one
-  write or read accepted without a replay. The next UTC day's full check,
-  `status --audit` and backup verification still replay all history and refuse.
-  This is not a defense against that actor.
+- The catalog receipt and the ledger hand-off attestation are **unkeyed**. For the
+  **catalog**, an actor who rewrites the database *and* the receipt so that they
+  agree, or who rewrites the file while restoring size, mtime, ctime and the change
+  counter, can get one write or read accepted without a replay; the next UTC day's
+  full check, `status --audit` and backup verification replay all history and
+  refuse. For the **intake ledger** there is no daily bound: the attestation is
+  checked against file identity only, with no date, so an identity-preserving
+  rewrite is detected only when a full ledger validation actually happens (a writer
+  with no valid attestation, or a validating `progress` read). Catalog audit and
+  backup verification do not validate the ledger. Neither is a defense against that
+  actor.
 - What the byte-hash binding saw and the identity binding does not: silent media
   corruption with no write through the OS, and an identity-restoring edit. Both
   are now caught at the next daily full check or audit, a window of at most one UTC
