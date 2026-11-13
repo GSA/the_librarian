@@ -128,6 +128,9 @@ re-read, re-hashed and checked against the ledger) before the first review eithe
 A replay of an unchanged inbox costs about 5 milliseconds per file, so rerunning or resuming
 `qualify` on a large cohort starts reviewing after minutes, not hours; measure it with
 `tools/diagnostics/ingest_benchmark.py --replay` ([current-state design](docs/design/current-state.md#3-intake-and-review)).
+
+A rendition outside the standing policy's scope costs no model call (`counts.out_of_scope`); with no policy file, the generated scope is every upload receipt (`"D*"`), and an existing policy is never rewritten (see `context/intake.md`).
+
 It prints body-free outcome counts, token usage and transport retry counts;
 incomplete reviews stay visibly `pending-review` and are not indexed. Up to
 `--concurrency N` (default 6; `1` is serial) model calls run at once, while all

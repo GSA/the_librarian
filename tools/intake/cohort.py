@@ -8,7 +8,7 @@ standing-policy review qualifies them. Printed output is body-free counts.
 """
 import argparse
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -409,7 +409,7 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
             "status": "active",
             "reviewer": f"{model_review.PROVIDER}:{model}",
             "scope": {
-                "receipts": [f"D{i}" for i in range(1, 2501)],
+                "receipts": [standing.ANY_RECEIPT],
                 "audiences": ["source"],
             },
             "budget": {
@@ -761,6 +761,21 @@ def _live_events(snapshot):
     return {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
 
 
+def _review(root, entry, standing_policy, model, transport):
+    """Model-review one rendition, unless the policy scope refuses it: that costs no model call.
+
+    A refused entry is staged with an empty findings pin that is never written; the
+    ``standing-review`` adapter then ends it as ``prohibited-scope`` by its own scope check.
+    """
+    if standing.refused_scope(root, standing_policy, entry["rendition"], entry["rendition_sha256"]):
+        home = policy.validate_instance_roots(root)["intake_home"]
+        return {"status": "reviewed", "skipped": "scope",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                "findings_path": f"{home}/findings/out-of-scope/{entry['rendition_sha256'][:24]}.json",
+                "findings_sha256": hashlib.sha256(b"").hexdigest()}
+    return model_review.review(root, entry["rendition"], standing_policy, model, transport)
+
+
 def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
                        model, transport, usage, snapshot=None, prefetched=None,
                        heads=None, live=None):
@@ -786,8 +801,8 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
         if failure is not None:
             raise failure
         if reviewed is None:
-            reviewed = model_review.review(
-                root, entry["rendition"], standing_policy, model, transport)
+            reviewed = _review(root, entry, standing_policy, model, transport)
+        entry["model_call_skipped"] = reviewed.get("skipped") == "scope"
         usage.update(reviewed["usage"])
         if reviewed["status"] != "reviewed":
             entry.update(qualification="pending-review", review_status=reviewed["status"])
@@ -864,7 +879,7 @@ def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manif
     order, so the outcome does not depend on completion order.
     """
     def review(entry):
-        return model_review.review(root, entry["rendition"], standing_policy, model, transport)
+        return _review(root, entry, standing_policy, model, transport)
 
     # One correction-chain index and one live-event set serve every entry of the run.
     shared = {"heads": store.Heads(), "live": _live_events(snapshot)}
@@ -991,6 +1006,10 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         # ``selections`` belong to other cohorts or to none provable (``unattributed``) and were
         # left as they were; ``orphaned`` named a receipt the catalog does not hold and were dropped.
         report["counts"]["other_cohorts"] = others
+    refused = [e for e in extracted if e.get("review_code") == "standing-exception-prohibited-scope"]
+    # Entries the policy scope refuses, and how many of them this run reached without a model call.
+    report["counts"]["out_of_scope"] = {
+        "entries": len(refused), "model_calls_skipped": sum(bool(e.get("model_call_skipped")) for e in refused)}
     report["counts"]["published"] = int(
         pub["status"] == "succeeded"
         and bool(inspected.get("availability", {}).get("available")))

@@ -1505,6 +1505,164 @@ class PublishTests(QualifyCase):
             self.assertEqual(cohort.main(argv[:-1] + ["config/missing.json"]), 2)
         self.assertIn("error", json.loads(err.getvalue()))
 
+class ScopePrecheckTests(QualifyCase):
+    """The standing scope is checked before a paid model call; the adapter stays the authority."""
+
+    def setUp(self):
+        super().setUp()
+        self.six = _cohort_files(Path(self.temp.name) / "scope-inbox", "a", 6)  # receipts D1..D6
+        self.transport, self.calls = self._transport()
+        self.policy_file = self.root / "config/standing-policy.local.json"
+        self.generation = 0
+
+    def fresh_instance(self):
+        """A second empty instance (same layout) and a new counting transport."""
+        from tools.review_events import event_store as events
+        self.generation += 1
+        root = Path(self.temp.name) / f"instance-{self.generation}"
+        (root / "config").mkdir(parents=True)
+        (root / "documents").mkdir()
+        store.initialize(root)
+        catalog.initialize(root)
+        events.initialize(root)
+        (root / "config/policy.local.json").write_text(json.dumps({"audience": "authorized-local"}))
+        (root / "documents/context.md").write_text("# Cohort Context\nQualified Falcon cohort context.\n")
+        self.root, self.policy_file = root, root / "config/standing-policy.local.json"
+        self.transport, self.calls = self._transport()
+
+    def _qualify(self, transport, **extra):
+        return super()._qualify(transport, inbox=self.six, **extra)
+
+    def write_policy(self, receipts, version=1, audiences=("source",)):
+        self.policy_file.write_text(json.dumps({
+            "schema": standing.POLICY_SCHEMA, "policy_id": "hand-written", "version": version,
+            "status": "active", "reviewer": "usai:gpt-5.6-terra",
+            "scope": {"receipts": list(receipts), "audiences": list(audiences)},
+            "budget": {"max_pages": renditions.DOCLING_MAX_PAGES,
+                       "max_records": renditions.DOCLING_MAX_RECORDS,
+                       "max_findings_bytes": standing.LIMIT},
+            "selection": {"context": ["documents/context.md"]}}, indent=2))
+        self.policy_file.chmod(0o600)
+
+    def outcomes(self, report):
+        return sorted((e["relative"], e["qualification"], e.get("review_code"))
+                      for e in report["entries"] if "qualification" in e)
+
+    def test_out_of_scope_entries_cost_no_model_call_and_end_as_before(self):
+        self.write_policy(["D1", "D2", "D3"])
+        # A fresh instance per run keeps receipts D1..D6 for the same six files.
+        for concurrency in (1, 3):
+            with self.subTest(concurrency=concurrency):
+                self.fresh_instance()
+                self.write_policy(["D1", "D2", "D3"])
+                report = self._qualify(self.transport, concurrency=concurrency)
+                self.assertEqual(len(self.calls), 3)
+                self.assertEqual(report["usage"], {"prompt_tokens": 30, "completion_tokens": 15})
+                self.assertEqual(report["counts"]["qualification"], {"qualified": 3, "exception": 3})
+                self.assertEqual(report["counts"]["out_of_scope"], {"entries": 3, "model_calls_skipped": 3})
+                refused = [e for e in report["entries"] if e.get("qualification") == "exception"]
+                self.assertEqual({e["review_code"] for e in refused},
+                                 {"standing-exception-prohibited-scope"})
+                self.assertEqual(report["counts"]["published"], 1)
+
+    def test_outcomes_match_a_run_that_pays_for_every_model_call(self):
+        self.write_policy(["D1", "D2", "D3"])
+        report = self._qualify(self.transport)
+        skipped = self.outcomes(report)
+        self.assertEqual(len(self.calls), 3)
+        self.fresh_instance()
+        self.write_policy(["D1", "D2", "D3"])
+        with unittest.mock.patch.object(standing, "refused_scope", return_value=False):
+            paid = self._qualify(self.transport)
+        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(skipped, self.outcomes(paid))
+        self.assertEqual(paid["counts"]["out_of_scope"], {"entries": 3, "model_calls_skipped": 0})
+
+    def test_a_skipped_entry_ends_in_the_same_terminal_stage_as_a_paid_one(self):
+        self.write_policy(["D1"])
+        report = self._qualify(self.transport)
+        entry = next(e for e in report["entries"] if e.get("review_code") ==
+                     "standing-exception-prohibited-scope")
+        sha = hashlib.sha256(self.policy_file.read_bytes()).hexdigest()
+        stage = store.inspect(self.root, "standing-" + cohort._standing_token(entry, sha))["stages"][0]
+        self.assertEqual(stage["status"], "blocked")
+        self.assertEqual(stage["attempts"][-1]["code"], "standing-exception-prohibited-scope")
+        self.assertEqual(stage["attempts"][-1]["category"], "blocked")
+
+    def test_rerun_neither_calls_the_model_nor_changes_the_outcome(self):
+        self.write_policy(["D1", "D2", "D3"])
+        first = self._qualify(self.transport)
+        self.calls.clear()
+        second = self._qualify(self.transport)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.outcomes(first), self.outcomes(second))
+        self.assertEqual(second["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+
+    def test_the_adapter_still_refuses_an_out_of_scope_request_staged_without_the_precheck(self):
+        self.write_policy(["D1"])
+        with unittest.mock.patch.object(standing, "refused_scope", return_value=False):
+            report = self._qualify(self.transport)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "exception": 5})
+        self.assertEqual(len(self.calls), 6)
+
+    def test_widening_scope_requires_a_new_version_and_costs_one_review_per_entry(self):
+        self.write_policy(["D1", "D2", "D3"])
+        first = self._qualify(self.transport)
+        self.assertEqual(first["counts"]["qualification"], {"qualified": 3, "exception": 3})
+        self.calls.clear()
+        self.write_policy([f"D{i}" for i in range(1, 7)], version=2)
+        widened = self._qualify(self.transport)
+        # The policy hash is part of every standing request, so every entry is reviewed once
+        # under the new policy; the three refused ones were never reviewed before.
+        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(widened["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(widened["counts"]["out_of_scope"], {"entries": 0, "model_calls_skipped": 0})
+        self.calls.clear()
+        again = self._qualify(self.transport)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(again["counts"]["qualification"], {"qualified": 6})
+
+    def test_an_existing_policy_is_never_rewritten_or_widened(self):
+        self.write_policy(["D1", "D2"])
+        before = self.policy_file.read_bytes()
+        report = self._qualify(self.transport)
+        self.assertEqual(self.policy_file.read_bytes(), before)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 2, "exception": 4})
+
+    def test_the_generated_policy_covers_any_receipt_without_a_list(self):
+        report = self._qualify(self.transport)
+        scope = json.loads(self.policy_file.read_text())["scope"]
+        self.assertEqual(scope, {"receipts": ["D*"], "audiences": ["source"]})
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(report["counts"]["out_of_scope"], {"entries": 0, "model_calls_skipped": 0})
+
+    def test_the_generated_policy_covers_receipts_beyond_the_old_2500_enumeration(self):
+        from tools.diagnostics.catalog_lock_benchmark import seed
+        seed(self.root, 2600)  # synthetic registrations D0..D2599; the cohort gets D2601..
+        report = self._qualify(self.transport)
+        receipts = {e["receipt_id"] for e in report["entries"] if "receipt_id" in e}
+        self.assertTrue(all(int(r[1:]) > 2500 for r in receipts), receipts)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(self.calls), 6)
+
+    def test_audience_is_still_part_of_the_scope_check(self):
+        self.write_policy(["D*"], audiences=("agent",))
+        report = self._qualify(self.transport)
+        self.assertEqual(report["counts"]["qualification"], {"exception": 6})
+        self.assertEqual(report["counts"]["out_of_scope"], {"entries": 6, "model_calls_skipped": 6})
+        self.assertEqual(self.calls, [])
+
+    def test_an_entry_whose_rendition_fails_validation_is_not_skipped_for_scope(self):
+        self.write_policy(["D1"])
+        original = standing._rendition
+        with unittest.mock.patch.object(standing, "_rendition",
+                                        side_effect=lambda *a: (b"", None, "rendition-fidelity")):
+            report = self._qualify(self.transport)
+        # An unvalidated rendition is not judged by scope: the model path runs as before.
+        self.assertEqual(report["counts"]["out_of_scope"], {"entries": 0, "model_calls_skipped": 0})
+        self.assertEqual(len(self.calls), 6)
+        self.assertIs(standing._rendition, original)
+
 
 class CliTests(CohortCase):
     def test_cli_prints_body_free_counts_and_writes_private_report(self):

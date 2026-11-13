@@ -100,7 +100,7 @@ def load_policy(root, name, expected_sha):
         scope, budget, selection = value["scope"], value["budget"], value["selection"]
         valid = (isinstance(scope, dict) and set(scope) == {"receipts", "audiences"}
                  and isinstance(scope["receipts"], list) and 0 < len(scope["receipts"]) <= renditions.MAX_SELECTIONS
-                 and all(_identifier(r, r"D0*[1-9][0-9]*") for r in scope["receipts"])
+                 and all(r == ANY_RECEIPT or _identifier(r, RECEIPT) for r in scope["receipts"])
                  and _texts(scope["audiences"]) and scope["audiences"]
                  and isinstance(budget, dict)
                  and set(budget) == {"max_pages", "max_records", "max_findings_bytes"}
@@ -117,6 +117,36 @@ def load_policy(root, name, expected_sha):
     except index.IndexError_ as error:
         raise Refusal("blocked", "standing-policy-invalid") from error
     return value
+
+
+RECEIPT = r"D0*[1-9][0-9]*"
+# A scope entry that stands for every upload receipt (``D<number>``), so a policy need not list IDs
+# that grow with the instance. Audiences are still listed.
+ANY_RECEIPT = "D*"
+
+
+def permits(scope, receipt_id, audience):
+    """True when the policy scope covers this receipt and audience; the one scope rule."""
+    receipts = scope["receipts"]
+    return ((receipt_id in receipts
+             or (ANY_RECEIPT in receipts and re.fullmatch(RECEIPT, receipt_id) is not None))
+            and audience in scope["audiences"])
+
+
+def refused_scope(root, standing, rendition, rendition_sha256):
+    """True when ``evaluate`` would end this rendition as ``prohibited-scope``, so no review is needed.
+
+    The rendition is validated exactly as ``evaluate`` does before it checks scope; one that
+    does not validate, or cannot be read, is not judged here and takes the ordinary path.
+    """
+    try:
+        _, value, failure = _rendition(
+            root, {"rendition": rendition, "rendition_sha256": rendition_sha256},
+            index.rendition_api(root))
+    except Refusal:
+        return False
+    return failure is None and not permits(
+        standing["scope"], value["source"]["receipt_id"], value["source"]["audience"])
 
 
 def _findings_valid(value):
@@ -254,6 +284,10 @@ def evaluate(root, args):
     try:
         _, raw = _read(root, args["findings_path"], LIMIT)
     except FileNotFoundError as error:
+        if refused_scope(root, standing, args["rendition"], args["rendition_sha256"]):
+            # Out of scope, so no review was requested (``qualify`` skips the model call); the
+            # outcome is the one the scope check below gives once findings exist.
+            return outcome("exception", "prohibited-scope")
         # The authorized reviewer has not produced findings: the route is unavailable.
         raise Refusal("retryable", "review-route-unavailable") from error
     if len(raw) > standing["budget"]["max_findings_bytes"]:
@@ -279,8 +313,7 @@ def evaluate(root, args):
     if failure:
         return outcome("exception", failure)
     source = value["source"]
-    if (source["receipt_id"] not in standing["scope"]["receipts"]
-            or source["audience"] not in standing["scope"]["audiences"]):
+    if not permits(standing["scope"], source["receipt_id"], source["audience"]):
         return outcome("exception", "prohibited-scope")
     child, original = _registered(root, value, args)
     if child is None:
@@ -487,8 +520,8 @@ def authorize_publication(root, manifest_name, standing, pinned):
             claims = [m.groups() for q in quotes for m in [STANDING_STATEMENT.fullmatch(q)] if m]
             if not claims:
                 continue
-            if (claims != [expected] or item["receipt_id"] not in standing["scope"]["receipts"]
-                    or _audience(root, item["path"]) not in standing["scope"]["audiences"]):
+            if (claims != [expected] or not permits(
+                    standing["scope"], item["receipt_id"], _audience(root, item["path"]) or "")):
                 raise Refusal("blocked", "standing-selection-unauthorized")
 
 

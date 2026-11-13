@@ -166,8 +166,38 @@ restated here.
   `test_a_b_a_b_keeps_every_cohorts_selections_and_publishes_them_all` through
   `test_two_processes_qualifying_different_cohorts_do_not_lose_each_others_writes`).
   Operator notes (restoring cohorts an older toolkit pruned; requalifying after a
-  policy bump) are in `context/intake.md`. The default generated scope
-  (`D1..D2500`) is a known limit tracked in Kata kc1k.
+  policy bump) are in `context/intake.md`.
+- **Standing scope is checked before the model call.** The policy's receipt and
+  audience scope used to be applied only by the `standing-review` adapter, after
+  the model had been paid, so every out-of-scope receipt cost a call and then
+  ended `exception`/`prohibited-scope`. `qualify` now reads `receipt_id` and
+  `audience` from the catalog-pinned rendition through the adapter's own
+  validation (`standing.refused_scope`, 0.07 to 2.2 ms read cost against 0.7 to
+  9.4 ms for the full validation, per rendition of 13 to 4,001 records), and when
+  the scope refuses it makes no call: the request is staged with an empty,
+  never-written findings pin and the adapter ends it `prohibited-scope` by its
+  own, unchanged scope rule (`standing.permits`, also used by publication
+  authorization). Any request staged by another path is refused as before; a
+  rendition that does not validate is not judged and takes the ordinary path.
+  The terminal state is the same blocked `standing-exception-prohibited-scope`;
+  the one deliberate difference is that an out-of-scope entry whose call would
+  have failed (transport, invalid reply, over budget) now ends there too instead
+  of staying `pending-review`. `counts.out_of_scope` reports `entries` and
+  `model_calls_skipped`. With no policy file, the generated scope is
+  `receipts: ["D*"]` (every upload receipt `D<number>`, audience `source`),
+  which is also allowed in a hand-written policy and is not limited by the
+  5,000-entry list cap; an existing policy is never rewritten or widened.
+  Widening a policy's scope changes its hash, and the hash is part of every
+  standing request, so the operator raises `version` with the edit and every
+  in-scope entry is then reviewed once under the new policy (one call each,
+  including entries already qualified; entries still refused cost nothing; a
+  rerun with an unchanged policy costs 0). Editing the scope without raising the
+  version ends the new reviews as `conflicting-review`. A policy containing
+  `D*` is not readable by a toolkit without this change. Measured on a synthetic
+  mixed fixture (40 renditions, half out of scope): 40 calls and 31,610 prompt
+  tokens before, 20 calls and 15,770 after, identical outcomes. Evidence:
+  `tests/test_intake_cohort.py::ScopePrecheckTests`,
+  `tests/test_standing.py::test_any_receipt_scope_entry_covers_upload_receipts_only`.
 - **Publication is one stage, run at the end of `qualify` or on demand.**
   `qualify` publishes the context index once, after reconciling the manifest;
   `cohort publish` runs the same `standing-publish` stage (policy pin, standing
@@ -448,8 +478,8 @@ owner preference rather than measured or test-enforced facts.
   number.
 - Declining agent memory and the dead-weight pruning signal (sections 6): reasoned,
   not measured.
-- The 5,000-entry manifest cap and the 2,500-receipt default scope are
-  implementation limits, not design goals.
+- The 5,000-entry manifest cap is an implementation limit, not a design goal; past
+  it `qualify` still reviews entries that cannot be selected (`selection-capacity`).
 - A single linear catalog hash chain (revisit triggers were: commit utilization
   above about a third of the ceiling with writers losing waits, multi-host
   writers, or a first-of-day hold above the 10 s wait even after the speedups).
