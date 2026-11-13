@@ -982,6 +982,150 @@ def submit(root, records, *, actor, request_id, expected_state, reason,
                 "rebased_from": rebased_from}
 
 
+class _Layered:
+    """Committed lookups overlaid with the records of batch members already accepted.
+
+    Gives ``validate_delta`` the view a member would meet if the members accepted before it had been
+    committed one at a time: their records win over the committed ones, and committed records they
+    rewrite no longer answer for the old content.
+    """
+
+    def __init__(self, old):
+        self.old, self.records = old, {}
+
+    def accept(self, records):
+        self.records.update((record["id"], record) for record in records)
+
+    def get(self, record_id):
+        return self.records[record_id] if record_id in self.records else self.old.get(record_id)
+
+    def referrers(self, ids):
+        ids = set(ids)
+        kept = [record for record in self.old.referrers(ids) if record["id"] not in self.records]
+        return kept + [record for record in self.records.values() if ids.intersection(_references(record))]
+
+    def claimants(self, paths):
+        paths = set(paths)
+        kept = [record for record in self.old.claimants(paths) if record["id"] not in self.records]
+        return kept + [record for record in self.records.values()
+                       if record["kind"] == "artifact" and record["data"]["path"] in paths]
+
+
+def _first_version(connection, record_id):
+    """``(revision, payload)`` of the first version ever written for ``record_id``, or None."""
+    row = connection.execute("SELECT revision,payload FROM versions WHERE record_id=? ORDER BY revision LIMIT 1",
+                             (record_id,)).fetchone()
+    return None if row is None else (row[0], row[1])
+
+
+def submit_batch(root, members, *, actor, reason, rebase=True, precommit_check=None):
+    """Commit many documents' records as ONE revision (Kata herq); each document is judged on its own.
+
+    ``members`` are ``{"marker", "records", "expected_state"}``. The ``marker`` is the ID of a record
+    the member creates, so it is the member's idempotency key: a member whose marker already has a
+    first version equal to the member's marker record is ``present`` (its revision and state are
+    reported, nothing is written); a marker that exists with other content is refused. A retry
+    therefore builds its batch from the members not yet present, whatever revisions committed the rest.
+
+    Each remaining member is judged as if committed alone and in order: its records must validate and
+    be written by no earlier member of this batch, and its pin must be the head or, with ``rebase``
+    (the default), a state in this catalog's history after which no revision wrote one of its records
+    (the same rule as ``submit``). A refused member is reported with its error and never blocks the
+    others. The accepted members are validated together (``validate_delta`` once; only when that
+    refuses are the members validated one by one to find the refused ones) and written in one SQLite
+    transaction: all of them or none. The revision hash chain is the ordinary one. The members of a
+    batch share one committed revision and state, so they settle together.
+
+    Returns ``{"members": [{marker, status, committed_revision, committed_state, rebased_from, error}],
+    state, backup, retention, committed_revision}`` where ``status`` is ``committed``, ``present`` or
+    ``refused``; ``committed_revision`` is None when nothing was written.
+    """
+    text(actor, "Actor", 200)
+    text(reason, "Revision reason")
+    require(isinstance(members, list) and bool(members), "A batch needs at least one member")
+    markers = [member.get("marker") for member in members]
+    require(len(set(markers)) == len(markers), "Duplicate batch markers")
+    with _writer(root) as writer:
+        connection, state, committed = writer.connection, writer.state, writer.committed
+        old = _CurrentRecords(connection)
+        results = [{"marker": marker, "status": None, "committed_revision": None, "committed_state": None,
+                    "rebased_from": None, "error": None} for marker in markers]
+        taken_ids, accepted = {}, []  # record ID -> accepting member index; accepted member indexes
+        records_of = {}
+        pins = {}
+        for index, member in enumerate(members):
+            result = results[index]
+            try:
+                validate_records(member["records"])
+                incoming = decode(canonical(member["records"]))
+                validate_records(incoming)
+                ids = [record["id"] for record in incoming]
+                require(member["marker"] in ids, "The marker must be one of the member's record IDs")
+                first = _first_version(connection, member["marker"])
+                if first is not None:
+                    mine = canonical(next(r for r in incoming if r["id"] == member["marker"]))
+                    if first[1] != mine:
+                        raise ConflictingWrite("The marker record already exists with different content")
+                    result.update(status="present", committed_revision=first[0],
+                                  committed_state=committed.state(first[0]))
+                    continue
+                clash = next((i for i in ids if i in taken_ids), None)
+                if clash is not None:
+                    raise ConflictingWrite("An earlier member of this batch wrote a record in this member")
+                if member["expected_state"] != state["state_token"]:
+                    if not rebase:
+                        raise StaleState("Stale expected state; re-read before writing")
+                    token = member["expected_state"]
+                    if token not in pins:
+                        pins[token] = committed.revision_of(token)
+                    if pins[token] is None:
+                        raise ConflictingWrite("Pinned state is not in this catalog's history")
+                    if committed.written_after(pins[token], ids):
+                        raise ConflictingWrite("A later revision rewrote a record in this request")
+                    result["rebased_from"] = pins[token]
+            except CatalogError as error:
+                result.update(status="refused", error=error)
+                continue
+            records_of[index] = incoming
+            for record_id in ids:
+                taken_ids[record_id] = index
+            accepted.append(index)
+        if accepted:
+            union = [record for index in accepted for record in records_of[index]]
+            try:
+                validate_delta(union, get=old.get, referrers=old.referrers, claimants=old.claimants)
+            except CatalogError:
+                # Some member does not validate: judge each in order against what the earlier ones add.
+                view, kept = _Layered(old), []
+                for index in accepted:
+                    try:
+                        validate_delta(records_of[index], get=view.get, referrers=view.referrers,
+                                       claimants=view.claimants)
+                    except CatalogError as error:
+                        results[index].update(status="refused", error=error, rebased_from=None)
+                        continue
+                    view.accept(records_of[index])
+                    kept.append(index)
+                accepted = kept
+        if not accepted:
+            return {"command": "submit-batch", "members": results, "state": state, "backup": None,
+                    "retention": None, "committed_revision": None}
+        incoming = [record for index in accepted for record in records_of[index]]
+        request_id = "batch-" + fingerprint([markers[index] for index in accepted])[:40]
+        require(committed.prior(request_id) is None, "Batch request ID already committed")
+        added = sum(1 for record in incoming if old.get(record["id"]) is None)
+        input_hash = fingerprint({"actor": actor, "reason": reason, "records": incoming})
+        written, committed_at, taken, retention = _commit_revision(
+            writer, incoming, request_id=request_id, actor=actor, reason=reason, input_hash=input_hash,
+            added=added, precommit_check=precommit_check)
+        for index in accepted:
+            results[index].update(status="committed", committed_revision=written["revision"],
+                                  committed_state=written)
+        return {"command": "submit-batch", "members": results, "state": written, "backup": taken,
+                "retention": retention, "committed_revision": written["revision"],
+                "committed_at": committed_at}
+
+
 def _attest_commit(connection, home, written, validated_on=None):
     """Vouch for the bytes this writer just committed after validating only its delta.
 
