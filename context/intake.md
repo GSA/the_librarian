@@ -202,6 +202,21 @@ submission superseding the old, or `changed-since-intake`). Measure it with
 checkouts can be compared): about 11 to 5 ms per file at 2,000 and 10,000 synthetic files of about 133 KiB.
 A MIME HTML file costs about 8 ms more in its parser during `classify`; that is the remaining floor.
 
+**Catalog lookup indexes.** Every write probes the committed catalog for records that reference a record it
+rewrites and for artifacts that already hold a path it moves. Catalogs created now have lookup indexes and a
+`refs` table for that, so those probes no longer scan the catalog; first ingest into a large catalog was about
+4x faster at 40,000 synthetic documents. An older catalog keeps working without them (slower, same decisions)
+until the operator runs, once and with no other writer in the way:
+
+```sh
+python -m tools.initialize --migrate-catalog-indexes      # idempotent; verifies and takes a snapshot first
+python -m tools.catalog.catalog_store migrate-indexes --check   # report "legacy" or "indexed"; writes nothing
+```
+
+If `status --audit` reports "Catalog lookup structures are incomplete or differ", run
+`python -m tools.catalog.catalog_store migrate-indexes --rebuild`: it recreates them only when the rest of the catalog
+verifies. Restoring a snapshot taken before the migration yields a working catalog without them; run the migration again.
+
 `ledger_scale_benchmark.py` reports `full_ledger_validations`; it should be about 1 per
 process, not about 2 per file. Timings come from a shared host: compare shapes, CPU and
 counts rather than third digits.
