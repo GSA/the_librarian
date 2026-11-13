@@ -75,10 +75,15 @@ class RecorderTests(unittest.TestCase):
         blocker.write_text("x")
         self.assertIsNone(Recorder("n", "usai", directory=blocker).record("m", {}))
 
-    def test_malformed_usage_is_ignored(self):
-        recorder = Recorder("n", "usai", directory=self.root)
-        for usage in ({"prompt_tokens": "many"}, {"prompt_tokens_details": 5}):
-            self.assertIsNone(recorder.record("m", usage))
+    def test_malformed_usage_is_recorded_as_zero(self):
+        for usage in ({"prompt_tokens": "5"}, {"prompt_tokens_details": 5},
+                      {"prompt_tokens": True, "completion_tokens": float("nan")}):
+            recorder = Recorder("n", "usai", directory=self.root)
+            recorder.record("m", usage)
+            line = json.loads(recorder.path.read_text().splitlines()[-1])
+            self.assertEqual(line["message"]["usage"],
+                             {"input": 0, "output": 0, "cacheRead": 0,
+                              "cacheWrite": 0, "totalTokens": 0})
 
     def test_environment_directory_is_used_without_explicit_directory(self):
         with patch.dict(os.environ, {"AGENTSVIEW_DIRECT_API_DIR": str(self.root / "env")}):

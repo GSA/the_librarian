@@ -1,6 +1,7 @@
 """Body-free record of direct model calls as an AgentsView "Direct API" session file."""
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import threading
@@ -9,6 +10,11 @@ import uuid
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _count(value):
+    """A usage value as a token count; anything non-numeric or non-finite is 0."""
+    return value if type(value) in (int, float) and math.isfinite(value) else 0
 
 
 class Recorder:
@@ -21,7 +27,7 @@ class Recorder:
 
     def __init__(self, name, provider, *, directory=None, cwd=None):
         self.name, self.provider = name, provider
-        self.directory, self.cwd = directory, cwd or os.getcwd()
+        self.directory, self.cwd = directory, cwd
         self.session_id, self.path, self.last_id = str(uuid.uuid4()), None, None
         self.lock = threading.Lock()
 
@@ -29,15 +35,16 @@ class Recorder:
         with self.lock:
             try:
                 usage = usage if isinstance(usage, dict) else {}
-                cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-                fresh = max((usage.get("prompt_tokens") or 0) - cached, 0)
-                output = usage.get("completion_tokens") or 0
+                details = usage.get("prompt_tokens_details")
+                cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else 0
+                fresh = max(_count(usage.get("prompt_tokens")) - cached, 0)
+                output = _count(usage.get("completion_tokens"))
                 now = _now()
                 lines, parent, path = [], self.last_id, self.path
                 if path is None:
                     parent = uuid.uuid4().hex[:8]
                     lines = [{"type": "session", "version": 3, "id": self.session_id,
-                              "timestamp": now, "cwd": self.cwd},
+                              "timestamp": now, "cwd": self.cwd or os.getcwd()},
                              {"type": "session_info", "id": parent, "parentId": None,
                               "timestamp": now, "name": self.name}]
                     directory = Path(self.directory or os.environ.get("AGENTSVIEW_DIRECT_API_DIR")
