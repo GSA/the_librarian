@@ -65,6 +65,23 @@ def classify(error):
     return adapters.StageFailure("permanent", "invalid-artifact")
 
 
+def failure_status(request, attempts, ordinal, error):
+    """``(failure, stage status)`` a failed attempt records; the one rule for single and batch runs.
+
+    A lost catalog race wrote nothing: it is charged to its own bounded budget, not to the fault
+    budget (each recorded race is one bounded wait).
+    """
+    failure = classify(error)
+    if isinstance(error, IntakeError):
+        failure = adapters.StageFailure("retryable" if error.retryable else "blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
+    charged, lost = spent([a for a in attempts if a["ordinal"] != ordinal])
+    charged, lost = (charged, lost + 1) if contention(failure) else (charged + 1, lost)
+    status = ("blocked" if failure.category == "blocked" else "dead-letter"
+              if failure.category == "permanent" or charged >= request["retry"]["max_attempts"]
+              or lost >= CONTENTION_BUDGET else "retryable")
+    return failure, status
+
+
 def run(root, correlation_id, stage_id, *, now=None, clock=None):
     # Explicit now retains the fixed-time interface used by existing callers.
     clock = clock if clock is not None else time.time if now is None else lambda: now
@@ -90,16 +107,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
                     c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
 
         def failed(error):
-            failure = classify(error)
-            if isinstance(error, IntakeError):
-                failure = adapters.StageFailure("retryable" if error.retryable else "blocked", "policy-changed" if error.code == "policy_changed" else error.code.replace("_", "-"))
-            # A lost catalog race wrote nothing: it is charged to its own bounded budget, not to
-            # the fault budget (each recorded race is one bounded wait).
-            charged, lost = spent([a for a in attempts if a["ordinal"] != ordinal])
-            charged, lost = (charged, lost + 1) if contention(failure) else (charged + 1, lost)
-            status = ("blocked" if failure.category == "blocked" else "dead-letter"
-                      if failure.category == "permanent" or charged >= request["retry"]["max_attempts"]
-                      or lost >= CONTENTION_BUDGET else "retryable")
+            failure, status = failure_status(request, attempts, ordinal, error)
             ended = clock()
             with c:
                 c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (ended, failure.category, failure.code, ended + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
