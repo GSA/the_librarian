@@ -160,8 +160,23 @@ restated here.
   cannot be proven that way is left alone, and orphans are dropped and counted.
   The manifest read-modify-write holds the ledger writer lock and replacement is
   atomic. The manifest holds at most `renditions.MAX_SELECTIONS` (5,000) entries
-  across all cohorts; a qualified rendition that does not fit stays
-  `pending-review` with `selection-capacity` and resumes from its saved review.
+  across all cohorts. An in-scope entry with no saved review is not sent to the
+  model when the manifest has no room for it: `qualify` checks the room (an
+  exact read, 2 ms at 5,000 entries) on the main thread just before the call,
+  and a refused entry ends `pending-review` with `selection-capacity` with
+  nothing staged, so the next run with room reviews it once. Concurrent
+  prefetching starts a review ahead only while the free room exceeds the entries
+  in the lookahead window; otherwise the entry is checked in its turn, so
+  outcomes do not depend on completion order. An entry with a saved review is
+  never re-reviewed and is selected when room exists; a select refused by a
+  concurrent cohort's write still ends `selection-capacity` with its review
+  kept. `counts.selection_capacity` reports `entries` held and
+  `model_calls_skipped`. Measured on a synthetic 40-file cohort with the cap
+  lowered to 10: 40 calls and 4,230 prompt tokens before, 10 and 1,058 after
+  (60 files, cap 20: 60 and 6,350 before, 20 and 2,117 after), same
+  qualified/pending counts. Evidence:
+  `tests/test_intake_cohort.py::SharedManifestTests` (the `selection_capacity`
+  and saved-review tests).
   Evidence: `tests/test_intake_cohort.py::QualifyTests` (about 15 tests from
   `test_a_b_a_b_keeps_every_cohorts_selections_and_publishes_them_all` through
   `test_two_processes_qualifying_different_cohorts_do_not_lose_each_others_writes`).
@@ -478,8 +493,13 @@ owner preference rather than measured or test-enforced facts.
   number.
 - Declining agent memory and the dead-weight pruning signal (sections 6): reasoned,
   not measured.
-- The 5,000-entry manifest cap is an implementation limit, not a design goal; past
-  it `qualify` still reviews entries that cannot be selected (`selection-capacity`).
+- The 5,000-entry manifest cap is an implementation limit, not a design goal. Past
+  it `qualify` no longer pays for reviews it cannot select, but the cap itself is
+  unmeasured above 800 real selections. Each select rewrites and revalidates the
+  whole manifest (20 ms at 1,000 entries, 93 ms at 5,000, 274 ms at 20,000, so
+  filling a manifest is quadratic), publish grew faster than linear from 200 to
+  800 selections, and index build, reader memory and publication authorization
+  were not measured at a larger size. Raising it needs those measurements.
 - A single linear catalog hash chain (revisit triggers were: commit utilization
   above about a third of the ceiling with writers losing waits, multi-host
   writers, or a first-of-day hold above the 10 s wait even after the speedups).

@@ -1,4 +1,5 @@
 """Read-only local cohort intake: classify, submit and extract with body-free counts."""
+import contextlib
 import hashlib
 import io
 import json
@@ -1301,27 +1302,129 @@ class SharedManifestTests(QualifyCase):
             self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "pending-review": 1})
             self.assertEqual([e["review_code"] for e in report["entries"] if e.get("review_code")],
                              ["selection-capacity"])
-            # Not a conflict: the select stage was left unrun, not blocked for explicit replay.
-            full = next(e for e in report["entries"] if e.get("review_code") == "selection-capacity")
-            corr = "standing-%s-%s-%s" % (full["submission_id"], full["rendition_sha256"][:12], hashlib.sha256(
-                (self.root / "config/standing-policy.local.json").read_bytes()).hexdigest()[:8])
-            self.assertEqual([s["status"] for s in store.inspect(self.root, corr)["stages"]],
-                             ["succeeded", "staged"])
+            self.assertEqual(report["counts"]["selection_capacity"],
+                             {"entries": 1, "model_calls_skipped": 1})
             # Cohort A is untouched by B's overflow, and still full.
             self.assertEqual(self.owners(("a", self.qualify("a"))).get("a"), 3)
             self.assertEqual(self.qualify("b")["counts"]["qualification"],
                              {"qualified": 1, "pending-review": 1})
-            # A frees a slot (a file leaves its inbox); B's pending rendition is then selected from
-            # its saved review: no model call, no manual replay.
+            # A frees a slot (a file leaves its inbox); B's held-back rendition was never reviewed,
+            # so it now costs its one review.
             (self.a / "a2.md").unlink()
             self.qualify("a")
             self.assertEqual(len(self.selections()), 3)
             self.calls.clear()
             resumed = self.qualify("b")
         self.assertEqual(resumed["counts"]["qualification"], {"qualified": 2})
-        self.assertEqual((self.calls, resumed["usage"]),
-                         ([], {"prompt_tokens": 0, "completion_tokens": 0}))
+        self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.selections()), 4)
+
+    def capped(self, cap):
+        """Patch the manifest cap seen by the selector and the cohort run (policy checks stay real)."""
+        class Cap(int):
+            def __ge__(self, other):
+                return True
+        small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(cap)})
+        stack = contextlib.ExitStack()
+        stack.enter_context(unittest.mock.patch.object(standing, "renditions", small))
+        stack.enter_context(unittest.mock.patch.object(cohort, "renditions", small))
+        return stack
+
+    def fresh_instance(self):
+        """A second empty instance with the same inboxes, and a new counting transport."""
+        from tools.review_events import event_store as events
+        root = Path(self.temp.name) / "instance-2"
+        (root / "config").mkdir(parents=True)
+        (root / "documents").mkdir()
+        store.initialize(root)
+        catalog.initialize(root)
+        events.initialize(root)
+        (root / "config/policy.local.json").write_text(json.dumps({"audience": "authorized-local"}))
+        (root / "documents/context.md").write_text("# Cohort Context\nQualified Falcon cohort context.\n")
+        self.root, self.manifest = root, root / "config/selection.local.json"
+        self.transport, self.calls = self._transport()
+
+    def check_held_back_entries_cost_no_call_and_resume_with_one_each(self, concurrency):
+        self.qualify("a")
+        # Cohort B has two files and one free slot (cap 4, three of A's entries).
+        self.calls.clear()
+        with self.capped(4):
+            report = self.qualify("b", concurrency=concurrency)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(report["usage"], {"prompt_tokens": 10, "completion_tokens": 5})
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "pending-review": 1})
+        self.assertEqual(report["counts"]["selection_capacity"], {"entries": 1, "model_calls_skipped": 1})
+        held = next(e for e in report["entries"] if e.get("review_code") == "selection-capacity")
+        # Nothing was staged for it, so no review is saved; it is not a conflict or a failure.
+        corr = "standing-%s-%s-%s" % (held["submission_id"], held["rendition_sha256"][:12], hashlib.sha256(
+            (self.root / "config/standing-policy.local.json").read_bytes()).hexdigest()[:8])
+        with self.assertRaises(IntakeError):
+            store.inspect(self.root, corr)
+        self.assertEqual(len(self.selections()), 4)
+        # A rerun at the same capacity stays at zero calls.
+        self.calls.clear()
+        with self.capped(4):
+            again = self.qualify("b", concurrency=concurrency)
+        self.assertEqual((self.calls, again["counts"]["selection_capacity"]),
+                         ([], {"entries": 1, "model_calls_skipped": 1}))
+        # Room appears: the held-back entry costs one review, the selected one none.
+        self.calls.clear()
+        resumed = self.qualify("b", concurrency=concurrency)
+        self.assertEqual(resumed["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(resumed["counts"]["selection_capacity"], {"entries": 0, "model_calls_skipped": 0})
+        self.assertEqual(len(self.selections()), 5)
+
+    def test_entries_that_cannot_be_selected_cost_no_model_call_and_resume_with_one_each(self):
+        self.check_held_back_entries_cost_no_call_and_resume_with_one_each(1)
+
+    def test_the_same_holds_with_concurrent_reviews(self):
+        self.check_held_back_entries_cost_no_call_and_resume_with_one_each(3)
+
+    def test_the_precheck_changes_only_the_calls_not_the_outcome_of_a_run_that_pays_for_all(self):
+        outcome = lambda r: sorted((e["relative"], e["qualification"], e.get("review_code"))
+                                   for e in r["entries"] if "qualification" in e)
+        self.qualify("a")
+        with self.capped(4):
+            skipped = self.qualify("b")
+        self.assertEqual(len(self.calls), 4)
+        self.fresh_instance()
+        self.qualify("a")
+        with self.capped(4), unittest.mock.patch.object(cohort, "_held_back", return_value=False):
+            paid = self.qualify("b")
+        self.assertEqual(len(self.calls), 5)
+        self.assertEqual(outcome(skipped), outcome(paid))
+        self.assertEqual(paid["counts"]["selection_capacity"], {"entries": 1, "model_calls_skipped": 0})
+
+    def test_a_saved_review_is_never_repeated_and_is_selected_when_room_exists(self):
+        self.qualify("a")
+        # Room looked available, so both of B's reviews were paid and saved; the select was refused.
+        with self.capped(3), unittest.mock.patch.object(cohort, "_selection_room", return_value=True):
+            self.qualify("b")
+        self.assertEqual(len(self.calls), 5)
+        self.calls.clear()
+        with self.capped(3):
+            held = self.qualify("b")
+        self.assertEqual((self.calls, held["counts"]["qualification"], held["counts"]["selection_capacity"]),
+                         ([], {"pending-review": 2}, {"entries": 2, "model_calls_skipped": 0}))
+        resumed = self.qualify("b")
+        self.assertEqual((self.calls, resumed["counts"]["qualification"], len(self.selections())),
+                         ([], {"qualified": 2}, 5))
+
+    def test_a_full_manifest_does_not_change_the_outcome_of_out_of_scope_entries(self):
+        self.qualify("a")
+        policy_file = self.root / "config/standing-policy.local.json"
+        raw = json.loads(policy_file.read_text())
+        raw["version"] += 1
+        raw["scope"]["receipts"] = ["D1", "D2", "D3"]  # B's receipts are D4 and D5
+        policy_file.write_text(json.dumps(raw))
+        policy_file.chmod(0o600)
+        self.calls.clear()
+        with self.capped(3):
+            report = self.qualify("b")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(report["counts"]["out_of_scope"], {"entries": 2, "model_calls_skipped": 2})
+        self.assertEqual(report["counts"]["selection_capacity"], {"entries": 0, "model_calls_skipped": 0})
 
     def test_a_select_blocked_by_a_cohort_that_filled_the_manifest_meanwhile_is_resumed(self):
         self.qualify("a")

@@ -752,6 +752,23 @@ def _selection_room(root, manifest, rendition):
     return len(selected) < renditions.MAX_SELECTIONS or any(r["path"] == rendition for r in selected)
 
 
+def _free_room(root, manifest):
+    """Selections the shared manifest can still take (an exact read, advisory across processes)."""
+    return renditions.MAX_SELECTIONS - len(_manifest_renditions(root, manifest))
+
+
+def _held_back(root, entry, standing_policy, manifest):
+    """True when a model review would be paid for an entry that cannot be selected.
+
+    The manifest has no room for the rendition and the policy scope does not already refuse it
+    (a refused entry ends ``prohibited-scope`` without a call, as before). The check reads the
+    manifest and never writes it; ``standing-select`` stays the authority on capacity.
+    """
+    return (not _selection_room(root, manifest, entry["rendition"])
+            and not standing.refused_scope(root, standing_policy, entry["rendition"],
+                                           entry["rendition_sha256"]))
+
+
 def _standing_token(entry, policy_sha):
     return "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
 
@@ -801,6 +818,11 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
         if failure is not None:
             raise failure
         if reviewed is None:
+            if _held_back(root, entry, standing_policy, manifest):
+                # Nothing is reviewed or staged: a later run reviews it once when room appears.
+                entry.update(qualification="pending-review", review_code="selection-capacity",
+                             capacity_call_skipped=True)
+                return
             reviewed = _review(root, entry, standing_policy, model, transport)
         entry["model_call_skipped"] = reviewed.get("skipped") == "scope"
         usage.update(reviewed["usage"])
@@ -905,8 +927,11 @@ def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manif
                     if entry is None:
                         break
                     corr = "standing-" + _standing_token(entry, policy_sha)
-                    window.append((entry, None if corr in existing
-                                   else pool.submit(review, entry)))
+                    # A review is started ahead only while the manifest has room for every entry
+                    # still in the window; any other entry is checked exactly, in turn, in
+                    # _review_and_select, so no call is paid for an entry that cannot be selected.
+                    ahead = corr not in existing and _free_room(root, manifest) > len(window)
+                    window.append((entry, pool.submit(review, entry) if ahead else None))
                 if not window:
                     return
                 entry, future = window.popleft()
@@ -1010,6 +1035,10 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     # Entries the policy scope refuses, and how many of them this run reached without a model call.
     report["counts"]["out_of_scope"] = {
         "entries": len(refused), "model_calls_skipped": sum(bool(e.get("model_call_skipped")) for e in refused)}
+    # Entries left pending for manifest capacity, and how many of them cost no model call at all.
+    report["counts"]["selection_capacity"] = {
+        "entries": sum(e.get("review_code") == "selection-capacity" for e in extracted),
+        "model_calls_skipped": sum(bool(e.get("capacity_call_skipped")) for e in extracted)}
     report["counts"]["published"] = int(
         pub["status"] == "succeeded"
         and bool(inspected.get("availability", {}).get("available")))

@@ -339,8 +339,15 @@ several inboxes can share one catalog, manifest and index ([design](../docs/desi
 Only an orphan (receipt missing from the catalog, or retained rendition file gone) is dropped. The
 read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
 processes keep each other's writes, and replacement is atomic. The manifest holds at most 5,000
-selections across all cohorts; a qualified rendition that does not fit stays `pending-review`
-(`selection-capacity`, resumed from its saved review once room appears). `counts.other_cohorts` (`selections`, `unattributed`, `orphaned`) is
+selections across all cohorts. When the manifest has no room for an in-scope rendition that has no
+saved review, `qualify` makes no model call for it: it stays `pending-review` (`selection-capacity`)
+with nothing saved, and a later run with room reviews it once. A rendition whose review is saved is
+selected without a call once room appears. `counts.selection_capacity` (`entries`,
+`model_calls_skipped`) reports what was held back and the calls avoided; free room is read just
+before each call, and `standing-select` remains the check at write time. With `--concurrency`,
+reviews run ahead only while there is room for every entry in flight, so near the cap the run
+proceeds more serially. To qualify a cohort larger than the free room, free space (retire entries
+of other cohorts) or expect the rest to wait; they cost nothing until room appears. `counts.other_cohorts` (`selections`, `unattributed`, `orphaned`) is
 present when other entries exist. Policy, manifest and context paths are validated (instance-relative, no
 symlinks, existing maintained sections) before anything is ingested or written;
 manifest and policy files are replaced atomically.  `qualify` always processes the whole inbox
