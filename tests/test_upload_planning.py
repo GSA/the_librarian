@@ -290,6 +290,32 @@ class IncrementalTests(Case):
             self.assertEqual((taken.highest, taken.present), (warm.highest, warm.present))
 
 
+    def test_a_ledger_over_the_index_bound_is_not_decoded_again_by_later_calls(self):
+        self.upload_n("a", "b", "c")
+        with patch.object(upload, "INDEX_LIMIT", 2):
+            first = upload.reserved_ids(self.root)
+            with patch.object(upload, "decode", wraps=upload.decode) as decode:
+                second = upload.reserved_ids(self.root)
+            self.assertEqual(decode.call_count, 0)  # served by the warm digest memo alone
+            self.assertEqual(second.highest, first.highest)
+            # A ledger that is a different file starts over and may use the index again.
+            other = Path(self.temp.name) / "small"
+            other.mkdir()
+            store.initialize(other)
+            catalog.initialize(other)
+            self.assertEqual(upload.reserved_ids(other).highest, {"S": 0, "D": 0})
+        upload.submit(other, self.file("o.txt", b"o\n"), value("o", "o.txt"))
+        self.assertEqual(upload.reserved_ids(other).highest, {"S": 1, "D": 1})
+        self.assertEqual(upload.RESERVED.key[0], str(other))
+
+    def test_the_index_stops_reading_once_the_bound_is_passed(self):
+        self.upload_n("a", "b", "c", "d")
+        with patch.object(upload, "INDEX_LIMIT", 5), patch.object(upload, "promised", wraps=upload.promised) as read, \
+                patch.object(upload, "scanned_ids", return_value=upload.Taken()):
+            upload.reserved_ids(self.root)
+        self.assertLessEqual(read.call_count, 2)  # 4 IDs per request: the second passes the bound
+
+
 class EquivalenceTests(Case):
     def test_allocation_matches_the_pre_change_algorithm_across_a_mixed_history(self):
         """Replay a history with commits, a blocked request and a correction; every planned record

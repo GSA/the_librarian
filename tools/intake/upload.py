@@ -362,25 +362,33 @@ class Reserved:
         self.reset(None)
 
     def reset(self, key):
-        self.key, self.top, self.ids = key, 0, set()
+        self.key, self.top, self.ids, self.over = key, 0, set(), False
         self.highest = {prefix: 0 for prefix in PREFIXES}
 
     def extend(self, c, key):
+        """Bring the index up to date; False when this ledger holds more than ``INDEX_LIMIT`` IDs."""
         top = c.execute("SELECT max(rowid) FROM requests").fetchone()[0] or 0
         if key != self.key or top < self.top:
             self.reset(key)
+        if self.over:
+            return False  # remembered: later calls go straight to the scan, not through a re-read
         if top == self.top:
             return True
-        added = [(rowid, sha256, raw) for rowid, sha256, raw in c.execute(
-            "SELECT rowid, request_sha256, raw FROM requests "
-            "WHERE rowid>? AND rowid<=? AND correlation_id LIKE 'upload-%' ORDER BY rowid", (self.top, top))]
+        # Streamed in row order and abandoned as soon as the bound is passed, so an oversized
+        # ledger is never read whole here; the entries are applied only if all of them fit.
         entries = []
-        for _, sha256, raw in added:
+        held = len(self.ids)
+        for _, sha256, raw in c.execute(
+                "SELECT rowid, request_sha256, raw FROM requests "
+                "WHERE rowid>? AND rowid<=? AND correlation_id LIKE 'upload-%' ORDER BY rowid", (self.top, top)):
             require(digest(raw) == sha256, "corrupt_request")
-            entries.append(promised(raw))
-        if len(self.ids) + sum(len(entry[0]) for entry in entries) > INDEX_LIMIT:
-            self.reset(None)  # too large to hold: this call and later ones take the bounded scan
-            return False
+            entry = promised(raw)
+            held += len(entry[0])
+            if held > INDEX_LIMIT:
+                self.reset(key)
+                self.over, self.top = True, top
+                return False
+            entries.append(entry)
         for entry in entries:
             self.ids.update(entry[0])
             for index, prefix in enumerate(PREFIXES, 1):
