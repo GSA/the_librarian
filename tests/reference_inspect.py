@@ -1,6 +1,6 @@
 """The pre-wjf9 ``catalog_store.inspect``, verbatim, as the reference for differential tests.
 
-Decision 0017 made inspect cheaper without weakening it; tests compare the production function
+The identity-bound receipt (docs/design/current-state.md, "What a catalog write validates") made inspect cheaper without weakening it; tests compare the production function
 with this one on valid and tampered histories, so a change that accepts or refuses differently
 fails. Do not optimize this copy.
 """

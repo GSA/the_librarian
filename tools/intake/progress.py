@@ -70,7 +70,7 @@ ATTENTION = CODED
 
 # Verification state reused across renders in this process. ``_memo`` holds SHA-256 digests of
 # request and artifact bytes already proven (store.PageMemo); ``_cached`` holds the one finished
-# ledger summary, valid only for the exact file identity it was computed from (decision 0014/0017).
+# ledger summary, valid only for the exact file identity it was computed from (see "Intake ledger" in docs/design/current-state.md).
 _memo = store.PageMemo()
 _cached = {}
 
@@ -142,8 +142,8 @@ def stage_signature(layout, statuses):
 def read_ledger(root, timeout=2.0, limit=50, runs=None):
     """Verify the whole ledger a page at a time and reduce it to counts and the few items shown.
 
-    Every page is read in its own short read transaction and verified after it ends (so, as in
-    decision 0014, no read lock is held across digest or shape work). Nothing but counters and
+    Every page is read in its own short read transaction and verified after it ends (so, as
+    described under "Intake ledger" in docs/design/current-state.md, no read lock is held across digest or shape work). Nothing but counters and
     the ``limit`` newest items per list is kept, so memory follows the page, not the ledger.
     """
     started = time.perf_counter()
@@ -366,7 +366,7 @@ _catalog_seen = {}  # canonical binding -> state of a full inspection this proce
 def catalog_state(catalog, connection, home):
     """The catalog's validated state without writing anything (no receipt is ever written here).
 
-    A read-validation receipt that covers exactly this file (decision 0017) vouches for a state
+    A read-validation receipt that covers exactly this file ("What a catalog write validates" in docs/design/current-state.md) vouches for a state
     that a writer or reader already validated in full today, and this process's own earlier full
     inspection of the identical binding does the same; otherwise the whole history is inspected.
     A receipt that cannot be read is ignored, never trusted.
