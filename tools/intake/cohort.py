@@ -1020,7 +1020,7 @@ def publish(root, *, policy_path, manifest, index_path=DEFAULT_INDEX):
         standing.load_policy(root, policy_path, policy_sha)
         selections = len(index.load_manifest(index.no_symlinks(root / manifest), root)[0]
                          .get("renditions", []))
-    except (index.IndexError_, standing.Refusal, OSError, UnicodeError) as error:
+    except (index.IndexError_, standing.Refusal, OSError, UnicodeError, ValueError) as error:
         raise IntakeError("preflight_invalid") from error
     stage, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     available = bool(inspected.get("availability", {}).get("available"))

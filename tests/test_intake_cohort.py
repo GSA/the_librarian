@@ -1393,6 +1393,22 @@ class PublishTests(QualifyCase):
                 self.publish(**extra)
         self.assertEqual(self.publish_requests(), [])
 
+    def test_publish_refuses_a_malformed_manifest_with_a_body_free_error(self):
+        self._qualify(self.transport)
+        self.manifest.write_text("{not json")
+        before = self.publish_requests()
+        with self.assertRaises(IntakeError) as caught:
+            self.publish()
+        self.assertEqual(caught.exception.code, "preflight_invalid")
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(cohort.main(["publish", "--root", str(self.root), "--policy",
+                                          "config/standing-policy.local.json",
+                                          "--manifest", "config/selection.local.json"]), 2)
+        self.assertEqual(json.loads(err.getvalue()), {"error": "preflight_invalid"})
+        self.assertEqual(self.publish_requests(), before)
+
     def test_cli_publish_prints_body_free_counts_and_needs_no_model(self):
         import contextlib
         self.interrupted_qualify()
