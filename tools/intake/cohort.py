@@ -25,7 +25,7 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import adapters, cli, model_review, runner, standing, store, upload
+from . import adapters, cli, model_review, runner, standing, store, throttle, upload
 from . import contracts
 from .contracts import IntakeError, LedgerBusy
 
@@ -778,7 +778,7 @@ def _live_events(snapshot):
     return {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
 
 
-def _review(root, entry, standing_policy, model, transport):
+def _review(root, entry, standing_policy, model, transport, inspected_form="list"):
     """Model-review one rendition, unless the policy scope refuses it: that costs no model call.
 
     A refused entry is staged with an empty findings pin that is never written; the
@@ -790,12 +790,13 @@ def _review(root, entry, standing_policy, model, transport):
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0},
                 "findings_path": f"{home}/findings/out-of-scope/{entry['rendition_sha256'][:24]}.json",
                 "findings_sha256": hashlib.sha256(b"").hexdigest()}
-    return model_review.review(root, entry["rendition"], standing_policy, model, transport)
+    return model_review.review(root, entry["rendition"], standing_policy, model, transport,
+                               inspected_form=inspected_form)
 
 
 def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
                        model, transport, usage, snapshot=None, prefetched=None,
-                       heads=None, live=None):
+                       heads=None, live=None, inspected_form="list"):
     """Review and select one extracted rendition; identity is bound to the exact rendition.
 
     ``prefetched`` optionally returns the model review already started for this entry
@@ -823,7 +824,7 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
                 entry.update(qualification="pending-review", review_code="selection-capacity",
                              capacity_call_skipped=True)
                 return
-            reviewed = _review(root, entry, standing_policy, model, transport)
+            reviewed = _review(root, entry, standing_policy, model, transport, inspected_form)
         entry["model_call_skipped"] = reviewed.get("skipped") == "scope"
         usage.update(reviewed["usage"])
         if reviewed["status"] != "reviewed":
@@ -893,7 +894,7 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
 
 
 def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
-                model, transport, usage, snapshot, concurrency):
+                model, transport, usage, snapshot, concurrency, inspected_form="list"):
     """Review and select each entry in input order, with up to ``concurrency`` model calls in flight.
 
     Only model_review.review runs on worker threads, and only for entries without a
@@ -901,10 +902,10 @@ def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manif
     order, so the outcome does not depend on completion order.
     """
     def review(entry):
-        return _review(root, entry, standing_policy, model, transport)
+        return _review(root, entry, standing_policy, model, transport, inspected_form)
 
     # One correction-chain index and one live-event set serve every entry of the run.
-    shared = {"heads": store.Heads(), "live": _live_events(snapshot)}
+    shared = {"heads": store.Heads(), "live": _live_events(snapshot), "inspected_form": inspected_form}
     if concurrency == 1:
         for entry in extracted:
             _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
@@ -979,10 +980,24 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
 
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
-            context=None, index_path=DEFAULT_INDEX, concurrency=1):
-    """Ingest, model-review, select and publish the cohort; return body-free counts and usage."""
+            context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
+            initial_concurrency=None, inspected_form="list"):
+    """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
+
+    ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
+    run starts at ``initial_concurrency`` (default: ``concurrency``) and halves the number in flight
+    when the provider answers 429 or 503, adding one back per window of clean replies, so it never
+    exceeds ``concurrency``; ``adaptive=False`` holds it fixed. ``report["throughput"]`` is the
+    effective rate. ``inspected_form`` (``list`` or ``ranges``) only changes how the reviewer is
+    asked to write the inspected record indices; findings and outcomes are identical.
+    """
     if type(concurrency) is not int or concurrency < 1:
         raise IntakeError("invalid_concurrency")
+    if initial_concurrency is not None and (
+            type(initial_concurrency) is not int or not 1 <= initial_concurrency <= concurrency):
+        raise IntakeError("invalid_concurrency")
+    if inspected_form not in model_review.FORMS:
+        raise IntakeError("invalid_inspected_form")
     root = Path(root).resolve()
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
@@ -1004,8 +1019,10 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     snapshot = event_reader.read_snapshot(root)
     retries = getattr(transport, "retries", None)
     retried = Counter(retries) if retries is not None else None
-    _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
-                model, transport, usage, snapshot, concurrency)
+    limiter = throttle.Limiter(concurrency, initial=initial_concurrency, adaptive=adaptive)
+    with limiter.gating(transport) as gated:
+        _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
+                    model, gated, usage, snapshot, concurrency, inspected_form)
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
     # Reconcile the cohort's manifest entries to exactly its qualified renditions from validated
     # review evidence, keeping an operator's explicit selection whose saved review was superseded.
@@ -1044,6 +1061,9 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         and bool(inspected.get("availability", {}).get("available")))
     report["usage"] = {"prompt_tokens": usage["prompt_tokens"],
                        "completion_tokens": usage["completion_tokens"]}
+    # Body-free effective model-call rate and what the adaptive limit did; timing-dependent, so
+    # kept apart from ``counts`` and ``entries``, which never vary with it.
+    report["throughput"] = {**limiter.report(), "inspected_form": inspected_form}
     if retries is not None:
         # Body-free per-code retry counts made by the transport during this run.
         report["retries"] = {code: count for code, count in sorted(
@@ -1117,7 +1137,15 @@ def main(argv=None):
             command.add_argument("--context", action="append", dest="context")
             command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
             command.add_argument("--concurrency", type=int, default=6,
-                                 help="model review calls in flight (default 6; 1 is serial)")
+                                 help="most model review calls in flight (default 6; 1 is serial); "
+                                      "an adaptive run backs off below it on 429/503, never above")
+            command.add_argument("--initial-concurrency", type=int,
+                                 help="calls in flight at the start (default: --concurrency)")
+            command.add_argument("--no-adaptive", action="store_true",
+                                 help="hold --concurrency fixed instead of backing off on 429/503")
+            command.add_argument("--inspected-form", choices=model_review.FORMS, default="list",
+                                 help="ask the reviewer for inspected records as every index "
+                                      "(list, default) or as ranges (ranges)")
     args = parser.parse_args(argv)
     try:
         if args.command == "recover-identity":
@@ -1134,7 +1162,9 @@ def main(argv=None):
                 policy_path=args.policy_path, manifest=args.manifest, model=args.model,
                 transport=model_review.usai_transport(args.models_config),
                 context=args.context, index_path=args.index_path,
-                concurrency=args.concurrency)
+                concurrency=args.concurrency, adaptive=not args.no_adaptive,
+                initial_concurrency=args.initial_concurrency,
+                inspected_form=args.inspected_form)
         elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                             limit=args.limit)
@@ -1149,7 +1179,7 @@ def main(argv=None):
     if args.report:
         _write_private(args.report, report)
     summary = {"counts": report["counts"]}
-    for key in ("usage", "retries"):
+    for key in ("usage", "retries", "throughput"):
         if key in report:
             summary[key] = report[key]
     print(json.dumps(summary, sort_keys=True))

@@ -13,7 +13,7 @@ from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import renditions
-from tools.intake import cohort, runner, standing, store, upload
+from tools.intake import cohort, model_review, runner, standing, store, upload
 from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
@@ -963,6 +963,8 @@ class QualifyTests(QualifyCase):
             events = sorted(e["event_id"] for e in event_reader.read_snapshot(self.root).events)
             manifest = (self.root / "config/selection.local.json").read_text()
             self.root = root
+            # ``throughput`` reports timing and varies by design; everything else must not.
+            report = {k: v for k, v in report.items() if k != "throughput"}
             return report, ledger, events, manifest, started, finished
 
         serial, parallel = run(1), run(6)
@@ -1481,6 +1483,161 @@ class SharedManifestTests(QualifyCase):
         policy_file.write_text(json.dumps(raw))
 
 
+class ThroughputTests(QualifyCase):
+    """Adaptive concurrency and range-encoded inspection change cost, never an outcome."""
+
+    def stub(self, ranges=False, throttle_every=0, delay=0.0):
+        """Counting transport: calls, tokens (reply characters / 4), simulated 429/503 retries."""
+        import threading
+        import time
+        from collections import Counter
+        lock, state = threading.Lock(), {"calls": 0, "completion": 0, "in_flight": 0, "peak": 0}
+
+        def encode(records):
+            if not ranges:
+                return records
+            out, start = [], None
+            for i, r in enumerate(records):
+                if start is None:
+                    start = r
+                if i + 1 == len(records) or records[i + 1] != r + 1:
+                    out.append(start if start == r else f"{start}-{r}")
+                    start = None
+            return out
+
+        def transport(model, messages):
+            with lock:
+                state["calls"] += 1
+                number = state["calls"]
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+            payload = json.loads(messages[-1]["content"])
+            records = [r["i"] for r in payload["records"]]
+            if "Just text" in messages[-1]["content"]:
+                records = records[:0]
+            if throttle_every and number % throttle_every == 0:
+                for observe in tuple(transport.observers):
+                    observe("http-429" if number % 2 else "http-503")
+                with lock:
+                    transport.retries["http-429"] += 1
+            time.sleep(delay)
+            content = json.dumps({
+                "decision": "accept", "inspected_records": encode(records),
+                "inspected_warnings": [w["ref"] for w in payload["warnings"]],
+                "contradictions": [], "missing_evidence": [],
+                "explanation": "Inspected all rendition records against standing policy."})
+            with lock:
+                state["in_flight"] -= 1
+                state["completion"] += len(content) // 4
+            return {"content": content, "usage": {"prompt_tokens": len(messages[-1]["content"]) // 4,
+                                                  "completion_tokens": len(content) // 4}}
+        transport.retries, transport.observers = Counter(), []
+        return transport, state
+
+    def run_copy(self, name, transport, **extra):
+        import shutil
+        from tools.review_events import event_store
+        root = self.root
+        self.root = Path(self.temp.name) / name
+        shutil.copytree(root, self.root)
+        try:
+            report = self._qualify(transport, **extra)
+            ledger = {r["correlation_id"]: [(st["id"], st["status"]) for st in
+                                            store.inspect(self.root, r["correlation_id"])["stages"]]
+                      for r in store.list_requests(self.root)}
+            events = sorted(e["event_id"] for e in
+                            __import__("tools.review_events.event_reader", fromlist=["x"])
+                            .read_snapshot(self.root).events)
+            findings = sorted(hashlib.sha256(p.read_bytes()).hexdigest()
+                              for p in (self.root / "documents").parent.rglob("findings/**/*.json"))
+            manifest = (self.root / "config/selection.local.json").read_text()
+            del event_store
+        finally:
+            self.root = root
+        return report, ledger, events, findings, manifest
+
+    def same(self, a, b):
+        self.assertEqual(a[0]["entries"], b[0]["entries"])
+        self.assertEqual(a[0]["counts"], b[0]["counts"])
+        self.assertEqual(a[1:], b[1:])
+
+    def test_adaptive_run_under_throttling_has_the_outcomes_of_a_fixed_run_and_never_exceeds_the_cap(self):
+        fixed_t, fixed = self.stub(delay=0.01)
+        fixed_report = self.run_copy("fixed", fixed_t, concurrency=1, adaptive=False)
+        adaptive_t, adaptive = self.stub(throttle_every=2, delay=0.01)
+        adaptive_report = self.run_copy("adaptive", adaptive_t, concurrency=4)
+        self.same(fixed_report, adaptive_report)
+        self.assertEqual(fixed_report[0]["usage"], adaptive_report[0]["usage"])
+        self.assertEqual((fixed["calls"], adaptive["calls"]), (6, 6))
+        self.assertLessEqual(adaptive["peak"], 4)
+        throughput = adaptive_report[0]["throughput"]
+        self.assertEqual((throughput["cap"], throughput["calls"]), (4, 6))
+        self.assertLessEqual(throughput["max_in_flight"], 4)
+        self.assertGreater(throughput["backoffs"], 0)
+        self.assertLess(throughput["lowest"], 4)
+        self.assertEqual(adaptive_report[0]["retries"], {"http-429": 3})
+
+    def test_an_adaptive_run_with_no_throttling_stays_at_the_configured_cap(self):
+        transport, state = self.stub(delay=0.02)
+        report = self._qualify(transport, concurrency=3)
+        throughput = report["throughput"]
+        self.assertEqual((throughput["final"], throughput["lowest"], throughput["backoffs"]), (3, 3, 0))
+        self.assertLessEqual(state["peak"], 3)
+        self.assertGreater(throughput["calls_per_minute"], 0)
+
+    def test_initial_concurrency_starts_below_the_cap_and_is_validated(self):
+        transport, state = self.stub(delay=0.01)
+        report = self._qualify(transport, concurrency=4, initial_concurrency=1)
+        # It starts at one call and earns the rest one clean window at a time.
+        self.assertEqual(report["throughput"]["initial"], 1)
+        self.assertLessEqual(state["peak"], 4)
+        self.assertGreater(report["throughput"]["final"], 1)
+        for bad in (0, 5, True):
+            with self.assertRaises(IntakeError):
+                self._qualify(transport, concurrency=4, initial_concurrency=bad)
+        with self.assertRaises(IntakeError):
+            self._qualify(transport, inspected_form="sparse")
+
+    def test_range_form_has_identical_entries_findings_events_and_selection_with_fewer_tokens(self):
+        listed_t, listed = self.stub()
+        ranged_t, ranged = self.stub(ranges=True)
+        a = self.run_copy("list", listed_t, concurrency=2)
+        b = self.run_copy("ranges", ranged_t, concurrency=2, inspected_form="ranges")
+        self.same(a, b)
+        self.assertEqual(a[0]["counts"]["qualification"], {"qualified": 5, "pending-review": 1})
+        self.assertEqual((listed["calls"], ranged["calls"]), (6, 6))
+        self.assertEqual(a[0]["usage"]["prompt_tokens"] <= b[0]["usage"]["prompt_tokens"], True)
+        self.assertLessEqual(ranged["completion"], listed["completion"])
+        self.assertEqual(b[0]["throughput"]["inspected_form"], "ranges")
+        # The ranged request carries the range instruction; the list request does not.
+        self.assertIn("first-last", model_review.SYSTEM + model_review.RANGE_NOTE)
+
+    def test_range_replies_are_accepted_whatever_form_was_asked_and_gaps_stay_incomplete(self):
+        base, _ = self._transport()
+
+        def gappy(model, messages):
+            payload = json.loads(messages[-1]["content"])
+            records = [r["i"] for r in payload["records"]]
+            gaps = ["0-%d" % (records[-1] - 1)] if len(records) > 1 else []
+            reply = base(model, messages)
+            value = json.loads(reply["content"])
+            value["inspected_records"] = gaps
+            return {**reply, "content": json.dumps(value)}
+        report = self.run_copy("gappy", gappy, concurrency=2, inspected_form="ranges")[0]
+        reference = self.run_copy("whole", base, concurrency=1)[0]
+        self.assertEqual(reference["counts"]["qualification"], {"qualified": 6})
+        self.assertNotEqual(report["counts"]["qualification"], reference["counts"]["qualification"])
+
+    def test_restart_after_a_throttled_run_reuses_saved_reviews_without_calls(self):
+        transport, state = self.stub(throttle_every=2)
+        first = self._qualify(transport, concurrency=4)
+        again_t, again = self.stub(throttle_every=2)
+        second = self._qualify(again_t, concurrency=4, inspected_form="ranges")
+        self.assertEqual(again["calls"], 0)
+        self.assertEqual(second["counts"]["qualification"], first["counts"]["qualification"])
+        self.assertEqual(second["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+
+
 class PublishTests(QualifyCase):
     """The standalone ``publish`` command: the end-of-run publication, without a re-run."""
 
@@ -1826,7 +1983,9 @@ class CliTests(CohortCase):
         for body in ("Fund codes", "Line", "Decided", "hello there", "Just text", "Plan", "inside"):
             self.assertNotIn(body, raw)
         printed = json.loads(raw)
-        self.assertEqual(set(printed), {"counts", "usage"})
+        self.assertEqual(set(printed), {"counts", "usage", "throughput"})
+        self.assertEqual(printed["throughput"]["cap"], 3)
+        self.assertLessEqual(printed["throughput"]["max_in_flight"], 3)
         self.assertEqual(printed["counts"]["qualification"], {"qualified": 6})
         self.assertEqual(printed["usage"], {"prompt_tokens": 30, "completion_tokens": 12})
         self.assertEqual(report.stat().st_mode & 0o777, 0o600)

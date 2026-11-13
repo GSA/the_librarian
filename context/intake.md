@@ -426,10 +426,46 @@ unchanged costs 0 calls. Do not edit the scope without raising `version`: the ne
 then block as `conflicting-review`. Requalify every cohort afterwards, since publication refuses a
 selection citing an older version. Estimate the cost first from `counts.out_of_scope.entries`
 plus the already-qualified count times the sample's tokens per document.
-`--concurrency N` (default 6) keeps up to N model calls in flight, each for a
+`--concurrency N` (default 6) is the most model calls ever in flight, each for a
 rendition with no saved `standing-<...>` request; staging, runs, selection,
 manifest writes and usage accounting stay on one thread in inbox order, so
 results match `--concurrency 1`, which is fully serial.
+The run is adaptive (AIMD, `tools/intake/throttle.py`): it starts at
+`--initial-concurrency` (default N), halves the calls in flight (minimum 1) when the
+provider answers 429 or 503 (including a call the transport then retries), and adds one back
+per window of clean replies (a window is as many clean replies as the current limit), never
+above N. A burst of simultaneous 429s from one overload costs one halving. Other errors (500,
+network, 4xx) do not change it. `--no-adaptive` holds N fixed. Every call of the run passes the
+limiter, so N bounds the provider load whatever the retry behavior; the limiter decides only how
+many calls overlap, never what is reviewed, so counts, entries, findings, events, selections,
+ledger and token usage match a serial run. Stdout and the report carry `throughput`:
+`cap`, `initial`, `final`, `lowest`, `backoffs`, `throttle_signals`, `max_in_flight`, `calls`,
+`seconds`, `mean_in_flight` and `calls_per_minute` (the effective rate of this run's model calls;
+it varies with timing and is kept out of `counts`). A restarted run reuses every saved review
+without a call. Start below N with `--initial-concurrency 1` against a provider whose limits are
+unknown and watch `lowest` and `retries`; set N to what the operator will allow.
+`--inspected-form ranges` asks the reviewer to write `inspected_records` as inclusive
+`"first-last"` strings and lone integers (`[0, "2-86", 90]`) instead of every index, which cuts
+completion tokens roughly in proportion to record count. A reply in either form is accepted
+and is expanded to the same explicit, sorted list before it is pinned, so findings, the standing
+check and `standing.evaluate` see no difference: a gap in the ranges is an uninspected record and
+the review stays incomplete, and overlaps, backwards or out-of-range items, or a range longer than
+the rendition's record count make the reply invalid. The inspection list is self-attested in both
+forms, so a range carries no less assurance than a list. The default stays `list` until the owner has
+run `python -m tools.diagnostics.inspection_form_ab` (below) and chosen otherwise.
+
+*Owner-run A/B of the inspected-records forms* (calls the real model; run it deliberately on about
+20 representative renditions, a mix of short, median and long, including some the policy
+rejects or defers):
+
+    python -m tools.diagnostics.inspection_form_ab --root ROOT --models-config FILE \
+        --model MODEL --rendition-list renditions.txt [--repeat 2] [--order alternate]
+
+It asks each rendition both ways and prints body-free counts only: per form tokens, seconds,
+complete inspections, failed replies and decisions, and across forms `decision_agreement`,
+`identical_inspection`, `completion_tokens_saved(_pct)` and `seconds_saved`. It records
+nothing in the instance. Keep the report privately; it is a measurement before choosing a default,
+not a gate. Use `--repeat 2` to see how much of any disagreement is ordinary model variance.
 Stdout prints body-free `counts`, token `usage` and `retries`: per-code counts
 (`http-429`, `http-503`, `network`, ...) of transport retries during the run.
 

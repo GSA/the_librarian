@@ -152,6 +152,24 @@ restated here.
   `test_advisory_references_do_not_block_...`), `tests/test_model_review.py`
   (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
+- **Review throughput is bounded by the operator's cap and changes no outcome.** `qualify
+  --concurrency N` is the most model calls ever in flight. Every call of a run passes one
+  `throttle.Limiter` (AIMD): it starts at `--initial-concurrency` (default N), halves on a 429
+  or 503 (a burst of simultaneous signals costs one halving), and adds one back per window of
+  clean replies, never above N or below 1; other errors do not move it. The limiter only
+  decides how many calls overlap: staging, review, selection, manifest and usage accounting
+  stay on the calling thread in inbox order, and `standing.evaluate` is still the only
+  authority on every entry. `report["throughput"]` is the effective rate and what the limit did
+  (timing-dependent, so apart from `counts` and `entries`). With `--inspected-form ranges` the
+  reviewer is asked to write `inspected_records` as `"first-last"` strings; `_parse` expands them
+  (bounded by the rendition's record count; overlaps, backwards ranges and out-of-range indices
+  are an invalid reply) to the same sorted explicit list that is pinned, so the findings bytes,
+  the standing check and the events are identical to the list form, and a gap stays an
+  uninspected record. The list is self-attested in either form. The default stays `list`
+  pending the owner-run A/B (`tools/diagnostics/inspection_form_ab.py`). Evidence:
+  `tests/test_throttle.py`, `tests/test_intake_cohort.py::ThroughputTests` (identical entries,
+  findings, events, ledger and manifest across adaptive/fixed and list/ranges against a counting
+  stub; restart with zero calls), `tests/test_model_review.py::RangeFindingsTests`.
 - **Model choice and cost** are the operator's. `model_review.evaluate` scores
   candidate models on a sample and `estimate()` extrapolates token use; nothing in
   the code requires an approved budget ceiling and the current instance runs

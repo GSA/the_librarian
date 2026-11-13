@@ -133,8 +133,12 @@ A rendition outside the standing policy's scope costs no model call (`counts.out
 
 It prints body-free outcome counts, token usage and transport retry counts;
 incomplete reviews stay visibly `pending-review` and are not indexed. Up to
-`--concurrency N` (default 6; `1` is serial) model calls run at once, while all
-ledger writes stay serial and in inbox order. Rate limits (429), transient
+`--concurrency N` (default 6; `1` is serial) is the most model calls run at once,
+while all ledger writes stay serial and in inbox order. Concurrency adapts: it halves on a 429
+or 503 and recovers one step per clean window, never above N, and the output reports the
+effective rate (`throughput`); `--no-adaptive` holds it fixed. `--inspected-form ranges` asks
+for `inspected_records` as ranges, which saves output tokens
+(`tools.diagnostics.inspection_form_ab` measures it on a sample; see `context/intake.md`). Rate limits (429), transient
 server errors (500/502/503/504) and network errors are retried with backoff,
 honouring `Retry-After`.
 
