@@ -30,7 +30,7 @@ restated here.
 
   | Kind | Stores | Rule of thumb |
   |---|---|---|
-  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step **(untested)**. |
+  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step (`tests/test_authority_store_upgrade_paths.py`). |
   | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
@@ -53,6 +53,18 @@ restated here.
   not invalidate earlier snapshots (not tested as a recovery path). `init`
   never overwrites, so the tested way forward is an empty re-initialization
   beside the refused store.
+  `tests/test_authority_store_upgrade_paths.py` builds populated catalog and
+  review-event stores in temporary release copies, bumps `user_version` or
+  changes the contract marker (catalog `contract_version`, review-event
+  `contract_hash`), and asserts that `initialize` (plain, `--relocate`,
+  `--migrate-storage`, `--recover-migration` with and without an interrupted
+  migration), each store CLI (`init`, `status`, `audit`, `backup`, `restore`,
+  `query`/`export`, `submit`/`append`, `get`), the context-index catalog
+  command and the review-event reader refuse and leave every file of the
+  instance byte-identical. `init` refuses an existing store before opening it;
+  an interrupted-migration recovery rolls store files back to their old location before it refuses, keeps its journal and leaves the database bytes unchanged (it never repairs a store); the
+  intake progress view reports the catalog as unavailable; and a derived-index
+  build never rewrites an authority store.
   Durability: every write connection the catalog, review-event and intake stores
   open (init, write, backup-init, intake `locked` and `relocate`) runs with
   `synchronous=FULL` on a rollback journal (`journal_mode=delete`), pinned by
@@ -416,7 +428,7 @@ synthetic documents the two scans were about half of the time per document).
   `test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt`,
   `test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot`).
   The ledger's equivalent residual (a file rewrite that preserves identity and
-  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k. "Never migrated or rebuilt" for authority stores is likewise only partly tested (Kata 5jjd).
+  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k.
 - **Never close a descriptor on a database file while a connection to it is open
   in this process.** On POSIX, closing any descriptor drops all of the process's
   fcntl locks on that file, including SQLite's, which let a concurrent commit tear a
