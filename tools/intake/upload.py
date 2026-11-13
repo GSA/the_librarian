@@ -347,13 +347,74 @@ def promised(raw):
     return (tuple(ids), *(highest_number(ids, prefix) for prefix in PREFIXES))
 
 
+class Reserved:
+    """Promised IDs of every ``upload-*`` request, extended with only the requests added since.
+
+    Like ``store.Heads`` it follows the ledger by row id: requests are appended under the ledger
+    lock and never deleted or rewritten by the toolkit, so ``top`` (the highest row id read) names
+    exactly the requests already counted. A different ledger file (another root, or the same path
+    replaced: device and inode) or a smaller highest row id resets it. A row added since is read,
+    checked against its stored digest and decoded once. Only a finished, valid read advances it.
+    Per process; never persisted.
+    """
+
+    def __init__(self):
+        self.reset(None)
+
+    def reset(self, key):
+        self.key, self.top, self.ids = key, 0, set()
+        self.highest = {prefix: 0 for prefix in PREFIXES}
+
+    def extend(self, c, key):
+        top = c.execute("SELECT max(rowid) FROM requests").fetchone()[0] or 0
+        if key != self.key or top < self.top:
+            self.reset(key)
+        if top == self.top:
+            return True
+        added = [(rowid, sha256, raw) for rowid, sha256, raw in c.execute(
+            "SELECT rowid, request_sha256, raw FROM requests "
+            "WHERE rowid>? AND rowid<=? AND correlation_id LIKE 'upload-%' ORDER BY rowid", (self.top, top))]
+        entries = []
+        for _, sha256, raw in added:
+            require(digest(raw) == sha256, "corrupt_request")
+            entries.append(promised(raw))
+        if len(self.ids) + sum(len(entry[0]) for entry in entries) > INDEX_LIMIT:
+            self.reset(None)  # too large to hold: this call and later ones take the bounded scan
+            return False
+        for entry in entries:
+            self.ids.update(entry[0])
+            for index, prefix in enumerate(PREFIXES, 1):
+                self.highest[prefix] = max(self.highest[prefix], entry[index])
+        self.top = top
+        return True
+
+
+# Promised IDs the index may hold (about 100 bytes each); a ledger past it takes the digest-memo scan.
+INDEX_LIMIT = 500_000
+RESERVED = Reserved()
+
+
+def forget_reserved():
+    RESERVED.reset(None)
+
+
 def reserved_ids(root, probe=()):
     """A ``Taken`` for catalog IDs promised by staged upload requests that may not be committed yet.
 
     Every ``upload-*`` request counts, whatever its stage status, so a blocked, retrying or
-    dead-lettered request keeps its IDs. Only requests whose digest was not seen before are decoded.
+    dead-lettered request keeps its IDs. Only requests added since the previous call are read.
     """
     probe = frozenset(probe)
+    with store.locked(root) as c:
+        _, _, db = store.locations(root)
+        info = os.stat(db)
+        if RESERVED.extend(c, (str(store.safe(root)), info.st_dev, info.st_ino)):
+            return Taken(dict(RESERVED.highest), probe & RESERVED.ids)
+    return scanned_ids(root, probe)
+
+
+def scanned_ids(root, probe):
+    """``reserved_ids`` without the index: every ``upload-*`` row, decoding only digests not seen before."""
     with store.locked(root) as c:
         rows = c.execute("SELECT correlation_id, request_sha256 FROM requests "
                          "WHERE correlation_id LIKE 'upload-%'").fetchall()

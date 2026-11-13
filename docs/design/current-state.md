@@ -153,6 +153,29 @@ restated here.
   `ingest_benchmark.py --replay`: 11 to 5 ms per file, identical report digest.
   Evidence: `tests/test_intake_cohort.py::ReplayTests`,
   `tests/test_policy_isolation.py::StorageRootChecksAreCheapButNotWeaker`.
+- **Extraction parses each document once per ingest and re-checks it four times.**
+  `extract.bundle` reads the receipt's catalog snapshot, reads and hashes the original,
+  recomputes the extractor identity (code and policy) and parses. A first ingest ran it six
+  times per document (each stage's prepare, its changed-identity guard and `run`'s own first
+  call). It now runs four: per stage, the pinning `prepare` (or the saved intent on a retry) and
+  one guard bundle that `extract.run` then reuses (`prepared=`). The parse is kept for the newest
+  document only, keyed by format, observed source SHA-256 and extractor SHA-256, so a changed source
+  or extractor is a different key and is parsed again; a failed parse is never kept. The re-checks
+  that remain, each with its own fresh read of the catalog, file and extractor, are: (1) `prepare`
+  pins the identity; (2) the stage's guard refuses a changed source, catalog record or extractor
+  (`changed_extraction_identity`) before anything is published or submitted, because the intent may
+  be hours old on a retry; and under the catalog writer lock `unchanged` runs (3) before
+  `prepare` publishes the rendition, (4) after that publication (for `register`, instead, once
+  before the saved registration is read), (5) before the registration is submitted and (6)
+  after its completion record is written. (3) to (6) re-read and re-hash the original and
+  recompute the extractor identity and never use the reused bundle, because the lock is the
+  boundary at which another writer or editor can act, and each stands between two durable
+  effects. Dropped: `run`'s own
+  first `bundle`, which re-read what the guard had read microseconds earlier and was followed
+  by (3) or (4) anyway. Evidence: `tests/test_extraction_reuse.py`
+  (one parse, four bundles, a source or extractor changed between prepare and register, after the
+  intent was saved, during publication or before submission still blocks),
+  `tests/test_intake_cohort.py::BlockedCase`.
 - **`qualify` and shared manifests.** An instance may ingest several inboxes
   (one `--system` label each) into one catalog, manifest and index. A manifest
   entry belongs to a cohort when its rendition was extracted by the current run
@@ -416,13 +439,18 @@ valid history and about 100 tamperings: same result or same refusal message),
   at `store.MEMO_BYTES` (128 MiB of keys). A hit needs identical bytes and an
   identical stored digest; failures are never cached. Upload planning
   (`upload.records_for`) reads the highest `S`/`D` number from the catalog's
-  primary-key index and the IDs promised by `upload-*` requests via a bounded
-  (65,536) per-process memo keyed by request digest; staged, retrying, blocked and
-  dead-letter requests keep their IDs reserved.
+  primary-key index and the IDs promised by `upload-*` requests. Those come from a
+  per-process index that, like `store.Heads`, follows the ledger by row id and reads
+  only the `upload-*` requests added since its last call (each checked against its
+  stored digest and decoded once); another ledger file (device and inode) or a smaller
+  highest row id resets it, and a ledger holding more than `upload.INDEX_LIMIT`
+  promised IDs falls back to the earlier bounded (65,536) digest-keyed memo scan.
+  Staged, retrying, blocked and dead-letter requests keep their IDs reserved.
 - Evidence: `tests/test_intake_ledger_scaling.py` (alternating writers, tamper and
   replaced-ledger cases, bounded waits, progress, forged-digest memo cases, memo
   cap), `tests/test_progress_scale.py` (reference-equal counts across page sizes,
-  tamper after a cached render, digest-keyed memo, single-flight), `tests/test_upload_planning.py`.
+  tamper after a cached render, digest-keyed memo, single-flight), `tests/test_upload_planning.py`
+  (including `IncrementalTests` for the row-id index).
 - A measured production-sized ledger (about 130 MB, 36k requests) made the
   original 16k/64k-entry caches useless for the in-order walk of `verify`; the
   memo above is the fix (about 0.9 s per pass down to about 0.14 s).

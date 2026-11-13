@@ -320,14 +320,38 @@ def source(root, receipt, format_name):
     return snapshot["state"], original, identity, raw
 
 
+# The newest parse: (format, source SHA-256, extractor SHA-256) -> payload. Stages of one document
+# (prepare, its guards, register) run back to back, so one entry is enough, and memory stays at one
+# payload. The key is the observed content hash and the extractor identity (code and policy), so a
+# changed source or extractor is a different key and is parsed afresh; only a finished parse is kept.
+# Callers treat the payload as read-only. It is a per-process cache, never persisted or trusted for
+# a source read: ``bundle`` still reads and hashes the original on every call.
+_PARSED = None
+
+
+def forget_parsed():
+    global _PARSED
+    _PARSED = None
+
+
+def parse(format_name, raw, root, key):
+    global _PARSED
+    cached = _PARSED
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "mhtml": mime_html,
+               "odt": odt}[format_name](raw)
+    _PARSED = (key, payload)
+    return payload
+
+
 def bundle(root, receipt, format_name):
     state, original, identity, raw = source(root, receipt, format_name)
     settings = policy.for_root(root)[0]
     extractions_home = policy.validate_instance_roots(root)["extractions_home"]
     engine = {"version": VERSION, "sha256": fingerprint(root, format_name)}
     run = digest(encoded({"source": identity, "extractor": engine, "format": format_name}))
-    payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "mhtml": mime_html,
-               "odt": odt}[format_name](raw)
+    payload = parse(format_name, raw, root, (format_name, identity["sha256"], engine["sha256"]))
     value = {"schema_version": VERSION, "run_id": run, "extractor": engine,
              "source": identity, "boundary": BOUNDARY + " " + settings["handling"], "payload": payload}
     path = root / extractions_home / receipt / run / "extraction.json"
@@ -402,9 +426,21 @@ def registration_records(root, original, path, value):
     return [parent, child, relation]
 
 
-def run(root, command, receipt, format_name, actor=None, expected_state=None, rebase=False):
+def run(root, command, receipt, format_name, actor=None, expected_state=None, rebase=False,
+        prepared=None):
+    """Run one lifecycle command.
+
+    ``prepared`` is a ``bundle`` result the caller has just read for this receipt and format (the
+    intake adapters' changed-identity guard); it replaces the bundle ``run`` would read first.
+    Everything ``run`` does under the writer lock still re-reads and re-hashes the source and
+    recomputes the extractor identity (``unchanged``), so a reused bundle never stands in for them.
+    """
     root = catalog.safe_path(root)
-    state, original, path, value = bundle(root, receipt, format_name)
+    if prepared is None:
+        prepared = bundle(root, receipt, format_name)
+    state, original, path, value = prepared
+    require(value["source"]["receipt_id"] == receipt and value["payload"]["format"] == format_name
+            and path.is_relative_to(root), "Prepared bundle is for a different receipt, format or root")
     raw = encoded(value)
     require(len(raw) <= MAX_EXPANDED, "Complete rendition exceeds output limit")
     home = root / HOME
