@@ -281,6 +281,39 @@ class StandingEvaluationTests(StandingCase):
         self.write_private("config/standing-policy.json", self.policy)
         self.assert_outcome("exception", "prohibited-scope")
 
+    def test_any_receipt_scope_entry_covers_upload_receipts_only(self):
+        self.policy["scope"]["receipts"] = ["D*"]
+        self.write_private("config/standing-policy.json", self.policy)
+        self.assertEqual(self.evaluate()["outcome"], "qualified")
+        scope = {"receipts": ["D*"], "audiences": ["source"]}
+        self.assertTrue(standing.permits(scope, "D90000", "source"))
+        self.assertFalse(standing.permits(scope, "D90000", "agent"))
+        self.assertFalse(standing.permits(scope, "X1", "source"))
+        self.assertFalse(standing.permits({"receipts": ["D1"], "audiences": ["source"]}, "D2", "source"))
+
+    def test_out_of_scope_rendition_without_findings_is_prohibited_scope_not_retryable(self):
+        self.policy["scope"]["receipts"] = ["D2"]
+        self.write_private("config/standing-policy.json", self.policy)
+        args = self.review_args()
+        (self.root / "config/standing-findings.json").unlink()
+        self.assertTrue(standing.refused_scope(
+            self.root, self.policy, RENDITION, sha(self.raw)))
+        result = standing.evaluate(self.root, args)
+        self.assertEqual((result["outcome"], result["reasons"]), ("exception", ["prohibited-scope"]))
+        # In scope, a missing review stays the retryable route-unavailable refusal.
+        self.policy["scope"]["receipts"] = ["D1"]
+        args["policy_sha256"] = self.write_private("config/standing-policy.json", self.policy)
+        self.assertFalse(standing.refused_scope(self.root, self.policy, RENDITION, sha(self.raw)))
+        with self.assertRaises(standing.Refusal) as caught:
+            standing.evaluate(self.root, args)
+        self.assertEqual(caught.exception.code, "review-route-unavailable")
+
+    def test_scope_precheck_does_not_judge_a_stale_or_missing_rendition(self):
+        self.policy["scope"]["receipts"] = ["D2"]
+        self.assertFalse(standing.refused_scope(self.root, self.policy, RENDITION, "0" * 64))
+        self.assertFalse(standing.refused_scope(
+            self.root, self.policy, RENDITION.replace("D1", "D9"), sha(self.raw)))
+
     def test_stale_source(self):
         (self.root / "sources/input.pdf").write_bytes(b"%PDF-changed")
         with self.assertRaises(standing.Refusal) as caught:

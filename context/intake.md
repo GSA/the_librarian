@@ -374,6 +374,25 @@ and the same policy, manifest and index; saved reviews are reused (0 model calls
 each cohort's selections return, while the others stay. After a standing-policy version bump,
 requalify every cohort before expecting a publication: a selection citing an older version's
 review is refused until its cohort is requalified.
+**Standing scope.** The policy's `scope.receipts` and `scope.audiences` decide which renditions
+`qualify` may review. A rendition outside the scope costs no model call: `qualify` reads its
+`receipt_id` and `audience` from the pinned rendition (the check the adapter makes) before
+scheduling a call, stages the request, and the `standing-review` adapter ends it as the blocked
+`exception` `prohibited-scope` by its own unchanged scope rule. `counts.out_of_scope` reports
+`entries` refused and `model_calls_skipped`. With no policy file, `qualify` generates
+`scope.receipts: ["D*"]` (any upload receipt `D<number>`, audience `source`), so it covers the
+cohort without a list of IDs; a policy that exists is never rewritten. A hand-written policy lists
+receipt IDs (at most 5,000) or may include `"D*"`.
+*Operator note: widening an existing instance's scope.* Edit the scope **and raise `version`**
+in the private policy file, then re-run `qualify` once per cohort with the same `--system`,
+`--inbox`, policy, manifest and index. Because the policy hash is part of every standing request, the
+re-run reviews every in-scope entry again under the new version: one model call (and its tokens)
+per entry, including entries already qualified under the old version, and the first review of
+entries previously refused. Entries still refused cost nothing. A later re-run with the policy
+unchanged costs 0 calls. Do not edit the scope without raising `version`: the new-hash reviews
+then block as `conflicting-review`. Requalify every cohort afterwards, since publication refuses a
+selection citing an older version. Estimate the cost first from `counts.out_of_scope.entries`
+plus the already-qualified count times the sample's tokens per document.
 `--concurrency N` (default 6) keeps up to N model calls in flight, each for a
 rendition with no saved `standing-<...>` request; staging, runs, selection,
 manifest writes and usage accounting stay on one thread in inbox order, so
