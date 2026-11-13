@@ -23,6 +23,7 @@ from tools.context_index import qualification
 from tools.context_index import renditions
 from tools.review_events import event_reader
 from tools.review_events import event_store as events
+from . import selection_manifest
 from .contracts import IntakeError, canonical, pairs
 
 POLICY_SCHEMA = "standing-policy-v1"
@@ -553,8 +554,20 @@ def write_manifest(root, name, entry, replaces=()):
     """Atomically add one selection entry to the manifest; idempotent for retries.
 
     An existing entry for the same path is replaced only when every review it
-    cites is one this review supersedes (``replaces``)."""
+    cites is one this review supersedes (``replaces``). A new path is appended in
+    constant time (``selection_manifest``); a replacement, an empty list or a file
+    the append cannot extend in place takes the full read, validate and rewrite.
+    The caller holds the ledger writer lock."""
     path = index.no_symlinks(Path(root) / name)
+    selection_manifest.recover(root, name)
+    known = selection_manifest.view(root, name)
+    if not known.has(entry["path"]):
+        if known.count >= renditions.MAX_SELECTIONS:
+            raise Refusal("blocked", "selection-capacity")
+        digest = selection_manifest.append(root, name, entry, known)
+        if digest is not None:
+            return digest
+    selection_manifest.forget(path)
     config, _ = index.load_manifest(path, root)
     raw = json.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=index.strict_object)
     selected = raw.setdefault("renditions", [])

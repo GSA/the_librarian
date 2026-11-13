@@ -32,6 +32,7 @@
   "tools/intake/store.py",
   "tools/intake/runner.py",
   "tools/intake/adapters.py",
+  "tools/intake/selection_manifest.py",
   "tools/intake/standing.py",
   "tools/intake/cli.py",
   "tools/intake/upload.py",
