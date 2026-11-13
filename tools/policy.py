@@ -63,7 +63,24 @@ def _validate_retention_days(days):
     return days
 
 
+_VALIDATED_ROOTS = {}
+
+
 def _validate_storage_roots(raw_roots, markdown_roots, original_roots):
+    """Validated storage roots (a fresh dict). The check is a pure function of its arguments, so a
+    result is reused for an identical policy; a refusal is never cached."""
+    try:
+        key = json.dumps([raw_roots, markdown_roots, original_roots], sort_keys=True)
+    except (TypeError, ValueError):
+        return _check_storage_roots(raw_roots, markdown_roots, original_roots)
+    if key not in _VALIDATED_ROOTS:
+        if len(_VALIDATED_ROOTS) >= 64:
+            _VALIDATED_ROOTS.clear()
+        _VALIDATED_ROOTS[key] = _check_storage_roots(raw_roots, markdown_roots, original_roots)
+    return dict(_VALIDATED_ROOTS[key])
+
+
+def _check_storage_roots(raw_roots, markdown_roots, original_roots):
     if not isinstance(raw_roots, dict):
         raise ValueError("Policy storage_roots must be an object")
     if set(raw_roots) - set(DEFAULT_STORAGE_ROOTS):
@@ -378,8 +395,16 @@ def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=Fal
     if not ignore_migration_lock and (migration.exists() or migration.is_symlink()):
         raise ValueError("Interrupted store migration detected; run initialize --recover-migration")
     roots = storage_roots(instance_root)
-    for key, rel in roots.items():
-        _no_symlinks(instance_root / rel)
+    # ``instance_root`` and its ancestors are checked once above; check each distinct component below it once.
+    seen = set()
+    for rel in roots.values():
+        cursor = instance_root
+        for part in PurePosixPath(rel).parts:
+            cursor = cursor / part
+            if cursor not in seen:
+                seen.add(cursor)
+                if cursor.is_symlink():
+                    raise ValueError("Policy symlinks are not permitted")
     store_artifacts = (
         ("catalog_home", "catalog.sqlite3"),
         ("review_events_home", "events.sqlite3"),

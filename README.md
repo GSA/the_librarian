@@ -114,7 +114,9 @@ them through validated correction requests
 ([context/intake.md](context/intake.md#read-only-cohort-intake)).
 
 To review, select and publish the extracted cohort in one rerunnable step
-(model traffic stays within the configured USAi provider):
+(model traffic stays within the configured USAi provider). `qualify` runs `ingest` itself,
+so do not run `ingest` first: an unchanged, already received inbox is replayed (each file is
+re-read, re-hashed and checked against the ledger) before the first review either way:
 
 ```sh
 .venv/bin/python -m tools.intake.cohort qualify --root . --inbox /path/to/inbox \
@@ -123,6 +125,9 @@ To review, select and publish the extracted cohort in one rerunnable step
   --model MODEL --context documents/CONTEXT.md
 ```
 
+A replay of an unchanged inbox costs a few milliseconds per file, so rerunning or resuming
+`qualify` on a large cohort starts reviewing after minutes, not hours; measure it with
+`tools/diagnostics/ingest_benchmark.py --replay` ([decision 0009](docs/decisions/0009-read-only-cohort-intake.md)).
 It prints body-free outcome counts, token usage and transport retry counts;
 incomplete reviews stay visibly `pending-review` and are not indexed. Up to
 `--concurrency N` (default 6; `1` is serial) model calls run at once, while all

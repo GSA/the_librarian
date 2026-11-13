@@ -216,13 +216,17 @@ def _failure(stage_id, stage):
 def _process(root, inbox, entry, system, actor, heads=None):
     identity = submission(entry["relative"], system, entry["format"])
     superseded = None
-    prior = upload.ledger_request(root, upload.correlation(identity["submission_id"]))
+    # One ledger open yields the saved receipt request and its stage summary; submit and the receipt
+    # check below reuse them for a succeeded receipt. Dropped as soon as the file's bytes differ.
+    known = upload.known_requests(root, [upload.correlation(identity["submission_id"])])
+    prior = next((request for request, _ in known.values()), None)
     if prior is not None:
         orig = next((r for r in upload.submit_records(prior)
                      if r["kind"] == "artifact" and r["data"].get("role") == "original"), None)
         if orig is not None and orig["data"]["sha256"] != entry["sha256"]:
             superseded = identity["submission_id"]
             identity = submission(entry["relative"], system, entry["format"], entry["sha256"])
+            known = {}
         elif prior.get("correction_of"):
             # An existing identity keeps the correction it was first submitted with.
             superseded = prior["correction_of"].removeprefix("upload-")
@@ -238,14 +242,15 @@ def _process(root, inbox, entry, system, actor, heads=None):
             correction_of=superseded,
             name=identity["name"], actor=actor, reason=REASON, origin_kind="local-path",
             origin_system=system, origin_locator=identity["locator"],
-            expected_sha256=entry["sha256"]))
+            expected_sha256=entry["sha256"]), known=known)
     except LedgerBusy:
         raise  # retried by _settled, never reported as a receipt refusal
     except IntakeError as error:
         outcome = "changed-since-intake" if error.code == "changed_input" else "failed"
         return {"outcome": outcome, "stage": "receipt", "code": error.code}
     entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
-    receipt = store.inspect(root, ack["correlation_id"])["stages"][0]
+    receipt = (upload.settled_summary(known, ack["correlation_id"])
+               or store.inspect(root, ack["correlation_id"]))["stages"][0]
     entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(receipt)
     if ack["receipt"]["state"] != "committed":
         return _failure("receipt", receipt)
