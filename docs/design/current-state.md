@@ -31,7 +31,7 @@ restated here.
   | Kind | Stores | Rule of thumb |
   |---|---|---|
   | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step (`tests/test_authority_store_upgrade_paths.py`). |
-  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`) | Private work intent. Cannot reconstruct authority. |
+  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
   Evidence: `tests/test_kit.py::test_new_application_ids_and_superseded_refusal`
@@ -64,8 +64,15 @@ restated here.
   instance byte-identical. `init` refuses an existing store before opening it;
   an interrupted-migration recovery rolls store files back to their old location before it refuses, keeps its journal and leaves the database bytes unchanged (it never repairs a store); the
   intake progress view reports the catalog as unavailable; and a derived-index
-  build never rewrites an authority store. Not pinned by a test:
-  `synchronous=FULL` on the three stores (Kata 0dz3).
+  build never rewrites an authority store.
+  Durability: every write connection the catalog, review-event and intake stores
+  open (init, write, backup-init, intake `locked` and `relocate`) runs with
+  `synchronous=FULL` on a rollback journal (`journal_mode=delete`), pinned by
+  `tests/test_store_durability.py` (Kata 0dz3). `synchronous` is per connection and
+  not stored in the file, so the tests read it on each connection that executed a
+  write, after starting it at `OFF`; weakening or dropping any of the seven pragma
+  sites fails them. `Connection.backup` copy targets are not covered: they are
+  fsynced and hash-verified before use rather than relying on the pragma.
 - **Upgrade behavior.** Code never migrates an authority store implicitly: a
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
@@ -259,7 +266,7 @@ restated here.
   removed after the new snapshot verifies; nothing is deleted unless a verified
   snapshot remains in the window; a retention failure never fails the write.
   `python3 -m tools.backups prune` is a dry run unless `--apply`.
-- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` and
+- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` (`tests/test_store_durability.py`) and
   the hash-chained history: the worst case restores the day's first snapshot and
   replays that day's requests by their original request ids. This is a deliberate
   trade against per-write snapshots, which in one measured cohort produced 5,815
@@ -334,6 +341,61 @@ rebase, daily snapshot on the fast path), `tests/test_catalog_identity_binding.p
 (production `inspect` vs a verbatim copy in `tests/reference_inspect.py` on a
 valid history and about 100 tamperings: same result or same refusal message),
 `tests/test_validation_cost.py`.
+
+### Lookup indexes and the `refs` table
+
+A write needs two lookups into the committed state: the current records that reference a
+record the batch rewrites (`referrers`), and the current artifacts that already hold a path
+the batch moves (`claimants`). They used to be `instr(payload, ?)` scans over every current
+record, so each write cost O(catalog) and a first ingest grew quadratically (at 40,000
+synthetic documents the two scans were about half of the time per document).
+
+- **Structures** (`LOOKUP_OBJECTS` in `catalog_store.py`, mirrored in `tools/schemas/catalog.sql`):
+  partial expression indexes on `versions` for `$.data.path`, `receipt_id`, `parent_id`,
+  `artifact_id`, `from_id` and `to_id`, and `refs(ref, revision, ordinal)`, one row per
+  `source_ids` entry of every *receipt version*, kept by an `AFTER INSERT` trigger on `versions`.
+  `source_ids` is an array, which an expression index cannot cover. `refs` is keyed by version,
+  not record, so it is append-only like `versions` (a rewritten receipt adds rows and deletes none)
+  and the lookup keeps only versions that are still current. The probe is one `IN (...)` query per
+  field joined to `current_records` by `EXISTS`, not `JOIN`: a join made SQLite scan.
+  Nothing in them is authority; they are derived from `versions`.
+- **Two valid shapes.** `inspect` accepts a catalog with none of the structures (`legacy`, the
+  scans, slower and decision-identical) or with all of them exactly as specified (`indexed`; the
+  `sqlite_master` SQL of every object is compared with the code's text, and `refs` must equal the
+  rows the replayed payloads imply). Anything between, a changed definition or a missing,
+  extra, altered or moved `refs` row is refused ("Catalog lookup structures are incomplete or
+  differ ..."). `PRAGMA integrity_check` already covers the index pages. A forged receipt cannot hide this
+  past the daily replay or `audit`, like any other edit.
+- **Schema version unchanged.** The authority data, the hash chain, every state token and the
+  `contract_version` metadata are the same, so `VERSION` stays 1. Bumping it would refuse every existing
+  catalog and invalidate every backup receipt (`backup_version == VERSION`) for a change that
+  adds no authority data. The cost of this choice is that two binaries disagree about shape only in speed:
+  a catalog written by older code keeps working (the trigger keeps `refs` current for any writer, including
+  an older binary), and older `inspect` ignores the extra objects.
+- **Migration.** New catalogs get the structures at `init`. An existing catalog is migrated explicitly
+  and never implicitly: `python -m tools.initialize --migrate-catalog-indexes` (or
+  `python -m tools.catalog.catalog_store migrate-indexes [--check|--rebuild]`). Under the writer lock and one
+  `BEGIN IMMEDIATE` transaction it fully inspects, publishes a verified `pre-index-migration` snapshot,
+  creates the indexes, fills `refs`, inspects again and requires the identical state, then commits and
+  attests the new bytes. Any failure rolls back. A killed process leaves SQLite's rollback journal, which
+  `connect` refuses like any other unsupported sidecar; `migrate-indexes --recover` (writer lock held; WAL and
+  shared-memory sidecars still refused) lets SQLite roll it back to the earlier, `legacy` file, fully verifies it and
+  migrates. A second run only verifies. `--rebuild` drops damaged or half-present structures in the same transaction and recreates them,
+  and succeeds only if the rest of the catalog verifies. `--check` writes nothing.
+- **Restore.** A snapshot taken after the migration carries the structures and restores as `indexed`; a
+  snapshot from before it restores as `legacy` and works unchanged (slower) until `migrate-indexes` is run
+  again. `audit` and `verify-backup` verify whichever shape they find.
+- Measured on synthetic production-shaped catalogs (4 and 3 records per document; shared host, CPU time
+  per document of a first ingest into a catalog already holding N documents): 130 to 103 ms at 2,000,
+  296 to 126 ms at 10,000, 977 to 260 ms at 40,000; the catalog grows 10% at 40,000 (291 to 311 MB) and the migration
+  takes about 20 s there. Rerun with `tools/diagnostics/ingest_benchmark.py` on a seeded instance.
+- Evidence: `tests/test_catalog_lookup_indexes.py` (randomized decisions equal with and without the
+  indexes and equal to `validate_graph`; referrer and claimant results equal brute force on every step; a
+  receipt whose `source_ids` reference an existing source; only current receipt versions count;
+  query plans use indexes, no scan; tamper tests for each dropped or altered index, `refs` table, trigger
+  and row; a corrupted index page; migration idempotency, snapshot, failed and killed migration,
+  rebuild, restore of an older snapshot, command line), and `tests/test_catalog_inspect_equivalence.py`
+  (`inspect` equals the reference on both shapes).
 
 ### Trust model and residual risk (kept)
 
