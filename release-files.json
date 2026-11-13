@@ -102,5 +102,6 @@
   "tests/test_catalog_inspect_equivalence.py",
   "tests/reference_inspect.py",
   "tests/test_validation_cost.py",
-  "tests/test_upload_planning.py"
+  "tests/test_upload_planning.py",
+  "tests/test_store_durability.py"
 ]
