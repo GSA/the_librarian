@@ -33,7 +33,7 @@ it is never retrieval context and no tool reads it. Summarize it without bodies:
 librarian-audit --root <root> report [--log PATH]
 ```
 
-See [decision 0011](../../docs/decisions/0011-full-text-mcp-audit-log.md).
+See the [current-state design](../../docs/design/current-state.md) (observation).
 
 ## Retrieval diagnostics
 

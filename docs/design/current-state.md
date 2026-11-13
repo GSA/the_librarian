@@ -1,0 +1,394 @@
+# The Librarian: current-state design
+
+**Audience:** maintainers, operators and their agents.
+**What this is:** a description of how the system works today and why, with the
+test or code that backs each claim. It replaces the numbered decision records
+(0001-0021), which are in git history (`git log -- docs/decisions`).
+
+**What this is not:** a list of rules. Nothing here is a permanent constraint
+because it is written here. Where a statement is backed by a test it says so,
+and the test is the thing to keep green or deliberately change. Where it is
+backed only by reasoning or a one-off measurement, it says that too. Any of it
+may be changed when evidence supports a better approach; change the code and
+tests first, then update this file in the same PR. Operator procedures live in
+[`context/intake.md`](../../context/intake.md) and the [README](../../README.md);
+planned work lives in the [ROADMAP](../../ROADMAP.md) and in Katas.
+
+Safety and trust statements (paths, untrusted text, attestation, authority,
+tamper, durability, backup) are kept even where no test pins them, and are
+marked **(untested)** so a test can be added; they are not weakened by being
+restated here.
+
+## 1. Identity and stores
+
+- **Names.** Checkout `the_librarian`, distribution `the-librarian-mcp`, module
+  `the_librarian_mcp`, commands `librarian-mcp`, `librarian-preflight`,
+  `librarian-audit`, MCP server name `the-librarian`. The earlier
+  `qualified-context-*` names have no aliases. Evidence:
+  `tools/context-mcp/pyproject.toml`; `tests/test_kit.py::test_librarian_identity_and_role_documents_are_packaged`.
+- **Three kinds of store**, all SQLite under a per-instance data root:
+
+  | Kind | Stores | Rule of thumb |
+  |---|---|---|
+  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step **(untested)**. |
+  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`) | Private work intent. Cannot reconstruct authority. |
+  | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
+
+  Evidence: `tests/test_kit.py::test_new_application_ids_and_superseded_refusal`
+  (superseded `FCAT`/`FREV`/`FCTX` identities refuse with a migration message),
+  `::test_initialize_refuses_an_unmigrated_legacy_index`,
+  `tests/test_catalog_inspect_equivalence.py` (about 100 tamperings of catalog
+  rows, triggers, metadata and application id refuse),
+  `tests/test_kit.py::test_native_review_correction_retry_and_restore`
+  (`DELETE FROM events` aborts), `tests/test_intake.py::test_wrong_identity_modes_and_missing_store_refuse`,
+  `tests/test_kit.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
+  Not pinned by a test: the review-event `contract_hash` refusal
+  (`event_store.py`), `synchronous=FULL` on the three stores (Katas dp9y, 0dz3).
+- **Upgrade behavior.** Code never migrates an authority store implicitly: a
+  store whose application id, `user_version`, `contract_version` or
+  `contract_hash` differs from the installed contract refuses with an
+  explicit-migration message. The derived index is assumed to need a rebuild
+  after any code change, because its fingerprint covers the reader and policy
+  module bytes (`context_index.engine_fingerprint`,
+  `tests/test_kit.py::test_qualification_code_is_bound_into_engine_fingerprint`).
+  Schema snapshots in `tools/schemas/*.sql` are not backups.
+- **Store locations** are instance configuration (`storage_roots` in
+  `config/policy*.json`), recorded with instance and store ids in
+  `.local/instance.json`. `tools/initialize.py --migrate-storage` /
+  `--recover-migration` move populated stores transactionally;
+  `--relocate` rebinds the intake ledger root after a host-path move. The index
+  binds a *logical* root (instance id, store ids, storage roots), so moving the
+  instance directory keeps it fresh while substituting another instance's
+  database file is refused. Evidence:
+  `tests/test_kit.py::test_portable_roots_relocation_substitution_and_migration_recovery`
+  and `::test_portable_roots_edge_cases_and_instance_policy_propagation`.
+- **Topology.** One instance is one full clone: its own checkout, `.venv`,
+  `config/*.local.json`, inbox and stores. Policy is resolved per `--root` on
+  every operation; a root without its own policy files gets only the versioned
+  defaults (`tests/test_policy_isolation.py`). Instances can run different
+  versions. The reason is isolation by filesystem with no cross-instance code
+  path; the cost is N environments to upgrade (reasoning, not measured).
+  `.local/instance.json` records ids and layout only; it does not record the
+  distribution version or store contract versions (an earlier design wanted it
+  to, and nothing reads it; Kata 7jkt).
+
+## 2. Distribution and runtime
+
+- **Packaging** is an explicit allowlist, `release-files.json`, built by
+  `tools/package.py`. It excludes `.local`, `.venv`, databases, `data`, `sources`,
+  `documents`, `*.local.*` files and symlinks. Evidence:
+  `tests/test_kit.py::test_clean_copy_and_policy_freshness` (the archive equals
+  the allowlist and omits `policy.local.json`), `::test_release_paths_rejects_missing_and_symlinked_files`,
+  `::test_package_rejects_symlinked_output_parent`, `::test_empty_initialization`
+  (the shipped toolkit seeds zero records).
+- **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
+  and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
+  to start on an incomplete clone or a symlinked toolkit path
+  (`tests/test_mcp.py`). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
+  are ranges and transitive dependencies are unpinned. There is no lock file,
+  image or installer, and no failing-probe test (Kata vckd). Whether those are
+  wanted is an open product question, not a commitment (Kata 7jkt).
+- **Optional Docling worker** runs in its own interpreter with pinned assets
+  (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
+  The reader needs none of it.
+- The first proof-of-concept installation is closed; this repository does not
+  maintain or port from it. Its clean-copy tests only prove this repository's
+  packaging and policy boundary.
+
+## 3. Intake and review
+
+- **Inbox first.** Content enters through the supported writers: manual upload
+  (`tools/intake/upload.py`), read-only cohort intake (`tools/intake/cohort.py`)
+  and the durable ledger (`tools/intake/*`). A copied file is not a registered
+  receipt until its catalog commit is confirmed; a receipt is not extracted
+  text; extracted text is not a review; a review is not selection. Connectors,
+  scheduling and hosted sources are not built (ROADMAP). Evidence:
+  `tests/test_intake_upload.py::test_missing_or_unmarked_drop_is_never_success`,
+  `::test_blocked_receipt_is_reported_without_claiming_success`,
+  `tests/test_intake_cohort.py::test_ingest_submits_and_extracts_admitted_files_with_body_free_counts`.
+- **Cohort intake never writes the inbox.** Every file gets exactly one counted
+  disposition; formats without a reader are `needs-reader`; a missing or
+  unlistable inbox fails instead of counting nothing; the inbox tree is
+  byte-identical after a run. Evidence:
+  `tests/test_intake_cohort.py::test_every_file_gets_one_explicit_disposition`,
+  `::test_missing_or_unlistable_inbox_fails_instead_of_counting_nothing`,
+  `::test_over_limit_is_counted_not_dropped`.
+- **Standing review.** A model reply is recorded as findings exactly as
+  reported; the standing policy, not the model, decides qualification. Missing
+  inspection, internal contradictions and out-of-scope receipts block; references
+  to material outside the rendition are advisory. Model traffic stays within the
+  configured provider and redirects are refused. Evidence:
+  `tests/test_standing.py` (`test_fabricated_success_without_inspection_is_not_qualified`,
+  `test_confidence_never_yields_verification`, `test_prohibited_scope`,
+  `test_advisory_references_do_not_block_...`), `tests/test_model_review.py`
+  (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
+  `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
+- **Model choice and cost** are the operator's. `model_review.evaluate` scores
+  candidate models on a sample and `estimate()` extrapolates token use; nothing in
+  the code requires an approved budget ceiling and the current instance runs
+  without one. (An earlier record said a ceiling was required before bulk review;
+  the owner decided otherwise and the code never enforced it.)
+- **`qualify` and shared manifests.** An instance may ingest several inboxes
+  (one `--system` label each) into one catalog, manifest and index. A manifest
+  entry belongs to a cohort when its rendition was extracted by the current run
+  or its receipt's pinned `local-path` sidecar names that system; anything that
+  cannot be proven that way is left alone, and orphans are dropped and counted.
+  The manifest read-modify-write holds the ledger writer lock and replacement is
+  atomic. The manifest holds at most `renditions.MAX_SELECTIONS` (5,000) entries
+  across all cohorts; a qualified rendition that does not fit stays
+  `pending-review` with `selection-capacity` and resumes from its saved review.
+  Evidence: `tests/test_intake_cohort.py::QualifyTests` (about 15 tests from
+  `test_a_b_a_b_keeps_every_cohorts_selections_and_publishes_them_all` through
+  `test_two_processes_qualifying_different_cohorts_do_not_lose_each_others_writes`).
+  Operator notes (restoring cohorts an older toolkit pruned; requalifying after a
+  policy bump) are in `context/intake.md`. The default generated scope
+  (`D1..D2500`) is a known limit tracked in Kata kc1k.
+
+## 4. Backups
+
+- Catalog and review-event writes take a verified `daily` snapshot before the
+  commit only when the store has no intact snapshot for the current UTC day; an
+  idempotent retry takes none, post-write snapshots are not taken, and
+  `init`, `backup` and restore keep their own snapshots. Snapshots, receipts and
+  `.partial` files older than `backup_retention_days` (default 7, minimum 1) are
+  removed after the new snapshot verifies; nothing is deleted unless a verified
+  snapshot remains in the window; a retention failure never fails the write.
+  `python3 -m tools.backups prune` is a dry run unless `--apply`.
+- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` and
+  the hash-chained history: the worst case restores the day's first snapshot and
+  replays that day's requests by their original request ids. This is a deliberate
+  trade against per-write snapshots, which in one measured cohort produced 5,815
+  backups (35 GB) for a 12.7 MB catalog.
+- On the first write of a UTC day the snapshot is the serialized image of the
+  transaction that was just fully inspected, written, fsynced, re-read and refused
+  unless its hash equals the image (`catalog_store.py`, "Backup bytes mismatch").
+  Fresh verification checks fields, size, SHA-256 and receipt state instead of a
+  third replay; every older snapshot is still fully verified before it counts.
+- Evidence: `tests/test_backups.py` (daily gate, corrupt or same-length-corrupt
+  snapshots do not count, window pruning, never deleting the only verified
+  snapshot, dry-run default, protected snapshots, restore, review events follow
+  the same rule), `tests/test_catalog_daily_snapshot.py`.
+- Not covered: offsite copies, scheduled backups, snapshots of the intake ledger
+  and the rebuildable index.
+
+## 5. Catalog validation, writers and cost
+
+This section is the product of several performance passes. The current behavior
+is what matters; the chain of how it got here is in git history and the Katas
+(fg46, yxc2, 2c1h, wjf9, 2r8q, 3re5, 2vfn, 1mbc, 2rye).
+
+### What a catalog write validates
+
+1. **Receipt.** A validation receipt in `<catalog home>/.local/read-validation.json`
+   records the state a full validation produced and a *binding*: for a plain
+   rollback-journal database, the file identity (device, inode, size, mtime_ns,
+   ctime_ns, SQLite change counter) plus the validator-file hash and runtime
+   versions; otherwise (journal or WAL present, or no `sqlite_dbpage`) the SHA-256
+   of the exact database bytes. An identity-bound receipt is trusted only on the
+   UTC date of the full validation it descends from (`validated_on`); the first
+   validated read or write of the next UTC day replays all history and rewrites it.
+2. **Trusted head.** When the binding matches, the writer takes the state from the
+   receipt (it must equal the state re-derived from the database head); otherwise
+   it runs a full `inspect`. An unreadable receipt only costs a replay; it never
+   blocks a write.
+3. **Delta.** `contracts.validate_delta` checks only the batch, referrers of
+   rewritten records, moved path claims and parent chains, through indexed lookups,
+   and refuses what `validate_graph` would refuse on the same history. Idempotency
+   (`request_id`, `input_hash`), the rebase pin lookup and "did a later revision
+   write this record" use indexed queries.
+4. **Re-check** under `BEGIN IMMEDIATE` compares the binding, not a second replay.
+5. **Attestation.** After a successful commit the writer writes the receipt for
+   the new bytes (best effort). A crash after COMMIT leaves a receipt that no
+   longer matches, so the next reader or writer validates in full and the retry is
+   idempotent.
+6. **First write of a UTC day** replays the history once (`inspect` with
+   `detail=False`, state only) inside the writer lock, then writes the snapshot.
+   `inspect` decodes and encodes each payload once, falls back to the original
+   step-by-step checks on any irregularity, and streams revisions and versions.
+   `status --audit`, `verify_backup`, restore and the daily snapshot always replay
+   in full.
+
+Measured when written, on synthetic catalogs of four records per registration
+(shared host; compare shapes, rerun the benchmarks before relying on a figure):
+lock hold for a normal write fell from 5.7 s to 0.33 s at 25,600 registrations
+before identity binding, and to about 0.14 s after; a validated read fell from 84
+to 0.8 ms; the first write of a day was about 2.8 s of lock hold at 25,600
+registrations and 11 s at 100,000; a body-free read of one production-sized
+catalog (63k records, 22.5k revisions, 92 MB) put one full `inspect` at about 4.4 s
+before the last speedup. Reproduce with the tools in `tools/diagnostics/`
+(`catalog_lock_benchmark.py`, `catalog_commit_ceiling.py`,
+`catalog_daily_replay_benchmark.py`, `ingest_benchmark.py`,
+`ledger_scale_benchmark.py`, `upload_planning_benchmark.py`,
+`ledger_verify_benchmark.py`, `catalog_contention_budget.py`). Use synthetic
+fixtures only.
+
+Evidence: `tests/test_catalog_delta_commit.py` (randomized and named equivalence
+with `validate_graph`, tamper classes, forged receipts, crash after commit,
+rebase, daily snapshot on the fast path), `tests/test_catalog_identity_binding.py`,
+`tests/test_catalog_daily_snapshot.py`, `tests/test_catalog_inspect_equivalence.py`
+(production `inspect` vs a verbatim copy in `tests/reference_inspect.py` on a
+valid history and about 100 tamperings: same result or same refusal message),
+`tests/test_validation_cost.py`.
+
+### Trust model and residual risk (kept)
+
+- The catalog receipt and the ledger hand-off attestation are **unkeyed**. An actor
+  who rewrites the database *and* the receipt so that they agree, or who rewrites
+  the file while restoring size, mtime, ctime and the change counter, can get one
+  write or read accepted without a replay. The next UTC day's full check,
+  `status --audit` and backup verification still replay all history and refuse.
+  This is not a defense against that actor.
+- What the byte-hash binding saw and the identity binding does not: silent media
+  corruption with no write through the OS, and an identity-restoring edit. Both
+  are now caught at the next daily full check or audit, a window of at most one UTC
+  day. Everything else refuses at the next read or write: SQLite edits, raw
+  same-size `pwrite`s (even with mtime restored, because `utime` moves ctime), a
+  replaced file, a restored older file.
+- Evidence: `tests/test_catalog_identity_binding.py` (`test_raw_same_size_edit_is_refused`,
+  `test_raw_edit_with_restored_mtime_is_refused_because_utime_moves_ctime`,
+  `test_residual_identity_restoring_edit_is_served_until_the_next_utc_day`,
+  `test_audit_always_replays`), `tests/test_catalog_delta_commit.py`
+  (`test_forged_receipt_for_other_bytes_does_not_vouch_for_tampered_bytes`,
+  `test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt`,
+  `test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot`).
+  The ledger's equivalent residual (a file rewrite that preserves identity and
+  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k. "Never migrated or rebuilt" for authority stores is likewise only partly tested (Kata 5jjd).
+- **Never close a descriptor on a database file while a connection to it is open
+  in this process.** On POSIX, closing any descriptor drops all of the process's
+  fcntl locks on that file, including SQLite's, which let a concurrent commit tear a
+  validating reader's snapshot (observed as spurious "Current records differ" and
+  "database disk image is malformed"). `tools/file_identity.py` therefore reads
+  stat fields from the path and the change counter from page 1 through the open
+  connection. Evidence: `tests/test_file_identity_locks.py`.
+
+### Concurrent writers
+
+- The catalog raises typed errors: `StaleState` (pin outdated), `WriterBusy`
+  (writer lock still held after a bounded 10 s wait across processes; same-thread
+  re-entry fails at once) and `ConflictingWrite`. Readers wait up to 10 s for an
+  in-progress writer's journal and refuse an abandoned one.
+  `submit(..., rebase=True)` accepts an outdated pin from this catalog's history
+  when no later revision wrote any record in the request, and still validates the
+  full graph; intake registration stages use it. There is one linear revision chain
+  and no single-writer queue.
+- Intake maps `StaleState`/`WriterBusy` to retryable `catalog-stale-state` /
+  `catalog-busy`, `ConflictingWrite` to blocked `catalog-conflict`. A lost race
+  wrote nothing, so it does not spend a stage's `max_attempts`. It is counted
+  against a separate bound (`CONTENTION_BUDGET` = 30 per stage cycle, then
+  dead-letter) and one `settle` call retries at most `CONTENTION_RETRIES` = 6 in a
+  row (about 60 s at the 10 s wait) before leaving the stage `retryable`. Input
+  faults and transient errors are still charged. `recover-conflicts [--apply]`
+  replays legacy blocked registrations.
+- Evidence: `tests/test_intake_concurrency.py` (rebase, busy, reader behavior,
+  two processes commit every receipt once, the whole contention-budget group,
+  `recover-conflicts`).
+- Throughput is still serialized by the catalog writer lock. The commit ceiling at
+  a 1,600-registration catalog was about 10 registrations/s with one writer when
+  measured; batching many registrations per revision was tried on paper and not
+  adopted because it changes idempotency, partial-failure and rebase semantics.
+
+### Intake ledger
+
+- A writer fully validates the ledger (SQLite integrity, digests, stage and
+  attempt shape) unless the previous clean writer attested the file. On clean
+  unlock a writer records file identity and SQLite change counter in `writer.lock`;
+  the next writer, in any process, consumes it while holding the lock and skips
+  full validation only if the live file matches. A crash, failure after a partial
+  write, or a foreign commit leaves no attestation. A block that raises a
+  read-only refusal (for example `unknown_request`) still hands off when the file
+  identity equals what the writer validated on entry.
+- The writer lock is polled non-blocking with jitter for at most
+  `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values refuse)
+  and the same value is the SQLite busy timeout. Exceeding it, or a transient SQLite
+  BUSY/LOCKED during a stage, raises retryable `ledger_busy`; nothing was written.
+  `settle` and cohort ingest retry up to three times. `progress` reads inside a
+  short transaction and verifies digests afterwards, so it cannot hold a read lock
+  across O(ledger) work.
+- `store.verify` keeps one memo of the previous successful pass keyed by exact
+  request bytes and artifact text with the digest they were proven to have, capped
+  at `store.MEMO_BYTES` (128 MiB of keys). A hit needs identical bytes and an
+  identical stored digest; failures are never cached. Upload planning
+  (`upload.records_for`) reads the highest `S`/`D` number from the catalog's
+  primary-key index and the IDs promised by `upload-*` requests via a bounded
+  (65,536) per-process memo keyed by request digest; staged, retrying, blocked and
+  dead-letter requests keep their IDs reserved.
+- Evidence: `tests/test_intake_ledger_scaling.py` (alternating writers, tamper and
+  replaced-ledger cases, bounded waits, progress, forged-digest memo cases, memo
+  cap), `tests/test_upload_planning.py`.
+- A measured production-sized ledger (about 130 MB, 36k requests) made the
+  original 16k/64k-entry caches useless for the in-order walk of `verify`; the
+  memo above is the fix (about 0.9 s per pass down to about 0.14 s).
+
+## 6. Observation: audit log and diagnostics
+
+- **Diagnostics** (`--diagnostics-log`, off by default): a closed, body-free field
+  set. Query text, locators and excerpts are unrepresentable and records that
+  contradict themselves are refused. Search is recorded with its absence
+  classification (`absent-corpus`, `absent-partial`, `present-uncombined`); `get`
+  and `get_many` are recorded only as a bare read count with no locator. No
+  read-to-search ratio is reported, because the counts cannot tell an
+  unconvincing excerpt from an agent that read enough in the excerpt. Nothing reads
+  the log to change selection, ranking or qualification. Evidence:
+  `tests/test_kit.py` (`test_absence_never_echoes_query_terms_or_source_text`,
+  `test_refuses_query_text_and_unknown_fields`, `test_reads_are_counted_but_never_attributed`,
+  `test_report_counts_reads_without_deriving_a_ratio`, `test_rejects_unsafe_log_paths`),
+  `tests/test_mcp.py::test_diagnostics_*`.
+- **Audit log** (`--audit-log [PATH] --agent-label L`, off by default): one record
+  per tool call with arguments, full returned text, character count, SHA-256 and the
+  locators and record ids mentioned. Files are 0600 in a 0700 directory below the
+  ignored `<root>/.local`, opened `O_APPEND|O_NOFOLLOW`, locked and fsynced per
+  record. If the record cannot be written the call returns an error and not the
+  result. Rotation renames at 64 MiB and never truncates, overwrites or deletes.
+  The audit log is never indexed (`.local` is excluded), searched or returned by a
+  tool. `librarian-audit report` prints counts and hash mismatches without text.
+  Evidence: `tests/test_mcp_audit.py` (about 20 tests, including
+  `test_audit_failure_withholds_the_result`, `test_rotation_preserves_every_record_without_overwriting`,
+  `test_paths_outside_local_symlinks_and_unsafe_modes_are_refused`); `.local`
+  exclusion: `tests/test_kit.py` (`index.eligible(".local/database.md")` is false).
+  The diagnostics log and the audit log are deliberately separate files and formats.
+- **The MCP adapter is read-only** and exposes six tools (`status`, `search`,
+  `get`, `get_many`, `catalog`, `review_events`); `tests/test_mcp.py` asserts that
+  set. Adding a write tool would be a change to that test and a design discussion.
+- **Agent findings** persist through the contribution/disposition contract
+  (`agents/contributions.md`), which ends in a review, not through a trace store.
+  No trace endpoint exists. The reasoning (an agent's own unsourced recollection
+  retrieved next to sourced material is hard for a model to distinguish, and
+  compounds) is an argument, not a measurement; if a recorded case shows repeated
+  work the contribution route could not capture, revisit it.
+
+## 7. Relationship traversal
+
+No graph capability exists (the earlier ontology and entity graph were removed,
+Kata 7eme). If traversal is ever wanted, the evaluation to date favors a
+rebuildable, freshness-bound SQLite projection over a graph server: it keeps the
+file-based, single-writer, offline shape and cannot become an authority. The one
+installation that had such a prototype measured its limit as interface
+expressiveness, not storage engine, and found its candidate path queries were
+hypothetical rather than failed real questions. Embedded graph engines checked in
+October 2026 (Kuzu: archived upstream; Apache AGE: server extension, release
+candidates only) were not adoptable then; that table dates quickly, so re-check
+before relying on it. This is a weakly evidenced preference (small scale, no real
+failed question), not a prohibition.
+
+## 8. Assumptions worth revisiting
+
+Items below were held as constraints in earlier documents and are reasoning or
+owner preference rather than measured or test-enforced facts.
+
+- One full clone per instance is the right topology (isolation without new code;
+  N upgrades). Nothing measures N or the upgrade burden.
+- Pinning the complete runtime and recording the interpreter minor version in the
+  instance record; neither is built.
+- A per-instance record of the distribution and store contract versions, and a
+  per-release compatibility statement; neither is built.
+- Daily snapshots with seven-day retention; seven is a default, not a derived
+  number.
+- Declining agent memory and the dead-weight pruning signal (sections 6): reasoned,
+  not measured.
+- The 5,000-entry manifest cap and the 2,500-receipt default scope are
+  implementation limits, not design goals.
+- A single linear catalog hash chain (revisit triggers were: commit utilization
+  above about a third of the ceiling with writers losing waits, multi-host
+  writers, or a first-of-day hold above the 10 s wait even after the speedups).
+  At 10.6k registrations on one production catalog the first of those had not been
+  met.
