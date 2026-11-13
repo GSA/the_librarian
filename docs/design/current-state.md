@@ -31,7 +31,7 @@ restated here.
   | Kind | Stores | Rule of thumb |
   |---|---|---|
   | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step **(untested)**. |
-  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`) | Private work intent. Cannot reconstruct authority. |
+  | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
   Evidence: `tests/test_kit.py::test_new_application_ids_and_superseded_refusal`
@@ -52,8 +52,15 @@ restated here.
   `verified_snapshot` and `restore`; an edit of only the live store's hash does
   not invalidate earlier snapshots (not tested as a recovery path). `init`
   never overwrites, so the tested way forward is an empty re-initialization
-  beside the refused store. Not pinned by a test:
-  `synchronous=FULL` on the three stores (Kata 0dz3).
+  beside the refused store.
+  Durability: every write connection the catalog, review-event and intake stores
+  open (init, write, backup-init, intake `locked` and `relocate`) runs with
+  `synchronous=FULL` on a rollback journal (`journal_mode=delete`), pinned by
+  `tests/test_store_durability.py` (Kata 0dz3). `synchronous` is per connection and
+  not stored in the file, so the tests read it on each connection that executed a
+  write, after starting it at `OFF`; weakening or dropping any of the seven pragma
+  sites fails them. `Connection.backup` copy targets are not covered: they are
+  fsynced and hash-verified before use rather than relying on the pragma.
 - **Upgrade behavior.** Code never migrates an authority store implicitly: a
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
@@ -247,7 +254,7 @@ restated here.
   removed after the new snapshot verifies; nothing is deleted unless a verified
   snapshot remains in the window; a retention failure never fails the write.
   `python3 -m tools.backups prune` is a dry run unless `--apply`.
-- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` and
+- **Loss window.** Between snapshots recovery relies on `synchronous=FULL` (`tests/test_store_durability.py`) and
   the hash-chained history: the worst case restores the day's first snapshot and
   replays that day's requests by their original request ids. This is a deliberate
   trade against per-write snapshots, which in one measured cohort produced 5,815
