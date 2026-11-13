@@ -187,6 +187,46 @@ class FindingsTests(ReviewCase):
             self.review(Transport())
 
 
+class RangeFindingsTests(ReviewCase):
+    def test_range_reply_records_the_same_explicit_findings_as_a_list_reply(self):
+        listed = model_review.review(self.root, self.rendition, self.policy, "model-a",
+                                     Transport(reply()))
+        ranged_transport = Transport(reply(records=["0-1"]))
+        ranged = model_review.review(self.root, self.rendition, self.policy, "model-a",
+                                     ranged_transport, inspected_form="ranges")
+        self.assertEqual(listed["findings_sha256"], ranged["findings_sha256"])
+        self.assertEqual(listed["findings_path"], ranged["findings_path"])
+        self.assertIn("first-last", ranged_transport.calls[0][1][0]["content"])
+
+
+class InspectionFormABTests(ReviewCase):
+    def test_report_is_body_free_and_compares_forms_without_writing(self):
+        from tools.diagnostics import inspection_form_ab as ab
+
+        def transport(model, messages):
+            wants_ranges = "first-last" in messages[0]["content"]
+            return reply(records=["0-1"] if wants_ranges else [0, 1])
+        before = sorted(p for p in self.root.rglob("*") if p.is_file())
+        report = ab.run_ab(self.root, [self.rendition, self.rendition], "model-a", transport)
+        self.assertEqual(sorted(p for p in self.root.rglob("*") if p.is_file()), before)
+        self.assertEqual((report["comparison"]["paired"], report["comparison"]["decision_agreement"],
+                          report["comparison"]["identical_inspection"]), (2, 2, 2))
+        self.assertEqual(report["forms"]["list"]["complete"], 2)
+        self.assertNotIn("Distinct heading phrase", json.dumps(report))
+        with self.assertRaises(ValueError):
+            ab.run_ab(self.root, [self.rendition], "model-a", transport, order="sideways")
+
+    def test_a_failed_reply_in_one_form_is_counted_not_paired(self):
+        from tools.diagnostics import inspection_form_ab as ab
+
+        def transport(model, messages):
+            if "first-last" in messages[0]["content"]:
+                return reply(records=["5-9"])
+            return reply()
+        report = ab.run_ab(self.root, [self.rendition], "model-a", transport)
+        self.assertEqual((report["forms"]["ranges"]["failed"], report["comparison"]["paired"]), (1, 0))
+
+
 class EvaluationTests(ReviewCase):
     def test_sample_scores_are_body_free_and_choose_the_best_cheapest_model(self):
         transports = {"model-a": [reply(), reply()],
@@ -398,6 +438,21 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "http-503")
         self.assertEqual((len(self.urls), len(self.waits)), (3, 2))
         self.assertEqual(dict(call.retries), {"http-503": 2})
+
+    def test_each_http_attempt_runs_through_the_gate_and_waits_outside_it(self):
+        call = self.transport(429, 503, 200)
+        events = []
+
+        def gate(fn):
+            events.append(("enter", len(self.waits)))
+            result = fn()
+            events.append(("exit", len(self.waits)))
+            return result
+        call.gate = gate
+        call("model-a", [])
+        # Each retry's backoff sleep happens between gated attempts, never inside one.
+        self.assertEqual(events, [("enter", 0), ("exit", 0), ("enter", 1), ("exit", 1),
+                                  ("enter", 2), ("exit", 2)])
 
     def test_redirects_are_refused(self):
         handler = model_review._NoRedirect()
