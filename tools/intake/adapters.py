@@ -71,6 +71,13 @@ def standing_publish_guard(root, args):
     return pinned
 
 
+def extract_intent(operation, root, prepared):
+    """The pinned identity of one ``extract.bundle`` result."""
+    _, _, path, value = prepared
+    return {"operation": operation, "run_id": value["run_id"], "source": value["source"],
+            "rendition": path.relative_to(root).as_posix(), "extractor": value["extractor"]}
+
+
 def prepare(root, stage):
     try:
         return _prepare(root, stage)
@@ -120,9 +127,7 @@ def _prepare(root, stage):
                 events.prepare_submission(args["value"], root)
             return {"operation": operation}
         if operation.startswith("extract-"):
-            _, _, path, value = extract.bundle(root, args["receipt"], args["format_name"])
-            return {"operation": operation, "run_id": value["run_id"], "source": value["source"],
-                    "rendition": path.relative_to(root).as_posix(), "extractor": value["extractor"]}
+            return extract_intent(operation, root, extract.bundle(root, args["receipt"], args["format_name"]))
         if operation.startswith("docling-"):
             _, _, path, value, _ = docling._bundle(root, args["receipt"], args["format_name"], Path(args["artifacts_path"]), Path(args["python"]))
             return {"operation": operation, "run_id": value["run_id"], "source": value["source"],
@@ -243,11 +248,15 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                     "event_ids": [e["event_id"] for e in args["value"]["events"]],
                     "request_id": args["request_id"], "backup": result["backup"]}
         if operation.startswith("extract-"):
-            # Refuse a changed source/extractor before any publication or registration.
-            require(prepare(root, stage) == intent, "changed_extraction_identity")
+            # Refuse a changed source/extractor before any publication or registration. The bundle
+            # read for this check is the one ``run`` uses; ``run`` still re-reads and re-hashes the
+            # source and recomputes the extractor identity under the catalog writer lock.
+            prepared = extract.bundle(root, args["receipt"], args["format_name"])
+            require(extract_intent(operation, root, prepared) == intent, "changed_extraction_identity")
             command = operation.removeprefix("extract-")
             result = extract.run(root, command, args["receipt"], args["format_name"],
-                                 args.get("actor"), args.get("expected_state"), rebase=True)
+                                 args.get("actor"), args.get("expected_state"), rebase=True,
+                                 prepared=prepared)
             require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"],
                     "changed_extraction_identity")
             evidence = {"boundary": "extraction-" + command, "run_id": result["run_id"],

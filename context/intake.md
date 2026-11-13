@@ -189,7 +189,8 @@ python3 tools/diagnostics/ledger_scale_benchmark.py --ledger 36000 --catalog 256
 
 Planning a submission (`upload.records_for`) no longer scans history ([design](../docs/design/current-state.md#intake-ledger)):
 the next `S`/`D` numbers come from the highest current ID per prefix in the catalog's primary-key index plus
-the highest promised by any `upload-*` request in the ledger, decoded once per process by request digest;
+the highest promised by any `upload-*` request in the ledger, read incrementally (only requests added since the
+previous call, by row id, each decoded once per process; a different or smaller ledger resets it);
 staged, retrying, blocked and dead-letter requests keep their IDs reserved. Profile it with
 `python3 tools/diagnostics/upload_planning_benchmark.py --catalog 1600,6400,25600 --ledger 36000`, and use
 `ledger_scale_benchmark.py --matched --warm` (a ledger with one committed upload request per registration, and
@@ -209,6 +210,16 @@ submission superseding the old, or `changed-since-intake`). Measure it with
 (wall and CPU seconds, bytes read from `/proc/self/io`, and a digest of the whole report so two `--tree`
 checkouts can be compared): about 11 to 5 ms per file at 2,000 and 10,000 synthetic files of about 133 KiB.
 A MIME HTML file costs about 8 ms more in its parser during `classify`; that is the remaining floor.
+
+**Extraction work per document.** Each extract stage reads the catalog snapshot, the original and the extractor
+identity afresh (`extract.bundle`) and parses the original; a first ingest used to do that six times per document
+and now does it four times and parses once (the newest parse is kept, keyed by format, source SHA-256 and extractor
+SHA-256). A source or extractor change between `prepare` and `register` still blocks: each stage re-reads and
+compares the pinned identity before publishing or submitting (`changed-extraction-identity`), and `extract.run`
+re-reads and re-hashes the original and recomputes the extractor identity under the catalog writer lock before and
+after publication and before and after registration (`Source changed during extraction/registration`). See the
+design document for why each check remains. Measure it with `tools/diagnostics/ingest_benchmark.py` (the
+`tools.extraction.extract.run` and `upload.reserved_ids` timers) on a seeded instance.
 
 **Catalog lookup indexes.** Every write probes the committed catalog for records that reference a record it
 rewrites and for artifacts that already hold a path it moves. Catalogs created now have lookup indexes and a
