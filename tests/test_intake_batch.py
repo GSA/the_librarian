@@ -189,6 +189,63 @@ class FailedDocumentDoesNotBlockItsBatch(unittest.TestCase):
         self.assertEqual(sorted(set(snapshot(root)["versions"].values())), [1, 2])
 
 
+class RetriesAndBusyStores(unittest.TestCase):
+    """The batched path keeps the single path's treatment of lost races and a busy ledger."""
+
+    def test_a_catalog_busy_during_a_batch_is_retried_and_counted_per_entry(self):
+        root, inbox = make_instance(self, 4)
+        real = catalog.submit_batch
+        calls = []
+
+        def busy_once(root_, members, **kwargs):
+            calls.append(len(members))
+            if len(calls) == 2:  # the registration batch loses one race, before anything is written
+                raise catalog.WriterBusy("Another catalog writer is active; retry later")
+            return real(root_, members, **kwargs)
+        with patch.object(catalog, "submit_batch", busy_once):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 4)
+        self.assertEqual(report["counts"]["retried_after_conflict"], {"entries": 4, "succeeded": 4, "attempts": 4})
+        self.assertEqual(report["counts"]["failed_by_code"], {})
+        self.assertEqual(len(revisions(root)), 2)
+
+    def test_a_busy_ledger_repeats_the_chunk_and_then_fails_visibly_without_stopping_the_run(self):
+        root, inbox = make_instance(self, 4)
+        real = upload.stage_submission
+        calls = []
+
+        def busy_once(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise cohort.LedgerBusy()
+            return real(*args, **kwargs)
+        with patch.object(upload, "stage_submission", busy_once):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 4)
+        self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 1)
+        with patch.object(upload, "stage_submission", side_effect=cohort.LedgerBusy()):
+            again = cohort.ingest(root, inbox, system="s2", actor="a", batch_size=4)
+        self.assertEqual(again["counts"]["failed_by_code"], {"ledger/ledger_busy": 4})
+
+    def test_a_blocked_registration_is_recoverable_by_recover_conflicts_like_any_other(self):
+        root, inbox = make_instance(self, 2)
+        legacy = catalog.CatalogError("Stale expected state; re-read before writing")
+        real = catalog.submit_batch
+        calls = []
+
+        def failing(root_, members, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise legacy
+            return real(root_, members, **kwargs)
+        with patch.object(catalog, "submit_batch", failing):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=2)
+        self.assertEqual(report["counts"]["failed_by_code"], {"register/native-input": 2})
+        self.assertEqual(runner.recover_conflicts(root)["candidates"], 2)
+        self.assertEqual(runner.recover_conflicts(root, apply=True)["results"], {"succeeded": 2})
+        self.assertEqual(cohort.ingest(root, inbox, system="s", actor="a", batch_size=2)["counts"]["outcome"]["extracted"], 2)
+
+
 CRASH = """
 import os, sys
 from pathlib import Path
