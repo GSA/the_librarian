@@ -111,5 +111,6 @@
   "tests/test_upload_planning.py",
   "tests/test_store_durability.py",
   "tests/test_catalog_batch.py",
-  "tests/test_intake_batch.py"
+  "tests/test_intake_batch.py",
+  "tools/diagnostics/batch_ingest_benchmark.py"
 ]
