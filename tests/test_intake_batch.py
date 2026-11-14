@@ -189,6 +189,87 @@ class FailedDocumentDoesNotBlockItsBatch(unittest.TestCase):
         self.assertEqual(sorted(set(snapshot(root)["versions"].values())), [1, 2])
 
 
+class MarkerScope(unittest.TestCase):
+    """Marker idempotency applies to upload submissions only; other receipt updates still write."""
+
+    def test_an_update_of_a_committed_receipt_that_keeps_its_original_artifact_is_written(self):
+        root, inbox = make_instance(self, 2)
+        cohort.ingest(root, inbox, system="s", actor="a", batch_size=2)
+        records = catalog.read_records(root, limit=100)["records"]
+        receipt = next(r for r in records if r["kind"] == "receipt")
+        original = next(r for r in records if r["id"] == receipt["data"]["artifact_id"])
+        updated = json.loads(json.dumps(receipt))
+        updated["data"]["provenance"] = [{"path": "originals/uploads/x/extra.json", "sha256": None,
+                                          "line_start": None, "line_end": None}]
+        for batched in (False, True):
+            store.stage(root, json.dumps({
+                "version": 1, "correlation_id": "req-update-%s" % batched, "correction_of": None,
+                "policy": {"version": 1, "sha256": upload.policy.for_root(root)[1]},
+                "retry": {"max_attempts": 3, "backoff_seconds": 0},
+                "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit", "arguments": {
+                    "records": [updated, original], "actor": "a", "request_id": "update-%s" % batched,
+                    "reason": "Receipt update", "expected_state": catalog.status(root)["state_token"]}}]}).encode())
+            before = len(revisions(root))
+            if batched:
+                runner.settle_batch(root, [("req-update-True", "receipt")])
+            else:
+                runner.settle(root, "req-update-False", "receipt")
+            self.assertEqual(len(revisions(root)), before + 1, batched)
+            if not batched:
+                updated["data"]["provenance"][0]["path"] += "2"  # a different update for the second pass
+        current = {r["id"]: r for r in catalog.read_records(root, limit=100)["records"]}
+        self.assertEqual(current[receipt["id"]]["data"]["provenance"], updated["data"]["provenance"])
+
+    def test_only_an_upload_registration_has_a_marker(self):
+        records = catalog_records_for_upload()
+        args = {"records": records, "request_id": "upload-sub"}
+        self.assertEqual(adapters.receipt_marker(args), "A-upload-sub-original")
+        self.assertIsNone(adapters.receipt_marker({**args, "request_id": "update-1"}))
+        self.assertIsNone(adapters.receipt_marker({"records": records[:1], "request_id": "upload-sub"}))
+        self.assertIsNone(adapters.receipt_marker({"records": records, "request_id": "upload-other"}))
+
+
+def catalog_records_for_upload():
+    from tools.diagnostics.catalog_lock_benchmark import registration
+    records = registration(0)
+    for record in records:
+        record["id"] = record["id"].replace("A-upload-0-", "A-upload-sub-")
+        for key in ("artifact_id", "parent_id"):
+            if record["data"].get(key):
+                record["data"][key] = record["data"][key].replace("A-upload-0-", "A-upload-sub-")
+    return records
+
+
+class BatchWideFailures(unittest.TestCase):
+    def test_extraction_lock_contention_fails_the_batch_retryably_instead_of_aborting_the_run(self):
+        root, inbox = make_instance(self, 4)
+        real = extract.register_batch
+        calls = []
+
+        def busy_once(root_, items, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise catalog.WriterBusy("Another catalog writer is active; retry later")
+            return real(root_, items, **kwargs)
+        with patch.object(extract, "register_batch", busy_once):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 4)
+        self.assertEqual(report["counts"]["failed_by_code"], {})
+        self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 4)
+
+    def test_a_persistent_extraction_lock_is_recorded_per_stage_and_the_run_reports(self):
+        root, inbox = make_instance(self, 3)
+        with patch.object(extract, "register_batch", side_effect=catalog.WriterBusy("held")):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=3)
+        self.assertEqual(report["counts"]["outcome"]["received"], 3)
+        self.assertEqual(report["counts"]["failed_by_code"], {"register/catalog-busy": 3})
+        for request in store.list_requests(root):
+            for stage in request["stages"]:
+                self.assertNotEqual(stage["status"], "running")  # no attempt is left unfinished
+        again = cohort.ingest(root, inbox, system="s", actor="a", batch_size=3)
+        self.assertEqual(again["counts"]["outcome"]["extracted"], 3)
+
+
 class RetriesAndBusyStores(unittest.TestCase):
     """The batched path keeps the single path's treatment of lost races and a busy ledger."""
 

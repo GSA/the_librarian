@@ -1048,6 +1048,59 @@ def _first_version(connection, record_id):
     return None if row is None else (row[0], row[1])
 
 
+def _claims(record):
+    """What two members of one batch may not both write: a record ID, or a path an artifact holds."""
+    claims = [("id", record["id"])]
+    if record["kind"] == "artifact" and record["data"]["path"] is not None:
+        claims.append(("path", record["data"]["path"]))
+    return claims
+
+
+def _select_members(pending, records_of, old, results):
+    """The members of ``pending`` (in order) that commit together; the others are refused in ``results``.
+
+    Two members of one batch may not write the same record or give two artifacts one path: the earlier
+    one that is not itself refused keeps it. The retained members are validated together (one ``validate_delta``); only if that is
+    refused is each judged against the committed state plus every OTHER retained member, so a member may
+    reference one that comes later in the batch, an invalid member is found, and a member that depended on
+    a refused one is refused in the next pass. The loop ends with a union that validated.
+    """
+    pending = list(pending)
+    while True:
+        taken, active, overlapped = set(), [], []
+        for index in pending:
+            claims = {key for r in records_of[index] for key in _claims(r)}
+            if claims & taken:
+                overlapped.append(index)
+            else:
+                taken |= claims
+                active.append(index)
+        union = [record for index in active for record in records_of[index]]
+        try:
+            if union:
+                validate_delta(union, get=old.get, referrers=old.referrers, claimants=old.claimants)
+        except CatalogError as union_error:
+            failing = {}
+            for index in active:
+                view = _Layered(old)
+                view.accept([record for other in active if other != index for record in records_of[other]])
+                try:
+                    validate_delta(records_of[index], get=view.get, referrers=view.referrers,
+                                   claimants=view.claimants)
+                except CatalogError as error:
+                    failing[index] = error
+            if not failing:
+                raise union_error  # unreachable unless validate_delta disagrees with itself
+            for index, error in failing.items():
+                results[index].update(status="refused", error=error, rebased_from=None)
+            pending = [index for index in pending if index not in failing]
+            continue
+        for index in overlapped:
+            results[index].update(status="refused", rebased_from=None, error=ConflictingWrite(
+                "An earlier member of this batch wrote a record in this member"))
+        return active
+
+
 def marker_present(root, marker):
     """Whether the catalog holds a first version of record ``marker`` (read in one validated snapshot)."""
     identifier_text = text  # the marker is any record ID; validate_record has checked its shape on write
@@ -1092,9 +1145,7 @@ def submit_batch(root, members, *, actor, reason, rebase=True, precommit_check=N
         old = _CurrentRecords(connection)
         results = [{"marker": marker, "status": None, "committed_revision": None, "committed_state": None,
                     "rebased_from": None, "error": None} for marker in markers]
-        taken_ids, accepted = {}, []  # record ID -> accepting member index; accepted member indexes
-        records_of = {}
-        pins = {}
+        records_of, pins, pending = {}, {}, []
         for index, member in enumerate(members):
             result = results[index]
             try:
@@ -1107,9 +1158,6 @@ def submit_batch(root, members, *, actor, reason, rebase=True, precommit_check=N
                 if found is not None:
                     result.update(status="present", committed_revision=found[0], committed_state=found[1])
                     continue
-                clash = next((i for i in ids if i in taken_ids), None)
-                if clash is not None:
-                    raise ConflictingWrite("An earlier member of this batch wrote a record in this member")
                 if member["expected_state"] != state["state_token"]:
                     if not rebase:
                         raise StaleState("Stale expected state; re-read before writing")
@@ -1125,26 +1173,8 @@ def submit_batch(root, members, *, actor, reason, rebase=True, precommit_check=N
                 result.update(status="refused", error=error)
                 continue
             records_of[index] = incoming
-            for record_id in ids:
-                taken_ids[record_id] = index
-            accepted.append(index)
-        if accepted:
-            union = [record for index in accepted for record in records_of[index]]
-            try:
-                validate_delta(union, get=old.get, referrers=old.referrers, claimants=old.claimants)
-            except CatalogError:
-                # Some member does not validate: judge each in order against what the earlier ones add.
-                view, kept = _Layered(old), []
-                for index in accepted:
-                    try:
-                        validate_delta(records_of[index], get=view.get, referrers=view.referrers,
-                                       claimants=view.claimants)
-                    except CatalogError as error:
-                        results[index].update(status="refused", error=error, rebased_from=None)
-                        continue
-                    view.accept(records_of[index])
-                    kept.append(index)
-                accepted = kept
+            pending.append(index)
+        accepted = _select_members(pending, records_of, old, results)
         if not accepted:
             return {"command": "submit-batch", "members": results, "state": state, "backup": None,
                     "retention": None, "committed_revision": None}

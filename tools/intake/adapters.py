@@ -232,7 +232,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
         if operation == "catalog-submit":
             # The pinned state may be outdated by another writer; the commit still
             # refuses when a later revision wrote one of these records.
-            result = catalog.submit(root, **args, rebase=True, marker=receipt_marker(args["records"]))
+            result = catalog.submit(root, **args, rebase=True, marker=receipt_marker(args))
             return {"boundary": "receipt-committed", "committed_revision": result["committed_revision"],
                     "request_id": args["request_id"], "record_ids": [r["id"] for r in args["records"]],
                     "receipt_ids": [r["id"] for r in args["records"] if r["kind"] == "receipt"],
@@ -289,17 +289,22 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
         raise StageFailure("blocked", "native-input") from error
 
 
-def receipt_marker(records):
-    """The record ID that makes a registration idempotent across batch revisions, or None.
+def receipt_marker(args):
+    """The record ID that makes an upload registration idempotent across batch revisions, or None.
 
-    An upload registration creates exactly one receipt and names its original artifact, whose ID
-    carries the submission; no other registration creates it. Other ``catalog-submit`` shapes have
-    no such record and stay idempotent by request ID alone.
+    Only a manual-upload registration has one: its request ID is ``upload-<submission>`` and it creates
+    the receipt and the original artifact ``A-upload-<submission>-original`` that the receipt names, a
+    record no other request creates. Any other ``catalog-submit`` (a receipt update that merely carries
+    the original artifact, say) has none and stays idempotent by request ID alone, so its changes are
+    always written.
     """
-    receipts = [r for r in records if r["kind"] == "receipt"]
-    if len(receipts) != 1:
+    request_id, records = args["request_id"], args["records"]
+    if not request_id.startswith("upload-"):
         return None
-    marker = receipts[0]["data"]["artifact_id"]
+    marker = "A-" + request_id + "-original"
+    receipts = [r for r in records if r["kind"] == "receipt"]
+    if len(receipts) != 1 or receipts[0]["data"]["artifact_id"] != marker:
+        return None
     return marker if any(r["id"] == marker for r in records) else None
 
 
@@ -350,12 +355,12 @@ def execute_batch(root, entries):
         groups = {}
         for index, (stage, intent, previous) in enumerate(entries):
             args = stage["arguments"]
-            if receipt_marker(args["records"]) is None:
+            if receipt_marker(args) is None:
                 single(index)
             else:
                 groups.setdefault((args["actor"], args["reason"]), []).append(index)
         for (actor, reason), indexes in groups.items():
-            members = [{"marker": receipt_marker(entries[i][0]["arguments"]["records"]),
+            members = [{"marker": receipt_marker(entries[i][0]["arguments"]),
                         "records": entries[i][0]["arguments"]["records"],
                         "expected_state": entries[i][0]["arguments"]["expected_state"]} for i in indexes]
             try:
@@ -401,8 +406,17 @@ def execute_batch(root, entries):
         items.append({"receipt": args["receipt"], "format_name": args["format_name"], "actor": args.get("actor"),
                       "expected_state": args.get("expected_state"), "prepared": prepared})
         owners.append(index)
-    for index, result in zip(owners, extract.register_batch(root, items) if items else []):
+    try:
+        registered = extract.register_batch(root, items) if items else []
+    except (OSError, sqlite3.Error, *NATIVE_ERRORS) as error:
+        # A failure of the whole batch (the extraction lock held too long, say) is each stage's failure,
+        # classified like the single path's, so its attempt is recorded and contention is retried.
+        registered = [error] * len(items)
+    for index, result in zip(owners, registered):
         _, intent, _ = entries[index]
+        if isinstance(result, (OSError, sqlite3.Error)):
+            outcomes[index] = result
+            continue
         if isinstance(result, Exception):
             outcomes[index] = _failure_of(result)
             continue

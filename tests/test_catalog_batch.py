@@ -288,7 +288,7 @@ class FailedMemberDoesNotBlockTheBatch(Case):
                 record["data"]["path"] = first["records"][2]["data"]["path"]
         result = catalog.submit_batch(self.root, [first, second, member(2, pin)], actor="a", reason="r")
         self.assertEqual([m["status"] for m in result["members"]], ["committed", "refused", "committed"])
-        self.assertIn("share path", str(result["members"][1]["error"]))
+        self.assertIn("earlier member", str(result["members"][1]["error"]))
         self.assertEqual([r["revision"] for r in self.revisions()], [1])
         self.assertEqual(self.revisions()[0]["record_count"], 8)
 
@@ -302,6 +302,58 @@ class FailedMemberDoesNotBlockTheBatch(Case):
         result = catalog.submit_batch(self.root, [child, parent], actor="a", reason="r")
         self.assertEqual(self.statuses(result), {"A-upload-1-original": "committed", "A-upload-0-original": "committed"})
         self.assertEqual(len(self.revisions()), 1)
+
+    def test_an_invalid_earlier_member_does_not_block_a_valid_later_member_that_shares_a_record_id(self):
+        pin = self.pin()
+        shared = {"id": "S99", "kind": "source", "data": {"category": "artifact", "provenance": []}}
+        bad = member(0, pin)
+        bad["records"][1]["data"]["source_ids"] = ["S-missing-0"]
+        bad["records"].append(shared)
+        good = member(1, pin)
+        good["records"].append(shared)
+        result = catalog.submit_batch(self.root, [bad, good], actor="a", reason="r")
+        self.assertEqual([m["status"] for m in result["members"]], ["refused", "committed"])
+        self.assertIn("S99", self.current())
+
+    def test_a_valid_earlier_member_still_wins_a_shared_record_id(self):
+        pin = self.pin()
+        shared = {"id": "S99", "kind": "source", "data": {"category": "artifact", "provenance": []}}
+        first, second = member(0, pin), member(1, pin)
+        first["records"].append(shared)
+        second["records"].append(shared)
+        result = catalog.submit_batch(self.root, [first, second], actor="a", reason="r")
+        self.assertEqual([m["status"] for m in result["members"]], ["committed", "refused"])
+        self.assertIsInstance(result["members"][1]["error"], catalog.ConflictingWrite)
+
+    def test_a_child_before_its_parent_commits_even_when_an_unrelated_member_is_refused(self):
+        pin = self.pin()
+        parent = member(0, pin)
+        child = member(1, pin)
+        child["records"].append({"id": "R-child-of-0", "kind": "relationship", "data": {
+            "from_id": "A-upload-1-original", "to_id": "A-upload-0-original", "relation": "version-of",
+            "scope": "t", "basis": "reported", "provenance": []}})
+        unrelated = self.bad_member(2, pin)
+        result = catalog.submit_batch(self.root, [child, unrelated, parent], actor="a", reason="r")
+        self.assertEqual([m["status"] for m in result["members"]], ["committed", "refused", "committed"])
+        catalog.status(self.root, audit=True)
+        self.assertEqual(len(self.revisions()), 1)
+
+    def test_a_member_that_depended_on_a_refused_member_is_refused_too(self):
+        pin = self.pin()
+        child = member(1, pin)
+        child["records"].append({"id": "R-child-of-0", "kind": "relationship", "data": {
+            "from_id": "A-upload-1-original", "to_id": "A-upload-0-original", "relation": "version-of",
+            "scope": "t", "basis": "reported", "provenance": []}})
+        result = catalog.submit_batch(self.root, [child, self.bad_member(0, pin), member(2, pin)],
+                                      actor="a", reason="r")
+        self.assertEqual([m["status"] for m in result["members"]], ["refused", "refused", "committed"])
+        self.assertEqual(len(self.current()), 4)
+        catalog.status(self.root, audit=True)
+
+    def bad_member(self, n, pin):
+        broken = member(n, pin)
+        broken["records"][1]["data"]["source_ids"] = ["S-missing-%d" % n]
+        return broken
 
     def test_an_invalid_member_input_is_refused_alone(self):
         pin = self.pin()
