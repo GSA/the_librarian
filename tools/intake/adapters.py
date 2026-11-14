@@ -1,5 +1,5 @@
 """Fixed native stage adapters; no executable request-defined callbacks."""
-from contextlib import closing
+from contextlib import closing, nullcontext
 import errno
 import json
 from pathlib import Path
@@ -232,7 +232,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
         if operation == "catalog-submit":
             # The pinned state may be outdated by another writer; the commit still
             # refuses when a later revision wrote one of these records.
-            result = catalog.submit(root, **args, rebase=True)
+            result = catalog.submit(root, **args, rebase=True, marker=receipt_marker(args["records"]))
             return {"boundary": "receipt-committed", "committed_revision": result["committed_revision"],
                     "request_id": args["request_id"], "record_ids": [r["id"] for r in args["records"]],
                     "receipt_ids": [r["id"] for r in args["records"] if r["kind"] == "receipt"],
@@ -287,6 +287,138 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         # Undecodable native inputs block durably rather than escaping as a crash.
         raise StageFailure("blocked", "native-input") from error
+
+
+def receipt_marker(records):
+    """The record ID that makes a registration idempotent across batch revisions, or None.
+
+    An upload registration creates exactly one receipt and names its original artifact, whose ID
+    carries the submission; no other registration creates it. Other ``catalog-submit`` shapes have
+    no such record and stay idempotent by request ID alone.
+    """
+    receipts = [r for r in records if r["kind"] == "receipt"]
+    if len(receipts) != 1:
+        return None
+    marker = receipts[0]["data"]["artifact_id"]
+    return marker if any(r["id"] == marker for r in records) else None
+
+
+BATCH_OPERATIONS = ("catalog-submit", "extract-register")
+NATIVE_ERRORS = (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError,
+                 index.IndexError_, extract.ExtractionError, BadZipFile, ET.ParseError)
+
+
+def batch_scope(operation, count):
+    """What a batch of ``count`` stages of ``operation`` runs inside (a parse memo for registrations)."""
+    return extract.keeping_parsed(count) if operation == "extract-register" else nullcontext()
+
+
+def _failure_of(error):
+    """The failure ``_execute`` would raise for ``error`` (native families classified), else the error itself."""
+    if isinstance(error, NATIVE_ERRORS):
+        failure = native_failure(error)
+        failure.__cause__ = error
+        return failure
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        failure = StageFailure("blocked", "native-input")
+        failure.__cause__ = error
+        return failure
+    return error
+
+
+def execute_batch(root, entries):
+    """``execute`` for many stages of one operation; one entry per stage, evidence or its failure.
+
+    ``entries`` are ``(stage, intent, previous)``. Each result is the evidence ``execute`` would return
+    or the exception that would have ended that stage alone (a ``StageFailure``, ``OSError``,
+    ``sqlite3.Error`` or ``IntakeError``); one stage's refusal never decides another's. Registrations
+    commit together as one catalog revision; everything else a stage checks is checked per stage.
+    """
+    operations = {stage["operation"] for stage, _, _ in entries}
+    require(len(operations) == 1 and operations <= set(BATCH_OPERATIONS), "unsupported_batch")
+    operation = operations.pop()
+    outcomes = [None] * len(entries)
+
+    def single(index):
+        stage, intent, previous = entries[index]
+        try:
+            outcomes[index] = _execute(root, stage, intent, previous)
+        except (StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+            outcomes[index] = error
+
+    if operation == "catalog-submit":
+        groups = {}
+        for index, (stage, intent, previous) in enumerate(entries):
+            args = stage["arguments"]
+            if receipt_marker(args["records"]) is None:
+                single(index)
+            else:
+                groups.setdefault((args["actor"], args["reason"]), []).append(index)
+        for (actor, reason), indexes in groups.items():
+            members = [{"marker": receipt_marker(entries[i][0]["arguments"]["records"]),
+                        "records": entries[i][0]["arguments"]["records"],
+                        "expected_state": entries[i][0]["arguments"]["expected_state"]} for i in indexes]
+            try:
+                submitted = catalog.submit_batch(root, members, actor=actor, reason=reason, rebase=True)
+            except (OSError, sqlite3.Error) as error:
+                for i in indexes:
+                    outcomes[i] = error
+                continue
+            except NATIVE_ERRORS as error:
+                for i in indexes:
+                    outcomes[i] = _failure_of(error)
+                continue
+            first = True
+            committed = sum(m["status"] == "committed" for m in submitted["members"])
+            for i, member in zip(indexes, submitted["members"]):
+                args = entries[i][0]["arguments"]
+                if member["status"] == "refused":
+                    outcomes[i] = _failure_of(member["error"])
+                    continue
+                outcomes[i] = {"boundary": "receipt-committed", "committed_revision": member["committed_revision"],
+                               "request_id": args["request_id"], "record_ids": [r["id"] for r in args["records"]],
+                               "receipt_ids": [r["id"] for r in args["records"] if r["kind"] == "receipt"],
+                               "committed_state": member["committed_state"],
+                               "backup": submitted["backup"] if first and member["status"] == "committed" else None,
+                               "batch": {"documents": committed}}
+                first = first and member["status"] != "committed"
+        return outcomes
+    items, owners = [], []
+    for index, (stage, intent, previous) in enumerate(entries):
+        args = stage["arguments"]
+        try:
+            # The same guard ``_execute`` makes before it registers: the source, extractor and catalog
+            # are read afresh and must still be the pinned identity.
+            prepared = extract.bundle(root, args["receipt"], args["format_name"])
+            require(extract_intent(operation, root, prepared) == intent, "changed_extraction_identity")
+        except NATIVE_ERRORS as error:
+            outcomes[index] = _failure_of(error)
+            continue
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            outcomes[index] = _failure_of(error)
+            continue
+        except (StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+            outcomes[index] = error
+            continue
+        items.append({"receipt": args["receipt"], "format_name": args["format_name"], "actor": args.get("actor"),
+                      "expected_state": args.get("expected_state"), "prepared": prepared})
+        owners.append(index)
+    for index, result in zip(owners, extract.register_batch(root, items) if items else []):
+        _, intent, _ = entries[index]
+        if isinstance(result, Exception):
+            outcomes[index] = _failure_of(result)
+            continue
+        try:
+            require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"],
+                    "changed_extraction_identity")
+        except IntakeError as error:
+            outcomes[index] = error
+            continue
+        outcomes[index] = {"boundary": "extraction-register", "run_id": result["run_id"],
+                           "rendition": result["rendition"], "rendition_sha256": result["rendition_sha256"],
+                           "source_sha256": result["source_sha256"], "request_id": result["request_id"],
+                           "committed_revision": result["committed_revision"]}
+    return outcomes
 
 
 def availability(root, stage, evidence):

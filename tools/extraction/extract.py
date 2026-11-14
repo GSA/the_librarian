@@ -328,7 +328,7 @@ def source(root, receipt, format_name):
 # Callers treat the payload as read-only. It is a per-process cache, never persisted or trusted for
 # a source read: ``bundle`` still reads and hashes the original on every call.
 _PARSED = OrderedDict()
-_KEEP, _KEEP_BYTES = 1, 128 * 1024 * 1024
+_KEEP, _KEEP_BYTES = 1, 32 * 1024 * 1024
 _PARSED_BYTES = 0
 
 
@@ -347,7 +347,7 @@ def _trim_parsed():
 
 @contextmanager
 def keeping_parsed(count):
-    """Remember up to ``count`` parses (and at most 128 MB of source bytes) while a batch runs.
+    """Remember up to ``count`` parses (and at most 32 MB of source bytes) while a batch runs.
 
     A batch prepares every document and then re-reads each one in its guard; one remembered parse
     would be evicted by the next document. The entries are keyed exactly as one (format, observed

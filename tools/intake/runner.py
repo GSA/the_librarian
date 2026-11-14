@@ -140,6 +140,117 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
         return store.summary(c, correlation_id)
 
 
+def run_batch(root, items, *, clock=None):
+    """``run`` for many single-stage requests of one batchable operation, committing their catalog work once.
+
+    ``items`` are ``(correlation_id, stage_id)``. Returns ``{correlation_id: summary}``. Each stage keeps
+    its own attempt, intent, evidence and status exactly as ``run`` records them, and one stage's failure
+    is recorded on that stage alone. A stage that is blocked, dead-lettered, in backoff or out of
+    attempts is left as it is. The ledger sees two commits for the whole batch (intents and attempts
+    before the native work, evidence after), the catalog one revision. A crash anywhere leaves unfinished
+    attempts that the next call reuses; a stage whose registration committed is found committed by its
+    marker and its evidence is recorded without a second write.
+    """
+    clock = clock if clock is not None else time.time
+    started = clock()
+    with store.locked(root) as c:
+        live = []
+        for correlation_id, stage_id in items:
+            request, stage, saved = selected(c, correlation_id, stage_id)
+            if saved["status"] in {"succeeded", "return-pending", "blocked", "dead-letter"}:
+                continue
+            attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? AND cycle=? ORDER BY ordinal",
+                                 (correlation_id, stage_id, saved["cycle"])).fetchall()
+            unfinished = attempts[-1] if attempts and attempts[-1]["outcome"] is None else None
+            if attempts and unfinished is None and started < attempts[-1]["eligible_at"]:
+                continue
+            ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
+            if unfinished is None:
+                charged, lost = spent(attempts)
+                if not (charged < request["retry"]["max_attempts"] and lost < CONTENTION_BUDGET):
+                    continue
+            live.append({"correlation_id": correlation_id, "stage_id": stage_id, "request": request,
+                         "stage": stage, "saved": saved, "attempts": attempts, "unfinished": unfinished,
+                         "ordinal": ordinal, "error": None, "intent": None})
+        operations = {item["stage"]["operation"] for item in live}
+        require(len(operations) <= 1, "unsupported_batch")
+        with adapters.batch_scope(next(iter(operations), None), len(live)):
+            for item in live:
+                try:
+                    require(policy.for_root(root)[1] == item["request"]["policy"]["sha256"], "policy_changed")
+                    saved = item["saved"]
+                    item["intent"] = (decode(saved["intent"].encode()) if saved["intent"]
+                                      else adapters.prepare(store.safe(root), item["stage"]))
+                except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+                    item["error"] = error
+            with c:
+                for item in live:
+                    if item["error"] is None and item["saved"]["intent"] is None:
+                        save_artifact(c, item["correlation_id"], item["stage_id"], "intent", item["intent"])
+                    if item["unfinished"] is None:
+                        c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)",
+                                  (item["correlation_id"], item["stage_id"], item["saved"]["cycle"], item["ordinal"], started))
+                        c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?",
+                                  (item["correlation_id"], item["stage_id"]))
+            ready = [item for item in live if item["error"] is None]
+            if ready:
+                outcomes = adapters.execute_batch(store.safe(root), [
+                    (item["stage"], item["intent"], decode(item["saved"]["evidence"].encode()) if item["saved"]["evidence"] else None)
+                    for item in ready])
+                for item, outcome in zip(ready, outcomes):
+                    if isinstance(outcome, Exception):
+                        item["error"] = outcome
+                    else:
+                        item["evidence"] = outcome
+        ended = clock()
+        with c:
+            for item in live:
+                correlation_id, stage_id, saved = item["correlation_id"], item["stage_id"], item["saved"]
+                if item["error"] is not None:
+                    failure, status = failure_status(item["request"], item["attempts"], item["ordinal"], item["error"])
+                    c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?",
+                              (ended, failure.category, failure.code, ended + item["request"]["retry"]["backoff_seconds"],
+                               correlation_id, stage_id, saved["cycle"], item["ordinal"]))
+                    c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
+                else:
+                    save_artifact(c, correlation_id, stage_id, "evidence", item["evidence"])
+                    c.execute("UPDATE attempts SET ended=?,outcome='succeeded',eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?",
+                              (ended, ended, correlation_id, stage_id, saved["cycle"], item["ordinal"]))
+                    c.execute("UPDATE stages SET status='succeeded' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
+        return {correlation_id: store.summary(c, correlation_id) for correlation_id, _ in items}
+
+
+def settle_batch(root, items):
+    """``run_batch`` retried while some stage lost a catalog race, like ``settle`` for one stage.
+
+    Returns ``{correlation_id: summary}``. A busy ledger raises ``LedgerBusy`` after the same bounded
+    retries ``settle`` makes; nothing was written then.
+    """
+    busy = lost = 0
+    result = {}
+    while True:
+        try:
+            summaries = run_batch(root, items)
+        except LedgerBusy:
+            busy += 1
+            if busy >= BUSY_RETRIES:
+                raise
+            continue
+        result.update(summaries)
+        retry = []
+        for correlation_id, stage_id in items:
+            stage = next(s for s in summaries[correlation_id]["stages"] if s["id"] == stage_id)
+            current = [a for a in stage["attempts"] if a["cycle"] == stage["cycle"]]
+            if stage["status"] == "retryable" and current and current[-1]["code"] in CONTENTION_CODES:
+                retry.append((correlation_id, stage_id))
+        if not retry:
+            return result
+        lost += 1
+        if lost >= CONTENTION_RETRIES:
+            return result
+        items = retry
+
+
 def settle(root, correlation_id, stage_id):
     """Run a stage and retry it while it is retryable, within its attempt budget.
 
