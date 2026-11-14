@@ -1048,6 +1048,18 @@ def _first_version(connection, record_id):
     return None if row is None else (row[0], row[1])
 
 
+def marker_present(root, marker):
+    """Whether the catalog holds a first version of record ``marker`` (read in one validated snapshot)."""
+    identifier_text = text  # the marker is any record ID; validate_record has checked its shape on write
+    identifier_text(marker, "Marker", 200)
+    home, db, _ = locations(root)
+    require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
+    with closing(connect(db)) as connection:
+        connection.execute("BEGIN")
+        validated_state(connection, home)
+        return _first_version(connection, marker) is not None
+
+
 def submit_batch(root, members, *, actor, reason, rebase=True, precommit_check=None):
     """Commit many documents' records as ONE revision (Kata herq); each document is judged on its own.
 
@@ -1254,6 +1266,7 @@ class _CommittedStates:
     def __init__(self, connection, head):
         self.connection, self.head = connection, head
         self._added = None
+        self._scan = None
 
     def prior(self, request_id):
         row = self.connection.execute("SELECT * FROM revisions WHERE request_id=?", (request_id,)).fetchone()
@@ -1274,15 +1287,22 @@ class _CommittedStates:
     def revision_of(self, token):
         """The revision whose committed state carries ``token`` (0 for the empty catalog).
 
-        Searches newest first, so the cost follows how far behind the pin is.
+        Searches newest first, so the cost follows how far behind the pin is. The search resumes where
+        the last one stopped, so a batch whose members carry many pins reads the history once.
         """
-        hashes = dict(self.connection.execute("SELECT revision,revision_hash FROM revisions"))
-        records = self.head["records"]
-        for number in range(self.head["revision"], 0, -1):
-            if make_state(self.head, number, hashes[number], records)["state_token"] == token:
-                return number
-            records -= self._first_writes().get(number, 0)
-        return 0 if token == make_state(self.head, 0, "", 0)["state_token"] else None
+        if self._scan is None:
+            hashes = dict(self.connection.execute("SELECT revision,revision_hash FROM revisions"))
+            self._scan = [self.head["revision"], self.head["records"], hashes, {}]
+        scan = self._scan
+        while token not in scan[3] and scan[0] >= 0:
+            number = scan[0]
+            if number == 0:
+                scan[3].setdefault(make_state(self.head, 0, "", 0)["state_token"], 0)
+            else:
+                scan[3].setdefault(make_state(self.head, number, scan[2][number], scan[1])["state_token"], number)
+                scan[1] -= self._first_writes().get(number, 0)
+            scan[0] -= 1
+        return scan[3].get(token)
 
     def written_after(self, revision, ids):
         for start in range(0, len(ids), 500):

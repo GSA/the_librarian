@@ -2,7 +2,8 @@
 """Receipt-scoped local text extraction; no review, indexing or intake-stage changes."""
 
 import argparse
-from collections import Counter
+from collections import Counter, OrderedDict
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import io
@@ -326,22 +327,52 @@ def source(root, receipt, format_name):
 # changed source or extractor is a different key and is parsed afresh; only a finished parse is kept.
 # Callers treat the payload as read-only. It is a per-process cache, never persisted or trusted for
 # a source read: ``bundle`` still reads and hashes the original on every call.
-_PARSED = None
+_PARSED = OrderedDict()
+_KEEP, _KEEP_BYTES = 1, 128 * 1024 * 1024
+_PARSED_BYTES = 0
 
 
 def forget_parsed():
-    global _PARSED
-    _PARSED = None
+    global _PARSED_BYTES
+    _PARSED.clear()
+    _PARSED_BYTES = 0
+
+
+def _trim_parsed():
+    global _PARSED_BYTES
+    while len(_PARSED) > _KEEP or (len(_PARSED) > 1 and _PARSED_BYTES > _KEEP_BYTES):
+        _, (_, size) = _PARSED.popitem(last=False)
+        _PARSED_BYTES -= size
+
+
+@contextmanager
+def keeping_parsed(count):
+    """Remember up to ``count`` parses (and at most 128 MB of source bytes) while a batch runs.
+
+    A batch prepares every document and then re-reads each one in its guard; one remembered parse
+    would be evicted by the next document. The entries are keyed exactly as one (format, observed
+    source hash, extractor hash), so a changed source or extractor never finds a stale parse.
+    """
+    global _KEEP
+    previous = _KEEP
+    _KEEP = max(previous, count)
+    try:
+        yield
+    finally:
+        _KEEP = previous
+        _trim_parsed()
 
 
 def parse(format_name, raw, root, key):
-    global _PARSED
-    cached = _PARSED
-    if cached is not None and cached[0] == key:
-        return cached[1]
+    global _PARSED_BYTES
+    if key in _PARSED:
+        _PARSED.move_to_end(key)
+        return _PARSED[key][0]
     payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "mhtml": mime_html,
                "odt": odt}[format_name](raw)
-    _PARSED = (key, payload)
+    _PARSED[key] = (payload, len(raw))
+    _PARSED_BYTES += len(raw)
+    _trim_parsed()
     return payload
 
 
@@ -482,6 +513,82 @@ def finish_registration(root, path, value, recipe, outcome):
                               "preserve registration.json and retry the same request: " + str(error)) from error
 
 
+REGISTER_ERRORS = (ExtractionError, catalog.CatalogError, OSError, sqlite3.Error, ValueError, BadZipFile,
+                   ET.ParseError)
+
+
+def register_batch(root, items, *, rebase=True):
+    """``run(..., "register")`` for many receipts, committing their registrations as ONE catalog revision.
+
+    ``items`` are ``{"receipt", "format_name", "actor", "expected_state", "prepared"}`` (``prepared`` is
+    a fresh ``bundle`` result, as for ``run``). Returns one entry per item: the ``run`` result, or the
+    exception that refused that item alone (the other items still commit). Every check ``run`` makes is
+    made here for each item: the rendition on disk, the source and extractor re-read and re-hashed
+    twice under the extraction lock, the saved registration (``registration.json``) and the completion
+    check. Items whose registration is already in the catalog (a batch committed it before a crash)
+    are reported as committed at that revision without being written again.
+    """
+    root = catalog.safe_path(root)
+    outcomes = [None] * len(items)
+    with catalog.writer_lock(root / HOME):
+        ready = []  # (index, item, path, value, recipe, result)
+        for index, item in enumerate(items):
+            try:
+                receipt, format_name = item["receipt"], item["format_name"]
+                state, original, path, value = item["prepared"]
+                require(value["source"]["receipt_id"] == receipt and value["payload"]["format"] == format_name
+                        and path.is_relative_to(root), "Prepared bundle is for a different receipt, format or root")
+                raw = encoded(value)
+                require(len(raw) <= MAX_EXPANDED, "Complete rendition exceeds output limit")
+                require(item["actor"] is not None and item["expected_state"] is not None,
+                        "Registration requires actor and explicit expected catalog state")
+                require(path.exists(), "Prepared rendition missing; run prepare for this source/extractor version")
+                require(catalog.private_file(path).read_bytes() == raw,
+                        "Rendition differs from repeat extraction; preserve it and investigate")
+                unchanged(root, value)
+                result = {"command": "register", "receipt_id": receipt, "run_id": value["run_id"],
+                          "rendition": path.relative_to(root).as_posix(), "created": False,
+                          "source_sha256": value["source"]["sha256"], "rendition_sha256": digest(raw),
+                          "catalog_state": state, "boundary": BOUNDARY, "warnings": value["payload"]["warnings"]}
+                marker = registration_marker(value)
+                recipe = registration_recipe(root, original, path, value, state, item["actor"],
+                                             registered=lambda marker=marker: catalog.marker_present(root, marker))
+                unchanged(root, value)
+            except REGISTER_ERRORS as error:
+                outcomes[index] = error
+                continue
+            ready.append((index, item, path, value, recipe, result))
+        groups = {}
+        for entry in ready:  # one revision per (actor, reason): the revision records exactly one of each
+            groups.setdefault((entry[4]["actor"], entry[4]["reason"]), []).append(entry)
+        for (actor, reason), entries in groups.items():
+            members = [{"marker": registration_marker(value), "records": recipe["records"],
+                        "expected_state": item["expected_state"]} for _, item, _, value, recipe, _ in entries]
+            try:
+                submitted = catalog.submit_batch(root, members, actor=actor, reason=reason, rebase=rebase)
+            except REGISTER_ERRORS as error:
+                for entry in entries:
+                    outcomes[entry[0]] = error
+                continue
+            for (index, item, path, value, recipe, result), member in zip(entries, submitted["members"]):
+                if member["status"] == "refused":
+                    outcomes[index] = member["error"]
+                    continue
+                outcome = {"command": "submit", "idempotent": member["status"] == "present",
+                           **member["committed_state"], "state": member["committed_state"],
+                           "request_id": recipe["request_id"], "committed_revision": member["committed_revision"],
+                           "committed_state": member["committed_state"], "backup": None, "retention": None}
+                try:
+                    finish_registration(root, path, value, recipe, outcome)
+                except REGISTER_ERRORS as error:
+                    outcomes[index] = error
+                    continue
+                result.update(catalog_state=outcome["state"], registered=True, idempotent=outcome["idempotent"],
+                              request_id=recipe["request_id"], committed_revision=member["committed_revision"])
+                outcomes[index] = result
+    return outcomes
+
+
 def run(root, command, receipt, format_name, actor=None, expected_state=None, rebase=False,
         prepared=None):
     """Run one lifecycle command.
@@ -520,9 +627,11 @@ def run(root, command, receipt, format_name, actor=None, expected_state=None, re
         if command == "register":
             require(actor is not None and expected_state is not None,
                     "Registration requires actor and explicit expected catalog state")
-            recipe = registration_recipe(root, original, path, value, state, actor)
+            recipe = registration_recipe(root, original, path, value, state, actor,
+                                         registered=lambda: catalog.marker_present(root, registration_marker(value)))
             unchanged(root, value)
-            outcome = catalog.submit(root, expected_state=expected_state, rebase=rebase, **recipe)
+            outcome = catalog.submit(root, expected_state=expected_state, rebase=rebase,
+                                     marker=registration_marker(value), **recipe)
             finish_registration(root, path, value, recipe, outcome)
             result.update(catalog_state=outcome["state"], registered=True,
                           idempotent=outcome["idempotent"], request_id=recipe["request_id"])
