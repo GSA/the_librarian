@@ -488,7 +488,7 @@ def publication_lock(db):
 
 
 def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
-    review_snapshot = (load_event_reader().read_snapshot(root)
+    review_snapshot = (load_event_reader().read_snapshot(root, full=True)
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
     selected, rendition_identity = renditions.inputs(
@@ -591,7 +591,7 @@ def count_index(connection):
 def freshness(connection, root, manifest, db, config, manifest_hash):
     no_symlinks(db)
     actual = dict(connection.execute("SELECT key,value FROM metadata"))
-    review_snapshot = (load_event_reader().read_snapshot(root)
+    review_snapshot = (load_event_reader().read_snapshot(root, full=True)
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
     expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)

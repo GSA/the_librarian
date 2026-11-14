@@ -375,7 +375,9 @@ operator's, or one whose submission cannot be proven) is left byte-identical and
 several inboxes can share one catalog, manifest and index ([design](../docs/design/current-state.md#3-intake-and-review)).
 Only an orphan (receipt missing from the catalog, or retained rendition file gone) is dropped. The
 read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
-processes keep each other's writes, and replacement is atomic. The manifest holds at most 5,000
+processes keep each other's writes, and replacement is atomic (a new selection is appended in place
+in constant time; if a run is killed mid-append, the next `qualify`, `publish` or select finishes it
+from `.<manifest>.append-intent` and removes that file). The manifest holds at most 5,000
 selections across all cohorts. When the manifest has no room for an in-scope rendition that has no
 saved review, `qualify` makes no model call for it: it stays `pending-review` (`selection-capacity`)
 with nothing saved, and a later run with room reviews it once. A rendition whose review is saved is

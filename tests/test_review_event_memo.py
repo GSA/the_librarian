@@ -320,18 +320,19 @@ class MemoConcurrentWriter(MemoCase):
         "add(Path(sys.argv[1]), int(sys.argv[2]))\n"
     )
 
-    def test_a_commit_by_another_process_invalidates_the_memo(self):
+    def test_a_commit_by_another_process_extends_the_memo_by_its_delta(self):
         self.assertEqual(self.read().state["events"], 3)
         subprocess.run([sys.executable, "-c", self.CHILD, str(self.root), "7"], check=True, cwd=ROOT,
                        capture_output=True, text=True)
         calls, patched = self.full_passes()
         with patched:
             seen = self.read()
-            self.assertEqual(len(calls), 1)
+            # Only the other process's one new event is verified (Kata m0tg), never the history.
+            self.assertEqual(calls, [])
             self.assertEqual(seen.state["events"], 4)
             self.assertIn("rev-memo-7", {e["event_id"] for e in seen.events})
             self.read()
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls, [])
 
     def test_a_pass_that_overlaps_a_commit_is_not_remembered(self):
         """A commit between the identity taken before and after the pass stores nothing."""
@@ -349,6 +350,167 @@ class MemoConcurrentWriter(MemoCase):
         with patched:
             self.read()
         self.assertEqual(len(calls), 1)
+
+
+class DeltaVerification(MemoCase):
+    """After SQLite's own commits only the rows past the remembered head are verified (Kata m0tg)."""
+
+    def deltas(self):
+        seen = []
+        real = events.validate_delta
+
+        def counting(history, incoming, root=None, upto=None):
+            seen.append(len(incoming))
+            return real(history, incoming, root, upto)
+        return seen, patch.object(events, "validate_delta", counting)
+
+    def fresh_state(self):
+        events.clear_memo()
+        return self.read()
+
+    def test_an_append_validates_only_its_incoming_events_not_the_history(self):
+        self.read()
+        calls, patched = self.full_passes()
+        seen, delta = self.deltas()
+        with patched, delta:
+            add(self.root, 3)
+        self.assertEqual((calls, seen), ([], [1, 1]))  # the incoming check, then the read after commit
+
+    def test_the_delta_state_equals_a_full_replay_of_the_same_file(self):
+        self.read()
+        for n in range(3, 8):
+            add(self.root, n)
+            extended = self.read()
+            replayed = self.fresh_state()
+            self.assertEqual((extended.state, extended.events, extended.successors),
+                             (replayed.state, replayed.events, replayed.successors))
+
+    def test_a_correction_across_the_delta_is_verified_against_the_remembered_history(self):
+        self.read()
+        first = event(self.root, 0)
+        correction = event(self.root, 50, supersedes=["rev-memo-0"], correction_reason="Synthetic correction.",
+                           recorded_at=(datetime.fromisoformat(first["recorded_at"]) + timedelta(seconds=5)).isoformat())
+        correction["source"] = first["source"]
+        correction["scope"] = first["scope"]
+        state = events.status(self.root)
+        events.append(self.root, events.bundle([correction]), ACTOR, "req-memo-50",
+                      state["revision"], state["state_token"])
+        got = self.read()
+        self.assertEqual(got.successors, {"rev-memo-0": "rev-memo-50"})
+        self.assertEqual(got.state, self.fresh_state().state)
+        again = event(self.root, 51, supersedes=["rev-memo-0"], correction_reason="Second branch.",
+                      recorded_at=(datetime.fromisoformat(first["recorded_at"]) + timedelta(seconds=9)).isoformat())
+        again["source"], again["scope"] = first["source"], first["scope"]
+        state = events.status(self.root)
+        with self.assertRaisesRegex(contract.ReviewError, "Conflicting correction branches"):
+            events.append(self.root, events.bundle([again]), ACTOR, "req-memo-51",
+                          state["revision"], state["state_token"])
+
+    def test_append_refuses_a_duplicate_event_id_and_an_unresolved_correction(self):
+        self.read()
+        state = events.status(self.root)
+        with self.assertRaisesRegex(contract.ReviewError, "Event ID already exists"):
+            events.append(self.root, events.bundle([event(self.root, 1)]), ACTOR, "req-dup",
+                          state["revision"], state["state_token"])
+        ghost = event(self.root, 60, supersedes=["rev-nowhere"], correction_reason="Synthetic.")
+        with self.assertRaisesRegex(contract.ReviewError, "Unresolved/self correction"):
+            events.append(self.root, events.bundle([ghost]), ACTOR, "req-ghost",
+                          state["revision"], state["state_token"])
+
+    def test_a_reader_older_than_a_commit_never_sees_events_past_its_state(self):
+        before = self.read()
+        add(self.root, 3)
+        self.read()
+        self.assertEqual(len(before.events), 3)
+        self.assertIsNone(before.event("rev-memo-3"))
+        self.assertEqual(before.at("sources/memo-3.txt"), [])
+        self.assertEqual(self.read().event("rev-memo-3")["event_id"], "rev-memo-3")
+
+    def test_a_forged_row_appended_outside_the_writer_is_refused_by_the_delta(self):
+        self.read()
+        with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
+            connection.execute("INSERT INTO batches VALUES (99,'req-forged','x','2026-01-01T00:00:00+00:00','0',1,'0','0')")
+        os.chmod(self.db, 0o600)
+        self.refused()
+
+    def bump_counter(self):
+        """What a SQLite commit does to the header, without a commit (an editor who knows the format)."""
+        descriptor = os.open(self.db, os.O_RDWR)
+        counter = int.from_bytes(os.pread(descriptor, 4, 24), "big")
+        os.pwrite(descriptor, (counter + 1).to_bytes(4, "big"), 24)
+        os.close(descriptor)
+
+    def test_an_old_row_edit_disguised_as_a_commit_is_seen_by_an_audit_a_full_read_and_the_next_day(self):
+        """The stated bound of the delta: rows before the remembered head are read again only at the
+        next full check (audit, publication, backup, new UTC day, other contract or file)."""
+        self.read()
+        self.raw_edit(restore_mtime=False)
+        self.bump_counter()
+        calls, patched = self.full_passes()
+        with patched:
+            self.assertEqual(self.read().state["events"], 3)  # served by the delta: nothing past the head
+            self.assertEqual(calls, [])
+            with self.day_after():
+                self.refused("Event payload hash mismatch")
+
+    def test_an_audit_refuses_the_disguised_edit(self):
+        self.read()
+        self.raw_edit(restore_mtime=False)
+        self.bump_counter()
+        self.assertEqual(self.read().state["events"], 3)
+        with self.assertRaisesRegex(contract.ReviewError, "Event payload hash mismatch"):
+            events.status(self.root, audit=True)
+
+    def test_an_edit_that_leaves_the_counter_alone_is_refused_at_once(self):
+        self.read()
+        self.raw_edit(restore_mtime=False)
+        self.refused("Event payload hash mismatch")
+
+    def test_a_publication_read_replays_everything_it_serves(self):
+        self.read()
+        add(self.root, 3)
+        calls, patched = self.full_passes()
+        with patched:
+            event_reader.read_snapshot(self.root, full=True)
+            event_reader.read_snapshot(self.root)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_full_read_catches_an_old_row_edit_the_delta_would_not(self):
+        self.read()
+        with closing(events.connect(self.db)) as connection:
+            connection.execute("BEGIN")
+            identity = events.file_identity(self.db, connection)
+        self.raw_edit(restore_mtime=False)
+        with patch.object(events, "file_identity", lambda path, connection: identity):
+            self.assertEqual(self.read().state["events"], 3)  # same identity: the documented residual
+            with self.assertRaisesRegex(contract.ReviewError, "Event payload hash mismatch"):
+                event_reader.read_snapshot(self.root, full=True)
+
+    def test_a_changed_contract_is_refused_on_the_delta_path(self):
+        self.read()
+        add(self.root, 3)
+        schema = events.store_schema(self.root)
+        schema["description"] = "A different installed contract."
+        with patch.object(events, "store_schema", lambda root=None: schema):
+            self.refused("Stored contract differs")
+
+    def test_a_dropped_trigger_is_refused_on_the_delta_path(self):
+        self.read()
+        with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
+            connection.execute("DROP TRIGGER immutable_events_update")
+        os.chmod(self.db, 0o600)
+        self.refused("Append-only trigger missing or changed")
+
+    def test_a_removed_remembered_head_is_not_extended(self):
+        self.read()
+        with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
+            for table in ("metadata", "batches", "events", "corrections"):
+                for action in ("update", "delete"):
+                    connection.execute(f"DROP TRIGGER immutable_{table}_{action}")
+            connection.execute("DELETE FROM corrections")
+            connection.execute("UPDATE events SET entry_hash='0' WHERE sequence=3")
+        os.chmod(self.db, 0o600)
+        self.refused()
 
 
 class QualifyEquivalence(QualifyCase):

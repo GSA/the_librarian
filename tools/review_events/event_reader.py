@@ -41,6 +41,20 @@ class Snapshot:
     events: list
     successors: dict
     root: Path = contract.ROOT
+    history: object = None
+
+    def event(self, event_id):
+        """The event with this ID, or None; constant time on a memoized history."""
+        if self.history is not None:
+            return self.history.event(event_id, self.state["events"])
+        return next((e for e in self.events if e["event_id"] == event_id), None)
+
+    def at(self, locator):
+        """Events whose source locator is ``locator``, in store order; constant time to find."""
+        if self.history is None:
+            return [e for e in self.events if e["source"]["locator"] == locator]
+        count = self.state["events"]
+        return [self.history.events[n - 1] for n in self.history.by_locator.get(locator, ()) if n <= count]
 
     def query(self, *, receipt_id=None, source_id=None, outcome=None, content=None,
               unit=None, scope=None, origin=None, include_history=False, limit=10,
@@ -121,17 +135,18 @@ class Snapshot:
         return packet
 
 
-def read_snapshot(root):
-    """Read once with mode=ro and BEGIN; validate all history before any filtering."""
+def read_snapshot(root, *, full=False):
+    """Read once with mode=ro and BEGIN; validate all history before any filtering.
+
+    A memoized store verifies only what changed since it was last validated (Kata m0tg); ``full``
+    replays the whole history first, as publication does for everything it serves."""
     try:
         _, db, _ = store.locations(root)
         contract.require(db.exists(), "Review-event database is missing; no legacy fallback")
         with closing(store.connect(db)) as connection:
             connection.execute("BEGIN")
-            state, events = store.inspect(connection, root, reuse=True)
-            successors = {predecessor: event["event_id"]
-                          for event in events for predecessor in event["supersedes"]}
-        return Snapshot(state, events, successors, root)
+            state, events, successors, history = store.view(connection, root, reuse=True, full=full)
+        return Snapshot(state, events, successors, root, history)
     except contract.ReviewError:
         raise
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, RecursionError) as error:

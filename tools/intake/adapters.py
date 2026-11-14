@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from zipfile import BadZipFile
 
 from tools.catalog import catalog_store as catalog
+from tools.review_events import event_reader
 from tools.review_events import event_store as events
 from tools.extraction import docling_adapter as docling
 from tools.extraction import extract
@@ -53,10 +54,28 @@ STANDING_REVIEW = ("policy_path", "policy_sha256", "rendition", "rendition_sha25
                    "findings_path", "findings_sha256", "event_id")
 
 
-def standing_intent(root, stage):
+class OneRead:
+    """A review-event snapshot read at most once, on first use, shared by the steps of one stage.
+
+    Calling it returns the snapshot; an unreadable store refuses exactly as ``standing.evaluate``
+    does when it reads for itself."""
+
+    def __init__(self, root):
+        self.root, self.value = root, None
+
+    def __call__(self):
+        if self.value is None:
+            try:
+                self.value = event_reader.read_snapshot(self.root)
+            except events.contract.ReviewError as error:
+                raise standing.Refusal("blocked", "review-store-unavailable") from error
+        return self.value
+
+
+def standing_intent(root, stage, snapshot=None):
     """Evaluate a standing-policy stage; the outcome is pinned before any write."""
     args = {key: stage["arguments"][key] for key in STANDING_REVIEW}
-    result = standing.evaluate(root, args)
+    result = standing.evaluate(root, args, snapshot)
     result.pop("child", None)
     return {"operation": stage["operation"], **result}
 
@@ -90,15 +109,15 @@ def _prepare(root, stage):
         args = stage["arguments"]
         operation = stage["operation"]
         if operation in {"standing-review", "standing-select"}:
-            intent = standing_intent(root, stage)
+            snapshot = OneRead(root)
+            intent = standing_intent(root, stage, snapshot)
             if operation == "standing-review" and intent["outcome"] == "qualified":
                 # Fixed once in the saved intent so a crash-after-commit retry
                 # resubmits the identical event under the same request ID. A
                 # correction must be recorded strictly after what it supersedes.
                 recorded = standing.datetime.now(standing.timezone.utc).replace(microsecond=0)
                 for predecessor in intent.get("supersedes", ()):
-                    prior = standing.datetime.fromisoformat(
-                        events.status(root, predecessor)["event"]["recorded_at"])
+                    prior = standing.datetime.fromisoformat(snapshot().event(predecessor)["recorded_at"])
                     recorded = max(recorded, prior.replace(microsecond=0) + standing.timedelta(seconds=1))
                 intent["recorded_at"] = recorded.isoformat()
             return intent
@@ -148,10 +167,12 @@ def execute(root, stage, intent, previous=None):
         raise StageFailure(error.category, error.code) from error
 
 
-def _standing_result(root, stage, intent):
-    """Re-evaluate against current inputs; stale policy, source or findings refuse."""
+def _standing_result(root, stage, intent, snapshot=None):
+    """Re-evaluate against current inputs; stale policy, source or findings refuse.
+
+    ``snapshot`` is the one review-event read the caller shares across this stage's steps."""
     args = {key: stage["arguments"][key] for key in STANDING_REVIEW}
-    result = standing.evaluate(root, args)
+    result = standing.evaluate(root, args, snapshot)
     current = {"operation": stage["operation"], **{k: v for k, v in result.items() if k != "child"}}
     expected = {k: v for k, v in intent.items() if k != "recorded_at"}
     if current != expected:
@@ -165,10 +186,13 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
         args = stage["arguments"]
         operation = stage["operation"]
         if operation == "standing-review":
-            review_args, result = _standing_result(root, stage, intent)
+            # One read serves the evaluation and the expected state; the commit and the binding check
+            # after it each read what they must see (Kata m0tg).
+            snapshot = OneRead(root)
+            review_args, result = _standing_result(root, stage, intent, snapshot)
             event = standing.review_event(result, review_args,
                                           standing.datetime.fromisoformat(intent["recorded_at"]))
-            state = events.status(root)
+            state = snapshot().state
             committed = events.append(root, events.bundle([event]), result["reviewer"], args["request_id"],
                                       state["revision"], state["state_token"])
             if standing.bound_event(root, result, review_args) is None:
@@ -177,8 +201,9 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                     "event_ids": [args["event_id"]], "request_id": args["request_id"],
                     "policy": result["policy"], "idempotent": committed["idempotent"]}
         if operation == "standing-select":
-            review_args, result = _standing_result(root, stage, intent)
-            if standing.bound_event(root, result, review_args) is None:
+            snapshot = OneRead(root)
+            review_args, result = _standing_result(root, stage, intent, snapshot)
+            if standing.bound_event(root, result, review_args, snapshot()) is None:
                 raise StageFailure("blocked", "review-event-missing")
             child = standing.selected_child(result, review_args)
             submitted = catalog.submit(
