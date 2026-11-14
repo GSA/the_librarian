@@ -76,10 +76,12 @@ def derived(root, c):
         try:
             extract = heads_of.resolve(c, "extract-" + submission_id + suffix)
             register = heads_of.resolve(c, "register-" + submission_id + suffix)
-        except IntakeError:
-            skipped["ambiguous"] = skipped.get("ambiguous", 0) + 1
-            continue
-        found[(system, path)] = {"format": fmt, **docs.derive(c, submission_id, suffix, extract, register)}
+            row = docs.derive(c, submission_id, suffix, fmt, extract, register)
+        except IntakeError as error:
+            if error.code != "ambiguous_correction":
+                raise
+            row = docs.ambiguous(c, submission_id, suffix, fmt)
+        found[(system, path)] = {"format": fmt, **row}
     return found, skipped
 
 

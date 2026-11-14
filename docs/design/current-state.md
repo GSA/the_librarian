@@ -227,7 +227,10 @@ restated here.
   `ingest --trust-stat` reports an extracted document straight from its row, without reading,
   hashing or looking it up in the ledger, when its stat identity equals the row's; a same-size edit
   that restores the mtime still changes `ctime`, but a tool that also resets `ctime` is outside what
-  stat can show, which is why the mode is opt-in (efz3 decision D8). Evidence:
+  stat can show, which is why the mode is opt-in (efz3 decision D8). A row never vouches for a chain
+  `ingest` would refuse: a head that does not repeat the document's operation, receipt and format is
+  state `mismatch`, a branching chain is `ambiguous`, and an upload correction repoints the row in the
+  staging transaction and drops the old stat identity; none of these is trusted. Evidence:
   `tests/test_intake_docs.py` (recording, same-transaction rollback, correction repointing, backfill
   and audit, same-size edit with restored mtime, rename-over, truncate, append and touch with and
   without `--trust-stat`, report equality with and without it).

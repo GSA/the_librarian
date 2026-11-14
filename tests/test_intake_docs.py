@@ -330,3 +330,83 @@ class ChangeDetectionTests(DocsCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
         self.extra = None
+
+
+class CorrectionSafetyTests(DocsCase):
+    """Roborev findings on the first docs commit: a row never vouches for a chain ingest would refuse."""
+
+    def blocked_registers(self):
+        real = catalog.submit
+
+        def race(root, records, **kwargs):
+            if kwargs["request_id"].startswith("extract-"):
+                raise catalog.CatalogError("Stale expected state; re-read before writing")
+            return real(root, records, **kwargs)
+        with unittest.mock.patch.object(catalog, "submit", side_effect=race):
+            self.ingest()
+        return sorted(r["correlation_id"] for r in store.list_requests(self.root)
+                      if r["correlation_id"].startswith("register-"))
+
+    def test_a_settled_correction_for_another_receipt_is_never_trusted(self):
+        self.ingest()
+        first, other = sorted(r["correlation_id"] for r in store.list_requests(self.root)
+                              if r["correlation_id"].startswith("register-"))[:2]
+        stage = store.request(self.root, other)["stages"][0]
+        cohort._stage_request(self.root, first + "-wrong", [stage], correction_of=first)
+        runner.settle(self.root, first + "-wrong", "register")
+        path = next(p for (_, p), r in rows(self.root).items() if r["register_head"] == first + "-wrong")
+        self.assertEqual(rows(self.root)[("inbox", path)]["state"], "mismatch")
+        for trust in (False, True):
+            report = self.ingest(trust_stat=trust)
+            self.assertEqual(self.entry(report, path)["code"], "correction_mismatch")
+            self.assertEqual(report["counts"]["outcome"]["failed"], 1)
+
+    def test_a_branching_chain_is_ambiguous_and_never_trusted(self):
+        self.ingest()
+        first = sorted(r["correlation_id"] for r in store.list_requests(self.root)
+                       if r["correlation_id"].startswith("register-"))[0]
+        stage = store.request(self.root, first)["stages"][0]
+        for name in ("-one", "-two"):
+            cohort._stage_request(self.root, first + name, [stage], correction_of=first)
+        states = [r["state"] for r in rows(self.root).values()]
+        self.assertEqual(sorted(states), ["ambiguous"] + ["extracted"] * 5)
+        for trust in (False, True):
+            report = self.ingest(trust_stat=trust)
+            self.assertEqual(report["counts"]["failed_by_code"], {"register/ambiguous_correction": 1})
+        self.assertEqual(docsync.audit(self.root)["differences"], [])
+
+    def test_an_upload_correction_repoints_the_row_before_anything_else_runs(self):
+        first = self.ingest()
+        old = self.entry(first, "a/notes.md")
+        self.writable()
+        (self.inbox / "a/notes.md").write_bytes(b"# Notes\nA different line\n")
+        new = cohort.submission("a/notes.md", "inbox", "text", hashlib.sha256(b"# Notes\nA different line\n").hexdigest())
+        descriptor = upload.descriptor(
+            submission_id=new["submission_id"], format_name="text", correction_of=old["submission_id"],
+            name=new["name"], actor="cohort-runner", reason=cohort.REASON, origin_kind="local-path",
+            origin_system="inbox", origin_locator=new["locator"])
+        with unittest.mock.patch.object(runner, "settle"):  # staged, but never run
+            upload.submit(self.root, self.inbox / "a/notes.md", descriptor)
+        row = rows(self.root)[("inbox", "a/notes.md")]
+        self.assertEqual((row["submission_id"], row["state"], row["ino"], row["extract_head"]),
+                         (new["submission_id"], "staged", None, None))
+        self.assertEqual(docsync.audit(self.root)["differences"], [])
+
+    def test_a_limited_run_reports_no_private_fields(self):
+        for trust in (False, True):
+            self.ingest()
+            report = self.ingest(limit=2, trust_stat=trust)
+            self.assertFalse([e for e in report["entries"] if "_stat" in e or "_fast" in e])
+            self.assertEqual(report["counts"]["outcome"]["not-processed"], 4)
+
+    def test_recording_looks_up_only_the_batch_not_the_cohort(self):
+        self.ingest()
+        seen = []
+        real = docs.load
+
+        def spy(c, system, paths=None):
+            seen.append(paths)
+            return real(c, system, paths)
+        with unittest.mock.patch.object(docs, "load", spy):
+            self.ingest()
+        self.assertEqual([len(p) for p in seen], [6])

@@ -331,7 +331,7 @@ def _record(root, system, pending, heads):
     with store.locked(root) as c:
         if not docs.present(c):
             return
-        saved = docs.load(c, system)
+        saved = docs.load(c, system, [entry["relative"] for entry, _ in pending])
         with c:
             for entry, stat in pending:
                 if not entry.get("submission_id"):
@@ -340,20 +340,21 @@ def _record(root, system, pending, heads):
                 sid = entry["submission_id"]
                 if c.execute("SELECT 1 FROM requests WHERE correlation_id=?", ("upload-" + sid,)).fetchone() is None:
                     continue
+                row = saved.get(entry["relative"])
                 try:
                     extract = heads.resolve(c, "extract-" + sid + suffix)
                     register = heads.resolve(c, "register-" + sid + suffix)
+                    if row and row["submission_id"] == sid and row["suffix"] == suffix:
+                        derived = {k: row[k] for k in ("submission_id", "suffix", "receipt_id", "original", "sha256")}
+                        derived.update(extract_head=extract, register_head=register,
+                                       **docs.measure(c, sid, suffix, entry["format"], row["receipt_id"],
+                                                      extract, register))
+                    else:
+                        derived = docs.derive(c, sid, suffix, entry["format"], extract, register)
                 except IntakeError as error:
                     if error.code != "ambiguous_correction":
                         raise
-                    continue  # no single head to follow: the entry already failed, and has no row
-                row = saved.get(entry["relative"])
-                if row and row["submission_id"] == sid and row["suffix"] == suffix:
-                    derived = {k: row[k] for k in ("submission_id", "suffix", "receipt_id", "original", "sha256")}
-                    derived.update(extract_head=extract, register_head=register,
-                                   **docs.measure(c, sid, extract, register))
-                else:
-                    derived = docs.derive(c, sid, suffix, extract, register)
+                    derived = docs.ambiguous(c, sid, suffix, entry["format"])
                 keep = stat if entry.get("sha256") == derived["sha256"] else None
                 wanted = {**derived, "format": entry["format"], **dict(zip(docs.STAT, keep or (None,) * 5))}
                 if row and all(row[k] == wanted[k] for k in (*docs.DERIVED, *docs.STAT)):
@@ -385,12 +386,12 @@ def ingest(root, inbox, *, system, actor, limit=None, trust_stat=False):
     heads = store.Heads()
     pending = []
     for number, entry in enumerate(admitted):
+        stat, fast = entry.pop("_stat", None), entry.pop("_fast", False)
         if limit is not None and number >= limit:
             entry["outcome"] = "not-processed"
             outcome["not-processed"] += 1
             continue
-        stat = entry.pop("_stat", None)
-        if entry.pop("_fast", False):
+        if fast:
             entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
         else:
             entry.update(_settled(root, inbox, entry, system, actor, heads))
