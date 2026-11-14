@@ -539,7 +539,8 @@ class ReplayTests(CohortCase):
         with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
                 unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
             self.ingest()
-        self.assertEqual(locked.call_count, 3 * admitted)
+        # Plus one open to confirm the docs rows (Kata e22r) for the whole inbox (500 entries per open).
+        self.assertEqual(locked.call_count, 3 * admitted + 1)
         inspected.assert_not_called()
 
     def test_a_file_modified_between_runs_is_still_detected_and_corrected(self):

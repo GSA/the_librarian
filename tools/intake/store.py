@@ -12,6 +12,7 @@ import time
 
 from tools import policy
 from tools.file_identity import file_identity
+from . import docs
 from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, request_layout, request_shape, require
 
 APPLICATION_ID = 0x4C494E54
@@ -39,7 +40,23 @@ CREATE TABLE acknowledgments (
  correlation_id TEXT NOT NULL, stage_id TEXT NOT NULL, payload TEXT NOT NULL,
  payload_sha256 TEXT NOT NULL, PRIMARY KEY(correlation_id,stage_id),
  FOREIGN KEY(correlation_id,stage_id) REFERENCES stages(correlation_id,stage_id));
+-- Derived (Kata e22r): one row per cohort document, recomputable from the requests above.
+CREATE TABLE docs (
+ system TEXT NOT NULL, path TEXT NOT NULL, format TEXT NOT NULL,
+ submission_id TEXT NOT NULL, suffix TEXT NOT NULL DEFAULT '', sha256 TEXT NOT NULL,
+ receipt_id TEXT NOT NULL, original TEXT NOT NULL, state TEXT NOT NULL,
+ conflicts INTEGER NOT NULL DEFAULT 0, rendition TEXT, rendition_sha256 TEXT,
+ extract_head TEXT, register_head TEXT,
+ dev INTEGER, ino INTEGER, size INTEGER, mtime_ns INTEGER, ctime_ns INTEGER, last_run REAL,
+ PRIMARY KEY(system, path)) WITHOUT ROWID;
+CREATE INDEX docs_state ON docs(state);
+CREATE INDEX docs_upload ON docs(submission_id);
+CREATE INDEX docs_extract ON docs(extract_head);
+CREATE INDEX docs_register ON docs(register_head);
 """
+# The derived table is the tail of ``DDL``: a ledger that predates it gets exactly these statements
+# from ``cohort backfill-docs``, and nothing else about the ledger changes.
+DOCS_DDL = DDL[DDL.index("-- Derived (Kata e22r)"):]
 
 
 def safe(path):
@@ -435,6 +452,8 @@ def stage(root, raw):
             with c:
                 c.execute("INSERT INTO requests VALUES (?,?,?,?,?)", (correlation, value["correction_of"], raw, digest(raw), str(safe(root))))
                 c.executemany("INSERT INTO stages(correlation_id,stage_id,ordinal,status) VALUES (?,?,?,'staged')", [(correlation, s["id"], i) for i, s in enumerate(value["stages"])])
+                if value["correction_of"]:
+                    docs.repoint(c, value["correction_of"], correlation)
         return summary(c, correlation)
 
 
@@ -480,6 +499,20 @@ class Heads:
                                        "WHERE rowid>? AND correction_of IS NOT NULL", (self._top,)):
             self._children.setdefault(parent, []).append(child)
         self._top = top
+
+    def resolve(self, c, correlation_id):
+        """The newest request of ``correlation_id``'s chain on an open ledger; None when it is absent."""
+        self._extend(c)
+        if c.execute("SELECT 1 FROM requests WHERE correlation_id=?", (correlation_id,)).fetchone() is None:
+            return None
+        current, seen = correlation_id, {correlation_id}
+        while True:
+            children = self._children.get(current, [])
+            if not children:
+                return current
+            require(len(children) == 1 and children[0] not in seen, "ambiguous_correction")
+            current = children[0]
+            seen.add(current)
 
     def head(self, root, correlation_id):
         with locked(root) as c:
