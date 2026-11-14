@@ -163,8 +163,11 @@ def load_compaction():
     return module
 
 
-def original_allowed(path, root=None):
-    return isinstance(path, str) and policy.allowed(path, "original_roots", root)
+def original_allowed(path, root=None, settings=None):
+    """``settings`` is a policy the caller already loaded for ``root``; omitted, it is read now."""
+    if settings is None:
+        return isinstance(path, str) and policy.allowed(path, "original_roots", root)
+    return isinstance(path, str) and policy.allowed_in(settings, path, "original_roots")
 
 
 def rendition_api(root=None):
@@ -175,9 +178,16 @@ def rendition_api(root=None):
         )
     }
     if root is not None:
+        loaded = []
+
+        def settings():
+            # The instance policy is read once per API object (one operation), not once per selection.
+            if not loaded:
+                loaded.append(policy.for_root(root)[0])
+            return loaded[0]
         api["eligible"] = lambda p: eligible(p, root)
         api["canonical_locator"] = lambda v: canonical_locator(v, root)
-        api["original_allowed"] = lambda p: original_allowed(p, root)
+        api["original_allowed"] = lambda p: original_allowed(p, root, settings())
         api["validate_context"] = lambda c: validate_context(c, root)
     return types.SimpleNamespace(**api)
 
@@ -588,13 +598,15 @@ def count_index(connection):
 
 
 
-def freshness(connection, root, manifest, db, config, manifest_hash):
+def freshness(connection, root, manifest, db, config, manifest_hash, expected=None):
+    """Reasons the index is stale; ``expected`` is a ``metadata_expected`` the caller just computed."""
     no_symlinks(db)
     actual = dict(connection.execute("SELECT key,value FROM metadata"))
     review_snapshot = (load_event_reader().read_snapshot(root)
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
-    expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)
+    if expected is None:
+        expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)
     reasons = [f"metadata changed: {key}" for key in expected if actual.get(key) != expected[key]]
     if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rendition_documents'").fetchone():

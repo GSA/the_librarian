@@ -375,8 +375,8 @@ operator's, or one whose submission cannot be proven) is left byte-identical and
 several inboxes can share one catalog, manifest and index ([design](../docs/design/current-state.md#3-intake-and-review)).
 Only an orphan (receipt missing from the catalog, or retained rendition file gone) is dropped. The
 read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
-processes keep each other's writes, and replacement is atomic. The manifest holds at most 5,000
-selections across all cohorts. When the manifest has no room for an in-scope rendition that has no
+processes keep each other's writes, and replacement is atomic. The manifest holds at most 20,000
+selections across all cohorts (a 36,000-document cohort needs about 13,000 at a 37% acceptance rate). When the manifest has no room for an in-scope rendition that has no
 saved review, `qualify` makes no model call for it: it stays `pending-review` (`selection-capacity`)
 with nothing saved, and a later run with room reviews it once. A rendition whose review is saved is
 selected without a call once room appears. `counts.selection_capacity` (`entries`,
@@ -407,7 +407,7 @@ review a run appends until the next publish); `publish` recovers that at the cos
 publication instead of a re-run's whole ingest and entry walk. It is idempotent: a saved success
 is reused while the index is present and fresh, otherwise a new revision is staged. Output is
 body-free `counts` (`published`, `selections`) and `publication` (`status`, `available`, and the
-blocking `code` when refused); exit status 0 only when published. A run's entries not yet
+blocking `code` when refused); exit status 0 only when published. Publication re-validates every selection, so its cost is linear in selections: about 2.6 ms per selection on a shared development host (a first publish of 20,000 selections about 53 s and about 1.4 GB of memory, an unchanged re-publish about 8 s; `tools/diagnostics/publish_benchmark.py` measures it on synthetic selections). Raising the cap makes every existing index stale once, because the engine fingerprint changed; the next publish rebuilds it. A run's entries not yet
 reviewed are not selected, so what is served is exactly the selections made so far. Qualification
 is not published during a run on purpose: while reviews are still being appended an interim index
 is stale again at the next review, so it could not serve progress.
@@ -426,7 +426,7 @@ scheduling a call, stages the request, and the `standing-review` adapter ends it
 `entries` refused and `model_calls_skipped`. With no policy file, `qualify` generates
 `scope.receipts: ["D*"]` (any upload receipt `D<number>`, audience `source`), so it covers the
 cohort without a list of IDs; a policy that exists is never rewritten. A hand-written policy lists
-receipt IDs (at most 5,000) or may include `"D*"`.
+receipt IDs (at most 20,000) or may include `"D*"`.
 *Operator note: widening an existing instance's scope.* Edit the scope **and raise `version`**
 in the private policy file, then re-run `qualify` once per cohort with the same `--system`,
 `--inbox`, policy, manifest and index. Because the policy hash is part of every standing request, the

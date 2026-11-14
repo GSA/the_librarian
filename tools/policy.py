@@ -253,7 +253,11 @@ def fingerprint(root=None):
 
 
 def allowed(name, category, root=None):
-    settings = for_root(root)[0]
+    return allowed_in(for_root(root)[0], name, category)
+
+
+def allowed_in(settings, name, category):
+    """``allowed`` against settings the caller already loaded (one read per operation, not per path)."""
     path = PurePosixPath(name)
     if path.is_absolute() or "\\" in name or any(p in ("", ".", "..") for p in name.split("/")):
         return False

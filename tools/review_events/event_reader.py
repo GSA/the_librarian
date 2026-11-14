@@ -4,7 +4,7 @@
 import argparse
 from contextlib import closing
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
@@ -41,6 +41,21 @@ class Snapshot:
     events: list
     successors: dict
     root: Path = contract.ROOT
+    _by_id: tuple = field(default=None, init=False, repr=False, compare=False)
+
+    def event_index(self):
+        """``event_id`` -> event, built once per snapshot rather than once per selection.
+
+        The cache holds the list it was built from and that list's length, so a different or longer
+        ``events`` list is indexed afresh; callers treat the events as read-only, as the memo requires.
+        """
+        cached = self._by_id
+        if cached is None or cached[0] is not self.events or cached[1] != len(self.events):
+            cached = self._by_id = (self.events, len(self.events), self._index_events())
+        return cached[2]
+
+    def _index_events(self):
+        return {event.get("event_id"): event for event in self.events if isinstance(event, dict)}
 
     def query(self, *, receipt_id=None, source_id=None, outcome=None, content=None,
               unit=None, scope=None, origin=None, include_history=False, limit=10,

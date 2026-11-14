@@ -3,15 +3,19 @@
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 from bisect import bisect_right
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from tools.context_index import qualification
 
 
-# One instance publishes a reviewed cohort (thousands of files), not a hand-picked handful.
-MAX_SELECTIONS = 5000
+# One instance publishes a reviewed cohort (tens of thousands of files), not a hand-picked handful.
+# Sized for a 36,000-document cohort at the observed acceptance rate (about 13,000 selections) with
+# headroom; publish cost and manifest rewrite cost at this size are in docs/design/current-state.md.
+MAX_SELECTIONS = 20000
 DOCLING_MAX_PAGES = 100
 DOCLING_MAX_RECORDS = 10000
 DOCLING_RENDER_SCALE = 3.0
@@ -72,11 +76,38 @@ def validate(config, engine, root=None):
         seen.add(item["path"])
 
 
+def _checker(root, engine):
+    """A ``no_symlinks`` that looks only at the components below ``root``.
+
+    The instance root's own ancestors are checked once per call, not once per selected file; every
+    component below it (the extraction directories and the file) is checked each time. A path that
+    is not below the root takes the full check.
+    """
+    top = str(engine.no_symlinks(root))
+    prefix = top.rstrip(os.sep) + os.sep
+
+    def check(path):
+        name = os.path.abspath(path)
+        if not name.startswith(prefix) or ".." in Path(path).parts:
+            return engine.no_symlinks(path)
+        current = top
+        for part in name[len(prefix):].split(os.sep):
+            current = current + os.sep + part
+            try:
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    return engine.no_symlinks(path)
+            except OSError:
+                break  # nothing at or below a missing component can be a symlink; the read fails next
+        return Path(name)
+    return check
+
+
 def inputs(root, config, engine, review_snapshot=None):
     """Pin selected catalog records, original bytes and retained extraction bytes."""
     selections = config.get("renditions", [])
     if not selections:
         return [], ""
+    no_symlinks = _checker(root, engine)
     catalog = engine.load_catalog()
     if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
             and review_snapshot is None):
@@ -92,7 +123,7 @@ def inputs(root, config, engine, review_snapshot=None):
         data = original["data"]
         if not engine.original_allowed(data["path"]):
             engine.fail("Original source excluded by current policy")
-        path = engine.no_symlinks(root / item["path"])
+        path = no_symlinks(root / item["path"])
         raw = catalog.private_file(path).read_bytes()
         if hashlib.sha256(raw).hexdigest() != item["sha256"]:
             engine.fail("Selected rendition hash changed: " + item["path"])
@@ -160,7 +191,7 @@ def inputs(root, config, engine, review_snapshot=None):
                 or relation_data.get("to_id") != original["id"]
                 or relation_data.get("relation") != "rendition-of"):
             engine.fail("Rendition/source registration mismatch: " + item["path"])
-        original_path = engine.no_symlinks(root / engine.relative_name(source["path"]))
+        original_path = no_symlinks(root / engine.relative_name(source["path"]))
         if not original_path.is_file() or original_path.stat().st_size != source["bytes"]:
             engine.fail("Original source missing or changed: " + source["path"])
         with original_path.open("rb") as stream:

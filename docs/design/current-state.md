@@ -234,10 +234,11 @@ restated here.
   or its receipt's pinned `local-path` sidecar names that system; anything that
   cannot be proven that way is left alone, and orphans are dropped and counted.
   The manifest read-modify-write holds the ledger writer lock and replacement is
-  atomic. The manifest holds at most `renditions.MAX_SELECTIONS` (5,000) entries
-  across all cohorts. An in-scope entry with no saved review is not sent to the
+  atomic. The manifest holds at most `renditions.MAX_SELECTIONS` (20,000) entries
+  across all cohorts (sized for a 36,000-document cohort at the observed 37%
+  acceptance, about 13,000 selections, with headroom; Kata jysk). An in-scope entry with no saved review is not sent to the
   model when the manifest has no room for it: `qualify` checks the room (an
-  exact read, 2 ms at 5,000 entries) on the main thread just before the call,
+  exact read, 2 ms at 5,000 entries and linear) on the main thread just before the call,
   and a refused entry ends `pending-review` with `selection-capacity` with
   nothing staged, so the next run with room reviews it once. Concurrent
   prefetching starts a review ahead only while the free room exceeds the entries
@@ -257,6 +258,37 @@ restated here.
   `test_two_processes_qualifying_different_cohorts_do_not_lose_each_others_writes`).
   Operator notes (restoring cohorts an older toolkit pruned; requalifying after a
   policy bump) are in `context/intake.md`.
+- **Publishing a cohort-sized manifest (Kata jysk).** Publishing validates every
+  selection (`renditions.inputs`: catalog records, original and rendition
+  bytes, review binding) and runs it several times per publish. Three
+  per-selection costs that did not need to be per selection are gone: the
+  review-event id map was rebuilt per selection (an O(selections x events)
+  build, now once per snapshot, `Snapshot.event_index`); the storage policy was
+  re-read and re-validated for every original-path check (now once per
+  operation, `policy.allowed_in`); and every selected file re-walked the
+  instance root's own ancestors for symlinks (now the components below the root
+  are checked each time, the root's ancestors once per call). Publication also
+  derived the same index metadata twice more than needed: the index-build stage
+  reuses the metadata `prepare` has just derived and pinned while the manifest
+  hash still equals the pinned one (`adapters.pinned_metadata`), and
+  `availability` derives it once for the freshness check and the evidence
+  comparison. `renditions.inputs` ran 9 times per publish and now runs 7; an
+  unchanged re-publish ran it twice and now once. Nothing a publish verifies is
+  skipped: every selection is still fully re-validated by each remaining call.
+  Measured with `tools/diagnostics/publish_benchmark.py` on synthetic text
+  selections (host shared, ratios more reliable than seconds): first publish
+  44 s before and 34 s after at 5,000 selections (a loaded run: 143 s before,
+  34 s after); unchanged re-publish 9.7 s before and 1.9 s after; after, at
+  10,000 / 15,000 / 20,000: 26 s / 39 s / 53 s first publish (about 2.6 ms
+  per selection, linear) and 3.6 s / 5.5 s / 7.7 s re-publish; peak memory 0.7 /
+  1.0 / 1.4 GB. Budget at the cap: a first publish under one minute and a
+  re-publish under ten seconds on that host. The cap change and the code edits
+  change `engine_fingerprint` (it hashes `renditions.py`, `qualification.py`,
+  `context_index.py` and `policy.py`), so every existing index is stale once
+  and is rebuilt by the next publish; no manifest, store or published output
+  changes. Evidence: `tests/test_publish_scale.py` (constant policy reads and
+  one event index regardless of selection count, the cap boundary, a
+  publish that serves every selection).
 - **Standing scope is checked before the model call.** The policy's receipt and
   audience scope used to be applied only by the `standing-review` adapter, after
   the model had been paid, so every out-of-scope receipt cost a call and then
@@ -276,7 +308,7 @@ restated here.
   `model_calls_skipped`. With no policy file, the generated scope is
   `receipts: ["D*"]` (every upload receipt `D<number>`, audience `source`),
   which is also allowed in a hand-written policy and is not limited by the
-  5,000-entry list cap; an existing policy is never rewritten or widened.
+  20,000-entry list cap; an existing policy is never rewritten or widened.
   Widening a policy's scope changes its hash, and the hash is part of every
   standing request, so the operator raises `version` with the edit and every
   in-scope entry is then reviewed once under the new policy (one call each,
@@ -671,13 +703,13 @@ owner preference rather than measured or test-enforced facts.
   number.
 - Declining agent memory and the dead-weight pruning signal (sections 6): reasoned,
   not measured.
-- The 5,000-entry manifest cap is an implementation limit, not a design goal. Past
-  it `qualify` no longer pays for reviews it cannot select, but the cap itself is
-  unmeasured above 800 real selections. Each select rewrites and revalidates the
-  whole manifest (20 ms at 1,000 entries, 93 ms at 5,000, 274 ms at 20,000, so
-  filling a manifest is quadratic), publish grew faster than linear from 200 to
-  800 selections, and index build, reader memory and publication authorization
-  were not measured at a larger size. Raising it needs those measurements.
+- The 20,000-entry manifest cap is an implementation limit, not a design goal. It
+  replaced 5,000 (Kata jysk) once publishing was linear in selections (see
+  "Publishing a cohort-sized manifest" in section 3). Not measured above 20,000.
+  Each select still rewrites and revalidates the whole manifest (about 0.15 s
+  at 5,000 entries and 0.2 s at 15,000 in the publish benchmark, so filling a
+  manifest is quadratic until the manifest append of Kata m0tg (c) lands); that
+  is the open cost, not publication.
 - A single linear catalog hash chain (revisit triggers were: commit utilization
   above about a third of the ceiling with writers losing waits, multi-host
   writers, or a first-of-day hold above the 10 s wait even after the speedups).

@@ -33,8 +33,7 @@ def docling(selection, value, identity, snapshot, engine):
 
 def _bound(selection, source, snapshot, engine, complete_scope, label):
     """Return reviewed content for configured active events binding the exact rendition."""
-    by_id = {event.get("event_id"): event for event in snapshot.events
-             if isinstance(event, dict)}
+    by_id = snapshot.event_index()
     reviewed_content = set()
     reviewed_scope = []
     for event_id in selection["review_event_ids"]:
