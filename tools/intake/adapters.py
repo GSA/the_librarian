@@ -369,7 +369,6 @@ def execute_batch(root, entries):
                     outcomes[i] = _failure_of(error)
                 continue
             first = True
-            committed = sum(m["status"] == "committed" for m in submitted["members"])
             for i, member in zip(indexes, submitted["members"]):
                 args = entries[i][0]["arguments"]
                 if member["status"] == "refused":
@@ -379,8 +378,7 @@ def execute_batch(root, entries):
                                "request_id": args["request_id"], "record_ids": [r["id"] for r in args["records"]],
                                "receipt_ids": [r["id"] for r in args["records"] if r["kind"] == "receipt"],
                                "committed_state": member["committed_state"],
-                               "backup": submitted["backup"] if first and member["status"] == "committed" else None,
-                               "batch": {"documents": committed}}
+                               "backup": submitted["backup"] if first and member["status"] == "committed" else None}
                 first = first and member["status"] != "committed"
         return outcomes
     items, owners = [], []
