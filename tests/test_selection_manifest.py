@@ -188,6 +188,26 @@ class CrashRecovery(ManifestCase):
         self.assertEqual(self.add(entry(2)), index.digest(self.path.read_bytes()))
         self.assertEqual(len(self.disk()), 2)
 
+    def test_a_short_write_is_completed_and_a_stalled_one_keeps_the_intent(self):
+        self.write([entry(1)])
+        real = os.pwrite
+        calls = []
+
+        def short(descriptor, data, offset):
+            calls.append(len(data))
+            return real(descriptor, bytes(data)[:7], offset)  # at most seven bytes per call
+        with patch.object(os, "pwrite", short):
+            self.add(entry(2))
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(self.path.read_bytes(), self.full_rewrite([entry(1), entry(2)]))
+        self.assertFalse(os.path.lexists(manifest.intent_path(self.root, NAME)))
+        with patch.object(os, "pwrite", lambda descriptor, data, offset: 0):
+            with self.assertRaises(OSError):
+                self.add(entry(3))
+        self.assertTrue(os.path.lexists(manifest.intent_path(self.root, NAME)))  # nothing is lost
+        manifest.recover(self.root, NAME)
+        self.assertEqual(self.path.read_bytes(), self.full_rewrite([entry(1), entry(2), entry(3)]))
+
     def test_an_intent_for_a_file_that_changed_since_is_dropped_without_writing(self):
         self.write([entry(1)])
         self.crash_after_intent(entry(2))

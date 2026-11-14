@@ -368,13 +368,13 @@ def evaluate(root, args, snapshot=None):
     same = snapshot.at(args["rendition"])
     earlier = sorted(e["event_id"] for e in same
                      if e["event_id"] != args["event_id"]
-                     and snapshot.successors.get(e["event_id"], args["event_id"]) == args["event_id"]
+                     and (snapshot.superseded_by(e["event_id"]) or args["event_id"]) == args["event_id"]
                      and _earlier_standing_review(e, standing, source, qualified, args))
     if earlier:
         qualified["supersedes"] = earlier
     candidate = {**result, **qualified}
     # Only this exact standing event (a crash-after-commit retry) is exempt.
-    others = [e for e in same if e["event_id"] not in snapshot.successors
+    others = [e for e in same if snapshot.superseded_by(e["event_id"]) is None
               and e["event_id"] not in earlier
               and not _matches(e, candidate, args)]
     if others:
@@ -484,7 +484,7 @@ def bound_event(root, result, args, snapshot=None):
     except events.contract.ReviewError:
         return None
     event = snapshot.event(args["event_id"])
-    if event is None or args["event_id"] in snapshot.successors or not _matches(event, result, args):
+    if event is None or snapshot.superseded_by(args["event_id"]) is not None or not _matches(event, result, args):
         return None
     return event
 

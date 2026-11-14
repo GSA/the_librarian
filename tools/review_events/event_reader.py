@@ -4,7 +4,6 @@
 import argparse
 from contextlib import closing
 from copy import deepcopy
-from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -33,15 +32,38 @@ def json_output(packet):
     return store.canonical(packet) + "\n"
 
 
-@dataclass
 class Snapshot:
-    """One fully validated history, detached from its read-only database transaction."""
+    """One fully validated history, detached from its read-only database transaction.
 
-    state: dict
-    events: list
-    successors: dict
-    root: Path = contract.ROOT
-    history: object = None
+    On a memoized store ``events`` and ``successors`` are built on first use, bounded to the
+    state this snapshot was read at, so a caller that only looks events up (``event``, ``at``) or
+    reads ``state`` does no work proportional to the history (Kata m0tg).
+    """
+
+    def __init__(self, state, events, successors, root=contract.ROOT, history=None):
+        self.state, self.root, self.history = state, root, history
+        self._events, self._successors = events, successors
+
+    @property
+    def events(self):
+        if self._events is None:
+            self._events = self.history.events[:self.state["events"]]
+        return self._events
+
+    @property
+    def successors(self):
+        if self._successors is None:
+            count = self.state["events"]
+            self._successors = {target: successor for target, successor in self.history.successors.items()
+                                if self.history.by_id[successor] <= count}
+        return self._successors
+
+    def superseded_by(self, event_id):
+        """The ID of the event that corrects ``event_id`` in this snapshot, or None; constant time."""
+        if self.history is None:
+            return self.successors.get(event_id)
+        successor = self.history.successors.get(event_id)
+        return successor if successor is not None and self.history.event(successor, self.state["events"]) else None
 
     def event(self, event_id):
         """The event with this ID, or None; constant time on a memoized history."""
@@ -145,7 +167,8 @@ def read_snapshot(root, *, full=False):
         contract.require(db.exists(), "Review-event database is missing; no legacy fallback")
         with closing(store.connect(db)) as connection:
             connection.execute("BEGIN")
-            state, events, successors, history = store.view(connection, root, reuse=True, full=full)
+            state, events, successors, history = store.view(connection, root, reuse=True, full=full,
+                                                            materialize=False)
         return Snapshot(state, events, successors, root, history)
     except contract.ReviewError:
         raise

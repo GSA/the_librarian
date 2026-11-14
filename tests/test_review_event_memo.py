@@ -466,6 +466,20 @@ class DeltaVerification(MemoCase):
         self.raw_edit(restore_mtime=False)
         self.refused("Event payload hash mismatch")
 
+    def test_a_state_or_indexed_read_does_no_work_proportional_to_the_history(self):
+        self.read()
+        add(self.root, 3)
+        snapshot = self.read()
+        self.assertIsNone(snapshot._events)
+        self.assertIsNone(snapshot._successors)
+        snapshot.event("rev-memo-1")
+        snapshot.at("sources/memo-1.txt")
+        snapshot.superseded_by("rev-memo-1")
+        events.status(self.root)
+        events.status(self.root, "rev-memo-1")
+        self.assertIsNone(snapshot._events)
+        self.assertEqual(len(snapshot.events), 4)  # built on use, bounded to this read
+
     def test_a_publication_read_replays_everything_it_serves(self):
         self.read()
         add(self.root, 3)

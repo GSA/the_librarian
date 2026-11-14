@@ -536,7 +536,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   row that also bumps the change counter and leaves the heads alone is served until that next
   full check. `History` indexes events by ID and by source locator, so `Snapshot.event` and
   `Snapshot.at` are constant time, and `qualify`'s standing adapters share one snapshot per
-  stage (`adapters.OneRead`) instead of reading four to five times. Evidence:
+  stage (`adapters.OneRead`) instead of reading four to five times. A snapshot builds its `events` list and `successors` map only on first use, so state, indexed lookups and `append` do no work proportional to the history. Measured with `tools/diagnostics/review_event_scale_benchmark.py` (synthetic, `nice`d): per-entry read, lookup and one-event append stay flat at about 1 ms, 5 microseconds and 15 ms from 1,000 to 13,000 events; replaying the whole history (`--no-delta`, the earlier behaviour) costs 72 ms and 215 ms at 1,000 events and 317 ms and 697 ms at 4,000. Evidence:
   `tests/test_review_event_memo.py::DeltaVerification` and the memo tamper cases (every
   existing refusal still refuses), `tests/test_standing.py`.
 - **Residual** (the catalog receipt's, 0017). The memo is unkeyed. An edit that restores

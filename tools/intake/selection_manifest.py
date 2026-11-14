@@ -24,6 +24,7 @@ see a write in flight; it sees invalid JSON and refuses, never a different valid
 Anything the fast path cannot do (an empty list, a replacement, a file that is not canonical, a
 view that no longer matches the file) takes the original full read, validate and atomic replace.
 """
+import errno
 import hashlib
 import json
 import os
@@ -152,7 +153,7 @@ def recover(root, name):
             and _in_flight(data[offset:], text)):
         descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
         try:
-            os.pwrite(descriptor, text, offset)
+            _write_all(descriptor, text, offset)
             os.ftruncate(descriptor, offset + len(text))
             os.fsync(descriptor)
         finally:
@@ -171,6 +172,18 @@ def _in_flight(rest, text):
         if rest == text[:written] + TAIL[written:]:
             return True
     return False
+
+
+def _write_all(descriptor, data, offset=None):
+    """Write every byte (``pwrite`` at ``offset``, else ``write``); a short write advances, no progress raises."""
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view) if offset is None else os.pwrite(descriptor, view, offset)
+        if written <= 0:
+            raise OSError(errno.EIO, "No progress writing the selection manifest")
+        view = view[written:]
+        if offset is not None:
+            offset += written
 
 
 def _remove(intent):
@@ -223,12 +236,12 @@ def append(root, name, entry, current):
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
         written = os.open(intent, flags, 0o600)
         try:
-            os.write(written, record.encode("utf-8"))
+            _write_all(written, record.encode("utf-8"))
             os.fsync(written)
         finally:
             os.close(written)
         _sync_directory(path.parent)
-        os.pwrite(descriptor, text, current.end)
+        _write_all(descriptor, text, current.end)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

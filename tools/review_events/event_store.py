@@ -299,8 +299,13 @@ def _grew(old, new):
     return old[:2] == new[:2] and new[2] >= old[2] and old[5] != new[5]
 
 
-def _served(state, history):
-    """Fresh containers for exactly the events ``state`` describes, even if the history has grown."""
+def _served(state, history, materialize=True):
+    """Fresh containers for exactly the events ``state`` describes, even if the history has grown.
+
+    Without ``materialize`` only ``state`` and the shared ``history`` are returned (events and
+    successors are None): a caller that needs the state or indexed lookups pays nothing per event."""
+    if not materialize:
+        return dict(state), None, None, history
     count = state["events"]
     corrections = count - state["active_events"]
     successors = history.successors
@@ -309,12 +314,14 @@ def _served(state, history):
     return dict(state), history.events[:count], successors, history
 
 
-def view(connection, root=None, *, reuse=False, full=False):
+def view(connection, root=None, *, reuse=False, full=False, materialize=True):
     """``(state, events, successors, history)`` of the validated store.
 
     ``reuse`` serves an identical file from memory and verifies only a delta after SQLite's own
     commits (see above); ``full`` skips both and replays the whole history, then remembers it.
     ``history`` is the shared read-only index when the result was memoized and None otherwise.
+    ``materialize=False`` leaves ``events`` and ``successors`` None when ``history`` is returned, so
+    state-only and indexed-lookup callers do no work proportional to the history.
     """
     if not reuse:
         state, events = _inspect(connection, root)
@@ -338,7 +345,7 @@ def view(connection, root=None, *, reuse=False, full=False):
                 if (connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
                         and connection.execute("PRAGMA user_version").fetchone()[0] == VERSION
                         and _heads(connection) == _state_heads(state)):
-                    return _served(state, history)
+                    return _served(state, history, materialize)
                 forget(path)
             elif entry is not None and entry[0][1:] == key[1:] and _grew(entry[0][0], identity):
                 try:
@@ -350,7 +357,7 @@ def view(connection, root=None, *, reuse=False, full=False):
                     for event in added:
                         history.add(event)
                     _MEMO[path] = (key, state, history)
-                    return _served(state, history)
+                    return _served(state, history, materialize)
                 _MEMO.pop(path, None)
         state, events = _inspect(connection, root)
         history = History(events)
@@ -359,7 +366,7 @@ def view(connection, root=None, *, reuse=False, full=False):
                 if path not in _MEMO and len(_MEMO) >= _MEMO_LIMIT:
                     _MEMO.clear()
                 _MEMO[path] = (key, dict(state), history)
-        return _served(state, history) if _binding(connection) == binding else (
+        return _served(state, history, materialize) if _binding(connection) == binding else (
             state, events, _successors(events), None)
     finally:
         if own and connection.in_transaction:
@@ -612,7 +619,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
     input_hash = fingerprint(incoming)
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db, write=True)) as connection:
-        state, existing, _, history = view(connection, root, reuse=True)
+        state, existing, _, history = view(connection, root, reuse=True, materialize=False)
         prior = connection.execute("SELECT * FROM batches WHERE request_id=?", (request_id,)).fetchone()
         if prior is not None:
             require(prior["actor"] == actor and prior["input_hash"] == input_hash,
@@ -626,7 +633,8 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
         known = (lambda event_id: history.event(event_id, state["events"]) is not None) if history else (
             lambda event_id, ids={e["event_id"] for e in existing}: event_id in ids)
         origins = history.origins if history else {origin_key(e) for e in existing if origin_key(e) is not None}
-        ids, origins = set(), set(origins)
+        origins = set(origins)
+        ids = set()
         for event in incoming:
             require(event["event_id"] not in ids and not known(event["event_id"]),
                     "Event ID already exists; use original request ID for retries")
@@ -676,7 +684,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
                     "Do not resubmit as a new request; retry the same request or run backup."
                 ) from error
             raise
-        return {"command": "append", "idempotent": False, **view(connection, root, reuse=True)[0],
+        return {"command": "append", "idempotent": False, **view(connection, root, reuse=True, materialize=False)[0],
                 "backup": taken, "retention": retention}
 
 
@@ -775,13 +783,18 @@ def status(root, event_id=None, audit=False):
         connection.execute("BEGIN")
         if audit:
             forget(str(db))
-        state, events, successors, history = view(connection, root, reuse=not audit)
+        state, events, successors, history = view(connection, root, reuse=not audit,
+                                                  materialize=False)
         if event_id is None:
             return {"command": "status", **state}
-        found = history.event(event_id, state["events"]) if history is not None else next(
-            (e for e in events if e["event_id"] == event_id), None)
+        if history is not None:
+            found = history.event(event_id, state["events"])
+            successor = _successor(history, event_id, state["events"])
+        else:
+            found = next((e for e in events if e["event_id"] == event_id), None)
+            successor = successors.get(event_id)
         require(found is not None, "Unknown event ID")
-        return {"command": "get", **state, "event": found, "superseded_by": successors.get(event_id)}
+        return {"command": "get", **state, "event": found, "superseded_by": successor}
 
 
 def main(argv=None):
