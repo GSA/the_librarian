@@ -124,6 +124,16 @@ restated here.
   the allowlist and omits `policy.local.json`), `::test_release_paths_rejects_missing_and_symlinked_files`,
   `::test_package_rejects_symlinked_output_parent`, `::test_empty_initialization`
   (the shipped toolkit seeds zero records).
+- **Allowlist coverage.** Every file tracked by Git is either listed in
+  `release-files.json` or named in a short exclusion list with a reason
+  (`PackageTests.UNPACKAGED_TRACKED`): `.kata.toml` (this repository's Kata
+  binding), `.github/` (hosting and CI configuration) and `ruff.toml` (repository
+  lint configuration no packaged code or test reads). Toolkit code, tests,
+  diagnostics and documentation are packaged. Every manifest entry must be a
+  tracked, existing file and none may match an exclusion. The check runs only in a
+  Git checkout whose top level is the toolkit root and skips in packaged kits,
+  which carry no `.git`. Evidence:
+  `tests/test_kit.py::PackageTests::test_manifest_covers_every_tracked_file`.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path

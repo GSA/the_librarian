@@ -1874,6 +1874,36 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlinked"):
             package.release_paths(self.root)
 
+    # Tracked files deliberately kept out of the kit. Keys ending in "/" are prefixes.
+    UNPACKAGED_TRACKED = {
+        ".kata.toml": "Kata project binding for this repository's own work tracking",
+        ".github/": "hosting and CI configuration for this repository, not toolkit behavior",
+        "ruff.toml": "repository lint configuration; no packaged code or test reads it",
+    }
+
+    def test_manifest_covers_every_tracked_file(self):
+        try:
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=ROOT,
+                                 capture_output=True, text=True)
+        except FileNotFoundError:
+            self.skipTest("git is not installed")
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != ROOT.resolve():
+            self.skipTest("not a git checkout of the toolkit (packaged kits carry no .git)")
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True,
+                                 text=True, check=True).stdout.split("\0")
+        tracked = {name for name in tracked if name}
+        manifest = package.load_release_manifest(ROOT)
+
+        def excluded(name):
+            return any(name.startswith(key) if key.endswith("/") else name == key
+                       for key in self.UNPACKAGED_TRACKED)
+
+        self.assertEqual(sorted(name for name in tracked if name not in manifest and not excluded(name)), [],
+                         "add to release-files.json or to UNPACKAGED_TRACKED with a reason")
+        self.assertEqual(sorted(name for name in manifest if excluded(name)), [])
+        self.assertEqual(sorted(name for name in manifest
+                                if name not in tracked or not (ROOT / name).is_file()), [])
+
     def test_package_rejects_symlinked_output_parent(self):
         real = self.root / "real"
         real.mkdir()

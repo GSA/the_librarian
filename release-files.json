@@ -118,5 +118,17 @@
   "tests/test_store_durability.py",
   "tests/test_catalog_batch.py",
   "tests/test_intake_batch.py",
-  "tools/diagnostics/batch_ingest_benchmark.py"
+  "tools/diagnostics/batch_ingest_benchmark.py",
+  "tests/test_authority_store_upgrade_paths.py",
+  "tests/test_extraction_reuse.py",
+  "tests/test_file_identity_locks.py",
+  "tests/test_instance_root_cache.py",
+  "tests/test_policy_isolation.py",
+  "tests/test_preflight.py",
+  "tests/test_publish_scale.py",
+  "tests/test_review_event_contract.py",
+  "tests/test_review_event_memo.py",
+  "tests/test_selection_manifest.py",
+  "tools/diagnostics/ledger_verify_benchmark.py",
+  "tools/diagnostics/publish_benchmark.py"
 ]
