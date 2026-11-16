@@ -18,7 +18,7 @@ import unicodedata
 import uuid
 
 from tools import backups as snapshots, policy
-from tools.file_identity import file_identity
+from tools.file_identity import KeyedConnection, file_identity, file_key
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, KINDS, CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
     now, require, safe_relative, text, validate_graph, GraphValidator,
@@ -254,17 +254,6 @@ def _journal_state(path):
         os.close(descriptor)
 
 
-class _Connection(sqlite3.Connection):
-    """Remembers the (device, inode) it opened, so a validation is never bound to a different
-    file that a concurrent restore moved into the path afterwards."""
-    opened = None
-
-
-def _file_key(path):
-    info = os.stat(path)
-    return (info.st_dev, info.st_ino)
-
-
 def connect(path, write=False):
     path = private_file(path)
     if not write:
@@ -282,10 +271,10 @@ def connect(path, write=False):
         if time.monotonic() >= deadline:
             raise WriterBusy("Another catalog writer is active; retry later")
         time.sleep(0.02)
-    before = _file_key(path)
+    before = file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
                                  uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
-                                 factory=_Connection)
+                                 factory=KeyedConnection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -295,7 +284,7 @@ def connect(path, write=False):
         if write:
             connection.execute("PRAGMA synchronous=FULL")
         # The pragmas above opened the file; the path must still be the same file.
-        require(_file_key(path) == before, "Catalog file replaced while opening; retry")
+        require(file_key(path) == before, "Catalog file replaced while opening; retry")
         connection.opened = before
     except (CatalogError, OSError, sqlite3.Error):
         connection.close()

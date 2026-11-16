@@ -15,7 +15,7 @@ import threading
 import uuid
 
 from tools import backups as snapshots
-from tools.file_identity import file_identity
+from tools.file_identity import KeyedConnection, file_identity, file_key
 from tools.review_events import review_events as contract
 
 
@@ -154,22 +154,11 @@ def writer_lock(home):
         os.close(descriptor)
 
 
-class _Connection(sqlite3.Connection):
-    """Remembers the (device, inode) it opened, so a memoized validation is never bound to a
-    different file that was moved into the path afterwards."""
-    opened = None
-
-
-def _file_key(path):
-    info = os.stat(path)
-    return (info.st_dev, info.st_ino)
-
-
 def connect(path, write=False):
     private_file(path)
-    before = _file_key(path)
+    before = file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=0, isolation_level=None, factory=_Connection)
+                                 uri=True, timeout=0, isolation_level=None, factory=KeyedConnection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -179,7 +168,7 @@ def connect(path, write=False):
             require(connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete",
                     "Unsupported journal mode; do not change storage pragmas")
         # The statements above opened the file; the path must still be the same file.
-        require(_file_key(path) == before, "Review-event file replaced while opening; retry")
+        require(file_key(path) == before, "Review-event file replaced while opening; retry")
         connection.opened = before
     except (contract.ReviewError, OSError, sqlite3.Error):
         connection.close()
