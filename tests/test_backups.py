@@ -81,12 +81,42 @@ class DailySnapshots(unittest.TestCase):
         os.chmod(self.files()[0], 0o600)
         self.assertIsNotNone(self.write("S1")["backup"])
 
-    def test_same_length_corruption_does_not_satisfy_the_daily_gate(self):
+    def test_a_write_after_todays_snapshot_does_not_read_the_snapshot_body(self):
+        snapshot, real_open = str(self.files()[0]), open
+
+        def guarded(path, *args, **kwargs):
+            if str(path) == snapshot:
+                raise AssertionError("snapshot body opened on the write path")
+            return real_open(path, *args, **kwargs)
+        with patch("builtins.open", guarded):
+            result = self.write("S1")
+        self.assertIsNone(result["backup"])
+
+    def test_truncated_todays_snapshot_does_not_count(self):
+        path = self.files()[0]
+        path.write_bytes(path.read_bytes()[:-1])
+        os.chmod(path, 0o600)
+        self.assertIsNotNone(self.write("S1")["backup"])
+
+    def test_malformed_or_foreign_receipt_does_not_count(self):
+        receipt = self.files(".json")[0]
+        original = receipt.read_text()
+        for damaged in ("{not json", json.dumps({**json.loads(original), "extra": 1}),
+                        json.dumps({**json.loads(original), "state": {**json.loads(original)["state"],
+                                                                     "store_id": "f" * 32}})):
+            with self.subTest(damaged=damaged[:20]):
+                receipt.write_text(damaged)
+                self.assertFalse(backups.has_snapshot_today(self.backups, catalog.status(self.root)["store_id"]))
+                receipt.write_text(original)
+
+    def test_same_size_corruption_passes_the_write_gate_but_not_full_verification(self):
         path = self.files()[0]
         raw = bytearray(path.read_bytes())
         raw[-1] ^= 0xFF
         path.write_bytes(bytes(raw))
-        self.assertIsNotNone(self.write("S1")["backup"])
+        self.assertIsNone(self.write("S1")["backup"])  # the gate no longer detects tampering
+        with self.assertRaises(catalog.CatalogError):
+            catalog.verify_backup(path)
 
     def test_snapshots_older_than_the_window_are_pruned_after_the_new_one(self):
         self.write("S1")
