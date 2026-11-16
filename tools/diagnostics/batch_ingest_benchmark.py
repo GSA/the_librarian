@@ -141,8 +141,8 @@ def seed(root, documents):
 
 
 def build_seed(tree, destination, documents):
-    sys.path.insert(0, str(tree))
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(tree)
     from tools.catalog import catalog_store as catalog
     from tools.intake import store
     destination.mkdir(parents=True)
@@ -155,8 +155,8 @@ def build_seed(tree, destination, documents):
 
 def measure(args):
     """Child process: ingest ``--files`` documents into a copy of the seed and print one JSON line."""
-    sys.path.insert(0, str(args.tree))
-    os.chdir(args.tree)
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools.catalog import catalog_store as catalog
     from tools.diagnostics.ingest_benchmark import fixture
     from tools.intake import cohort, store

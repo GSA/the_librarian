@@ -13,7 +13,6 @@ Body-free JSON; synthetic fixtures only.
 import argparse
 import json
 import multiprocessing
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -21,7 +20,8 @@ import time
 
 
 def worker(tree, root, number, count, batch, start_at, queue):
-    sys.path.insert(0, tree)
+    from _harness import use_tree
+    use_tree(tree)
     from tools.catalog import catalog_store as cs
     from tools.diagnostics.catalog_lock_benchmark import registration
     root = Path(root)
@@ -54,9 +54,8 @@ def main(argv=None):
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    tree = str(args.tree.resolve())
-    sys.path.insert(0, tree)
-    os.chdir(tree)
+    from _harness import use_tree
+    tree = use_tree(args.tree)
     from tools.diagnostics.catalog_lock_benchmark import seed
     from tools.catalog import catalog_store as cs
     from tools.intake import store

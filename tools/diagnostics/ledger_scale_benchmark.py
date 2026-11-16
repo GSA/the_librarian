@@ -15,10 +15,8 @@ import argparse
 import contextlib
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import sqlite3
-import sys
 import tempfile
 import time
 
@@ -109,8 +107,8 @@ def main(argv=None):
     parser.add_argument("--profile", action="store_true", help="also report per-function wall and CPU totals")
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools.catalog import catalog_store as catalog
     from tools.diagnostics.catalog_lock_benchmark import seed
     from tools.diagnostics.ingest_benchmark import fixture, instrument

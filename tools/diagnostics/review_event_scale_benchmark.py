@@ -14,9 +14,7 @@ whole history on every read and append (the behaviour before the delta check) fo
 import argparse
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
-import sys
 import tempfile
 import time
 
@@ -50,8 +48,8 @@ def main(argv=None):
     parser.add_argument("--batch", type=int, default=250, help="events per seeding append (at most 256)")
     parser.add_argument("--no-delta", action="store_true", help="replay the whole history on every call")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools import policy
     from tools.catalog import catalog_store as catalog
     from tools.review_events import event_reader, event_store as events

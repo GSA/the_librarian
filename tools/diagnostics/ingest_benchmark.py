@@ -23,7 +23,6 @@ import contextlib
 from collections import Counter
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import sys
@@ -294,8 +293,8 @@ def main(argv=None):
     parser.add_argument("--label", default="")
     parser.add_argument("--keep", type=Path, help="parent directory for fixtures (default: temporary)")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     results = []
     for size in (int(s) for s in args.sizes.split(",")):
         if args.replay:
