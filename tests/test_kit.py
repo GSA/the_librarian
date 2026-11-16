@@ -1834,11 +1834,12 @@ class ScriptConventionTests(unittest.TestCase):
             with self.subTest(module=name):
                 module = importlib.import_module(name)
                 self.assertTrue(callable(module.parser))
-                with self.assertRaises(SystemExit):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     module.parser().parse_args(["--roo", "/tmp"])
-                with self.assertRaises(SystemExit) as stopped:
+                with redirect_stdout(io.StringIO()) as shown, self.assertRaises(SystemExit) as stopped:
                     module.main(["--help"])
                 self.assertEqual(stopped.exception.code, 0)
+                self.assertIn("usage:", shown.getvalue())
 
 
 class PackageTests(unittest.TestCase):
