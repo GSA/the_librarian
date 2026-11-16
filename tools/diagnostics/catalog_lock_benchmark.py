@@ -43,8 +43,10 @@ def registration(n):
             artifact, meta]
 
 
-def seed(root, count):
-    """Append ``count`` registrations as ``count`` revisions without per-write validation."""
+def seed(root, count, records_for=registration):
+    """Append ``count`` registrations as ``count`` revisions without per-write validation.
+
+    ``records_for(n)`` returns registration ``n``'s records (default: an upload-shaped registration)."""
     from tools.catalog import catalog_store as cs
     from tools.catalog.contracts import canonical, fingerprint, now
     home, db, _ = cs.locations(root)
@@ -53,7 +55,7 @@ def seed(root, count):
         state = cs.inspect(connection)[0]
         revision, previous = state["revision"], state["head_hash"]
         for n in range(count):
-            records = registration(n)
+            records = records_for(n)
             revision += 1
             batch = {"revision": revision, "request_id": f"seed-{n}", "actor": "bench", "reason": "seed",
                      "committed_at": now(),

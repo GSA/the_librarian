@@ -90,6 +90,15 @@ def standing_publish_guard(root, args):
     return pinned
 
 
+def pinned_metadata(intent, checksum):
+    """The metadata a ``prepare`` equal to ``intent`` just derived, for the manifest read as ``checksum``.
+
+    Reusing it spares a second validation of every selection per freshness check. It applies only
+    to the very manifest the intent pins; any other manifest recomputes (``None``).
+    """
+    return intent["metadata"] if intent.get("manifest_sha256") == checksum else None
+
+
 def extract_intent(operation, root, prepared):
     """The pinned identity of one ``extract.bundle`` result."""
     _, _, path, value = prepared
@@ -241,7 +250,8 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                 fresh = False
                 if db.exists():
                     with closing(index.readonly(db)) as connection:
-                        fresh = not index.freshness(connection, root, manifest, db, config, checksum)
+                        fresh = not index.freshness(connection, root, manifest, db, config, checksum,
+                                                    pinned_metadata(intent, checksum))
 
                 def guard():
                     require(prepare(root, stage) == intent, "changed_publication_inputs")
@@ -251,7 +261,8 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
                     index.build(root, manifest, db, config, checksum, publication_guard=guard)
                 require(prepare(root, stage) == intent, "changed_publication_inputs")
                 with closing(index.readonly(db)) as connection:
-                    require(not index.freshness(connection, root, manifest, db, config, checksum), "stale_publication")
+                    require(not index.freshness(connection, root, manifest, db, config, checksum,
+                                                pinned_metadata(intent, checksum)), "stale_publication")
             return {"boundary": "publication-confirmed", "selection_validated": True,
                     "manifest_sha256": checksum, "metadata": intent["metadata"], "database": args["db"]}
         if operation == "catalog-submit":
@@ -475,9 +486,11 @@ def availability(root, stage, evidence):
         config, checksum = index.load_manifest(manifest, root)
         db = index.validate_db_path(root, root / stage["arguments"]["db"])
         with closing(index.readonly(db)) as connection:
-            fresh = not index.freshness(connection, root, manifest, db, config, checksum)
+            # One validation of the selection serves both the freshness check and the comparison.
+            expected = index.metadata_expected(root, checksum, config)
+            fresh = not index.freshness(connection, root, manifest, db, config, checksum, expected)
         return {"available": fresh and checksum == evidence["manifest_sha256"]
-                and index.metadata_expected(root, checksum, config) == evidence["metadata"],
+                and expected == evidence["metadata"],
                 "scope": "selected-index"}
     except (OSError, ValueError, index.IndexError_, KeyError, sqlite3.Error):
         return {"available": False, "reason": "unavailable-or-stale", "scope": "selected-index"}

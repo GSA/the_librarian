@@ -43,6 +43,7 @@ class Snapshot:
     def __init__(self, state, events, successors, root=contract.ROOT, history=None):
         self.state, self.root, self.history = state, root, history
         self._events, self._successors = events, successors
+        self._by_id = None
 
     @property
     def events(self):
@@ -69,7 +70,16 @@ class Snapshot:
         """The event with this ID, or None; constant time on a memoized history."""
         if self.history is not None:
             return self.history.event(event_id, self.state["events"])
-        return next((e for e in self.events if e["event_id"] == event_id), None)
+        # No memoized history: index the events once per snapshot (not a scan per lookup, which made
+        # publishing O(selections x events)). The index is keyed to the list it was built from.
+        cached = self._by_id
+        if cached is None or cached[0] is not self.events or cached[1] != len(self.events):
+            cached = self._by_id = (self.events, len(self.events), self._index_events())
+        return cached[2].get(event_id)
+
+    def _index_events(self):
+        return {event["event_id"]: event for event in self.events
+                if isinstance(event, dict) and "event_id" in event}
 
     def at(self, locator):
         """Events whose source locator is ``locator``, in store order; constant time to find."""
