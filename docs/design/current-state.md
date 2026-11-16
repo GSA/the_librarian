@@ -86,8 +86,9 @@ restated here.
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
   explicit-migration message. The derived index is assumed to need a rebuild
-  after any code change, because its fingerprint covers the reader and policy
-  module bytes (`context_index.engine_fingerprint`,
+  after any code change, because its fingerprint covers the reader modules
+  (`context_index.py`, `packets.py`, `renditions.py`, `qualification.py`,
+  `compact_records.py`) and policy module bytes (`context_index.engine_fingerprint`,
   `tests/test_workspace.py::test_qualification_code_is_bound_into_engine_fingerprint`).
   Schema snapshots in `tools/schemas/*.sql` are not backups.
 - **Store locations** are instance configuration (`storage_roots` in

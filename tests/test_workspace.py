@@ -22,6 +22,7 @@ from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.context_index import compact_records
 from tools.context_index import context_index as index
+from tools.context_index import packets
 from tools.context_index import qualification
 from tools.diagnostics import retrieval_log as diagnostics
 from tools.extraction import docling_bridge, extract
@@ -88,22 +89,22 @@ class WorkspaceTests(WorkspaceCase):
     def test_exact_packets_and_compaction(self):
         self.docs()
         with closing(index.readonly(self.db)) as db:
-            packet = index.packet(db, self.config, "documents/README.md#interfaces", 60000, root=self.root)
+            packet = packets.packet(db, self.config, "documents/README.md#interfaces", 60000, root=self.root)
             self.assertIn("documents/AGENTS.md", {p["path"] for p in packet["pieces"]})
             for piece in packet["pieces"]:
                 raw = (self.root / piece["path"]).read_bytes()
                 lines = raw.decode().splitlines(keepends=True)
                 self.assertEqual(piece["source_hash"], hashlib.sha256(raw).hexdigest())
                 self.assertEqual(piece["text"], "".join(lines[piece["line_start"]-1:piece["line_end"]]))
-            compact = index.compact_packet(packet)
+            compact = packets.compact_packet(packet)
             self.assertEqual([p["text"] for p in compact["pieces"]], [p["text"] for p in packet["pieces"]])
-            many = index.packet_many(db, self.config,
+            many = packets.packet_many(db, self.config,
                                      ["documents/README.md#interfaces", "documents/AGENTS.md"], 60000, root=self.root)
             self.assertEqual(len(many["requests"]), 2)
             with self.assertRaises(index.IndexError_):
-                index.packet(db, self.config, "documents/README.md", 1, root=self.root)
+                packets.packet(db, self.config, "documents/README.md", 1, root=self.root)
             with self.assertRaises(index.IndexError_):
-                index.packet_many(db, self.config, [], 60000, root=self.root)
+                packets.packet_many(db, self.config, [], 60000, root=self.root)
 
     def test_missing_context_refuses_build(self):
         self.docs()
@@ -269,7 +270,7 @@ class WorkspaceTests(WorkspaceCase):
             found = index.search(db, "exactly four characters", 10, None, root=self.root)
             self.assertEqual(found["hits"][0]["locator"], prepared["rendition"] + "#line-2")
             self.assertEqual(index.search(db, "class", 10, None, root=self.root)["hits"], [])
-            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000, root=self.root)
+            packet = packets.packet(db, self.config, prepared["rendition"] + "#line-2", 60000, root=self.root)
             self.assertEqual(packet["renditions"][prepared["rendition"]]["method"]["name"],
                              "mhtml-html-text")
 
@@ -294,7 +295,7 @@ class WorkspaceTests(WorkspaceCase):
                 "json_pointer": "/payload/lines/0", "original_line": 1,
                 "byte_start": 0, "byte_end": 7, "terminator": "crlf",
             })
-            packet = index.packet(db, self.config, prepared["rendition"] + "#line-2", 60000, root=self.root)
+            packet = packets.packet(db, self.config, prepared["rendition"] + "#line-2", 60000, root=self.root)
             piece = next(piece for piece in packet["pieces"] if piece["locator"].endswith("#line-2"))
             self.assertIn('"text": "β\\n"', piece["text"])
             metadata = packet["renditions"][prepared["rendition"]]
@@ -312,7 +313,7 @@ class WorkspaceTests(WorkspaceCase):
         prepared = self.selected_text(content.encode("utf-8"))
         locator = prepared["rendition"] + "#line-1"
         with closing(index.readonly(self.db)) as db:
-            packet = index.packet(db, self.config, locator, 60000, root=self.root)
+            packet = packets.packet(db, self.config, locator, 60000, root=self.root)
         piece = next(piece for piece in packet["pieces"] if piece["locator"] == locator)
         physical = (self.root / prepared["rendition"]).read_text().splitlines(keepends=True)
         # splitlines() is intentionally unsuitable here; derive physical JSON
@@ -529,7 +530,7 @@ class WorkspaceTests(WorkspaceCase):
         with closing(index.readonly(self.db)) as db:
             rows = db.execute("SELECT locator,payload FROM rendition_locations ORDER BY locator").fetchall()
             self.assertEqual([row[0] for row in rows], [path + "#table-1", path + "#text-1"])
-            text_packet = index.packet(db, self.config, path + "#text-1", 60000, root=self.root)
+            text_packet = packets.packet(db, self.config, path + "#text-1", 60000, root=self.root)
             text_piece = next(piece for piece in text_packet["pieces"]
                               if piece["locator"] == path + "#text-1")
             self.assertEqual(json.loads(text_piece["text"]), value["conversion"]["document"]["texts"][0])
@@ -539,7 +540,7 @@ class WorkspaceTests(WorkspaceCase):
             text_location = text_piece["source_location"]
             self.assertEqual(text_piece["text"].encode(),
                              rendition_raw[text_location["byte_start"]:text_location["byte_end"]])
-            table_packet = index.packet(db, self.config, path + "#table-1", 60000, root=self.root)
+            table_packet = packets.packet(db, self.config, path + "#table-1", 60000, root=self.root)
             table_piece = next(piece for piece in table_packet["pieces"]
                                if piece["locator"] == path + "#table-1")
             self.assertEqual(json.loads(table_piece["text"]), value["conversion"]["document"]["tables"][0])
@@ -567,7 +568,7 @@ class WorkspaceTests(WorkspaceCase):
             # A broad context rule attached to the table must not leak into a
             # packet for the distinct non-line-based text record.
             self.config["context_rules"] = {path + "#table-1": ["documents/README.md"]}
-            isolated = index.packet(db, self.config, path + "#text-1", 60000, root=self.root)
+            isolated = packets.packet(db, self.config, path + "#text-1", 60000, root=self.root)
             self.assertNotIn("documents/README.md", {piece["path"] for piece in isolated["pieces"]})
             self.assertIn("null", text_packet["renditions"][path]["citation_contract"])
             self.assertIn("byte", text_packet["renditions"][path]["citation_contract"])
@@ -695,7 +696,7 @@ class WorkspaceTests(WorkspaceCase):
         before = index.engine_fingerprint()
         paths = [Path(index.__file__), ROOT / "tools/context_index/compact_records.py",
                  ROOT / "tools/context_index/renditions.py", qualification_path,
-                 Path(policy.__file__)]
+                 ROOT / "tools/context_index/packets.py", Path(policy.__file__)]
         contents = {path: path.read_bytes() for path in paths}
         with patch.object(Path, "read_bytes", autospec=True,
                           side_effect=lambda path: contents[path]
@@ -802,7 +803,7 @@ class WorkspaceTests(WorkspaceCase):
         self.selected_odt()
         with closing(index.readonly(self.db)) as db:
             row = db.execute("SELECT locator FROM rendition_locations ORDER BY locator LIMIT 1").fetchone()
-            packet = index.packet(db, self.config, row[0], 60000, root=self.root)
+            packet = packets.packet(db, self.config, row[0], 60000, root=self.root)
             self.assertIn("renditions", packet)
             self.assertIn("documents/AGENTS.md", {p["path"] for p in packet["pieces"]})
 
@@ -841,7 +842,7 @@ class WorkspaceTests(WorkspaceCase):
                 self.assertEqual(self.db.read_bytes(), preserved)
         self.build()
         with closing(index.readonly(self.db)) as db:
-            self.assertTrue(index.packet(db, self.config, locator, 60000, root=self.root)["pieces"])
+            self.assertTrue(packets.packet(db, self.config, locator, 60000, root=self.root)["pieces"])
 
     def test_text_extraction_contract(self):
         raw = b"\xef\xbb\xbfalpha\r\n\r\n\xce\xb2\nlast\r"
