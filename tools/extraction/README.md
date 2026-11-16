@@ -47,10 +47,15 @@ PIP_ONLY_BINARY=:all: tools/extraction/.local/venv-docling/bin/python -m pip ins
 tools/extraction/.local/venv-docling/bin/python -m pip check
 ```
 
-These pins describe the Python 3.14 Linux CPU environment, including
-`pypdfium2==5.14.0`; do not install a separate overriding PDFium version.
-Follow the requirement file's current two-step comments if its pins change.
-Never substitute another project's environment.
+`requirements-docling.in` lists the direct dependencies, pinned exactly because
+they define the accepted conversion profile. `requirements-docling.txt` is the
+full resolved lock for Python 3.14 on Linux x86_64 CPU, including
+`pypdfium2==5.14.0`; do not install a separate overriding PDFium version. The
+worker reads the lock and refuses (`runtime_mismatch`/`missing_dependency`) any
+installed version that differs. To change a pin, edit the `.in` file, then
+regenerate the lock with the procedure in its header. Other platforms or Python
+versions need their own resolved lock. Never substitute another project's
+environment.
 
 ## Model assets
 

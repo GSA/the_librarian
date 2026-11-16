@@ -649,5 +649,19 @@ class AdapterProcess(unittest.TestCase):
         self.assertEqual(raised.exception.code, "invalid_result")
 
 
+class WorkerRequirements(unittest.TestCase):
+    def test_lock_pins_every_direct_constraint_in_worker_format(self):
+        def pins(name):
+            text = (ROOT / "tools/extraction" / name).read_text()
+            lines = [line for line in text.splitlines() if line and not line.startswith("#")]
+            for line in lines:
+                self.assertRegex(line, r"^[A-Za-z0-9._-]+(\[[a-z0-9,-]+\])?==[^=\s]+$")
+            return {line.split("==")[0].split("[")[0].lower(): line.split("==")[1]
+                    for line in lines}
+        lock = pins("requirements-docling.txt")
+        for name, version in pins("requirements-docling.in").items():
+            self.assertEqual(lock.get(name), version, name)
+
+
 if __name__ == "__main__":
     unittest.main()

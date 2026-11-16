@@ -139,7 +139,7 @@ def schema_validate(bundle, schema=None, *, root=None):
         from referencing import Registry
         from referencing.exceptions import NoSuchResource
     except ImportError as error:
-        raise ReviewError("Install tools/review_events/requirements.txt in a local environment") from error
+        raise ReviewError("Install ./tools/context-mcp in a local environment") from error
     if schema is None:
         schema, _ = read_json(SCHEMA)
         audience = policy.for_root(root)[0]["audience"]

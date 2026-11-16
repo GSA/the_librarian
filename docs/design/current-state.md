@@ -141,8 +141,12 @@ restated here.
   explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
   and missing FTS5, and reports the Python, SQLite and `mcp` versions and
   `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
-  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
-  are ranges and transitive dependencies are unpinned. There is no lock file,
+  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` (`>=4.10,<5`)
+  and `jsonschema` (`>=4.20,<5`) are ranges whose floors are those `mcp` 2.2.0
+  requires on Python 3.14 (the suite passed at both floors and at the latest
+  releases, 2026-11-16), and transitive dependencies are unpinned.
+  `tools/context-mcp/pyproject.toml` is the only toolkit dependency declaration;
+  the review-event and context-index import errors point to it. There is no lock file,
   image or installer, by decision (Kata 7jkt, 2026-11-13). Measured drift: two
   `.venv`s of the same commit already differed in anyio, pydantic, starlette,
   sse-starlette and other transitive patch versions, and the repository history and
@@ -152,6 +156,10 @@ restated here.
   package; the first step then is to pin that package, not to add a lock file.
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
+  Its direct dependencies are exact pins in `tools/extraction/requirements-docling.in`;
+  `requirements-docling.txt` is the full Python 3.14 Linux CPU lock the worker
+  enforces at runtime, and every direct pin must appear in it unchanged
+  (`tests/test_docling.py::WorkerRequirements`).
   The reader needs none of it.
 - The first proof-of-concept installation is closed; this repository does not
   maintain or port from it. Its clean-copy tests only prove this repository's
