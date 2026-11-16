@@ -25,6 +25,7 @@ from tools.extraction import mhtml
 
 HOME = Path("data/extractions/.local")
 VERSION = 1
+# Native formats parse in this unsandboxed process, so their source cap is below the Docling 64 MiB.
 MAX_SOURCE = 16 * 1024 * 1024
 MAX_XML = 8 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
