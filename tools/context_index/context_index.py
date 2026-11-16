@@ -140,7 +140,7 @@ def load_event_reader():
     try:
         from tools.review_events import event_reader
     except ImportError as error:
-        fail(f"Event reader unavailable; install tools/review_events/requirements.txt: {error}")
+        fail(f"Event reader unavailable; install ./tools/context-mcp: {error}")
     return event_reader
 
 

@@ -1,14 +1,24 @@
-# Optional worker only. Install the released CPU wheels FIRST:
-# python3 -m pip --python tools/extraction/.local/venv-docling/bin/python install \
-#   --index-url https://download.pytorch.org/whl/cpu \
-#   torch==2.14.1+cpu torchvision==0.29.1+cpu
-# Then install this manifest into that same dedicated interpreter.
+# Full lock for the optional Docling worker: Python 3.14, Linux x86_64, CPU only.
+# Direct constraints live in requirements-docling.in. docling_worker.py reads
+# every `name==version` line here and refuses a runtime whose installed version
+# differs, so keep one exact pin per line and comments only at column 0.
+# Regenerate in a fresh dedicated interpreter (paths relative to the toolkit root):
+#   python3.14 -m venv .local/venv-lock
+#   PIP_ONLY_BINARY=:all: .local/venv-lock/bin/python -m pip install \
+#     --index-url https://download.pytorch.org/whl/cpu \
+#     torch==2.14.1+cpu torchvision==0.29.1+cpu
+#   PIP_ONLY_BINARY=:all: .local/venv-lock/bin/python -m pip install \
+#     -r tools/extraction/requirements-docling.in
+#   .local/venv-lock/bin/python -m pip check
+#   .local/venv-lock/bin/python -m pip freeze --all --exclude pip | sort -f
+# (`--all` keeps setuptools, which torch requires at runtime.)
+# Replace the pins below with that output, keep this header, and rerun
+# `docling_extract inspect` against the provisioned assets.
 torch==2.14.1+cpu
 torchvision==0.29.1+cpu
 docling-slim[convert-core,format-pdf,models-local,feat-ocr-rapidocr-onnx,cli]==2.140.0
 rapidocr==3.10.0
 onnxruntime==1.31.0
-# Complete resolved Python 3.14 Linux CPU environment, including transitive pins.
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 PyYAML==6.0.3
