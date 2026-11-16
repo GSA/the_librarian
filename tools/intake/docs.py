@@ -51,7 +51,7 @@ def state_of(upload, extract, register):
 def _repeats(c, head, base, operation, receipt_id, fmt):
     """True when ``head`` is ``base`` or a correction that repeats its operation, receipt and format.
 
-    This is the check ``cohort._request`` makes before it follows a correction chain; a document whose
+    This is the check ``cohort_ingest._request`` makes before it follows a correction chain; a document whose
     chain fails it is reported ``failed`` by ``ingest``, so it must never be trusted as extracted.
     """
     if head is None or head == base:

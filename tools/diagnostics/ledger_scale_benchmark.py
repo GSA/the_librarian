@@ -4,7 +4,7 @@
 Builds a temporary instance whose intake ledger already holds ``--ledger`` completed
 single-stage requests and whose catalog holds ``--catalog`` upload-shaped registrations (both written
 directly, without per-write validation, so large sizes build quickly), then ingests ``--files`` new
-synthetic markdown files through ``tools.intake.cohort.ingest``. Reports body-free JSON: wall and CPU
+synthetic markdown files through ``tools.intake.cohort_ingest.ingest``. Reports body-free JSON: wall and CPU
 seconds, seconds per file, how many times the whole ledger was validated and what share of the wall
 time that took. With a healthy hand-off ("Intake ledger" in docs/design/current-state.md) the ledger is validated about once per
 process, not once per lock acquisition. Synthetic fixtures only; never point it at a real instance.

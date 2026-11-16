@@ -15,7 +15,7 @@ from .contracts import IntakeError, decode, decode_request, digest, relative
 
 
 def suffix_of(fmt):
-    """The reader-version suffix of a format's extraction request names (see ``cohort._extract``)."""
+    """The reader-version suffix of a format's extraction request names (see ``cohort_ingest._extract``)."""
     return "-m%d" % mhtml.METHOD_VERSION if fmt == "mhtml" else ""
 
 

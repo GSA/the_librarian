@@ -3,7 +3,7 @@
 
 Seeds a production-shaped instance with ``--seed`` documents already ingested (two catalog revisions and
 three ledger requests each, written directly so large seeds build quickly), copies it, and ingests
-``--files`` new synthetic documents through ``tools.intake.cohort.ingest``, once per ``--batch-sizes``
+``--files`` new synthetic documents through ``tools.intake.cohort_ingest.ingest``, once per ``--batch-sizes``
 entry (1 is the one-revision-per-registration path; a tree without ``batch_size`` runs as 1). Reports body-free
 JSON per run: wall and CPU ms per document, fsync and fdatasync calls per document (counted by a small
 LD_PRELOAD shim compiled with gcc when available), catalog revisions written and bytes written per
