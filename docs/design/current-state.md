@@ -73,6 +73,15 @@ restated here.
   write, after starting it at `OFF`; weakening or dropping any of the seven pragma
   sites fails them. `Connection.backup` copy targets are not covered: they are
   fsynced and hash-verified before use rather than relying on the pragma.
+  The file-level primitives the stores share live in `tools/durable.py`: directory
+  and file fsync, exclusive 0600 creation (`reserve`, `write_new_private`) and
+  chunked SHA-256, each opened `O_NOFOLLOW` (`tests/test_durable.py`). Each store
+  still applies its own path rule and error type first (catalog `safe_path` also
+  refuses `..`; catalog modes must be exactly 0700/0600, review-event modes must
+  only deny group and other) and keeps its own `connect`, `private_directory`,
+  `private_file` and `writer_lock`, whose wait, timeout and journal semantics
+  differ. `tools/policy.py` keeps its own directory fsync because its bytes are
+  part of the policy and extraction fingerprints.
 - **Upgrade behavior.** Code never migrates an authority store implicitly: a
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
@@ -626,7 +635,9 @@ synthetic documents the two scans were about half of the time per document).
   validating reader's snapshot (observed as spurious "Current records differ" and
   "database disk image is malformed"). `tools/file_identity.py` therefore reads
   stat fields from the path and the change counter from page 1 through the open
-  connection. Evidence: `tests/test_file_identity_locks.py`.
+  connection. The catalog and review-event `connect` share its `KeyedConnection`,
+  which remembers the (device, inode) opened so a memo is never bound to a file
+  moved into the path later. Evidence: `tests/test_file_identity_locks.py`.
 
 ### Review-event validation
 
