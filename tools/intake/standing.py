@@ -8,25 +8,20 @@ page, text record, table and warning (Docling) or every extraction record and
 warning (text, transcript, ODT) of the exact rendition can qualify it.  Every other result stays a visible, unpublished
 outcome with explicit reasons.
 """
-from datetime import datetime, timezone
 import hashlib
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 import stat
-import tempfile
 
 from tools.catalog import catalog_store as catalog
-from tools.durable import fsync_directory
 from tools.context_index import context_index as index
-from tools.context_index import qualification
 from tools.context_index import renditions
 from tools.review_events import event_reader
 from tools.review_events import event_store as events
-from . import selection_manifest
-from .contracts import IntakeError, canonical, pairs
+from . import standing_events
+from .contracts import IntakeError, pairs
 
 POLICY_SCHEMA = "standing-policy-v1"
 # v2 adds the advisory, non-blocking `unverifiable_references` list; v1 findings
@@ -70,8 +65,9 @@ def _texts(value, limit=50):
     return isinstance(value, list) and len(value) <= limit and all(_text(v, 1000) for v in value)
 
 
-def _read(root, name, limit):
-    """Read one private (0600) regular file below the root without following symlinks."""
+def read_private(root, name, limit):
+    """Read (up to ``limit + 1`` bytes of) one private (0600) regular file below the root without
+    following symlinks."""
     try:
         path = catalog.safe_path(Path(root) / name)
     except catalog.CatalogError as error:
@@ -81,8 +77,7 @@ def _read(root, name, limit):
     if not path.is_file() or stat.S_IMODE(path.stat().st_mode) & 0o077:
         raise Refusal("blocked", "standing-private-file")
     with path.open("rb") as stream:
-        raw = stream.read(limit + 1)
-    return path, raw
+        return stream.read(limit + 1)
 
 
 def _decode(raw):
@@ -90,10 +85,39 @@ def _decode(raw):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("constant")))
 
 
+def _scope_valid(scope):
+    return (isinstance(scope, dict) and set(scope) == {"receipts", "audiences"}
+            and isinstance(scope["receipts"], list) and 0 < len(scope["receipts"]) <= renditions.MAX_SELECTIONS
+            and all(r == ANY_RECEIPT or _identifier(r, RECEIPT) for r in scope["receipts"])
+            and _texts(scope["audiences"]) and bool(scope["audiences"]))
+
+
+def _budget_valid(budget):
+    return (isinstance(budget, dict)
+            and set(budget) == {"max_pages", "max_records", "max_findings_bytes"}
+            and all(type(budget[k]) is int for k in budget)
+            and 0 < budget["max_pages"] <= renditions.DOCLING_MAX_PAGES
+            and 0 < budget["max_records"] <= renditions.DOCLING_MAX_RECORDS
+            and 0 < budget["max_findings_bytes"] <= LIMIT)
+
+
+def _policy_valid(value):
+    return (isinstance(value, dict) and set(value) == {
+        "schema", "policy_id", "version", "status", "reviewer", "scope", "budget", "selection"}
+        and value["schema"] == POLICY_SCHEMA and _identifier(value["policy_id"])
+        and type(value["version"]) is int and value["version"] > 0
+        and isinstance(value["status"], str) and value["status"] in {"active", "revoked"}
+        and isinstance(value["reviewer"], str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}", value["reviewer"]) is not None
+        and _scope_valid(value["scope"]) and _budget_valid(value["budget"])
+        and isinstance(value["selection"], dict) and set(value["selection"]) == {"context"}
+        and isinstance(value["selection"]["context"], list) and bool(value["selection"]["context"]))
+
+
 def load_policy(root, name, expected_sha):
     """Return the exact pinned standing policy or refuse durably."""
     try:
-        _, raw = _read(root, name, 64 * 1024)
+        raw = read_private(root, name, 64 * 1024)
     except FileNotFoundError as error:
         raise Refusal("blocked", "standing-policy-missing") from error
     if hashlib.sha256(raw).hexdigest() != expected_sha:
@@ -102,31 +126,10 @@ def load_policy(root, name, expected_sha):
         value = _decode(raw)
     except (UnicodeError, ValueError, IntakeError) as error:
         raise Refusal("blocked", "standing-policy-invalid") from error
-    valid = (isinstance(value, dict) and set(value) == {
-        "schema", "policy_id", "version", "status", "reviewer", "scope", "budget", "selection"}
-        and value["schema"] == POLICY_SCHEMA and _identifier(value["policy_id"])
-        and type(value["version"]) is int and value["version"] > 0
-        and isinstance(value["status"], str) and value["status"] in {"active", "revoked"}
-        and isinstance(value["reviewer"], str)
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}", value["reviewer"]) is not None)
-    if valid:
-        scope, budget, selection = value["scope"], value["budget"], value["selection"]
-        valid = (isinstance(scope, dict) and set(scope) == {"receipts", "audiences"}
-                 and isinstance(scope["receipts"], list) and 0 < len(scope["receipts"]) <= renditions.MAX_SELECTIONS
-                 and all(r == ANY_RECEIPT or _identifier(r, RECEIPT) for r in scope["receipts"])
-                 and _texts(scope["audiences"]) and scope["audiences"]
-                 and isinstance(budget, dict)
-                 and set(budget) == {"max_pages", "max_records", "max_findings_bytes"}
-                 and all(type(budget[k]) is int for k in budget)
-                 and 0 < budget["max_pages"] <= renditions.DOCLING_MAX_PAGES
-                 and 0 < budget["max_records"] <= renditions.DOCLING_MAX_RECORDS
-                 and 0 < budget["max_findings_bytes"] <= LIMIT
-                 and isinstance(selection, dict) and set(selection) == {"context"}
-                 and isinstance(selection["context"], list) and selection["context"])
-    if not valid:
+    if not _policy_valid(value):
         raise Refusal("blocked", "standing-policy-invalid")
     try:
-        index.validate_context(selection["context"], root)
+        index.validate_context(value["selection"]["context"], root)
     except index.IndexError_ as error:
         raise Refusal("blocked", "standing-policy-invalid") from error
     return value
@@ -162,6 +165,15 @@ def refused_scope(root, standing, rendition, rendition_sha256):
         standing["scope"], value["source"]["receipt_id"], value["source"]["audience"])
 
 
+def _inspected_valid(inspected):
+    return (isinstance(inspected, dict) and set(inspected) in (DOCLING_INSPECTED, EXTRACT_INSPECTED)
+            and all(isinstance(inspected[k], list) and len(inspected[k]) <= renditions.DOCLING_MAX_RECORDS
+                    for k in inspected)
+            and all(type(p) is int for k in ("pages", "records") for p in inspected.get(k, []))
+            and all(isinstance(r, str) for k in ("texts", "tables", "warnings")
+                    for r in inspected.get(k, [])))
+
+
 def _findings_valid(value):
     if not (isinstance(value, dict) and isinstance(value.get("schema"), str)
             and value["schema"] in FINDINGS_SCHEMAS and set(value) == {
@@ -170,21 +182,40 @@ def _findings_valid(value):
             "correction_of", "new_mapping", "exception_resolution"}
             | FINDINGS_SCHEMAS[value["schema"]]):
         return False
-    inspected = value["inspected"]
     return (_texts(value.get("unverifiable_references", []))
             and isinstance(value["policy"], dict) and set(value["policy"]) == {"policy_id", "version"}
             and isinstance(value["decision"], str) and value["decision"] in {"accept", "reject", "defer"}
-            and isinstance(inspected, dict) and set(inspected) in (DOCLING_INSPECTED, EXTRACT_INSPECTED)
-            and all(isinstance(inspected[k], list) and len(inspected[k]) <= renditions.DOCLING_MAX_RECORDS
-                    for k in inspected)
-            and all(type(p) is int for k in ("pages", "records") for p in inspected.get(k, []))
-            and all(isinstance(r, str) for k in ("texts", "tables", "warnings")
-                    for r in inspected.get(k, []))
+            and _inspected_valid(value["inspected"])
             and _text(value["explanation"], 2000)
             and _texts(value["contradictions"]) and _texts(value["missing_evidence"])
             and (value["correction_of"] is None or _identifier(value["correction_of"], r"rev-[a-z0-9-]{1,100}"))
             and type(value["new_mapping"]) is bool
             and (value["exception_resolution"] is None or _text(value["exception_resolution"], 1000)))
+
+
+def _parse_rendition(name, raw, engine):
+    """The rendition's JSON once its shape and path identity validate; raises when they do not."""
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=index.strict_object)
+    if isinstance(value, dict) and "payload" in value:
+        engine.fields(value, ("schema_version", "run_id", "extractor", "source", "boundary",
+                              "payload"), "Extraction")
+        payload = value["payload"]
+        if (value["schema_version"] != 1 or not isinstance(payload, dict)
+                or payload.get("format") not in EXTRACT_FORMATS
+                or not isinstance(payload.get("warnings"), list)):
+            engine.fail("Unsupported extraction schema")
+    else:
+        engine.fields(value, ("schema", "run_id", "extractor", "source", "boundary",
+                              "conversion"), "Docling extraction")
+        if value["schema"] != "docling-rendition-v1":
+            engine.fail("Docling identity mismatch")
+    source = value["source"]
+    engine.fields(source, ("receipt_id", "artifact_id", "source_ids", "path", "sha256", "bytes",
+                           "audience", "handling_refs"), "Extraction source")
+    if (PurePosixPath(name).parts[-2] != value["run_id"]
+            or PurePosixPath(name).parts[-3] != source["receipt_id"]):
+        engine.fail("Docling identity mismatch")
+    return value
 
 
 def _rendition(root, args, engine):
@@ -193,34 +224,16 @@ def _rendition(root, args, engine):
     if not renditions.eligible(name, root):
         raise Refusal("blocked", "standing-rendition-path")
     try:
-        path, raw = _read(root, name, 64 * 1024 * 1024)
+        raw = read_private(root, name, 64 * 1024 * 1024)
     except FileNotFoundError as error:
         raise Refusal("blocked", "stale-rendition") from error
     if hashlib.sha256(raw).hexdigest() != args["rendition_sha256"]:
         raise Refusal("blocked", "stale-rendition")
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=index.strict_object)
-        if isinstance(value, dict) and "payload" in value:
-            engine.fields(value, ("schema_version", "run_id", "extractor", "source", "boundary",
-                                  "payload"), "Extraction")
-            payload = value["payload"]
-            if (value["schema_version"] != 1 or not isinstance(payload, dict)
-                    or payload.get("format") not in EXTRACT_FORMATS
-                    or not isinstance(payload.get("warnings"), list)):
-                engine.fail("Unsupported extraction schema")
-        else:
-            engine.fields(value, ("schema", "run_id", "extractor", "source", "boundary",
-                                  "conversion"), "Docling extraction")
-            if value["schema"] != "docling-rendition-v1":
-                engine.fail("Docling identity mismatch")
-        source = value["source"]
-        engine.fields(source, ("receipt_id", "artifact_id", "source_ids", "path", "sha256", "bytes",
-                               "audience", "handling_refs"), "Extraction source")
-        if (PurePosixPath(name).parts[-2] != value["run_id"]
-                or PurePosixPath(name).parts[-3] != source["receipt_id"]):
-            engine.fail("Docling identity mismatch")
+        value = _parse_rendition(name, raw, engine)
     except (UnicodeError, ValueError, index.IndexError_):
         return raw, None, "rendition-fidelity"
+    source = value["source"]
     if not engine.original_allowed(source["path"]):
         raise Refusal("blocked", "prohibited-source")
     original = catalog.safe_path(Path(root) / index.relative_name(source["path"]))
@@ -283,11 +296,11 @@ def _registration_reads(root, receipt_id):
 
 
 def _registered(root, value, args):
-    """Confirm the catalog registration binds the exact rendition and original."""
+    """The catalog's rendition child when it binds the exact rendition and original, else None."""
     source = value["source"]
     reads = _registration_reads(root, source["receipt_id"])
     if reads is None:
-        return None, None
+        return None
     metadata, records = reads
     original = metadata["registrations"][source["receipt_id"]]["artifact"]
     by_id = {record["id"]: record for record in records["records"]}
@@ -310,8 +323,8 @@ def _registered(root, value, args):
             or relation.get("relation") != "rendition-of"
             or data["sha256"] != source["sha256"] or data["path"] != source["path"]
             or data["presence"] != "present" or data["coverage"] == "excluded"):
-        return None, None
-    return child, original
+        return None
+    return child
 
 
 def registered(root, rendition, rendition_sha256):
@@ -322,7 +335,107 @@ def registered(root, rendition, rendition_sha256):
         _, value, failure = _rendition(root, args, index.rendition_api(root))
     except Refusal:
         return False
-    return failure is None and _registered(root, value, args)[0] is not None
+    return failure is None and _registered(root, value, args) is not None
+
+
+def _read_findings(root, args, standing):
+    """The decoded, valid findings, or the exception reason that stops evaluation."""
+    try:
+        raw = read_private(root, args["findings_path"], LIMIT)
+    except FileNotFoundError as error:
+        if refused_scope(root, standing, args["rendition"], args["rendition_sha256"]):
+            # Out of scope, so no review was requested (``qualify`` skips the model call); the
+            # outcome is the one the scope check gives once findings exist.
+            return None, "prohibited-scope"
+        # The authorized reviewer has not produced findings: the route is unavailable.
+        raise Refusal("retryable", "review-route-unavailable") from error
+    if len(raw) > standing["budget"]["max_findings_bytes"]:
+        return None, "budget-exceeded"
+    if hashlib.sha256(raw).hexdigest() != args["findings_sha256"]:
+        raise Refusal("blocked", "stale-findings")
+    try:
+        findings = _decode(raw)
+    except (UnicodeError, ValueError, IntakeError):
+        return None, "invalid-findings"
+    if not _findings_valid(findings):
+        return None, "invalid-findings"
+    return findings, None
+
+
+def _findings_match(findings, standing, args):
+    return (findings["policy"] == {"policy_id": standing["policy_id"], "version": standing["version"]}
+            and findings["rendition"] == args["rendition"]
+            and findings["rendition_sha256"] == args["rendition_sha256"]
+            and findings["reviewer"] == standing["reviewer"])
+
+
+def _expected_inspection(value, records):
+    """What complete inspection of this rendition covers: (expected, pages, records, content)."""
+    if _kind(value) == "docling":
+        conversion = value["conversion"]
+        document = conversion["document"]
+        expected = {"pages": sorted(page["page_no"] for page in conversion["pages"]),
+                    "texts": sorted(item["self_ref"] for item in document["texts"]),
+                    "tables": sorted(item["self_ref"] for item in document["tables"]),
+                    # Each warning instance is inspected individually, not per code.
+                    "warnings": sorted(f"#/warnings/{i}" for i in range(len(conversion["warnings"])))}
+        content = ["tables", "text"] if expected["tables"] else ["text"]
+        return expected, len(conversion["pages"]), records, content
+    payload = value["payload"]
+    # Every payload record is inspected, including records retrieval omits
+    # (transcript notes and footer), so review covers the whole rendition.
+    records = payload[EXTRACT_FORMATS[payload["format"]]]
+    expected = {"records": list(range(len(records))),
+                "warnings": sorted(f"#/payload/warnings/{i}" for i in range(len(payload["warnings"])))}
+    return expected, 0, records, ["text"]
+
+
+def _snapshot(root, snapshot):
+    if callable(snapshot):
+        return snapshot()  # a shared lazy read (adapters.OneRead)
+    if snapshot is not None:
+        return snapshot
+    try:
+        return event_reader.read_snapshot(root)
+    except events.contract.ReviewError as error:
+        raise Refusal("blocked", "review-store-unavailable") from error
+
+
+def _earlier_reviews(snapshot, same, standing, source, qualified, args):
+    """This policy's own earlier-version reviews of the same source and scope, which this review
+    replaces; ones it already superseded stay listed so a crash-after-commit retry rebuilds the
+    identical event."""
+    return sorted(e["event_id"] for e in same
+                  if e["event_id"] != args["event_id"]
+                  and (snapshot.superseded_by(e["event_id"]) or args["event_id"]) == args["event_id"]
+                  and standing_events.earlier_standing_review(e, standing, source, qualified, args))
+
+
+def _conflicting(snapshot, standing, qualified, result, args):
+    """Whether another live review of this rendition stands in the way; records in ``qualified``
+    the earlier reviews of this policy that this one supersedes."""
+    # Only events on this rendition can matter (both checks require its locator), found by index.
+    same = snapshot.at(args["rendition"])
+    earlier = _earlier_reviews(snapshot, same, standing, qualified["source"], qualified, args)
+    if earlier:
+        qualified["supersedes"] = earlier
+    candidate = {**result, **qualified}
+    # Only this exact standing event (a crash-after-commit retry) is exempt.
+    return any(snapshot.superseded_by(e["event_id"]) is None and e["event_id"] not in earlier
+               and not standing_events.matches(e, candidate, args) for e in same)
+
+
+def _decision(findings, expected):
+    if findings["decision"] == "reject":
+        return "rejected", "reviewer-rejected"
+    if findings["decision"] == "defer":
+        return "deferred", "reviewer-deferred"
+    if findings["contradictions"] or findings["missing_evidence"]:
+        return "pending-review", "unresolved-evidence"
+    inspected = {key: sorted(findings["inspected"][key]) for key in expected}
+    if inspected != expected:
+        return "pending-review", "insufficient-inspected-scope"
+    return "qualified", "complete-inspected-scope"
 
 
 def evaluate(root, args, snapshot=None):
@@ -341,32 +454,13 @@ def evaluate(root, args, snapshot=None):
 
     if standing["status"] != "active":
         return outcome("exception", "policy-revoked")
-    try:
-        _, raw = _read(root, args["findings_path"], LIMIT)
-    except FileNotFoundError as error:
-        if refused_scope(root, standing, args["rendition"], args["rendition_sha256"]):
-            # Out of scope, so no review was requested (``qualify`` skips the model call); the
-            # outcome is the one the scope check below gives once findings exist.
-            return outcome("exception", "prohibited-scope")
-        # The authorized reviewer has not produced findings: the route is unavailable.
-        raise Refusal("retryable", "review-route-unavailable") from error
-    if len(raw) > standing["budget"]["max_findings_bytes"]:
-        return outcome("exception", "budget-exceeded")
-    if hashlib.sha256(raw).hexdigest() != args["findings_sha256"]:
-        raise Refusal("blocked", "stale-findings")
-    try:
-        findings = _decode(raw)
-    except (UnicodeError, ValueError, IntakeError):
-        return outcome("exception", "invalid-findings")
-    if not _findings_valid(findings):
-        return outcome("exception", "invalid-findings")
+    findings, failure = _read_findings(root, args, standing)
+    if failure:
+        return outcome("exception", failure)
     result["explanation"] = findings["explanation"]
     result["exception_resolution"] = findings["exception_resolution"]
     result["unverifiable_references"] = len(findings.get("unverifiable_references", []))
-    if (findings["policy"] != {"policy_id": standing["policy_id"], "version": standing["version"]}
-            or findings["rendition"] != args["rendition"]
-            or findings["rendition_sha256"] != args["rendition_sha256"]
-            or findings["reviewer"] != standing["reviewer"]):
+    if not _findings_match(findings, standing, args):
         return outcome("exception", "findings-mismatch")
     engine = index.rendition_api(root)
     rendition_raw, value, failure = _rendition(root, args, engine)
@@ -375,302 +469,34 @@ def evaluate(root, args, snapshot=None):
     source = value["source"]
     if not permits(standing["scope"], source["receipt_id"], source["audience"]):
         return outcome("exception", "prohibited-scope")
-    child, original = _registered(root, value, args)
+    child = _registered(root, value, args)
     if child is None:
         return outcome("exception", "unregistered-rendition")
     try:
         records = list(renditions.records(rendition_raw, value, engine))
     except (index.IndexError_, TypeError, AttributeError, KeyError, ValueError):
         return outcome("exception", "rendition-fidelity")
-    if _kind(value) == "docling":
-        conversion = value["conversion"]
-        document = conversion["document"]
-        pages = len(conversion["pages"])
-        expected = {"pages": sorted(page["page_no"] for page in conversion["pages"]),
-                    "texts": sorted(item["self_ref"] for item in document["texts"]),
-                    "tables": sorted(item["self_ref"] for item in document["tables"]),
-                    # Each warning instance is inspected individually, not per code.
-                    "warnings": sorted(f"#/warnings/{i}" for i in range(len(conversion["warnings"])))}
-        content = ["tables", "text"] if expected["tables"] else ["text"]
-    else:
-        payload = value["payload"]
-        # Every payload record is inspected, including records retrieval omits
-        # (transcript notes and footer), so review covers the whole rendition.
-        records = payload[EXTRACT_FORMATS[payload["format"]]]
-        pages = 0
-        expected = {"records": list(range(len(records))),
-                    "warnings": sorted(f"#/payload/warnings/{i}"
-                                       for i in range(len(payload["warnings"])))}
-        content = ["text"]
+    expected, pages, records, content = _expected_inspection(value, records)
     if set(findings["inspected"]) != set(expected):
         return outcome("exception", "findings-mismatch")
     result["inspected"] = {key: len(items) for key, items in expected.items()}
-    if (pages > standing["budget"]["max_pages"]
-            or len(records) > standing["budget"]["max_records"]):
+    if pages > standing["budget"]["max_pages"] or len(records) > standing["budget"]["max_records"]:
         return outcome("exception", "budget-exceeded")
     if findings["correction_of"] is not None or findings["new_mapping"]:
         return outcome("pending-review", "independent-review-required")
-    if callable(snapshot):
-        snapshot = snapshot()  # a shared lazy read (adapters.OneRead)
-    elif snapshot is None:
-        try:
-            snapshot = event_reader.read_snapshot(root)
-        except events.contract.ReviewError as error:
-            raise Refusal("blocked", "review-store-unavailable") from error
+    snapshot = _snapshot(root, snapshot)
     qualified = {"source": source, "content": content,
                  "format": value["payload"]["format"] if _kind(value) == "extract" else "docling",
                  "reviewer": standing["reviewer"], "context": standing["selection"]["context"]}
-    # This policy's own earlier-version reviews of the same source and scope are
-    # replaced by this review; ones it already superseded stay listed so a
-    # crash-after-commit retry rebuilds the identical event.
-    # Only events on this rendition can matter (both checks below require its locator), found by index.
-    same = snapshot.at(args["rendition"])
-    earlier = sorted(e["event_id"] for e in same
-                     if e["event_id"] != args["event_id"]
-                     and (snapshot.superseded_by(e["event_id"]) or args["event_id"]) == args["event_id"]
-                     and _earlier_standing_review(e, standing, source, qualified, args))
-    if earlier:
-        qualified["supersedes"] = earlier
-    candidate = {**result, **qualified}
-    # Only this exact standing event (a crash-after-commit retry) is exempt.
-    others = [e for e in same if snapshot.superseded_by(e["event_id"]) is None
-              and e["event_id"] not in earlier
-              and not _matches(e, candidate, args)]
-    if others:
+    if _conflicting(snapshot, standing, qualified, result, args):
         return outcome("pending-review", "conflicting-review")
-    if findings["decision"] == "reject":
-        return outcome("rejected", "reviewer-rejected")
-    if findings["decision"] == "defer":
-        return outcome("deferred", "reviewer-deferred")
-    if findings["contradictions"] or findings["missing_evidence"]:
-        return outcome("pending-review", "unresolved-evidence")
-    inspected = {key: sorted(findings["inspected"][key]) for key in expected}
-    if inspected != expected:
-        return outcome("pending-review", "insufficient-inspected-scope")
-    result.update(qualified, child=child)
-    return outcome("qualified", "complete-inspected-scope")
+    name, reason = _decision(findings, expected)
+    if name == "qualified":
+        result.update(qualified, child=child)
+    return outcome(name, reason)
 
 
 def refusal(result):
     """Visible non-qualified outcomes block durably with their reason."""
     if result["outcome"] != "qualified":
         raise Refusal("blocked", "standing-" + result["outcome"] + "-" + result["reasons"][0])
-
-
-def review_event(result, args, recorded_at=None):
-    recorded = recorded_at or datetime.now(timezone.utc).replace(microsecond=0)
-    policy_ref = result["policy"]
-    inspected = result["inspected"]
-    if result["format"] == "docling":
-        scope = qualification.COMPLETE_SCOPE
-        covered = (f"Inspected all {inspected['pages']} pages, {inspected['texts']} text records, "
-                   f"{inspected['tables']} tables and {inspected['warnings']} conversion warnings")
-    else:
-        scope = qualification.EXTRACT_COMPLETE_SCOPE
-        covered = (f"Inspected all {inspected['records']} {result['format']} extraction records "
-                   f"and {inspected['warnings']} extraction warnings")
-    statements = [
-        f"Standing policy {policy_ref['policy_id']} v{policy_ref['version']} "
-        f"(sha256 {policy_ref['sha256']}) authorized this exact rendition review.",
-        covered + f" (findings sha256 {result['findings_sha256']}).",
-        "Reviewer explanation: " + result["explanation"],
-    ]
-    if result["exception_resolution"]:
-        statements.append("Exception resolution: " + result["exception_resolution"])
-    if result.get("unverifiable_references"):
-        statements.append(f"Reviewer noted {result['unverifiable_references']} advisory "
-                          "references to material outside the rendition.")
-    source = result["source"]
-    return {
-        "event_id": args["event_id"],
-        "source": {"receipt_id": source["receipt_id"], "source_id": source["source_ids"][0],
-                   "locator": args["rendition"], "parent_locator": source["path"],
-                   "checksum": {"sha256": args["rendition_sha256"], "basis": "reported"}},
-        "scope": {"content": result["content"], "unit": "file", "extent": "defined_scope",
-                  "coordinates": "not_applicable", "ranges": [],
-                  "description": scope},
-        "outcome": "reviewed",
-        "counts": {"total": 1, "reviewed": 1, "pending": 0, "unreadable": 0, "dispositioned": 0},
-        "reason": "Qualified under explicit standing policy; parser completion is not verification.",
-        "reviewer": result["reviewer"], "reviewed_on": recorded.date().isoformat(),
-        "recorded_at": recorded.isoformat(),
-        "evidence": [{"kind": "agent_statement", "pointer": None, "quote": q} for q in statements],
-        "uncertainties": [],
-        "handling": [events.contract.HANDLING],
-        "provenance": {"origin": "agent_review", "record": None,
-                       "mapping_version": None, "unmapped_fields": []},
-        "relationships": [], "supersedes": list(result.get("supersedes", [])),
-        "correction_reason": (
-            f"Re-reviewed under standing policy {policy_ref['policy_id']} v{policy_ref['version']}, "
-            "replacing this policy's earlier-version standing review."
-            if result.get("supersedes") else None),
-    }
-
-
-def _earlier_standing_review(event, standing, source, qualified, args):
-    """True for this standing policy's own review of the same rendition, source and
-    scope under an earlier policy version: its event ID must be the one that earlier
-    policy's review would have produced, so operator corrections never qualify."""
-    if (event["source"]["locator"] != args["rendition"]
-            or event["source"]["receipt_id"] != source["receipt_id"]
-            or event["source"]["source_id"] != source["source_ids"][0]
-            or event["provenance"]["origin"] != "agent_review"
-            or event["scope"]["content"] != qualified["content"]
-            or event["scope"]["description"] != (qualification.COMPLETE_SCOPE if qualified["format"] == "docling"
-                                                 else qualification.EXTRACT_COMPLETE_SCOPE)):
-        return False
-    claims = [m.groups() for e in event["evidence"] for m in [STANDING_STATEMENT.fullmatch(e["quote"] or "")] if m]
-    suffix = "-" + args["policy_sha256"][:8]
-    if len(claims) != 1 or not args["event_id"].endswith(suffix):
-        return False
-    policy_id, version, sha = claims[0]
-    own = args["event_id"][:-len(suffix)] + "-" + sha[:8]
-    reason = event["correction_reason"]
-    return (policy_id == standing["policy_id"] and int(version) < standing["version"]
-            and event["event_id"] == own
-            and (not event["supersedes"]
-                 or (reason or "").startswith(f"Re-reviewed under standing policy {policy_id} v{version},")))
-
-
-def bound_event(root, result, args, snapshot=None):
-    """Return the stored active event when it binds exactly this qualification.
-
-    ``snapshot`` is a read taken after the event could have been committed; without one the store
-    is read here."""
-    try:
-        if snapshot is None:
-            snapshot = event_reader.read_snapshot(root)
-    except events.contract.ReviewError:
-        return None
-    event = snapshot.event(args["event_id"])
-    if event is None or snapshot.superseded_by(args["event_id"]) is not None or not _matches(event, result, args):
-        return None
-    return event
-
-
-def _matches(event, result, args):
-    """True only for the exact deterministic standing event of this qualification."""
-    if event["event_id"] != args["event_id"]:
-        return False
-    try:
-        recorded = datetime.fromisoformat(event["recorded_at"])
-        return event == review_event(result, args, recorded)
-    except (TypeError, ValueError, KeyError):
-        return False
-
-
-STANDING_STATEMENT = re.compile(
-    r"Standing policy ([a-z0-9][a-z0-9-]{0,99}) v([1-9][0-9]*) \(sha256 ([a-f0-9]{64})\) "
-    r"authorized this exact rendition review\.")
-
-
-def authorize_publication(root, manifest_name, standing, pinned):
-    """Refuse a manifest whose standing-authorized selections this policy did not authorize.
-
-    Selections backed only by independent reviews are outside standing authority
-    and are left to the native qualification rules.
-    """
-    try:
-        path = index.no_symlinks(Path(root) / manifest_name)
-        index.load_manifest(path, root)
-        raw = json.loads(path.read_bytes().decode("utf-8"),
-                         object_pairs_hook=index.strict_object)
-        # Publication re-validates the whole history it authorizes, not just what changed.
-        snapshot = event_reader.read_snapshot(root, full=True)
-    except (OSError, UnicodeError, ValueError, index.IndexError_,
-            events.contract.ReviewError) as error:
-        raise Refusal("blocked", "standing-selection-unauthorized") from error
-    expected = (pinned["policy_id"], str(pinned["version"]), pinned["sha256"])
-    for item in raw.get("renditions", []):
-        for event_id in item.get("review_event_ids") or []:
-            event = snapshot.event(event_id)
-            quotes = [e.get("quote") or "" for e in (event or {}).get("evidence", [])]
-            claims = [m.groups() for q in quotes for m in [STANDING_STATEMENT.fullmatch(q)] if m]
-            if not claims:
-                continue
-            if (claims != [expected] or not permits(
-                    standing["scope"], item["receipt_id"], _audience(root, item["path"]) or "")):
-                raise Refusal("blocked", "standing-selection-unauthorized")
-
-
-def _audience(root, name):
-    try:
-        _, raw = _read(root, name, 64 * 1024 * 1024)
-        return json.loads(raw.decode("utf-8"))["source"]["audience"]
-    except (OSError, UnicodeError, ValueError, KeyError, TypeError, Refusal):
-        return None
-
-
-def selection_entry(result, args):
-    source = result["source"]
-    return {"path": args["rendition"], "sha256": args["rendition_sha256"],
-            "receipt_id": source["receipt_id"], "format": result["format"],
-            "context": list(result["context"]), "review_event_ids": [args["event_id"]]}
-
-
-def selected_child(result, args):
-    child = json.loads(canonical(result["child"]))
-    child["data"]["coverage"] = "indexed"
-    child["data"]["reason"] = (
-        f"Selected under standing policy {result['policy']['policy_id']} "
-        f"v{result['policy']['version']} after exact review {args['event_id']}.")
-    return child
-
-
-def write_manifest(root, name, entry, replaces=()):
-    """Atomically add one selection entry to the manifest; idempotent for retries.
-
-    An existing entry for the same path is replaced only when every review it
-    cites is one this review supersedes (``replaces``). A new path is appended in
-    constant time (``selection_manifest``); a replacement, an empty list or a file
-    the append cannot extend in place takes the full read, validate and rewrite.
-    The caller holds the ledger writer lock."""
-    path = index.no_symlinks(Path(root) / name)
-    selection_manifest.recover(root, name)
-    known = selection_manifest.view(root, name)
-    if not known.has(entry["path"]):
-        if known.count >= renditions.MAX_SELECTIONS:
-            raise Refusal("blocked", "selection-capacity")
-        digest = selection_manifest.append(root, name, entry, known)
-        if digest is not None:
-            return digest
-    selection_manifest.forget(path)
-    config, _ = index.load_manifest(path, root)
-    raw = json.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=index.strict_object)
-    selected = raw.setdefault("renditions", [])
-    current = [item for item in selected if item["path"] == entry["path"]]
-    if current == [entry]:
-        return index.digest(path.read_bytes())
-    if current and all(item.get("review_event_ids") and set(item["review_event_ids"]) <= set(replaces)
-                       for item in current):
-        selected[:] = [item for item in selected if item["path"] != entry["path"]]
-        current = []
-    if current:
-        raise Refusal("blocked", "selection-conflict")
-    if len(selected) >= renditions.MAX_SELECTIONS:
-        # Not a conflict: the manifest is full, and room may appear when another cohort frees some.
-        raise Refusal("blocked", "selection-capacity")
-    selected.append(entry)
-    data = (json.dumps(raw, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
-    mode = stat.S_IMODE(path.stat().st_mode)
-    descriptor, temporary = tempfile.mkstemp(prefix=".selection-", suffix=".json", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, mode)
-        index.load_manifest(Path(temporary), root)
-        os.replace(temporary, path)
-    except BaseException:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-        raise
-    fsync_directory(path.parent)
-    return index.digest(data)
-
-
-def manifest_entry(root, name, path):
-    raw = json.loads((Path(root) / name).read_bytes().decode("utf-8"),
-                     object_pairs_hook=index.strict_object)
-    return [item for item in raw.get("renditions", []) if item["path"] == path]

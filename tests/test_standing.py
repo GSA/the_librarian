@@ -10,7 +10,7 @@ from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index
 from tools.extraction import docling_bridge
 from tools.review_events import event_store as events
-from tools.intake import adapters, runner, standing, store
+from tools.intake import adapters, runner, standing, standing_events, standing_publication, store
 
 from tests.support import WorkspaceCase
 from test_intake_adapters import stage, stage_request
@@ -18,6 +18,11 @@ from test_intake_adapters import stage, stage_request
 RUN = "a" * 64
 RENDITION = f"data/extractions/.local/D1/{RUN}/extraction.json"
 DB = "tools/context_index/.local/index.sqlite3"
+
+
+def manifest_entry(root, name, path):
+    raw = json.loads((root / name).read_bytes().decode("utf-8"), object_pairs_hook=index.strict_object)
+    return [item for item in raw.get("renditions", []) if item["path"] == path]
 
 
 def sha(raw):
@@ -181,7 +186,7 @@ class StandingEvaluationTests(StandingCase):
         self.assertEqual(self.evaluate()["outcome"], "exception")
 
     def test_docling_fidelity_checks_page_and_table_content(self):
-        with patch.object(standing, "_registered", return_value=({"id": "x"}, {})):
+        with patch.object(standing, "_registered", return_value={"id": "x"}):
             for label, mutate in (
                     ("page", lambda v: v["conversion"]["document"]["tables"][0]["prov"][0]
                      .update(page_no=7)),
@@ -210,7 +215,7 @@ class StandingEvaluationTests(StandingCase):
         self.value["conversion"]["warnings"].append(
             {"code": "low_confidence", "message": "Second field"})
         self.assertEqual(len(self.value["conversion"]["warnings"]), 2)
-        with patch.object(standing, "_registered", return_value=({"id": "x"}, {})):
+        with patch.object(standing, "_registered", return_value={"id": "x"}):
             self.raw = self.write_rendition(self.value)
             self.findings["rendition_sha256"] = sha(self.raw)
             self.write_private("config/standing-findings.json", self.findings)
@@ -237,14 +242,14 @@ class StandingEvaluationTests(StandingCase):
 
     def assert_not_reusable(self, mutate):
         result = self.evaluate()
-        event = standing.review_event(result, self.review_args())
+        event = standing_events.review_event(result, self.review_args())
         mutate(event)
         event["evidence"] = [{"kind": "agent_statement", "pointer": None,
                               "quote": "Independent review outside the standing policy."}]
         state = events.status(self.root)
         events.append(self.root, events.bundle([event]), "standing-reviewer", "req-other",
                       state["revision"], state["state_token"])
-        self.assertIsNone(standing.bound_event(self.root, result, self.review_args()))
+        self.assertIsNone(standing_events.bound_event(self.root, result, self.review_args()))
         self.assert_outcome("pending-review", "conflicting-review")
 
     def test_select_cannot_reuse_partial_review_event(self):
@@ -350,7 +355,7 @@ class StandingEvaluationTests(StandingCase):
         self.write_private("config/standing-findings.json",
                            {**self.findings, "unverifiable_references": [cited, "Cites a repo."]})
         result = self.assert_outcome("qualified", "complete-inspected-scope")
-        quotes = [e["quote"] for e in standing.review_event(result, self.review_args())["evidence"]]
+        quotes = [e["quote"] for e in standing_events.review_event(result, self.review_args())["evidence"]]
         self.assertIn("Reviewer noted 2 advisory references to material outside the rendition.",
                       quotes)
         self.assertNotIn(cited, " ".join(quotes))
@@ -380,7 +385,7 @@ class StandingEvaluationTests(StandingCase):
         self.value["conversion"]["warnings"] = [
             {"code": "low_confidence", "message": f"Field {i}"} for i in range(12)]
         refs = [f"#/warnings/{i}" for i in range(12)]
-        with patch.object(standing, "_registered", return_value=({"id": "x"}, {})):
+        with patch.object(standing, "_registered", return_value={"id": "x"}):
             self.raw = self.write_rendition(self.value)
             self.findings["rendition_sha256"] = sha(self.raw)
             self.findings["inspected"]["warnings"] = refs
@@ -503,13 +508,13 @@ class StandingIntakeTests(StandingCase):
     def test_crash_after_selection_commit_retries_without_false_completion(self):
         self.stage_all()
         self.run_stage("review")
-        with patch.object(standing, "write_manifest", side_effect=OSError(5, "crash")):
+        with patch.object(standing_publication, "write_manifest", side_effect=OSError(5, "crash")):
             result = self.run_stage("select")
         self.assertEqual(result["status"], "retryable")
-        self.assertEqual(standing.manifest_entry(self.root, "config/selection.json", RENDITION), [])
+        self.assertEqual(manifest_entry(self.root, "config/selection.json", RENDITION), [])
         self.assertEqual(self.run_stage("select")["status"], "succeeded")
-        self.assertEqual(len(standing.manifest_entry(self.root, "config/selection.json",
-                                                     RENDITION)), 1)
+        self.assertEqual(len(manifest_entry(self.root, "config/selection.json",
+                                            RENDITION)), 1)
 
     def test_failed_refresh_stays_not_retrievable(self):
         self.stage_all()
@@ -609,7 +614,7 @@ class StandingIntakeTests(StandingCase):
         self.write_private("config/standing-findings.json", {**self.findings, "decision": "reject"})
         result = self.run_stage("select")
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(standing.manifest_entry(self.root, "config/selection.json", RENDITION), [])
+        self.assertEqual(manifest_entry(self.root, "config/selection.json", RENDITION), [])
 
     def test_confidence_never_yields_verification(self):
         self.stage_all()

@@ -6,7 +6,7 @@ extractions, one standing-authorized review event each, and the manifest, all wr
 large sizes build quickly) and times, in a fresh process per size: ``load_manifest`` (selection
 validation), ``renditions.inputs`` (one call, the dominant per-publish cost) and the first and the
 unchanged ``cohort.publish`` (the second one reuses the saved publication) and, last, one
-``standing.write_manifest`` select (the whole-manifest rewrite every selection pays). Reports body-free JSON,
+``standing_publication.write_manifest`` select (the whole-manifest rewrite every selection pays). Reports body-free JSON,
 including how many times ``renditions.inputs`` ran per publish and the engine's peak RSS. Synthetic
 fixtures only; never point it at a real instance.
 
@@ -183,12 +183,12 @@ out["published"] = report["counts"]["published"]
 calls[0] = 0
 out["republish_s"], again = timed(lambda: cohort.publish(root, policy_path=policy_path, manifest=manifest))
 out["republish_inputs_calls"] = calls[0]
-from tools.intake import standing
+from tools.intake import standing, standing_publication
 last = dict(config["renditions"][-1])
 last["path"] = last["path"].rsplit("/", 2)[0] + "/" + "f" * 64 + "/extraction.json"
 start = time.perf_counter()
 try:
-    standing.write_manifest(root, manifest, last)
+    standing_publication.write_manifest(root, manifest, last)
     out["select_write_s"] = round(time.perf_counter() - start, 3)
 except standing.Refusal as refusal:
     out["select_write_s"] = refusal.code  # the manifest is already at the cap
