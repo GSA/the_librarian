@@ -1340,7 +1340,7 @@ class SharedManifestTests(QualifyCase):
     def test_an_interrupted_manifest_write_leaves_the_manifest_as_it_was(self):
         self.qualify("a")
         before = self.manifest.read_bytes()
-        real_replace, real_pwrite = os.replace, os.pwrite
+        real_replace = os.replace
 
         def fail_replace(source, target, *args, **kwargs):
             if Path(target) == self.manifest:

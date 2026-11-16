@@ -175,7 +175,7 @@ def measure(args):
         store.inspect(root, "upload-inbox-" + hashlib.sha256(b"0").hexdigest()[:24]) if args.seed else None
         revisions = lambda: sqlite3.connect(root / ".local/catalog/catalog.sqlite3").execute(
             "SELECT count(*) FROM revisions").fetchone()[0]
-        before_revisions, before_io = revisions(), open("/proc/self/io").read()
+        before_revisions, before_io = revisions(), Path("/proc/self/io").read_text()
         sync0 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
         start, cpu = time.perf_counter(), time.process_time()
         parameters = inspect.signature(cohort.ingest).parameters
@@ -183,7 +183,7 @@ def measure(args):
         report = cohort.ingest(root, inbox, system="bench", actor="bench", **kwargs)
         wall, cpu = time.perf_counter() - start, time.process_time() - cpu
         sync1 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
-        io = dict(line.split(": ") for line in open("/proc/self/io").read().splitlines())
+        io = dict(line.split(": ") for line in Path("/proc/self/io").read_text().splitlines())
         io0 = dict(line.split(": ") for line in before_io.splitlines())
         files = args.files
         result = {"tree": args.tree.name, "batch_size": args.batch_size if kwargs else 1, "seed": args.seed,

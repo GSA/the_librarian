@@ -7,7 +7,6 @@ import hashlib
 import io
 import importlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -133,7 +132,7 @@ class StoreIdentity(unittest.TestCase):
                 (events, 0x46524556, "Superseded FREV")):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                state = module.initialize(root)
+                module.initialize(root)
                 database = module.locations(root)[1]
                 with sqlite3.connect(database) as connection:
                     connection.execute(f"PRAGMA application_id={old}")
@@ -1431,7 +1430,7 @@ class WorkspaceTests(WorkspaceCase):
 
         # 1. Initialize instance + deeply nested intake_home (.local/queues/recovery/intake)
         run_in(kit, "tools/initialize.py")
-        intake_init = intake_store.initialize(kit)
+        intake_store.initialize(kit)
         self.assertTrue((kit / ".local/queues/recovery/intake/intake.sqlite3").is_file())
         self.assertEqual(stat.S_IMODE((kit / ".local/queues/recovery").stat().st_mode), 0o700)
 
@@ -1835,11 +1834,12 @@ class ScriptConventionTests(unittest.TestCase):
             with self.subTest(module=name):
                 module = importlib.import_module(name)
                 self.assertTrue(callable(module.parser))
-                with self.assertRaises(SystemExit):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     module.parser().parse_args(["--roo", "/tmp"])
-                with self.assertRaises(SystemExit) as stopped:
+                with redirect_stdout(io.StringIO()) as shown, self.assertRaises(SystemExit) as stopped:
                     module.main(["--help"])
                 self.assertEqual(stopped.exception.code, 0)
+                self.assertIn("usage:", shown.getvalue())
 
 
 class PackageTests(unittest.TestCase):

@@ -3,7 +3,7 @@
 
 import argparse
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -20,9 +20,8 @@ import uuid
 from tools import backups as snapshots, policy
 from tools.file_identity import file_identity
 from tools.catalog.contracts import (
-    AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
-    CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
-    now, path_value, refs, require, safe_relative, text, validate_graph, GraphValidator,
+    AUDIENCES, COVERAGES, KINDS, CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
+    now, require, safe_relative, text, validate_graph, GraphValidator,
     validate_record, validate_records, validate_delta, _references,
 )
 

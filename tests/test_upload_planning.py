@@ -1,7 +1,5 @@
 """Per-file upload planning reads only the highest ID per prefix and memoizes reserved IDs (Kata 3re5)."""
 from contextlib import closing
-import json
-import os
 from pathlib import Path
 import sqlite3
 import tempfile

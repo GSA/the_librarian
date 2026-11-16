@@ -1,0 +1,11 @@
+# Toolkit-wide lint gate. Kept deliberately narrow: pyflakes plus bug-prone
+# bugbear checks. Style rules (formatting, line length) are not enforced.
+target-version = "py311"
+required-version = "==0.17.5"
+extend-exclude = [".local", "build", "dist"]
+
+[lint]
+select = ["F", "B", "SIM115"]
+# B007 (unused loop variable) and B905 (zip without strict=) are style or
+# behavior-changing suggestions rather than confirmed bugs here.
+ignore = ["B007", "B905"]

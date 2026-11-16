@@ -1,7 +1,6 @@
 """Batched ingest (Kata herq): outcomes equal the one-at-a-time path; crashes and refusals are safe."""
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -166,7 +165,6 @@ class FailedDocumentDoesNotBlockItsBatch(unittest.TestCase):
     def test_a_document_whose_extraction_check_fails_is_blocked_alone(self):
         root, inbox = make_instance(self, 5)
         real = extract.unchanged
-        calls = {"n": 0}
 
         def failing(root_, value):
             if value["source"]["receipt_id"] == "D3":

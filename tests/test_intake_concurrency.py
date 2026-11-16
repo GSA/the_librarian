@@ -214,7 +214,6 @@ class SettleTests(Case):
                 raise catalog.StaleState("Stale expected state; re-read before writing")
             return real(*args, **kwargs)
         import json
-        from tools import policy
         records = [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}]
         store.stage(self.root, json.dumps({
             "version": 1, "correlation_id": "req-backoff", "correction_of": None,

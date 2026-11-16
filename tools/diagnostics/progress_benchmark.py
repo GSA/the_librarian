@@ -17,9 +17,7 @@ Synthetic fixtures only; never point it at a real instance.
 import argparse
 from contextlib import closing
 import json
-import os
 from pathlib import Path
-import resource
 import sqlite3
 import subprocess
 import sys

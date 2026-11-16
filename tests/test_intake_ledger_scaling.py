@@ -13,7 +13,6 @@ import unittest
 from unittest import mock
 
 from tests.support import default_policy_hash
-from tools import policy
 from tools.intake import cohort, contracts, progress, runner, store
 
 WAIT_ENV = "LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS"

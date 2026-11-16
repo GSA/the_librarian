@@ -13,7 +13,6 @@ import threading
 import stat
 import subprocess
 import tempfile
-import time
 import uuid
 
 from tools.extraction import docling_bridge as bridge

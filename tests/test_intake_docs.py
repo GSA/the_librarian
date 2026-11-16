@@ -2,7 +2,6 @@
 from contextlib import closing
 import hashlib
 import io
-import json
 import os
 from pathlib import Path
 import sqlite3
@@ -316,7 +315,6 @@ class ChangeDetectionTests(DocsCase):
     def tearDown_inbox(self):
         """Fresh instance and inbox for each sub-case."""
         import shutil
-        import tempfile
         for path in (self.root, self.inbox):
             if path.exists():
                 self.writable()

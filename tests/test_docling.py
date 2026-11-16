@@ -2,8 +2,6 @@
 
 from copy import deepcopy
 import hashlib
-import importlib.util
-import json
 from pathlib import Path
 import sys
 import tempfile
@@ -236,13 +234,13 @@ class DoclingLifecycle(unittest.TestCase):
         for target in ("source", "policy"):
             with self.subTest(target=target):
                 mutated = [False]
-                def mutate(*args):
+                def mutate(*args, mutated=mutated, target=target):
                     result = snapshot(*args)
                     mutated[0] = True
                     if target == "source":
                         self.path.write_bytes(self.raw + b"changed")
                     return result
-                def current_binding(*_args, **_kwargs):
+                def current_binding(*_args, mutated=mutated, target=target, **_kwargs):
                     return {**binding, "policy_sha256": "changed"} if mutated[0] and target == "policy" else binding
                 with patch.object(catalog, "_daily_snapshot", side_effect=mutate), \
                      patch.object(bridge, "binding", side_effect=current_binding):

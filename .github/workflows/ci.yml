@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install ./tools/context-mcp ruff==0.17.5
+      - name: Lint
+        run: .venv/bin/ruff check
+      - name: Schema snapshots
+        run: .venv/bin/python -m tools.schemas.export_schemas --check
+      - name: Tests
+        run: .venv/bin/python -m unittest discover -s tests

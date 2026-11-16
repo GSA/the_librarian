@@ -4,7 +4,6 @@ The identity-bound receipt (docs/design/current-state.md, "What a catalog write 
 with this one on valid and tampered histories, so a change that accepts or refuses differently
 fails. Do not optimize this copy.
 """
-import sqlite3
 import uuid
 
 from tools.catalog.catalog_store import (

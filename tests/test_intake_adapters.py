@@ -344,7 +344,6 @@ class NativeTests(unittest.TestCase):
 
     def test_docling_stage_boundaries_and_restart(self):
         import test_docling
-        from tools.extraction import docling_adapter
         fixture = test_docling.DoclingLifecycle()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)

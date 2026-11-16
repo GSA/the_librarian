@@ -180,7 +180,6 @@ class ValidHistory(Case):
 
 class Tampering(Case):
     def test_named_tampering_classes_are_refused_with_the_original_messages(self):
-        payload = "SELECT payload FROM versions WHERE revision=2 AND ordinal=%d"
         cases = {
             "payload text edited": [("UPDATE versions SET payload=replace(payload,'Synthetic.','Edited.') "
                                      "WHERE revision=2")],

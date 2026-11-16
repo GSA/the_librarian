@@ -20,7 +20,6 @@ from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
 from tests.test_file_identity_locks import needs_dbpage
 from tests.test_intake_cohort import QualifyCase
-from tools.intake import cohort
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTOR = "memo-tester"

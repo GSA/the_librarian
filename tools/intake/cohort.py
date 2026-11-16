@@ -8,7 +8,7 @@ standing-policy review qualifies them. Printed output is body-free counts.
 """
 import argparse
 from collections import Counter, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -425,7 +425,8 @@ def _process_batch(root, inbox, entries, system, actor, heads):
                     "stage": "receipt", "code": error.code}
         pending = [(corr, "receipt") for _, corr, _, known in staged if upload.settled(known, corr) is None]
         try:
-            summaries = runner.settle_batch(root, pending) if pending else {}
+            if pending:
+                runner.settle_batch(root, pending)
             fresh = upload.known_requests(root, [corr for _, corr, _, _ in staged])
         except LedgerBusy:
             for entry, *_ in staged:
@@ -477,7 +478,7 @@ def _extract_batch(root, entries, actor, heads):
     state = None
     for entry, version, base in registers:
         try:
-            def arguments():
+            def arguments(base=base):
                 nonlocal state
                 # One state read pins every registration staged now; each is rebased on its own.
                 state = state or catalog.status(root)["state_token"]

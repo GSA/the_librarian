@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Local, derived Markdown retrieval. No source writes or remote access."""
 
-from collections import Counter
 from contextlib import contextmanager
 import hashlib
 import json
@@ -794,7 +793,6 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None
     piece_keys = {}
     queue = [(requested, "selected-section")]
     seen = set()
-    pairs = []
     assembled_chars = 0
 
     def add_piece(row, start, end, text, reason, source_locator=None):

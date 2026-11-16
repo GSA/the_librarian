@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import random
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -158,7 +157,7 @@ class Equivalence(Case):
         universe = list(range(1, 6))
         indexed = new_instance(self.temp.name, "indexed", indexed=True)
         legacy = new_instance(self.temp.name, "legacy", indexed=False)
-        committed, accepted, refused, steps = {}, 0, 0, 0
+        committed, accepted, refused = {}, 0, 0
         for step in range(260):
             batch = list({r["id"]: r for r in (self.random_record(rng, universe) for _ in range(rng.randint(1, 4)))}.values())
             merged = {**committed, **{r["id"]: r for r in batch}}

@@ -165,6 +165,13 @@ restated here.
   enforces at runtime, and every direct pin must appear in it unchanged
   (`tests/test_docling.py::WorkerRequirements`).
   The reader needs none of it.
+- **Continuous integration** (`.github/workflows/ci.yml`) runs on pull requests
+  and pushes to `main` with Python 3.14: it installs `tools/context-mcp` into a
+  fresh `.venv`, then runs `ruff check`, the schema snapshot `--check` and the
+  unittest suite. `ruff.toml` pins the ruff version and enforces only pyflakes
+  (`F`), bugbear (`B`, minus `B007`/`B905`) and `SIM115`; formatting and line
+  length are not enforced. Ruff is a CI/development tool, not a runtime
+  dependency.
 - The first proof-of-concept installation is closed; this repository does not
   maintain or port from it. Its clean-copy tests only prove this repository's
   packaging and policy boundary.

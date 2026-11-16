@@ -20,11 +20,9 @@ so an expensive first ingest is not paid per tree.
 """
 import argparse
 import contextlib
-from collections import Counter
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import sys
 import tempfile
 import time
