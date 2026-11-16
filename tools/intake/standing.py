@@ -46,6 +46,16 @@ class Refusal(Exception):
         super().__init__(code)
 
 
+class CatalogUnavailable(RuntimeError):
+    """The catalog could not be read for a reason other than an absent record.
+
+    Deliberately not a ``CatalogError``: adapters save those as durable stage failures, and an
+    unreadable catalog (such as a validator changed under this process) says nothing about the
+    rendition, so it stops the run instead and a restarted run re-checks the same stage.
+    """
+    code = "catalog_unavailable"
+
+
 def _identifier(value, pattern=r"[a-z0-9][a-z0-9-]{0,99}"):
     return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
@@ -240,8 +250,8 @@ def _registration_reads(root, receipt_id):
     """The receipt's metadata and records from one catalog state, or None when it is not there.
 
     Only an absent receipt or record means unregistered. A commit landing between the reads is
-    re-read and, if it persists, retryable; any other catalog failure (an unavailable store or a
-    validator changed under this process) propagates instead of being recorded as an outcome.
+    re-read and, if it persists, retryable; any other catalog failure raises ``CatalogUnavailable``
+    instead of being recorded as an outcome.
     """
     try:
         catalog.identifier(receipt_id, "receipt")
@@ -258,6 +268,8 @@ def _registration_reads(root, receipt_id):
             continue
         except catalog.WriterBusy as error:
             raise Refusal("retryable", error.code) from error
+        except catalog.CatalogError as error:
+            raise CatalogUnavailable(str(error)) from error
         return metadata, records
     raise Refusal("retryable", catalog.StaleState.code)
 

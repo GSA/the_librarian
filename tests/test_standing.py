@@ -409,7 +409,7 @@ class StandingEvaluationTests(StandingCase):
         # A catalog this process can no longer read is never saved as a review outcome.
         with patch.object(standing.catalog, "receipt_metadata", side_effect=catalog.CatalogError(
                 "Catalog validator changed after import; restart the reader")):
-            with self.assertRaises(catalog.CatalogError):
+            with self.assertRaises(standing.CatalogUnavailable):
                 self.evaluate()
         real, reads = catalog.read_records, []
 

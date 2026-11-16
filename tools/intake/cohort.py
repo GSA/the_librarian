@@ -1515,6 +1515,10 @@ def main(argv=None):
     except IntakeError as error:
         print(json.dumps({"error": error.code}), file=sys.stderr)
         return 2
+    except standing.CatalogUnavailable as error:
+        # Nothing about the entry was saved; restart once the catalog is readable.
+        print(json.dumps({"error": error.code}), file=sys.stderr)
+        return 2
     if args.report:
         _write_private(args.report, report)
     summary = {"counts": report["counts"]}

@@ -906,6 +906,32 @@ class QualifyTests(QualifyCase):
                          [c + "-c1" for c in blocked])
         self.assertEqual(len(calls), 12)
 
+    def test_unreadable_catalog_stops_qualify_without_saving_an_outcome(self):
+        from unittest.mock import patch
+        from tools.catalog import catalog_store
+        from tools.intake import standing
+
+        class ValidatorChanged:
+            def __getattr__(self, name):
+                return getattr(catalog_store, name)
+
+            def read_records(self, *args, **kwargs):
+                raise catalog_store.CatalogError(
+                    "Catalog validator changed after import; restart the reader")
+        transport, calls = self._transport()
+        with patch.object(standing, "catalog", ValidatorChanged()):
+            with self.assertRaises(standing.CatalogUnavailable):
+                self._qualify(transport)
+        reviews = [s for r in store.list_requests(self.root)
+                   if r["correlation_id"].startswith("standing-") for s in r["stages"]]
+        self.assertTrue(reviews)
+        self.assertFalse([s for s in reviews if s["status"] in {"blocked", "dead-letter"}])
+        spent = len(calls)
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        # The review staged before the stop is resumed from its saved findings.
+        self.assertEqual(len(calls), spent + 5)
+
     def test_review_saved_as_unregistered_is_corrected_once_the_catalog_confirms_it(self):
         from unittest.mock import patch
         from tools.intake import standing
