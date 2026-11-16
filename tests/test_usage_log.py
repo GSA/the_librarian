@@ -1,4 +1,6 @@
 """Usage recorder: body-free AgentsView session files for direct model calls."""
+from contextlib import redirect_stderr
+import io
 import json
 import tempfile
 import threading
@@ -70,10 +72,12 @@ class RecorderTests(unittest.TestCase):
         for previous, line in zip(lines[1:], lines[2:]):
             self.assertEqual(line["parentId"], previous["id"])
 
-    def test_unwritable_directory_is_ignored(self):
+    def test_unwritable_directory_is_ignored_with_a_payload_free_diagnostic(self):
         blocker = self.root / "file"
         blocker.write_text("x")
-        self.assertIsNone(Recorder("n", "usai", directory=blocker).record("m", {}))
+        with redirect_stderr(io.StringIO()) as stderr:
+            self.assertIsNone(Recorder("n", "usai", directory=blocker).record("secret-model", {}))
+        self.assertEqual(stderr.getvalue(), "usage log: record skipped (FileExistsError)\n")
 
     def test_malformed_usage_is_recorded_as_zero(self):
         for usage in ({"prompt_tokens": "5"}, {"prompt_tokens_details": 5},

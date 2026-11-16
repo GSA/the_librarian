@@ -586,4 +586,4 @@ writing, as with `recover-conflicts`.
 Model calls made by `qualify` and `model_review evaluate` are recorded body-free (model and token
 counts only, never prompts, documents or replies) as one session file per run in
 `$AGENTSVIEW_DIRECT_API_DIR`, default `~/.agentsview/direct-api`, for AgentsView's Direct API agent.
-A failure to write them never affects the run.
+A failure to write them never affects the run; it prints one stderr line naming only the exception type.

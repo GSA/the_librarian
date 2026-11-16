@@ -1,9 +1,11 @@
 """Body-free record of direct model calls as an AgentsView "Direct API" session file."""
+from contextlib import suppress
 from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 import uuid
 
@@ -22,7 +24,8 @@ class Recorder:
 
     ``$AGENTSVIEW_DIRECT_API_DIR`` (default ``~/.agentsview/direct-api``) is read at the
     first record, which also creates the file. Prompts, documents and replies are never
-    written, and a write failure is swallowed so it cannot affect the caller.
+    written. A write failure cannot affect the caller: it is reported as one stderr line
+    naming only the exception type.
     """
 
     def __init__(self, name, provider, *, directory=None, cwd=None):
@@ -63,5 +66,6 @@ class Recorder:
                     out.write("".join(json.dumps(line, separators=(",", ":")) + "\n"
                                       for line in lines))
                 self.path, self.last_id = path, message_id
-            except Exception:  # usage logging must never break a model call
-                pass
+            except Exception as error:  # usage logging must never break a model call
+                with suppress(Exception):
+                    print(f"usage log: record skipped ({type(error).__name__})", file=sys.stderr)
