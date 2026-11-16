@@ -2,7 +2,7 @@
 
 ``qualify`` adds one selection per qualified rendition and asks, per entry, whether the manifest
 has room. Re-reading, revalidating and rewriting the whole file each time made filling it
-quadratic (274 ms per select at 20,000 entries). Two things change the cost, not the file:
+quadratic (274 ms per select at 20,000 entries; the append stays flat at 50,000: about 39-55 ms per select including lock and validation overhead, Kata q4ks). Two things change the cost, not the file:
 
 * **A view remembered by file identity.** One full, validated read (``index.load_manifest`` plus a
   byte-for-byte comparison with the canonical rendering) is kept in memory for the file's identity
