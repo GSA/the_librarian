@@ -21,6 +21,8 @@ DDL = """
 CREATE TABLE requests (
  correlation_id TEXT PRIMARY KEY, correction_of TEXT REFERENCES requests(correlation_id),
  raw BLOB NOT NULL, request_sha256 TEXT NOT NULL, root TEXT NOT NULL);
+-- Kata 5m1h: every "who corrects this request" lookup (partial: most requests correct nothing).
+CREATE INDEX IF NOT EXISTS requests_correction ON requests(correction_of) WHERE correction_of IS NOT NULL;
 CREATE TABLE stages (
  correlation_id TEXT NOT NULL REFERENCES requests(correlation_id), stage_id TEXT NOT NULL,
  ordinal INTEGER NOT NULL, status TEXT NOT NULL, cycle INTEGER NOT NULL DEFAULT 0,
@@ -57,6 +59,8 @@ CREATE INDEX docs_register ON docs(register_head);
 # The derived table is the tail of ``DDL``: a ledger that predates it gets exactly these statements
 # from ``cohort backfill-docs``, and nothing else about the ledger changes.
 DOCS_DDL = DDL[DDL.index("-- Derived (Kata e22r)"):]
+# A ledger created before the index gets this one statement from the next writer to open it.
+CORRECTION_INDEX = DDL[DDL.index("CREATE INDEX IF NOT EXISTS requests_correction"):].split(";")[0]
 
 
 def safe(path):
@@ -397,6 +401,9 @@ def locked(root, wait=None):
             # it was last written by a validated writer, so the O(ledger) pass is skipped.
             if known is None or known != file_identity(db, c):
                 validate(c, root)
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='requests_correction'").fetchone() is None:
+                with c:
+                    c.execute(CORRECTION_INDEX)
             entered = file_identity(db, c)
         except sqlite3.Error as error:
             raise (LedgerBusy() if _busy(error) else IntakeError("corrupt_store")) from error

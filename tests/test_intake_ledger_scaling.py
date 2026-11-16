@@ -303,6 +303,89 @@ class ReaderTests(Case):
         self.assertEqual(caught.exception.code, "corrupt_request")
 
 
+class CorrectionIndexTests(Case):
+    LOOKUPS = (
+        ("SELECT 1 FROM requests WHERE correction_of=?", ("seed-000",)),
+        ("SELECT 1 FROM requests WHERE correction_of=? AND correlation_id!=?", ("seed-000", "seed-001")),
+        ("SELECT correlation_id FROM requests WHERE correction_of=?", ("seed-000",)),
+    )
+
+    def seed_corrections(self):
+        self.seed(3)
+        store.stage(self.root, request("seed-fix", correction_of="seed-000"))
+
+    def index(self):
+        with closing(sqlite3.connect(self.db)) as c:
+            return c.execute("SELECT sql FROM sqlite_master WHERE name='requests_correction'").fetchone()
+
+    def drop_index(self):
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("DROP INDEX requests_correction")
+
+    def ledger(self):
+        with closing(sqlite3.connect(self.db)) as c:
+            return {t: c.execute(f"SELECT * FROM {t} ORDER BY 1, 2").fetchall()
+                    for t in ("requests", "stages", "attempts", "replays", "acknowledgments")}
+
+    def test_every_correction_lookup_uses_the_index(self):
+        self.seed_corrections()
+        with store.locked(self.root) as c:
+            for sql, args in self.LOOKUPS:
+                plan = " ".join(row[3] for row in c.execute("EXPLAIN QUERY PLAN " + sql, args))
+                self.assertIn("requests_correction", plan, sql)
+                self.assertNotIn("SCAN", plan, sql)
+
+    def test_a_new_ledger_has_the_index(self):
+        self.assertIsNotNone(self.index())
+
+    def test_a_ledger_without_the_index_gains_it_on_the_next_writer_without_losing_data(self):
+        self.seed_corrections()
+        self.drop_index()
+        before = self.ledger()
+        self.assertEqual(store.head(self.root, "seed-000")["correlation_id"], "seed-fix")
+        self.assertIsNotNone(self.index())
+        self.assertEqual(self.ledger(), before)
+        with store.locked(self.root) as c:
+            self.assertIn("requests_correction", " ".join(
+                row[3] for row in c.execute("EXPLAIN QUERY PLAN " + self.LOOKUPS[0][0], self.LOOKUPS[0][1])))
+
+    def test_the_upgrade_is_idempotent_and_an_indexed_ledger_is_not_rewritten(self):
+        self.seed_corrections()
+        self.drop_index()
+        store.head(self.root, "seed-000")
+        stamp = self.db.stat().st_mtime_ns
+        store.head(self.root, "seed-000")
+        store.head(self.root, "seed-000")
+        self.assertEqual(self.db.stat().st_mtime_ns, stamp)
+
+    def test_the_upgrade_hands_off_a_valid_attestation_and_the_ledger_stays_verified(self):
+        self.seed_corrections()
+        self.drop_index()
+        store.head(self.root, "seed-000")
+        calls = []
+        real = store.validate
+        with mock.patch.object(store, "validate", side_effect=lambda *a: calls.append(1) or real(*a)):
+            store.head(self.root, "seed-000")
+        self.assertEqual(calls, [])
+        with closing(sqlite3.connect(self.db)) as c:
+            self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_a_reader_holding_the_ledger_delays_the_upgrade_to_a_retryable_busy(self):
+        self.seed_corrections()
+        self.drop_index()
+        reader = sqlite3.connect(self.db, isolation_level=None)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM requests").fetchall()
+        with mock.patch.dict(os.environ, {WAIT_ENV: "0.2"}), self.assertRaises(contracts.IntakeError) as caught:
+            store.head(self.root, "seed-000")
+        self.assertEqual(caught.exception.code, "ledger_busy")
+        self.assertIsNone(self.index())
+        reader.execute("ROLLBACK")
+        self.assertEqual(store.head(self.root, "seed-000")["correlation_id"], "seed-fix")
+        self.assertIsNotNone(self.index())
+
+
 class MemoTests(Case):
     """The verify memo is right-sized to the live ledger and never trusts changed bytes."""
 

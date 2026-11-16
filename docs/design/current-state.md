@@ -763,6 +763,16 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   highest row id resets it, and a ledger holding more than `upload.INDEX_LIMIT`
   promised IDs falls back to the earlier bounded (65,536) digest-keyed memo scan.
   Staged, retrying, blocked and dead-letter requests keep their IDs reserved.
+- `requests` has a partial index `requests_correction` on `correction_of WHERE correction_of IS NOT
+  NULL` (Kata 5m1h), so every "who corrects this request" lookup (`docs.repoint`, `_descendants`,
+  `store.head`, the cohort and runner head checks) is a search, not a scan of the whole table. A new
+  ledger gets it from `DDL`; a ledger created earlier gets the same `CREATE INDEX IF NOT EXISTS` from
+  the next writer to open it, inside that writer's lock and after validation, as one small committed
+  transaction. The schema version stays 1, no row is written, a ledger that already has the index is
+  not touched, and a reader or writer that holds the file past the lock wait makes the upgrade a
+  retryable `ledger_busy` that a later writer completes. Evidence:
+  `tests/test_intake_ledger_scaling.py::CorrectionIndexTests` (query plans, new and old ledger,
+  idempotence, attestation hand-off, busy reader).
 - Evidence: `tests/test_intake_ledger_scaling.py` (alternating writers, tamper and
   replaced-ledger cases, bounded waits, progress, forged-digest memo cases, memo
   cap), `tests/test_progress_scale.py` (reference-equal counts across page sizes,
