@@ -121,9 +121,10 @@ restated here.
   `tools/package.py`. It excludes `.local`, `.venv`, databases, `data`, `sources`,
   `documents`, `*.local.*` files and symlinks. Evidence:
   `tests/test_workspace.py::test_clean_copy_and_policy_freshness` (the archive equals
-  the allowlist and omits `policy.local.json`), `::test_release_paths_rejects_missing_and_symlinked_files`,
-  `::test_package_rejects_symlinked_output_parent`, `::test_empty_initialization`
-  (the shipped toolkit seeds zero records).
+  the allowlist and omits `policy.local.json`), `::test_empty_initialization`
+  (the shipped toolkit seeds zero records),
+  `tests/test_packaging.py::test_release_paths_rejects_missing_and_symlinked_files`
+  and `::test_package_rejects_symlinked_output_parent`.
 - **Allowlist coverage.** Every file tracked by Git is either listed in
   `release-files.json` or named in a short exclusion list with a reason
   (`PackageTests.UNPACKAGED_TRACKED`): `.kata.toml` (this repository's Kata
