@@ -228,11 +228,11 @@ class BusyTests(Case):
                 raise contracts.LedgerBusy()
             return real(*args, **kwargs)
         with mock.patch.object(upload, "submit", side_effect=busy_once):
-            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner")
+            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner", batch_size=1)
         self.assertEqual(report["counts"]["outcome"].get("extracted"), 1)
         self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 1)
         with mock.patch.object(upload, "submit", side_effect=contracts.LedgerBusy()):
-            again = cohort.ingest(self.root, self.root / "inbox", system="inbox2", actor="cohort-runner")
+            again = cohort.ingest(self.root, self.root / "inbox", system="inbox2", actor="cohort-runner", batch_size=1)
         self.assertEqual(again["counts"]["failed_by_code"], {"ledger/ledger_busy": 1})
 
     def test_invalid_explicit_waits_are_rejected_before_taking_the_lock(self):

@@ -32,6 +32,7 @@
   "tools/intake/store.py",
   "tools/intake/runner.py",
   "tools/intake/adapters.py",
+  "tools/intake/selection_manifest.py",
   "tools/intake/standing.py",
   "tools/intake/cli.py",
   "tools/intake/upload.py",
@@ -76,6 +77,8 @@
   "tools/diagnostics/inspection_form_ab.py",
   "tools/diagnostics/ledger_scale_benchmark.py",
   "tools/diagnostics/progress_benchmark.py",
+  "tools/diagnostics/review_event_scale_benchmark.py",
+  "tools/diagnostics/selection_manifest_benchmark.py",
   "tools/diagnostics/upload_planning_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
@@ -109,5 +112,8 @@
   "tests/reference_inspect.py",
   "tests/test_validation_cost.py",
   "tests/test_upload_planning.py",
-  "tests/test_store_durability.py"
+  "tests/test_store_durability.py",
+  "tests/test_catalog_batch.py",
+  "tests/test_intake_batch.py",
+  "tools/diagnostics/batch_ingest_benchmark.py"
 ]

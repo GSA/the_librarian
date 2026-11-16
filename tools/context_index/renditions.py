@@ -40,40 +40,50 @@ def validate(config, engine, root=None):
     # Read the storage policy once per manifest, not once per selection.
     pattern = _eligible_pattern(root) if selections else None
     for item in selections:
-        engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),
-                      "Rendition selection", optional=("review_event_ids",))
-        if (not isinstance(item["path"], str) or not pattern.fullmatch(item["path"])
-                or item["path"] in seen
-                or PurePosixPath(item["path"]).parts[-3] != item["receipt_id"]
-                or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "mhtml", "odt", "docling"}
-                or not isinstance(item["sha256"], str)
-                or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
-            engine.fail("Invalid or duplicate rendition selection")
-        review_ids = item.get("review_event_ids")
-        valid_review_ids = (isinstance(review_ids, list) and bool(review_ids)
-                            and all(isinstance(event_id, str)
-                                    and re.fullmatch(r"rev-[a-z0-9-]{1,100}", event_id)
-                                    for event_id in review_ids))
-        if (item["format"] == "docling" and
-                (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
-            engine.fail("Docling selection requires unique review_event_ids")
-        if (item["format"] != "docling" and review_ids is not None
-                and (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
-            engine.fail("Reviewed extraction selection requires unique review_event_ids")
-        if not item["context"]:
-            engine.fail("Rendition selection requires maintained source context")
-        context = item["context"]
-        key = (tuple(context) if isinstance(context, list)
-               and all(type(locator) is str for locator in context) else None)
-        if key is None or key not in valid_contexts:
-            # Identical context lists get identical answers within one manifest check.
-            engine.validate_context(context)
-            if any(not engine.eligible(engine.canonical_locator(locator).partition("#")[0])
-                   for locator in context):
-                engine.fail("Rendition context must select maintained Markdown")
-            if key is not None:
-                valid_contexts.add(key)
-        seen.add(item["path"])
+        validate_item(item, engine, pattern, seen, valid_contexts)
+
+
+def validate_item(item, engine, pattern, seen, valid_contexts):
+    """Check one selection and add its path to ``seen``; ``pattern`` is ``_eligible_pattern(root)``.
+
+    ``seen`` holds the paths already accepted (a duplicate is refused) and ``valid_contexts`` the
+    context lists already proven, so a caller adding one selection to a validated manifest can
+    check just that selection against the state it kept.
+    """
+    engine.fields(item, ("path", "sha256", "receipt_id", "format", "context"),
+                  "Rendition selection", optional=("review_event_ids",))
+    if (not isinstance(item["path"], str) or not pattern.fullmatch(item["path"])
+            or item["path"] in seen
+            or PurePosixPath(item["path"]).parts[-3] != item["receipt_id"]
+            or not isinstance(item["format"], str) or item["format"] not in {"gemini-txt", "text", "mhtml", "odt", "docling"}
+            or not isinstance(item["sha256"], str)
+            or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
+        engine.fail("Invalid or duplicate rendition selection")
+    review_ids = item.get("review_event_ids")
+    valid_review_ids = (isinstance(review_ids, list) and bool(review_ids)
+                        and all(isinstance(event_id, str)
+                                and re.fullmatch(r"rev-[a-z0-9-]{1,100}", event_id)
+                                for event_id in review_ids))
+    if (item["format"] == "docling" and
+            (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
+        engine.fail("Docling selection requires unique review_event_ids")
+    if (item["format"] != "docling" and review_ids is not None
+            and (not valid_review_ids or len(review_ids) != len(set(review_ids)))):
+        engine.fail("Reviewed extraction selection requires unique review_event_ids")
+    if not item["context"]:
+        engine.fail("Rendition selection requires maintained source context")
+    context = item["context"]
+    key = (tuple(context) if isinstance(context, list)
+           and all(type(locator) is str for locator in context) else None)
+    if key is None or key not in valid_contexts:
+        # Identical context lists get identical answers within one manifest check.
+        engine.validate_context(context)
+        if any(not engine.eligible(engine.canonical_locator(locator).partition("#")[0])
+               for locator in context):
+            engine.fail("Rendition context must select maintained Markdown")
+        if key is not None:
+            valid_contexts.add(key)
+    seen.add(item["path"])
 
 
 def _checker(root, engine):
@@ -111,7 +121,7 @@ def inputs(root, config, engine, review_snapshot=None):
     catalog = engine.load_catalog()
     if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
             and review_snapshot is None):
-        review_snapshot = engine.load_event_reader().read_snapshot(root)
+        review_snapshot = engine.load_event_reader().read_snapshot(root, full=True)
     snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
     state = snapshot["state"]["state_token"]
     # One validated catalog snapshot for every selected receipt, not one per rendition.

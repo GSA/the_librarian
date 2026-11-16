@@ -97,9 +97,11 @@ restated here.
   defaults (`tests/test_policy_isolation.py`). Instances can run different
   versions. The reason is isolation by filesystem with no cross-instance code
   path; the cost is N environments to upgrade (reasoning, not measured).
-  `.local/instance.json` records ids and layout only; it does not record the
-  distribution version or store contract versions (an earlier design wanted it
-  to, and nothing reads it; Kata 7jkt).
+  `.local/instance.json` records ids and layout only. It deliberately does not
+  record the distribution version, store contract versions or interpreter minor:
+  the stores refuse a mismatched contract themselves (section 1, `contract_hash`,
+  `user_version`, application id), `git log` in the clone is the distribution
+  version, and nothing would read a second copy (Kata 7jkt decision).
 
 ## 2. Distribution and runtime
 
@@ -119,8 +121,13 @@ restated here.
   `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
   child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
   are ranges and transitive dependencies are unpinned. There is no lock file,
-  image or installer. Whether those are
-  wanted is an open product question, not a commitment (Kata 7jkt).
+  image or installer, by decision (Kata 7jkt, 2026-11-13). Measured drift: two
+  `.venv`s of the same commit already differed in anyio, pydantic, starlette,
+  sse-starlette and other transitive patch versions, and the repository history and
+  Kata show no incident or test failure traced to dependency resolution. The one
+  dependency whose change breaks behavior (`mcp`) is pinned and refused by
+  preflight. Revisit if a real instance fails or diverges because of an unpinned
+  package; the first step then is to pin that package, not to add a lock file.
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
   The reader needs none of it.
@@ -234,7 +241,15 @@ restated here.
   or its receipt's pinned `local-path` sidecar names that system; anything that
   cannot be proven that way is left alone, and orphans are dropped and counted.
   The manifest read-modify-write holds the ledger writer lock and replacement is
-  atomic. The manifest holds at most `renditions.MAX_SELECTIONS` (20,000) entries
+  atomic; adding one new selection is a constant-time in-place append
+  (`tools/intake/selection_manifest.py`, Kata m0tg): a view (count, selected paths, running
+  SHA-256) is kept in memory for the file's identity after one validated read, the new entry
+  alone is validated, and its canonical bytes plus the fixed closing tail are written at the end
+  of the last selection, giving exactly the bytes a full rewrite would. An fsynced intent file
+  written first lets the next writer roll a crashed append forward (`recover`, called under
+  the lock and before `qualify`/`publish` read the manifest). A replacement, an empty list, a
+  non-canonical file or a stale view takes the full read, validate and atomic rewrite. The
+  manifest holds at most `renditions.MAX_SELECTIONS` (20,000) entries
   across all cohorts (sized for a 36,000-document cohort at the observed 37%
   acceptance, about 13,000 selections, with headroom; Kata jysk). An in-scope entry with no saved review is not sent to the
   model when the manifest has no room for it: `qualify` checks the room (an
@@ -539,11 +554,30 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   (`qualify` per-entry serial ms, first decile to last decile): 400 documents 89 to 432
   before, 66 to 149 after (mean 257 to 104); 1,200 documents 168 to 1,425 before, 120 to 388
   after (mean 770 to 242; qualify total 937 s to 303 s). Results, event ids and the manifest are unchanged (the `qualify` tests
-  are the same). What remains is what the memo does not touch: each event append still
-  validates `existing + incoming` once, each new commit costs one full validation at the
-  next read, and `qualify` still reads a snapshot per entry, so the cost still grows with
-  event count (about 0.25 ms per prior event after, against about 1.1 ms before). Removing
-  that term needs an O(delta) check (Kata m0tg).
+  are the same). The memo left each commit costing one full validation at the next read, each
+  append validating `existing + incoming`, and several snapshot reads per entry (Kata m0tg
+  removes those; below).
+- **Delta verification** (Kata m0tg). When the file's identity moved only the way SQLite's own
+  commit moves it (same device and inode, not smaller, a new change counter) and the remembered
+  chain heads are still in the file, `event_store.view` verifies only the rows past them:
+  their hash chain from the remembered head, batch chain and membership, payload hashes,
+  the contract and the correction links (`validate_delta`, which checks the new events against
+  the memoized `History` index through the `known`/`taken` hooks of `review_events.validate`),
+  and that the correction table grew by exactly the new links. `append` likewise checks only
+  its incoming events (duplicate ID, imported origin, correction targets, conflicting branches)
+  against that index. Any failure of the delta falls back to the full pass, which refuses with
+  its exact message. **Rows before the remembered head are not read again until the next full
+  check**: `audit`, a backup, publication (`read_snapshot(root, full=True)`, used by
+  `authorize_publication` and by index build and freshness, so publication still re-validates
+  everything it serves), the first check of a new UTC day, a different contract, a swapped file,
+  or any identity change SQLite did not make (an out-of-band write leaves the counter alone and
+  is refused at once, as before). The residual below widens by one case: an edit to an old
+  row that also bumps the change counter and leaves the heads alone is served until that next
+  full check. `History` indexes events by ID and by source locator, so `Snapshot.event` and
+  `Snapshot.at` are constant time, and `qualify`'s standing adapters share one snapshot per
+  stage (`adapters.OneRead`) instead of reading four to five times. A snapshot builds its `events` list and `successors` map only on first use, so state, indexed lookups and `append` do no work proportional to the history. Measured with `tools/diagnostics/review_event_scale_benchmark.py` (synthetic, `nice`d): per-entry read, lookup and one-event append stay flat at about 1 ms, 5 microseconds and 15 ms from 1,000 to 13,000 events; replaying the whole history (`--no-delta`, the earlier behaviour) costs 72 ms and 215 ms at 1,000 events and 317 ms and 697 ms at 4,000. Evidence:
+  `tests/test_review_event_memo.py::DeltaVerification` and the memo tamper cases (every
+  existing refusal still refuses), `tests/test_standing.py`.
 - **Residual** (the catalog receipt's, 0017). The memo is unkeyed. An edit that restores
   size, mtime, ctime and the change counter *and* leaves the last event and batch hashes
   and the correction count unchanged is served from the memo until this process's first
@@ -577,8 +611,55 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   `recover-conflicts`).
 - Throughput is still serialized by the catalog writer lock. The commit ceiling at
   a 1,600-registration catalog was about 10 registrations/s with one writer when
-  measured; batching many registrations per revision was tried on paper and not
-  adopted because it changes idempotency, partial-failure and rebase semantics.
+  measured. Cohort `ingest` therefore batches (next section): the lock is taken, the head
+  validated and the daily snapshot checked once per chunk of documents.
+
+### Batched registration (`catalog.submit_batch`)
+
+`catalog_store.submit_batch(root, members, actor=, reason=, rebase=True)` commits many documents'
+records as ONE ordinary revision (one `revisions` row, `record_count` the sum of the members' records,
+the usual hash chain and input hash; `submit` and `submit_batch` share `_writer` and `_commit_revision`).
+Cohort `ingest` (`--batch-size`, default 50; 1 keeps `submit`, two revisions per document) uses it for
+the receipt stage and again for the extraction-registration stage (`extract.register_batch`).
+
+- **Member idempotency is a marker record.** Each member names a `marker`: a record it creates whose ID no
+  other member or request creates (`A-upload-<submission>-original` for a receipt, `A-extract-<run>` for a
+  registration). A member whose marker already has a first version equal to the member's own marker record is
+  `present`: reported with the revision that wrote it and that revision's state, never written again. The same
+  marker with other content is refused (`ConflictingWrite`). Batch revisions get the request ID
+  `batch-<hash of the written markers>`, so a retry that writes a different subset never reuses one. `submit(...,
+  marker=)` gives the one-at-a-time path the same property, so a document the batched path committed is
+  idempotent under a stale pin there too. Only stages whose records contain exactly one receipt naming an
+  original artifact (`adapters.receipt_marker`) batch; any other `catalog-submit` keeps its request ID.
+- **Each member is judged as if committed alone, in order.** Its records must validate; no earlier accepted member
+  may write one of its record IDs; its pin must be the head or (with `rebase`) a state in this history after which
+  no revision wrote one of its records (`ConflictingWrite` or `StaleState` otherwise, for that member only).
+  Accepted members go through one `validate_delta` over the union; only if the union is refused is each member
+  validated in order over a layer of the earlier accepted members, which finds the refused ones (bisection by one
+  pass, not by repeated commits). The write is one transaction: all accepted members or none; a guard or SQLite
+  failure rolls the whole batch back, and a failure after COMMIT reports the committed revision for a retry.
+- **Ledger.** `runner.run_batch` / `settle_batch` give every stage its own attempt, intent, evidence and status
+  (`failure_status` is the one rule shared with `run`); a chunk's intents and attempts are one ledger commit
+  before the native work and evidence is one commit after, a refused stage is recorded on that stage only, and a
+  lost catalog race stays within the contention budget. Evidence names the committed revision, which the
+  chunk's documents share, so a chunk's stages settle together.
+- **Crash model.** A kill before the catalog COMMIT leaves SQLite's rollback journal and the prior revision
+  (recovered like any killed catalog writer); a kill after it leaves the batch committed with stages still
+  `running`, and the re-run finds each marker present and records its evidence; a kill between ledger members leaves
+  an unfinished attempt that is reused. Retained copies, `registration.json` and `completion.json` are written
+  without replacement and checked by content, so they too are completed, never duplicated.
+- **Snapshots and receipts.** A chunk is one commit: one first-write-of-the-UTC-day replay and snapshot, one
+  validation receipt, one lock hold. The lock is held for the chunk's validation and write (about the cost of one
+  `submit` plus per-record encoding), not for the model-free extraction.
+- **Compatibility.** The schema, `VERSION`, state tokens and revision hash chain are unchanged; `inspect` replays
+  batch and single revisions identically, and history written before batching stays valid.
+
+Evidence: `tests/test_catalog_batch.py` (one revision, idempotent markers, per-member rebase, refusal isolation
+and equivalence with committing one by one on random inputs, kills before COMMIT/after COMMIT/after the receipt,
+a failure between members, two-process contention) and `tests/test_intake_batch.py` (batched equals one-at-a-time
+end state, revisions per chunk, failed documents isolated, a kill at 14 points of the chunk completed by a re-run
+with no duplicate or lost document, two processes ingesting one instance). Measure with
+`tools/diagnostics/batch_ingest_benchmark.py`.
 
 ### Intake ledger
 
@@ -695,10 +776,11 @@ owner preference rather than measured or test-enforced facts.
 
 - One full clone per instance is the right topology (isolation without new code;
   N upgrades). Nothing measures N or the upgrade burden.
-- Pinning the complete runtime and recording the interpreter minor version in the
-  instance record; neither is built.
-- A per-instance record of the distribution and store contract versions, and a
-  per-release compatibility statement; neither is built.
+- Not building a full runtime pin or lock file, a per-instance version record or a
+  per-release compatibility statement (Kata 7jkt). Drift between instances was
+  measured (transitive patch versions differ) without any recorded harm; store
+  contract mismatches are refused by the stores, not by a note. Reasoning plus a
+  small measurement, not a guarantee.
 - Daily snapshots with seven-day retention; seven is a default, not a derived
   number.
 - Declining agent memory and the dead-weight pruning signal (sections 6): reasoned,
@@ -706,10 +788,9 @@ owner preference rather than measured or test-enforced facts.
 - The 20,000-entry manifest cap is an implementation limit, not a design goal. It
   replaced 5,000 (Kata jysk) once publishing was linear in selections (see
   "Publishing a cohort-sized manifest" in section 3). Not measured above 20,000.
-  Each select still rewrites and revalidates the whole manifest (about 0.15 s
-  at 5,000 entries and 0.2 s at 15,000 in the publish benchmark, so filling a
-  manifest is quadratic until the manifest append of Kata m0tg (c) lands); that
-  is the open cost, not publication.
+  Before Kata m0tg each select rewrote and revalidated the whole manifest (20 ms
+  at 1,000 entries, 93 ms at 5,000, 274 ms at 20,000, so filling a manifest was
+  quadratic); the append is flat.
 - A single linear catalog hash chain (revisit triggers were: commit utilization
   above about a third of the ceiling with writers losing waits, multi-host
   writers, or a first-of-day hold above the 10 s wait even after the speedups).

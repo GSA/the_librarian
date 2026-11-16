@@ -13,7 +13,7 @@ from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import renditions
-from tools.intake import cohort, model_review, runner, standing, store, upload
+from tools.intake import cohort, model_review, runner, selection_manifest, standing, store, upload
 from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
@@ -241,7 +241,9 @@ class BlockedCase(CohortCase):
         self.real = catalog.submit
 
     def run_ingest(self):
-        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        # These tests simulate a race by replacing ``catalog.submit``, the one-registration-per-revision
+        # commit, so they run that path; the batched path is covered in test_intake_batch.py.
+        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=1)
 
     def block_registrations(self):
         """A lost catalog race recorded as blocked native-input, as before concurrent-writer retries, then a
@@ -538,8 +540,18 @@ class ReplayTests(CohortCase):
         admitted = first["counts"]["outcome"]["received"]
         with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
                 unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
-            self.ingest()
+            cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=1)
         self.assertEqual(locked.call_count, 3 * admitted)
+        inspected.assert_not_called()
+
+    def test_batched_replay_opens_the_ledger_no_more_often_and_never_inspects(self):
+        first = self.ingest()
+        admitted = first["counts"]["outcome"]["received"]
+        with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
+                unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
+            again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=50)
+        self.assertEqual(again["counts"], first["counts"])
+        self.assertLessEqual(locked.call_count, 3 * admitted)
         inspected.assert_not_called()
 
     def test_a_file_modified_between_runs_is_still_detected_and_corrected(self):
@@ -1255,21 +1267,30 @@ class SharedManifestTests(QualifyCase):
     def test_an_interrupted_manifest_write_leaves_the_manifest_as_it_was(self):
         self.qualify("a")
         before = self.manifest.read_bytes()
-        real = os.replace
+        real_replace, real_pwrite = os.replace, os.pwrite
 
-        def fail(source, target, *args, **kwargs):
+        def fail_replace(source, target, *args, **kwargs):
             if Path(target) == self.manifest:
                 raise OSError(5, "simulated crash")
-            return real(source, target, *args, **kwargs)
-        with unittest.mock.patch.object(os, "replace", fail):
+            return real_replace(source, target, *args, **kwargs)
+
+        def fail_pwrite(descriptor, data, offset):
+            raise OSError(5, "simulated crash")
+        # Selections are appended in place (Kata m0tg), a replacement is an atomic rename; both fail.
+        # The process "dies" there, so nothing recovers the append until the next writer runs.
+        with unittest.mock.patch.object(os, "replace", fail_replace), \
+                unittest.mock.patch.object(os, "pwrite", fail_pwrite), \
+                unittest.mock.patch.object(selection_manifest, "recover", lambda *a: False):
             crashed = self.qualify("b")
-        # Never a partial or mixed manifest, and no temporary file left behind: A's entries stay.
+        # Never a partial or mixed manifest: A's entries stay, and the only trace is the append intent
+        # the next writer completes (a rename would leave no temporary file).
         self.assertEqual(crashed["counts"]["qualification"], {"pending-review": 2})
         self.assertEqual(self.manifest.read_bytes(), before)
         self.assertEqual([p.name for p in self.manifest.parent.iterdir()
-                          if p.name.startswith(".")], [])
+                          if p.name.startswith(".")], [".selection.local.json.append-intent"])
         self.calls.clear()
         self.assertEqual(self.qualify("b")["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual([p.name for p in self.manifest.parent.iterdir() if p.name.startswith(".")], [])
         self.assertEqual((len(self.selections()), self.calls), (5, []))
 
     def test_the_manifest_is_rewritten_while_holding_the_ledger_writer_lock(self):

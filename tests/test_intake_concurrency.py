@@ -194,7 +194,9 @@ class AgentTests(Case):
                 raise catalog.WriterBusy("Another catalog writer is active; retry later")
             return real(root, records, **kwargs)
         with patch.object(adapters.extract.catalog, "submit", side_effect=racing):
-            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner")
+            # The race is injected into ``catalog.submit``, the one-registration-per-revision commit;
+            # the batched path is covered in test_intake_batch.py.
+            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner", batch_size=1)
         self.assertEqual(report["counts"]["outcome"].get("extracted"), 2)
         self.assertEqual(report["counts"]["retried_after_conflict"],
                          {"entries": 2, "succeeded": 2, "attempts": 2})
@@ -369,7 +371,7 @@ class RecoveryTests(Case):
                 raise catalog.CatalogError("Stale expected state; re-read before writing")
             return real(root, records, **kwargs)
         with patch.object(adapters.extract.catalog, "submit", side_effect=legacy):
-            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner")
+            report = cohort.ingest(self.root, inbox, system="inbox", actor="cohort-runner", batch_size=1)
         self.assertFalse(report["counts"]["outcome"].get("extracted"))
         self.assertEqual(runner.recover_conflicts(self.root)["candidates"], 1)
         original = next(r for r in catalog.read_records(self.root, kind="artifact", limit=100)["records"]

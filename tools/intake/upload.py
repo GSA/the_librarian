@@ -602,39 +602,55 @@ def known_requests(root, correlation_ids):
     return found
 
 
-def submit(root, path, value, *, known=None):
-    """Stage, publish and register one explicitly supplied file; return its acknowledgment."""
-    root = store.safe(root)
+def _stage_locked(root, path, value, known):
+    """Publish the retained copy and stage the receipt request; the caller holds ``upload_lock``.
+
+    Returns ``(correlation_id, existing)``. Nothing is committed to the catalog.
+    """
     value = validate_descriptor(value)
     raw = read_file(path, FORMATS[value["format"]][1])
     if value["expected_sha256"] is not None:
         require(digest(raw) == value["expected_sha256"], "changed_input")
     check_type(raw, value["format"], value["name"])
     correlation_id = correlation(value["submission_id"])
+    directory, original_path, sidecar_path, sidecar = plan(root, value, raw)
+    prior = known[correlation_id][0] if known and correlation_id in known else ledger_request(root, correlation_id)
+    existing = prior is not None
+    if existing:
+        saved = {r["data"]["path"]: r["data"]["sha256"] for r in submit_records(prior) if r["kind"] == "artifact"}
+        require(saved == {original_path: digest(raw), sidecar_path: digest(sidecar)}, "submission_conflict")
+    else:
+        state, records = records_for(root, value, raw, original_path, sidecar_path, sidecar)
+        request = {"version": 1, "correlation_id": correlation_id,
+                   "correction_of": correlation(value["correction_of"]) if value["correction_of"] else None,
+                   "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+                   "retry": {"max_attempts": 3, "backoff_seconds": 0},
+                   "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit",
+                               "arguments": {"records": records, "actor": value["actor"],
+                                             "request_id": correlation_id, "expected_state": state["state_token"],
+                                             "reason": "Manual upload: " + value["reason"][:400]}}]}
+    # Retained bytes are durable before the receipt stage exists, so no
+    # run/resume can commit a present artifact whose file is missing.
+    target = private_directory(root, directory, 2)
+    publish(target, value["name"], raw)
+    publish(target, SIDECAR, sidecar)
+    if not existing:
+        store.stage(root, canonical(request).encode())
+    return correlation_id, existing
+
+
+def stage_submission(root, path, value, *, known=None):
+    """Everything ``submit`` does before the receipt stage runs: ``(correlation_id, existing)``."""
+    root = store.safe(root)
     with upload_lock(root):
-        directory, original_path, sidecar_path, sidecar = plan(root, value, raw)
-        prior = known[correlation_id][0] if known and correlation_id in known else ledger_request(root, correlation_id)
-        existing = prior is not None
-        if existing:
-            saved = {r["data"]["path"]: r["data"]["sha256"] for r in submit_records(prior) if r["kind"] == "artifact"}
-            require(saved == {original_path: digest(raw), sidecar_path: digest(sidecar)}, "submission_conflict")
-        else:
-            state, records = records_for(root, value, raw, original_path, sidecar_path, sidecar)
-            request = {"version": 1, "correlation_id": correlation_id,
-                       "correction_of": correlation(value["correction_of"]) if value["correction_of"] else None,
-                       "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-                       "retry": {"max_attempts": 3, "backoff_seconds": 0},
-                       "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit",
-                                   "arguments": {"records": records, "actor": value["actor"],
-                                                 "request_id": correlation_id, "expected_state": state["state_token"],
-                                                 "reason": "Manual upload: " + value["reason"][:400]}}]}
-        # Retained bytes are durable before the receipt stage exists, so no
-        # run/resume can commit a present artifact whose file is missing.
-        target = private_directory(root, directory, 2)
-        publish(target, value["name"], raw)
-        publish(target, SIDECAR, sidecar)
-        if not existing:
-            store.stage(root, canonical(request).encode())
+        return _stage_locked(root, path, value, known)
+
+
+def submit(root, path, value, *, known=None):
+    """Stage, publish and register one explicitly supplied file; return its acknowledgment."""
+    root = store.safe(root)
+    with upload_lock(root):
+        correlation_id, existing = _stage_locked(root, path, value, known)
         cached = settled(known, correlation_id)
         if cached:
             return acknowledgment(root, correlation_id, existing, cached)

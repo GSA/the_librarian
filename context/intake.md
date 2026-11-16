@@ -211,6 +211,37 @@ submission superseding the old, or `changed-since-intake`). Measure it with
 checkouts can be compared): about 11 to 5 ms per file at 2,000 and 10,000 synthetic files of about 133 KiB.
 A MIME HTML file costs about 8 ms more in its parser during `classify`; that is the remaining floor.
 
+**Batched catalog registration.** `ingest` processes admitted files in chunks (`--batch-size`, default 50; `1` is the
+old path of two catalog revisions per document). A chunk's receipts commit as ONE catalog revision and its extraction
+registrations as ONE more, so a document costs about 2/N revisions instead of 2, and the writer lock, fsyncs
+and per-commit validation are paid once per chunk. What stays per document: the retained copy, the ledger
+request, stage, attempt, intent and evidence of every receipt and extraction stage, and every changed-input check.
+Each document is judged on its own inside the chunk:
+
+- **Idempotency is per document.** A document's receipt is identified by its `A-upload-<submission>-original`
+  record, its registration by `A-extract-<run>`. A re-run builds its chunk from the documents whose marker record is
+  not yet in the catalog; one that is (committed by any earlier revision, batched or not) is reported at the
+  revision that wrote it and not written again. A marker that exists with different content refuses that document.
+- **Conflicts.** Each document keeps its own pin and is rebased on its own: refused with `catalog-conflict` when a
+  later revision wrote one of its records, otherwise accepted. Two documents of one chunk may not write the same
+  record; the later is refused. A refused or failing document is recorded on its own stage and never blocks the rest.
+- **Atomic.** The accepted documents are validated together and written in one SQLite transaction: all or none.
+  If the union does not validate, documents are validated one at a time in order to find the refused ones.
+- **Ledger.** Each stage keeps its own attempt and status; evidence names the revision the document committed in
+  (documents of one chunk share it) and a chunk's stages settle together.
+
+A process killed at any point leaves a catalog at a revision boundary (a killed writer's rollback journal needs the
+usual explicit recovery, `migrate-indexes --recover`) and a ledger whose unfinished attempts the next run reuses; run
+`ingest` again with any batch size and it completes with no duplicate and no lost document. The revision hash chain,
+state tokens and schema are unchanged, so existing instances and history written one document per revision stay
+valid, and daily-snapshot and validation-receipt behavior is per commit as before (a chunk is one commit). Measure
+it on synthetic seeds, never a real instance:
+
+```sh
+python3 tools/diagnostics/batch_ingest_benchmark.py --seed 2000 --files 60 --padding 1800 --batch-sizes 1,10,25,50
+python3 tools/diagnostics/batch_ingest_benchmark.py --tree PATH_TO_OTHER_CHECKOUT --seed 2000 --files 60 --batch-sizes 1
+```
+
 **Extraction work per document.** Each extract stage reads the catalog snapshot, the original and the extractor
 identity afresh (`extract.bundle`) and parses the original; a first ingest used to do that six times per document
 and now does it four times and parses once (the newest parse is kept, keyed by format, source SHA-256 and extractor
@@ -336,7 +367,7 @@ new `mhtml` submission that is recorded as a correction of the old one
 (`correction_of`), so it is extracted again rather than kept. Bump
 `mhtml.METHOD_VERSION` when conversion output changes.
 
-`ingest ... --system LABEL --actor A [--limit N]` submits each admitted file as
+`ingest ... --system LABEL --actor A [--limit N] [--batch-size N]` submits each admitted file as
 a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,
 percent-encoded inbox-relative locator, pinned SHA-256) and runs
 `extract-prepare` then `extract-register` through the ledger. When an inbox
@@ -375,7 +406,9 @@ operator's, or one whose submission cannot be proven) is left byte-identical and
 several inboxes can share one catalog, manifest and index ([design](../docs/design/current-state.md#3-intake-and-review)).
 Only an orphan (receipt missing from the catalog, or retained rendition file gone) is dropped. The
 read-modify-write of the manifest holds the ledger writer lock, so cohorts qualified in parallel
-processes keep each other's writes, and replacement is atomic. The manifest holds at most 20,000
+processes keep each other's writes, and replacement is atomic (a new selection is appended in place
+in constant time; if a run is killed mid-append, the next `qualify`, `publish` or select finishes it
+from `.<manifest>.append-intent` and removes that file). The manifest holds at most 20,000
 selections across all cohorts (a 36,000-document cohort needs about 13,000 at a 37% acceptance rate). When the manifest has no room for an in-scope rendition that has no
 saved review, `qualify` makes no model call for it: it stays `pending-review` (`selection-capacity`)
 with nothing saved, and a later run with room reviews it once. A rendition whose review is saved is

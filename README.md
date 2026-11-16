@@ -105,8 +105,10 @@ files through upload and extraction (see
   --system my-inbox --actor "$USER" --report .local/cohort-report.json
 ```
 
-Every file gets a counted disposition; nothing in the inbox is changed, and
-extracted renditions stay unselected until a standing-policy review qualifies
+Every file gets a counted disposition; nothing in the inbox is changed. Ingest commits
+catalog registrations in chunks of `--batch-size` documents (default 50) as one revision each;
+`--batch-size 1` keeps one revision per registration, and a re-run after any interruption completes the rest.
+Extracted renditions stay unselected until a standing-policy review qualifies
 them. If a registration reports `register/changed-extraction-identity` (the
 extractor changed after it was first prepared), `python -m tools.intake.cohort
 recover-identity --root .` lists the recoverable ones and `--apply` repairs
