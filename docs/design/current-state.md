@@ -234,7 +234,15 @@ restated here.
   or its receipt's pinned `local-path` sidecar names that system; anything that
   cannot be proven that way is left alone, and orphans are dropped and counted.
   The manifest read-modify-write holds the ledger writer lock and replacement is
-  atomic. The manifest holds at most `renditions.MAX_SELECTIONS` (5,000) entries
+  atomic; adding one new selection is a constant-time in-place append
+  (`tools/intake/selection_manifest.py`, Kata m0tg): a view (count, selected paths, running
+  SHA-256) is kept in memory for the file's identity after one validated read, the new entry
+  alone is validated, and its canonical bytes plus the fixed closing tail are written at the end
+  of the last selection, giving exactly the bytes a full rewrite would. An fsynced intent file
+  written first lets the next writer roll a crashed append forward (`recover`, called under
+  the lock and before `qualify`/`publish` read the manifest). A replacement, an empty list, a
+  non-canonical file or a stale view takes the full read, validate and atomic rewrite. The
+  manifest holds at most `renditions.MAX_SELECTIONS` (5,000) entries
   across all cohorts. An in-scope entry with no saved review is not sent to the
   model when the manifest has no room for it: `qualify` checks the room (an
   exact read, 2 ms at 5,000 entries) on the main thread just before the call,
@@ -507,11 +515,30 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   (`qualify` per-entry serial ms, first decile to last decile): 400 documents 89 to 432
   before, 66 to 149 after (mean 257 to 104); 1,200 documents 168 to 1,425 before, 120 to 388
   after (mean 770 to 242; qualify total 937 s to 303 s). Results, event ids and the manifest are unchanged (the `qualify` tests
-  are the same). What remains is what the memo does not touch: each event append still
-  validates `existing + incoming` once, each new commit costs one full validation at the
-  next read, and `qualify` still reads a snapshot per entry, so the cost still grows with
-  event count (about 0.25 ms per prior event after, against about 1.1 ms before). Removing
-  that term needs an O(delta) check (Kata m0tg).
+  are the same). The memo left each commit costing one full validation at the next read, each
+  append validating `existing + incoming`, and several snapshot reads per entry (Kata m0tg
+  removes those; below).
+- **Delta verification** (Kata m0tg). When the file's identity moved only the way SQLite's own
+  commit moves it (same device and inode, not smaller, a new change counter) and the remembered
+  chain heads are still in the file, `event_store.view` verifies only the rows past them:
+  their hash chain from the remembered head, batch chain and membership, payload hashes,
+  the contract and the correction links (`validate_delta`, which checks the new events against
+  the memoized `History` index through the `known`/`taken` hooks of `review_events.validate`),
+  and that the correction table grew by exactly the new links. `append` likewise checks only
+  its incoming events (duplicate ID, imported origin, correction targets, conflicting branches)
+  against that index. Any failure of the delta falls back to the full pass, which refuses with
+  its exact message. **Rows before the remembered head are not read again until the next full
+  check**: `audit`, a backup, publication (`read_snapshot(root, full=True)`, used by
+  `authorize_publication` and by index build and freshness, so publication still re-validates
+  everything it serves), the first check of a new UTC day, a different contract, a swapped file,
+  or any identity change SQLite did not make (an out-of-band write leaves the counter alone and
+  is refused at once, as before). The residual below widens by one case: an edit to an old
+  row that also bumps the change counter and leaves the heads alone is served until that next
+  full check. `History` indexes events by ID and by source locator, so `Snapshot.event` and
+  `Snapshot.at` are constant time, and `qualify`'s standing adapters share one snapshot per
+  stage (`adapters.OneRead`) instead of reading four to five times. A snapshot builds its `events` list and `successors` map only on first use, so state, indexed lookups and `append` do no work proportional to the history. Measured with `tools/diagnostics/review_event_scale_benchmark.py` (synthetic, `nice`d): per-entry read, lookup and one-event append stay flat at about 1 ms, 5 microseconds and 15 ms from 1,000 to 13,000 events; replaying the whole history (`--no-delta`, the earlier behaviour) costs 72 ms and 215 ms at 1,000 events and 317 ms and 697 ms at 4,000. Evidence:
+  `tests/test_review_event_memo.py::DeltaVerification` and the memo tamper cases (every
+  existing refusal still refuses), `tests/test_standing.py`.
 - **Residual** (the catalog receipt's, 0017). The memo is unkeyed. An edit that restores
   size, mtime, ctime and the change counter *and* leaves the last event and batch hashes
   and the correction count unchanged is served from the memo until this process's first
@@ -720,9 +747,9 @@ owner preference rather than measured or test-enforced facts.
   not measured.
 - The 5,000-entry manifest cap is an implementation limit, not a design goal. Past
   it `qualify` no longer pays for reviews it cannot select, but the cap itself is
-  unmeasured above 800 real selections. Each select rewrites and revalidates the
+  unmeasured above 800 real selections. Before Kata m0tg each select rewrote and revalidated the
   whole manifest (20 ms at 1,000 entries, 93 ms at 5,000, 274 ms at 20,000, so
-  filling a manifest is quadratic), publish grew faster than linear from 200 to
+  filling a manifest was quadratic); the append is flat (see the benchmark in the PR), publish grew faster than linear from 200 to
   800 selections, and index build, reader memory and publication authorization
   were not measured at a larger size. Raising it needs those measurements.
 - A single linear catalog hash chain (revisit triggers were: commit utilization
