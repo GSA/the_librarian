@@ -770,6 +770,14 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   cause. A 125,000-request synthetic ledger rendered in 11 s and 1.5 GB before and
   renders in 0.15 s unchanged, about 2 s after a commit and 4.5 s cold, at about
   140 MB (`tools/diagnostics/progress_benchmark.py`).
+- `progress` counts only correction-chain heads. It reads the set of requests that
+  some other request names in `correction_of` once per pass (`SELECT DISTINCT`, no
+  per-row probe), still verifies those rows with their page, and leaves them out of
+  the funnel, stage matrix, `exceptions`, `retrying`, per-run aggregates, attention
+  groups and items and `recent`. They are reported as `superseded` in `overall` and
+  each run, and in the text and HTML output, so counts reconcile with the ledger
+  (the ledger itself is unchanged). Test: `SupersededTests` in
+  `tests/test_progress_scale.py` (a chain of three, one uncorrected block).
 - `store.verify` keeps one memo of the previous successful pass keyed by exact
   request bytes and artifact text with the digest they were proven to have, capped
   at `store.MEMO_BYTES` (128 MiB of keys). A hit needs identical bytes and an

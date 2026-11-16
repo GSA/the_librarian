@@ -165,12 +165,16 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
                 return {**summary, "rates": moving, "cached": True,
                         "seconds": round(time.perf_counter() - started, 3)}
             store.check_identity(c)
+            # Requests some correction points at are not chain heads; read once, not per row.
+            corrected = {parent for (parent,) in c.execute(
+                "SELECT DISTINCT correction_of FROM requests WHERE correction_of IS NOT NULL")}
             c.execute("COMMIT")
         except sqlite3.OperationalError as error:
             raise IntakeError("ledger_unavailable") from error
         except sqlite3.DatabaseError as error:
             raise IntakeError("corrupt_store") from error
-        counts, overall, per_run = Counter(), Counter(), {name: Counter() for name in runs or {}}
+        counts, per_run = Counter(), {name: Counter() for name in runs or {}}
+        superseded, superseded_runs = 0, Counter()
         latest = {name: None for name in per_run}
         newest = None
         recent, groups = Best(limit), {}
@@ -190,6 +194,11 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
             layouts = store.verify_page(rows, root, _memo)
             for row, layout in zip(requests, layouts):
                 correlation_id = row["correlation_id"]
+                if correlation_id in corrected:  # verified with its page, but reported only as superseded
+                    superseded += 1
+                    for name, prefix in (runs or {}).items():
+                        superseded_runs[name] += correlation_id.startswith(prefix)
+                    continue
                 statuses, updated = [], None
                 for saved, (stage_id, _, _) in zip(stages_of[correlation_id], layout):
                     history = attempts_of.get((correlation_id, stage_id), [])
@@ -235,8 +244,8 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
         except sqlite3.DatabaseError as error:
             raise IntakeError("ledger_unavailable") from error
     summary = {
-        "overall": aggregate(counts, newest),
-        "runs": {name: aggregate(per_run[name], latest[name]) for name in per_run},
+        "overall": aggregate(counts, newest, superseded),
+        "runs": {name: aggregate(per_run[name], latest[name], superseded_runs[name]) for name in per_run},
         "recent": [public(make_item(c_)) for _, c_ in recent.entries],
         "attention_groups": [
             {"state": state, "funnel": funnel, "code": code, "count": count}
@@ -339,8 +348,9 @@ def item(correlation, correction_of, request, saved, attempts):
     }
 
 
-def aggregate(counts, last_activity):
-    """Counts for a ``Counter`` of (layout, ((status, code), ...)) request signatures."""
+def aggregate(counts, last_activity, superseded=0):
+    """Counts for a ``Counter`` of (layout, ((status, code), ...)) request signatures of chain heads;
+    ``superseded`` is the number of corrected originals left out of them."""
     funnel = dict.fromkeys(FUNNEL, 0)
     matrix = {kind: dict.fromkeys(STATUSES, 0) for kind in KINDS}
     exceptions = retrying = 0
@@ -351,7 +361,8 @@ def aggregate(counts, last_activity):
         exceptions += number * any(status in {"blocked", "dead-letter"} for status, _ in statuses)
         retrying += number * any(status == "retryable" for status, _ in statuses)
     return {"requests": sum(counts.values()), "funnel": funnel, "stages": matrix,
-            "exceptions": exceptions, "retrying": retrying, "last_activity": last_activity}
+            "exceptions": exceptions, "retrying": retrying, "superseded": superseded,
+            "last_activity": last_activity}
 
 
 def public(value):
@@ -521,7 +532,7 @@ def render_text(report):
     for label, data in groups:
         counts = ", ".join(f"{k}={v}" for k, v in data["funnel"].items() if v) or "none"
         lines.append(f"{label}: {data['requests']} requests, {data['exceptions']} exceptions, "
-                     f"{data['retrying']} retrying; {counts}")
+                     f"{data['retrying']} retrying, {data['superseded']} superseded; {counts}")
     moving = report.get("rates")
     if moving:
         lines.append("finished attempts (last " + "/".join(f"{w // 60}" for w in moving["windows_seconds"])
@@ -612,10 +623,11 @@ def render_html(report, *, refresh=5):
         if index["reasons"]:
             parts.append("<p>Stale: " + esc("; ".join(index["reasons"])) + "</p>")
     parts.append(f"<h2>Overall: {overall['requests']} requests, {overall['exceptions']} exceptions, "
-                 f"{overall['retrying']} retrying</h2>" + cards(overall["funnel"]))
+                 f"{overall['retrying']} retrying ({overall['superseded']} superseded originals not counted)</h2>" + cards(overall["funnel"]))
     for name, data in report["runs"].items():
         parts.append(f"<h2>Run {esc(name)} ({esc(data['prefix'])}*): {data['requests']} requests, "
-                     f"{data['exceptions']} exceptions</h2>" + cards(data["funnel"]))
+                     f"{data['exceptions']} exceptions ({data['superseded']} superseded not counted)</h2>"
+                     + cards(data["funnel"]))
     parts.append("<h2>Stages by kind and state</h2>" + table(
         ("kind", *STATUSES), [(k, *overall["stages"][k].values()) for k in KINDS]))
     catalog = report["catalog"]
