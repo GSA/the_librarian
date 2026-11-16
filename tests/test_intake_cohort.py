@@ -241,7 +241,9 @@ class BlockedCase(CohortCase):
         self.real = catalog.submit
 
     def run_ingest(self):
-        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        # These tests simulate a race by replacing ``catalog.submit``, the one-registration-per-revision
+        # commit, so they run that path; the batched path is covered in test_intake_batch.py.
+        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=1)
 
     def block_registrations(self):
         """A lost catalog race recorded as blocked native-input, as before concurrent-writer retries, then a
@@ -538,8 +540,18 @@ class ReplayTests(CohortCase):
         admitted = first["counts"]["outcome"]["received"]
         with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
                 unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
-            self.ingest()
+            cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=1)
         self.assertEqual(locked.call_count, 3 * admitted)
+        inspected.assert_not_called()
+
+    def test_batched_replay_opens_the_ledger_no_more_often_and_never_inspects(self):
+        first = self.ingest()
+        admitted = first["counts"]["outcome"]["received"]
+        with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
+                unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
+            again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=50)
+        self.assertEqual(again["counts"], first["counts"])
+        self.assertLessEqual(locked.call_count, 3 * admitted)
         inspected.assert_not_called()
 
     def test_a_file_modified_between_runs_is_still_detected_and_corrected(self):

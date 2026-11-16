@@ -545,8 +545,55 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   `recover-conflicts`).
 - Throughput is still serialized by the catalog writer lock. The commit ceiling at
   a 1,600-registration catalog was about 10 registrations/s with one writer when
-  measured; batching many registrations per revision was tried on paper and not
-  adopted because it changes idempotency, partial-failure and rebase semantics.
+  measured. Cohort `ingest` therefore batches (next section): the lock is taken, the head
+  validated and the daily snapshot checked once per chunk of documents.
+
+### Batched registration (`catalog.submit_batch`)
+
+`catalog_store.submit_batch(root, members, actor=, reason=, rebase=True)` commits many documents'
+records as ONE ordinary revision (one `revisions` row, `record_count` the sum of the members' records,
+the usual hash chain and input hash; `submit` and `submit_batch` share `_writer` and `_commit_revision`).
+Cohort `ingest` (`--batch-size`, default 50; 1 keeps `submit`, two revisions per document) uses it for
+the receipt stage and again for the extraction-registration stage (`extract.register_batch`).
+
+- **Member idempotency is a marker record.** Each member names a `marker`: a record it creates whose ID no
+  other member or request creates (`A-upload-<submission>-original` for a receipt, `A-extract-<run>` for a
+  registration). A member whose marker already has a first version equal to the member's own marker record is
+  `present`: reported with the revision that wrote it and that revision's state, never written again. The same
+  marker with other content is refused (`ConflictingWrite`). Batch revisions get the request ID
+  `batch-<hash of the written markers>`, so a retry that writes a different subset never reuses one. `submit(...,
+  marker=)` gives the one-at-a-time path the same property, so a document the batched path committed is
+  idempotent under a stale pin there too. Only stages whose records contain exactly one receipt naming an
+  original artifact (`adapters.receipt_marker`) batch; any other `catalog-submit` keeps its request ID.
+- **Each member is judged as if committed alone, in order.** Its records must validate; no earlier accepted member
+  may write one of its record IDs; its pin must be the head or (with `rebase`) a state in this history after which
+  no revision wrote one of its records (`ConflictingWrite` or `StaleState` otherwise, for that member only).
+  Accepted members go through one `validate_delta` over the union; only if the union is refused is each member
+  validated in order over a layer of the earlier accepted members, which finds the refused ones (bisection by one
+  pass, not by repeated commits). The write is one transaction: all accepted members or none; a guard or SQLite
+  failure rolls the whole batch back, and a failure after COMMIT reports the committed revision for a retry.
+- **Ledger.** `runner.run_batch` / `settle_batch` give every stage its own attempt, intent, evidence and status
+  (`failure_status` is the one rule shared with `run`); a chunk's intents and attempts are one ledger commit
+  before the native work and evidence is one commit after, a refused stage is recorded on that stage only, and a
+  lost catalog race stays within the contention budget. Evidence names the committed revision, which the
+  chunk's documents share, so a chunk's stages settle together.
+- **Crash model.** A kill before the catalog COMMIT leaves SQLite's rollback journal and the prior revision
+  (recovered like any killed catalog writer); a kill after it leaves the batch committed with stages still
+  `running`, and the re-run finds each marker present and records its evidence; a kill between ledger members leaves
+  an unfinished attempt that is reused. Retained copies, `registration.json` and `completion.json` are written
+  without replacement and checked by content, so they too are completed, never duplicated.
+- **Snapshots and receipts.** A chunk is one commit: one first-write-of-the-UTC-day replay and snapshot, one
+  validation receipt, one lock hold. The lock is held for the chunk's validation and write (about the cost of one
+  `submit` plus per-record encoding), not for the model-free extraction.
+- **Compatibility.** The schema, `VERSION`, state tokens and revision hash chain are unchanged; `inspect` replays
+  batch and single revisions identically, and history written before batching stays valid.
+
+Evidence: `tests/test_catalog_batch.py` (one revision, idempotent markers, per-member rebase, refusal isolation
+and equivalence with committing one by one on random inputs, kills before COMMIT/after COMMIT/after the receipt,
+a failure between members, two-process contention) and `tests/test_intake_batch.py` (batched equals one-at-a-time
+end state, revisions per chunk, failed documents isolated, a kill at 14 points of the chunk completed by a re-run
+with no duplicate or lost document, two processes ingesting one instance). Measure with
+`tools/diagnostics/batch_ingest_benchmark.py`.
 
 ### Intake ledger
 
