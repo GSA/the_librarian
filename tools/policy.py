@@ -393,8 +393,61 @@ def read_instance_binding(root):
     return value
 
 
+_VALIDATED = {}
+
+
+def _stat_id(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode)
+
+
+def _watched(instance_root, roots):
+    """Every path whose change can alter a successful validation: lock, policy, binding, root components, stores."""
+    watched = [BASE, LOCAL]
+    watched += [instance_root / name for name in (MIGRATION_FILE, INSTANCE_FILE,
+                                                  "config/policy.json", "config/policy.local.json")]
+    for rel in (*roots.values(), *DEFAULT_STORAGE_ROOTS.values()):
+        cursor = instance_root
+        for part in PurePosixPath(rel).parts:
+            cursor = cursor / part
+            watched.append(cursor)
+    for key, name in (("catalog_home", "catalog.sqlite3"), ("review_events_home", "events.sqlite3"),
+                      ("intake_home", "intake.sqlite3")):
+        watched += [instance_root / roots[key] / name, instance_root / DEFAULT_STORAGE_ROOTS[key] / name]
+    return tuple(dict.fromkeys(watched))
+
+
 def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=False):
+    """Validated storage roots, memoized per process while every watched path keeps its stat identity.
+
+    Only successes are cached; any change validation would detect alters a stat identity or the
+    in-process settings and forces a full revalidation (symlinks on the root's ancestors are rechecked
+    on every call).
+    """
     instance_root = _no_symlinks(root)
+    key = (instance_root, tuple(allow_missing), ignore_migration_lock, BASE, LOCAL)
+    cached = _VALIDATED.get(key)
+    if (cached is not None and cached[0] == SETTINGS
+            and cached[2] == tuple(_stat_id(path) for path in cached[1])):
+        return dict(cached[3])
+    # Snapshot before validating and cache only if nothing moved meanwhile, so a change that races the
+    # validation is revalidated on the next call instead of becoming the accepted baseline.
+    try:
+        before = _watched(instance_root, storage_roots(instance_root))
+        before_ids = tuple(_stat_id(path) for path in before)
+    except ValueError:
+        before = None
+    roots = _validate_instance_roots(instance_root, allow_missing, ignore_migration_lock)
+    if before is not None and _watched(instance_root, roots) == before and before_ids == tuple(
+            _stat_id(path) for path in before):
+        _VALIDATED[key] = (deepcopy(SETTINGS), before, before_ids, dict(roots))
+    return roots
+
+
+def _validate_instance_roots(instance_root, allow_missing, ignore_migration_lock):
     migration = instance_root / MIGRATION_FILE
     if not ignore_migration_lock and (migration.exists() or migration.is_symlink()):
         raise ValueError("Interrupted store migration detected; run initialize --recover-migration")
