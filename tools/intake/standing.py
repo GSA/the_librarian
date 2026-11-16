@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import sqlite3
 import stat
 import tempfile
 
@@ -250,8 +251,9 @@ def _registration_reads(root, receipt_id):
     """The receipt's metadata and records from one catalog state, or None when it is not there.
 
     Only an absent receipt or record means unregistered. A commit landing between the reads is
-    re-read and, if it persists, retryable; any other catalog failure raises ``CatalogUnavailable``
-    instead of being recorded as an outcome.
+    re-read and, if it persists, retryable; so is a SQLite or filesystem error the runner would
+    retry. Any other catalog failure (a changed validator, a malformed database, a permission
+    error) raises ``CatalogUnavailable`` instead of being recorded as an outcome.
     """
     try:
         catalog.identifier(receipt_id, "receipt")
@@ -270,6 +272,11 @@ def _registration_reads(root, receipt_id):
             raise Refusal("retryable", error.code) from error
         except catalog.CatalogError as error:
             raise CatalogUnavailable(str(error)) from error
+        except (sqlite3.Error, OSError) as error:
+            from .runner import classify  # runner imports this module through adapters
+            if classify(error).category == "retryable":
+                raise
+            raise CatalogUnavailable(f"{type(error).__name__}: {error}") from error
         return metadata, records
     raise Refusal("retryable", catalog.StaleState.code)
 

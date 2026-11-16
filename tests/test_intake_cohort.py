@@ -907,19 +907,31 @@ class QualifyTests(QualifyCase):
         self.assertEqual(len(calls), 12)
 
     def test_unreadable_catalog_stops_qualify_without_saving_an_outcome(self):
+        from tools.catalog import catalog_store
+        self._assert_unreadable_catalog_stops_qualify(catalog_store.CatalogError(
+            "Catalog validator changed after import; restart the reader"))
+
+    def test_malformed_catalog_stops_qualify_without_saving_an_outcome(self):
+        import sqlite3
+        self._assert_unreadable_catalog_stops_qualify(
+            sqlite3.DatabaseError("database disk image is malformed"))
+
+    def test_unpermitted_catalog_stops_qualify_without_saving_an_outcome(self):
+        self._assert_unreadable_catalog_stops_qualify(PermissionError(13, "Permission denied"))
+
+    def _assert_unreadable_catalog_stops_qualify(self, failure):
         from unittest.mock import patch
         from tools.catalog import catalog_store
         from tools.intake import standing
 
-        class ValidatorChanged:
+        class Unreadable:
             def __getattr__(self, name):
                 return getattr(catalog_store, name)
 
             def read_records(self, *args, **kwargs):
-                raise catalog_store.CatalogError(
-                    "Catalog validator changed after import; restart the reader")
+                raise failure
         transport, calls = self._transport()
-        with patch.object(standing, "catalog", ValidatorChanged()):
+        with patch.object(standing, "catalog", Unreadable()):
             with self.assertRaises(standing.CatalogUnavailable):
                 self._qualify(transport)
         reviews = [s for r in store.list_requests(self.root)
