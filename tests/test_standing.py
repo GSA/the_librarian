@@ -400,6 +400,33 @@ class StandingEvaluationTests(StandingCase):
                                   side_effect=self.metadata_with(original)):
                     self.assert_outcome("exception", "unregistered-rendition")
 
+    def test_only_an_absent_registration_is_unregistered(self):
+        with self.assertRaises(catalog.MissingRecord):
+            catalog.receipt_metadata(self.root, ["D999"])
+        with patch.object(standing.catalog, "receipt_metadata",
+                          side_effect=catalog.MissingRecord("Record missing from authoritative catalog: D1")):
+            self.assert_outcome("exception", "unregistered-rendition")
+        # A catalog this process can no longer read is never saved as a review outcome.
+        with patch.object(standing.catalog, "receipt_metadata", side_effect=catalog.CatalogError(
+                "Catalog validator changed after import; restart the reader")):
+            with self.assertRaises(catalog.CatalogError):
+                self.evaluate()
+        real, reads = catalog.read_records, []
+
+        def stale_once(*args, **kwargs):
+            reads.append(1)
+            if len(reads) == 1:
+                raise catalog.StaleState("Stale query state")
+            return real(*args, **kwargs)
+        with patch.object(standing.catalog, "read_records", side_effect=stale_once):
+            self.assertEqual(self.evaluate()["outcome"], "qualified")
+        with patch.object(standing.catalog, "read_records",
+                          side_effect=catalog.StaleState("Stale query state")):
+            with self.assertRaises(standing.Refusal) as caught:
+                self.evaluate()
+        self.assertEqual((caught.exception.category, caught.exception.code),
+                         ("retryable", "catalog-stale-state"))
+
     def metadata_with(self, original):
         real = catalog.receipt_metadata
 

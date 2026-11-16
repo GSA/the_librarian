@@ -900,6 +900,18 @@ def _inputs_changed(current):
             and review["attempts"][-1]["code"] == "changed-standing-inputs")
 
 
+def _registration_recovered(root, current, entry):
+    """A review saved as ``unregistered-rendition`` whose registration the catalog confirms now.
+
+    Before catalog reads distinguished an absent record from other failures, any catalog error
+    (such as a validator changed under a running process) was saved as this durable outcome.
+    """
+    review = current["stages"][0]
+    return (review["status"] == "blocked" and bool(review["attempts"])
+            and review["attempts"][-1]["code"] == "standing-exception-unregistered-rendition"
+            and standing.registered(root, entry["rendition"], entry["rendition_sha256"]))
+
+
 def _stage_correction(root, corr, active):
     """Restage a standing review whose pinned intent no longer matches its inputs as a
     correction of it: same review arguments and event, fresh request identities."""
@@ -1162,9 +1174,10 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
     active = current["correlation_id"]
     if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
         current = runner.run(root, active, "review")
-    if _inputs_changed(current):
+    if _inputs_changed(current) or _registration_recovered(root, current, entry):
         # The saved review's pinned intent is stale (e.g. an earlier-version review it
-        # conflicted with is now supersedable); re-pin it under a correction request.
+        # conflicted with is now supersedable, or a registration a failed catalog read
+        # missed is confirmed now); re-pin it under a correction request.
         active = _stage_correction(root, corr, active)
         current = runner.run(root, active, "review")
     select = current["stages"][1]

@@ -21,7 +21,7 @@ from tools import backups as snapshots, policy
 from tools.file_identity import file_identity
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
-    CatalogError, ConflictingWrite, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
+    CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
     now, path_value, refs, require, safe_relative, text, validate_graph, GraphValidator,
     validate_record, validate_records, validate_delta, _references,
 )
@@ -1553,7 +1553,8 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
 
 def current_record(connection, record_id):
     row = connection.execute("SELECT payload FROM catalog_current WHERE id=?", (record_id,)).fetchone()
-    require(row is not None, "Record missing from authoritative catalog: " + record_id)
+    if row is None:
+        raise MissingRecord("Record missing from authoritative catalog: " + record_id)
     return decode(row["payload"])
 
 
@@ -1578,8 +1579,8 @@ def receipt_metadata(root, receipt_ids):
         selected = {}
         for receipt_id in receipt_ids:
             receipt = current_record(connection, receipt_id)
-            require(receipt["kind"] == "receipt",
-                    "Receipt missing from authoritative catalog: " + receipt_id)
+            if receipt["kind"] != "receipt":
+                raise MissingRecord("Receipt missing from authoritative catalog: " + receipt_id)
             selected[receipt_id] = {
                 "receipt": receipt, "artifact": current_record(connection, receipt["data"]["artifact_id"]),
                 "sources": [current_record(connection, sid) for sid in receipt["data"]["source_ids"]],

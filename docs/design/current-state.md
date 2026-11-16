@@ -175,6 +175,17 @@ restated here.
   `test_advisory_references_do_not_block_...`), `tests/test_model_review.py`
   (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
+- **Only an absent registration is `unregistered-rendition`.** The standing check reads a
+  receipt's registration from one catalog state. The catalog raises `MissingRecord` for an absent
+  record or receipt, and only that, or a malformed receipt ID, yields the `unregistered-rendition`
+  exception. A commit landing between the two reads is re-read up to three times, then is retryable
+  `catalog-stale-state`. Any other catalog failure, such as `Catalog validator changed after
+  import` when the checkout is updated under a running process, propagates and stops the run
+  instead of being saved as an outcome. `qualify` restages a review saved as
+  `unregistered-rendition` as a correction once `standing.registered` confirms the binding. The
+  correction reuses the saved findings, so it makes no model call, and a still-absent
+  registration is left as it is. Evidence: `tests/test_standing.py::test_only_an_absent_registration_is_unregistered`,
+  `tests/test_intake_cohort.py::test_review_saved_as_unregistered_is_corrected_once_the_catalog_confirms_it`.
 - **Review throughput is bounded by the operator's cap and changes no outcome.** `qualify
   --concurrency N` is the most model calls (HTTP attempts: a retry takes a slot again after its backoff wait and
   none is held while waiting) ever in flight. Every attempt of a run passes one

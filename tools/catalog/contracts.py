@@ -21,6 +21,11 @@ class WriterBusy(CatalogError):
     code = "catalog-busy"
 
 
+class MissingRecord(CatalogError):
+    """The authoritative catalog holds no current record of the requested ID or kind."""
+    code = "catalog-missing-record"
+
+
 class ConflictingWrite(StaleState):
     """A later revision rewrote a record this request writes; a retry cannot succeed."""
     code = "catalog-conflict"

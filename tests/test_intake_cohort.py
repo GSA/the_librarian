@@ -906,6 +906,28 @@ class QualifyTests(QualifyCase):
                          [c + "-c1" for c in blocked])
         self.assertEqual(len(calls), 12)
 
+    def test_review_saved_as_unregistered_is_corrected_once_the_catalog_confirms_it(self):
+        from unittest.mock import patch
+        from tools.intake import standing
+        transport, calls = self._transport()
+        # A catalog read that failed for any reason used to be saved as this durable outcome.
+        with patch.object(standing, "_registration_reads", return_value=None):
+            saved = self._qualify(transport)
+            self.assertEqual(saved["counts"]["qualification"], {"exception": 6})
+            # Still unregistered: nothing is restaged.
+            self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"exception": 6})
+        blocked = [r["correlation_id"] for r in store.list_requests(self.root)
+                   if r["correlation_id"].startswith("standing-")]
+        self.assertEqual(len(blocked), 6)
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(report["counts"]["published"], 1)
+        self.assertEqual([store.head(self.root, c)["correlation_id"] for c in blocked],
+                         [c + "-c1" for c in blocked])
+        # The saved findings are reused: no review is paid twice, and settled corrections stay.
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(calls), 6)
+
     def test_qualify_restores_a_selection_missing_from_the_manifest(self):
         transport, calls = self._transport()
         self._qualify(transport)
