@@ -12,7 +12,7 @@ import json, sqlite3, sys
 from importlib.metadata import version
 import anyio, jsonschema
 from mcp.server import MCPServer
-assert sys.version_info >= (3, 11), 'Python 3.11+ required'
+assert sys.version_info >= (3, 14), 'Python 3.14+ required'
 assert version('mcp') == '2.2.0', 'This adapter requires mcp==2.2.0'
 with sqlite3.connect(':memory:') as db:
     db.execute('CREATE VIRTUAL TABLE probe USING fts5(text)')

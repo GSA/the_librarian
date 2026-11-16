@@ -84,10 +84,10 @@ class PreflightRuntimeProbe(unittest.TestCase):
         self.assertIn(diagnostic, check["error"])
         self.assertNotIn("result", check)
 
-    def test_python_below_3_11_is_refused(self):
-        for version in ((3, 10, 14), (3, 9, 0)):
+    def test_python_below_3_14_is_refused(self):
+        for version in ((3, 13, 9), (3, 11, 0)):
             with self.subTest(version=version):
-                self.assert_refused({"python": version}, "Python 3.11+ required")
+                self.assert_refused({"python": version}, "Python 3.14+ required")
 
     def test_any_mcp_version_other_than_the_pin_is_refused(self):
         for version in ("2.1.9", "2.2.1", "3.0.0"):
@@ -98,7 +98,7 @@ class PreflightRuntimeProbe(unittest.TestCase):
         self.assert_refused({"no_fts5": True}, "no such module: fts5")
 
     def test_passing_probe_reports_the_versions_in_use(self):
-        check = self.runtime_check({"python": [3, 11, 0], "mcp": "2.2.0"})
+        check = self.runtime_check({"python": [3, 14, 0], "mcp": "2.2.0"})
         self.assertTrue(check["ok"], check)
         self.assertEqual(check["result"], {
             "python": sys.version.split()[0], "sqlite": sqlite3.sqlite_version,

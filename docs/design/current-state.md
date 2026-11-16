@@ -134,7 +134,7 @@ restated here.
   Git checkout whose top level is the toolkit root and skips in packaged kits,
   which carry no `.git`. Evidence:
   `tests/test_kit.py::PackageTests::test_manifest_covers_every_tracked_file`.
-- **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
+- **Runtime checks.** `librarian-preflight` probes Python >= 3.14, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
   (`tests/test_mcp.py`). The adapter never imports the toolkit as a package: it
@@ -142,7 +142,7 @@ restated here.
   diagnostics writer by file path. The files it relies on are one set,
   `the_librarian_mcp.config.TOOLKIT_FILES`, which the root's `release-files.json`
   must contain (`tests/test_mcp.py::test_paths_are_derived_from_the_toolkit_root`). The runtime probe refuses, with a non-zero exit and an
-  explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
+  explicit diagnostic, Python below 3.14, any `mcp` version other than the pin,
   and missing FTS5, and reports the Python, SQLite and `mcp` versions and
   `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
   child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` (`>=4.10,<5`)

@@ -24,7 +24,7 @@ holds that program's content and config.
 
 ## Setup
 
-Requirements: Linux, Python 3.11+, and SQLite with FTS5 support.
+Requirements: Linux, Python 3.14+, and SQLite with FTS5 support.
 
 ```sh
 cd ~/the_librarian            # or an instance copy (see "Instance copies")
