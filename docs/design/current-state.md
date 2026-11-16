@@ -91,6 +91,18 @@ restated here.
   database file is refused. Evidence:
   `tests/test_kit.py::test_portable_roots_relocation_substitution_and_migration_recovery`
   and `::test_portable_roots_edge_cases_and_instance_policy_propagation`.
+- **Instance-root validation is memoized per process (Kata ck02).**
+  `policy.validate_instance_roots` (policy read, symlink and ambiguity checks,
+  binding read, authority-store id probes) used to run on every
+  `store.locations`. A success is now cached per root and reused while the
+  in-process settings and the stat identity (dev, ino, size, mtime, ctime, mode,
+  or absence) of the migration lock, policy files, instance binding, every
+  storage-root component and the three store files are unchanged; otherwise it
+  revalidates in full. Failures are never cached, and callers get a copy. Not
+  covered: a store file replaced with identical stat fields. Evidence:
+  `tests/test_instance_root_cache.py` (no store reopen on repeat calls; a
+  migration lock, changed storage roots, substituted store and symlinked root
+  each still refused after a cached success).
 - **Topology.** One instance is one full clone: its own checkout, `.venv`,
   `config/*.local.json`, inbox and stores. Policy is resolved per `--root` on
   every operation; a root without its own policy files gets only the versioned
