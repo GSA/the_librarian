@@ -932,6 +932,18 @@ class QualifyTests(QualifyCase):
         # The review staged before the stop is resumed from its saved findings.
         self.assertEqual(len(calls), spent + 5)
 
+    def test_a_trusted_qualify_replay_skips_unchanged_files_and_qualifies_alike(self):
+        from unittest.mock import patch
+        from tools.intake import upload
+        transport, calls = self._transport()
+        first = self._qualify(transport)
+        spent = len(calls)
+        with patch.object(upload, "stage_submission", wraps=upload.stage_submission) as staged:
+            again = self._qualify(transport, trust_stat=True)
+        self.assertEqual(staged.call_count, 0)
+        self.assertEqual(again["counts"]["qualification"], first["counts"]["qualification"])
+        self.assertEqual(len(calls), spent)
+
     def test_review_saved_as_unregistered_is_corrected_once_the_catalog_confirms_it(self):
         from unittest.mock import patch
         from tools.intake import standing
