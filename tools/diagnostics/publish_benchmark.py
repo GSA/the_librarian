@@ -80,6 +80,7 @@ def build(root, count):
         path.parent.mkdir(parents=True)
         data = extract.encoded(value)
         path.write_bytes(data)
+        path.chmod(0o600)  # as extraction writes it, whatever the umask
         rendition = path.relative_to(root).as_posix()
         rendition_sha = hashlib.sha256(data).hexdigest()
         ref = extract.reference(rendition, rendition_sha)
