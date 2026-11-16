@@ -1,7 +1,7 @@
 # The Librarian development and ingestion roadmap
 
 **Audience:** maintainers, operators and their agents.
-**Updated:** October 28, 2026.
+**Updated:** November 16, 2026.
 **Status:** capability inventory and proposed work, not an implementation,
 permission grant, delivery commitment or program-readiness register.
 
@@ -9,7 +9,22 @@ This is the canonical generic roadmap. Keep private source inventories,
 access decisions, tickets, job runs, evidence and observations in the program
 instance. No customer content is needed to maintain or distribute this plan.
 
-## Goal and current baseline
+## How to read this roadmap
+
+Every item carries one status label, checked against the code and tests in this
+repository:
+
+- **Delivered**: implemented and covered by tests; how it works today is in the
+  [current-state design](docs/design/current-state.md) and
+  [intake contract](context/intake.md).
+- **Partial**: some of the item is implemented; the remainder is stated.
+- **Open**: proposed, not implemented.
+
+Delivered work is listed under [Delivered](#delivered) and is not repeated as
+planned work. Labels describe the toolkit, not whether a program instance has
+exercised it on real data.
+
+## Goal
 
 Discover useful context across an authorized, initially unorganized document
 collection; maintain attributed knowledge; support Jira-to-Kata refinement
@@ -17,33 +32,42 @@ and engineering; and return supported discoveries to that knowledge base.
 The operator should not need to identify relevant documents before asking
 a question or refining a ticket.
 
-The current data-empty toolkit includes native catalog/review stores, verified
-local backups, configurable source restrictions, metadata inventory, strict
-ordinary UTF-8 text, Gemini TXT and ODT extraction, explicitly selected strictly
-reviewed Docling text/table retrieval, exact/compact/batched reads and read-only
-MCP. The October 3 extraction established the initial data-empty baseline;
-later dated sections record subsequent increments. Empty initialization and
-source-only packaging remain requirements, not temporary demo limitations.
+## Delivered
 
-The October 19 update names the project **The Librarian** and adds the
-[Librarian](agents/librarian.md), [ticket/refinement](agents/refiner.md),
-[Engineer](agents/coder.md) and
-[contribution/disposition](agents/contributions.md) contracts.
-These are instructions, not an agent runner, task importer or automatic inbox.
+### Data-empty toolkit baseline - October 3
 
-The October 21 update unifies software identity: the checkout, package,
-module, commands and MCP protocol name are all renamed to The Librarian, with
-no compatibility aliases. Record syntax remains unchanged. The later ingestion
-completion supersedes the unchanged-application-ID decision: catalog `LCAT`,
-review `LREV`, and derived index `LCTX` explicitly refuse `FCAT`, `FREV`, and
-`FCTX`. Authority stores need explicit migration or deliberate empty-store
-re-initialization; the derived index can be rebuilt from authority data.
-See the [current-state design](docs/design/current-state.md).
+**Delivered.** Native catalog/review stores, verified local backups,
+configurable source restrictions, metadata inventory, strict ordinary UTF-8
+text, Gemini TXT and ODT extraction, exact/compact/batched reads and read-only
+MCP. Empty initialization and source-only packaging remain requirements, not
+temporary demo limitations.
+
+### Role contracts - October 19
+
+**Delivered** (instructions only). The project is named **The Librarian** and
+ships the [Librarian](agents/librarian.md),
+[ticket/refinement](agents/refiner.md), [Engineer](agents/coder.md) and
+[contribution/disposition](agents/contributions.md) contracts. These are
+instructions, not an agent runner, task importer or automatic inbox; that
+orchestration is **Open** (see the reuse-gap table).
+
+### Identity rename - October 21
+
+**Delivered.** The checkout, package, module, commands and MCP protocol name
+are all The Librarian, with no compatibility aliases. Record syntax is
+unchanged. The later ingestion completion superseded the unchanged-application-ID
+decision: catalog `LCAT`, review `LREV`, and derived index `LCTX` explicitly
+refuse `FCAT`, `FREV`, and `FCTX`. Authority stores need explicit migration or
+deliberate empty-store re-initialization; the derived index can be rebuilt from
+authority data. The review-event schema `$id` became
+`urn:the-librarian:review-events:1`, which changed the store contract hash and
+required re-initializing the then-empty local review store. See the
+[current-state design](docs/design/current-state.md).
 
 ### Design baseline - October 21 to November 12
 
-Identity, store compatibility, instance topology, backups, validation, concurrency
-and observation are described as they work today in the
+**Delivered.** Identity, store compatibility, instance topology, backups,
+validation, concurrency and observation are described as they work today in the
 [current-state design](docs/design/current-state.md), with the test behind each
 claim. The numbered decision records that used to hold this are in git history. The
 configuration work they depended on (per-instance store homes, policy that follows
@@ -53,51 +77,66 @@ version record and a per-release compatibility note were considered and dropped
 (Kata 7jkt): measured dependency drift between instances has caused no incident, and
 the stores refuse a mismatched contract themselves.
 
-The October 21 update also renamed the review-event schema `$id` to
-`urn:the-librarian:review-events:1`, which changed the store contract hash and
-required re-initializing the then-empty local review store.
-
-It also adds an observation capability unlike the ingestion sources: **body-free
-retrieval diagnostics** covering coverage gaps, plus bare search and read counts,
-described under
-[Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution).
-Agent execution traces as durable agent memory were not built; see the design doc
-for the reasoning. The coverage-gap half is implemented: an empty search returns an
-absence classification, and an opt-in body-free log records it without the query.
-
 ### Docling integration - October 20-26
 
-The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extraction/docling_extract.py`, `docling_adapter.py`, `docling_bridge.py`, `docling_worker.py`, and `tools/extraction/README.md`) is implemented and verified:
+**Delivered.** The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extraction/docling_extract.py`, `docling_adapter.py`, `docling_bridge.py`, `docling_worker.py`, and `tools/extraction/README.md`):
 - Prepare twice with independent offline conversions, verify identical rendition bytes, and register deferred renditions in the catalog with idempotent retry.
 - Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries.
 - Qualified retrieval can explicitly select exact-rendition, substantively reviewed Docling text and table records, with retained-byte, JSON-pointer, and page provenance. Unsupported content collections fail closed.
-- The later standing-policy intake stages implement authorized evidence-based review, qualification, selection, and publication through the existing atomic index (see [the intake contract](context/intake.md)). Parser success alone never qualifies content. Real-document OCR accuracy remains unmeasured.
+- Parser success alone never qualifies content. Real-document OCR accuracy remains unmeasured.
 
+### Operator-run intake pipeline
+
+**Delivered**, run by an operator; nothing is fetched or scheduled. Contract:
+[context/intake.md](context/intake.md); design:
+[current-state design](docs/design/current-state.md#3-intake-and-review).
+- Durable intake ledger (`tools.intake.cli`): exact staged requests, named-stage
+  native writer recovery, bounded retries, dead-letter replay, pinned
+  publication and supplied transport acknowledgment (`tests/test_intake.py`,
+  `tests/test_intake_adapters.py`).
+- Manual upload (`submit-file`) and marked local drop (`drop-scan`,
+  `drop-submit`) (`tests/test_intake_upload.py`).
+- Read-only cohort intake (`tools.intake.cohort`): `classify`, batched `ingest`,
+  model-assisted standing-policy `qualify`, standalone `publish`,
+  `recover-identity` (`tests/test_intake_cohort.py`, `tests/test_intake_batch.py`,
+  `tests/test_standing.py`, `tests/test_model_review.py`).
+- MHTML/Confluence `.doc` extraction (`tools/extraction/mhtml.py`,
+  `tests/test_mhtml.py`).
+- Read-only, body-free progress view (`progress`, `progress-serve`)
+  (`tests/test_intake_progress.py`).
+
+### Retrieval diagnostics and MCP audit log
+
+**Partial.** Body-free retrieval diagnostics (search absence classification and
+a bare read count) and the opt-in full-text MCP audit log are delivered; agent
+execution traces were not built. Details under
+[Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution).
 
 ## Reuse gaps identified on October 19
 
-Comparison covers the extracted repository and the originating installation's
+Status labels in this table reflect the repository as of the **Updated** date
+above; the "State" column was first written on October 19. Comparison covers the extracted repository and the originating installation's
 current tooling/guides. It is a capability inventory, not exhaustive code
 parity, a correctness audit or permission to copy installation data.
-**No runtime backports are included in this documentation update.**
+The October 19 comparison itself included no runtime backports.
 Source component names below identify porting candidates, not files promised
 to exist in this distribution.
 
-| Capability | State in this repository | Required action |
-|---|---|---|
-| Three-agent collaboration and returned findings | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
-| Broader extraction | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT and ODT; optional offline Docling PDF/image conversion | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
-| Archive-member and large-workbook handling | No explicit retained-member extraction selector or row-chunk engine | Port member-policy/ancestor checks and versioned XLSX chunking without automatic recursive expansion or legacy-run rewriting |
-| Bounded ingestion cohorts | No cohort driver or operation-local catalog snapshot API | Adapt `cohort.py` and `ReceiptMetadataSnapshot`; retain source/state checks, serialized writes, saved requests, explicit partial failures and backups |
-| Read-only remote discovery | No remote connector; local explicit-root inventory exists | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
-| Continuous copy and intake | Private exact-request intake ledger, explicit native writer stages, bounded attempts/DLQ/replay, acknowledgment recording, and explicit manual file upload / marked local-drop intake; no acquisition or scheduler | Add separately authorized connectors, scheduling and return transport; a read-only mount is not a local copy or ingestion service |
-| MCP audit and body-free metrics | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); opt-in full-text per-agent MCP audit log (`--audit-log`, [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)); no cohort metrics | Add cohort metrics if wanted; keep private modes, explicit logging failures and no telemetry-as-job-authority. The audit log is implemented (`tests/test_mcp_audit.py`); see [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
-| Retrieval refinements | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
-| Reader diagnostics and regressions | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
-| Explicit relationship traversal | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in the [design](docs/design/current-state.md#7-relationship-traversal) (no real failed question has been recorded) |
-| Agent execution traces | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free coverage-gap diagnostics (implemented); reads are not attributed to documents and no retrieval-quality figure is derived. Agent findings route through the contribution contract; see the [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) |
-| Discovery-card experiments | Not shipped | Retain the lesson: skims can miss relevant material; evaluate candidate recall with deferred controls, never use cards as proof of absence |
-| Operating guidance | Generic role/feedback contracts now included; private corpus procedures intentionally omitted | Keep task-triggered loading and source fidelity/authority boundaries; add generic format/recovery guides alongside each future port |
+| Capability | Status | State in this repository | Required action |
+|---|---|---|---|
+| Three-agent collaboration and returned findings | Open | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
+| Broader extraction | Partial | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT, MHTML (including Confluence `.doc` exports) and ODT; optional offline Docling PDF/image conversion. Office formats are classified `needs-reader` | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
+| Archive-member and large-workbook handling | Open | No explicit retained-member extraction selector or row-chunk engine; cohort `classify` reads a zip only through an already expanded sibling `_extracted/<name>/` folder | Port member-policy/ancestor checks and versioned XLSX chunking without automatic recursive expansion or legacy-run rewriting |
+| Bounded ingestion cohorts | Partial | Cohort driver delivered (`tools.intake.cohort`: classify, batched ingest, qualify, publish) with saved ledger requests, serialized writes, explicit per-file outcomes and daily backups; no `ReceiptMetadataSnapshot`-style operation-local catalog snapshot API | Port an operation-local catalog snapshot API only if cohort cost measurements need it |
+| Read-only remote discovery | Open | No remote connector; local explicit-root inventory, marked local drop and read-only local inbox classification exist | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
+| Continuous copy and intake | Partial | Private exact-request intake ledger, explicit native writer stages, bounded attempts/DLQ/replay, acknowledgment recording, explicit manual file upload / marked local-drop intake and operator-run read-only cohort intake; no acquisition or scheduler | Add separately authorized connectors, scheduling and return transport; a read-only mount is not a local copy or ingestion service |
+| MCP audit and body-free metrics | Partial | Opt-in body-free retrieval diagnostics implemented for search absence and a bare read count (`tools/diagnostics/retrieval_log.py`); opt-in full-text per-agent MCP audit log (`--audit-log`, [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics)); body-free intake progress view; no cohort metrics in the MCP diagnostics | Add cohort metrics if wanted; keep private modes, explicit logging failures and no telemetry-as-job-authority. The audit log is implemented (`tests/test_mcp_audit.py`); see [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution) |
+| Retrieval refinements | Open | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
+| Reader diagnostics and regressions | Open | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
+| Explicit relationship traversal | Open | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in the [design](docs/design/current-state.md#7-relationship-traversal) (no real failed question has been recorded) |
+| Agent execution traces | Partial | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free coverage-gap diagnostics (implemented); reads are not attributed to documents and no retrieval-quality figure is derived. Agent findings route through the contribution contract; see the [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) |
+| Discovery-card experiments | Open (lesson only) | Not shipped | Retain the lesson: skims can miss relevant material; evaluate candidate recall with deferred controls, never use cards as proof of absence |
+| Operating guidance | Partial | Generic role/feedback contracts and the intake operator contract included; private corpus procedures intentionally omitted | Keep task-triggered loading and source fidelity/authority boundaries; add generic format/recovery guides alongside each future port |
 
 Do not re-port functionality already present: state-pinned native queries,
 append-only corrections, validated catalog read receipts, explicit selections,
@@ -131,7 +170,17 @@ scope, handling and business ambiguity. Initial enablement requires explicit
 source/destination/model permissions; each stage needs an implemented contract
 before it can run unattended.
 
+**Status: Partial.** Stages 2 to 6 run today as operator-invoked commands
+(see [Operator-run intake pipeline](#operator-run-intake-pipeline)); nothing
+discovers remote content, runs on a schedule or returns outcomes over a
+transport. Each stage below states what exists.
+
 ### 1. Discover documents and changes
+
+**Partial.** Explicit local discovery exists: `tools.catalog.inventory`,
+`drop-scan` of a marked drop and cohort `classify` of a read-only local inbox.
+Remote scopes, scheduled reconciliation polls and a durable discovery cursor are
+**Open**.
 
 Start with explicit allowlisted local inbox roots and read-only remote folder
 scopes. A scheduled reconciliation poll is sufficient for the first version;
@@ -152,6 +201,11 @@ do not infer unchanged content from titles or timestamps.
 
 ### 2. Copy into a preserved private inbox
 
+**Partial.** Upload, drop and cohort ingest publish hash-checked bytes and a
+provenance sidecar under the instance's original root without overwriting an
+earlier submission; changed bytes become linked corrections. Remote acquisition
+is **Open**.
+
 Copy only permitted content to staging beneath the authorized instance.
 Recheck identity/version around acquisition, hash and validate complete bytes,
 then publish without overwriting an earlier source version. Reject unsafe paths,
@@ -168,6 +222,11 @@ than assuming an old local copy remains authorized for retrieval.
 
 ### 3. Register and extract
 
+**Partial.** Registration through the catalog writer and format-routed
+extraction run as intake stages for text, Gemini TXT, MHTML and ODT (cohort
+ingest) and Docling PDF/images (staged requests). Further formats are **Open**
+(see the reuse-gap table).
+
 Register real receipt/source/artifact metadata through the supported catalog
 writer. A copied file is not a registered receipt until its commit is confirmed.
 Use a private operational journal for durable work and retries, **not** a
@@ -180,6 +239,11 @@ explicitly pending. No empty success fallback, macro execution or recursive
 archive expansion. New adapters need fidelity/recovery tests before scheduling.
 
 ### 4. Review and incorporate context
+
+**Partial.** Model-assisted standing-policy review of exact renditions
+(`qualify`, `tools/intake/model_review.py`) records attributed, append-only
+review events. Synthesizing reviewed knowledge into maintained documents
+remains agent or operator work under the [Librarian contract](agents/librarian.md).
 
 Select bounded review scopes and inspect substantive content, not only
 metadata/cards. Save actual attributed reviews and append-only corrections
@@ -194,12 +258,19 @@ independent review. Parsing, review and business acceptance stay separate.
 
 ### 5. Publish selected retrieval and return outcomes
 
+**Partial.** Standing-policy selection and publication (`standing-select`,
+`standing-publish`, cohort `publish`) are delivered; returning outcomes is
+limited to recording a supplied acknowledgment (`await-ack`/`acknowledge`).
+Return transport is **Open**.
+
 Apply explicit versioned source-selection/qualification policy; copying or
 registering a document must not automatically make it qualified context.
 Build the derived index atomically, validate freshness and exact packets, and
 make approved updated knowledge available only after successful publication.
-Any future automated selection needs its own defined policy and tests;
-the present installation still requires deliberate explicit selection.
+The only automated selection is standing-policy selection, which requires a
+pinned, authorized standing policy and a qualifying review of the exact
+rendition ([intake contract](context/intake.md)); any other selection is a
+deliberate edit of the selection manifest.
 
 Return receipt/disposition to an originating contribution or task when one
 exists. Mark a source consumed only under the instance's verified incorporation/
@@ -207,6 +278,9 @@ disposition rules, not because it downloaded or extracted successfully.
 Record refresh failures and unavailable return routes explicitly.
 
 ### 6. Operate, retry and reconcile
+
+**Partial.** The ledger, retries, dead-letter replay and the body-free progress
+view are delivered; a scheduler with pause, clean shutdown and resume is **Open**.
 
 The shipped `tools.intake` interface implements the private exact-request ledger,
 named-stage native writer recovery, bounded retries, explicit dead-letter replay,
@@ -238,7 +312,7 @@ Define pause, clean shutdown and explicit resume before enabling scheduling.
 
 ## Retrieval diagnostics from agent execution
 
-**Status: Partly implemented.** Search absence classification and an opt-in
+**Status: Partial.** Search absence classification and an opt-in
 body-free diagnostics log exist and are tested. How they behave, and the tests
 that back each claim, are in the
 [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics);
@@ -282,15 +356,15 @@ read-only tool set).
 
 ## Delivery sequence and completion gates
 
-| Phase | Scope | Completion gate |
-|---|---|---|
-| A: manual collaboration | Existing qualified retrieval plus the three role contracts and feedback route | Actual authorized Jira input becomes local Kata tasks and an implemented/reviewed change; a supported contribution receives a persisted disposition |
-| B: reusable parity | Prioritize extraction, cohort/snapshot support, metrics and retrieval fixes from the gap table | Generic tests and clean-root packaging pass; version/fidelity contracts and operational limits documented |
-| C: local continuous inbox | One allowlisted local inbox; scheduled discovery/copy/register/extract; explicit review/publication boundaries | Restart, duplicate, mutation, failure and committed-retry cases below pass without duplicate authoritative records |
-| D: remote discovery/copy | One approved read-only provider/folder scope, then additional scopes | Complete paginated reconciliation, binary/native identity behavior and authorization failures demonstrated; no destructive synchronization |
-| E: agent-driven maintenance | Bounded review/incorporation and approved publication policy | Evidence fidelity, independent-review triggers, recoverability and qualified-answer preservation shown under ongoing intake |
-| F: retrieval diagnostics | Body-free coverage-gap observation plus bare search and read counts; reads are not attributed to documents and no retrieval-quality figure is derived | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
-| Later, only if justified | Graph, richer discovery, hosted/multi-user services | Demonstrated use case and explicit handling, authorization, concurrency and recovery design; not prerequisites for the local demo. Graph evaluation notes are in the [design](docs/design/current-state.md#7-relationship-traversal) |
+| Phase | Status | Scope | Completion gate |
+|---|---|---|---|
+| A: manual collaboration | Partial: contracts delivered; gate evidence is kept in program instances, not here | Existing qualified retrieval plus the three role contracts and feedback route | Actual authorized Jira input becomes local Kata tasks and an implemented/reviewed change; a supported contribution receives a persisted disposition |
+| B: reusable parity | Partial: MHTML, cohort driver and MCP audit delivered; remaining gap-table items open | Prioritize extraction, cohort/snapshot support, metrics and retrieval fixes from the gap table | Generic tests and clean-root packaging pass; version/fidelity contracts and operational limits documented |
+| C: local continuous inbox | Partial: operator-run cohort intake of one local inbox delivered; scheduling open | One allowlisted local inbox; scheduled discovery/copy/register/extract; explicit review/publication boundaries | Restart, duplicate, mutation, failure and committed-retry cases below pass without duplicate authoritative records |
+| D: remote discovery/copy | Open | One approved read-only provider/folder scope, then additional scopes | Complete paginated reconciliation, binary/native identity behavior and authorization failures demonstrated; no destructive synchronization |
+| E: agent-driven maintenance | Partial: standing-policy review and publication delivered; gate not demonstrated | Bounded review/incorporation and approved publication policy | Evidence fidelity, independent-review triggers, recoverability and qualified-answer preservation shown under ongoing intake |
+| F: retrieval diagnostics | Delivered | Body-free coverage-gap observation plus bare search and read counts; reads are not attributed to documents and no retrieval-quality figure is derived | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
+| Later, only if justified | Open | Graph, richer discovery, hosted/multi-user services | Demonstrated use case and explicit handling, authorization, concurrency and recovery design; not prerequisites for the local demo. Graph evaluation notes are in the [design](docs/design/current-state.md#7-relationship-traversal) |
 
 These are proposed dependencies, not assignments or dates. The full automation
 roadmap is not a prerequisite for the first real business demonstration.
