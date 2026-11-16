@@ -99,7 +99,7 @@ def rates(c, now):
                      + " FROM attempts WHERE ended>=? AND outcome IS NOT NULL GROUP BY outcome",
                      [now - w for w in WINDOWS] + [now - max(WINDOWS)]).fetchall()
     return {"windows_seconds": list(WINDOWS), "finished": {
-        outcome: dict(zip(map(str, WINDOWS), counts)) for outcome, *counts in sorted(rows)}}
+        outcome: dict(zip(map(str, WINDOWS), counts)) for outcome, *counts in sorted(rows, key=lambda row: row[0])}}
 
 
 def header_identity(db):

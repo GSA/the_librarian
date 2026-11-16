@@ -502,6 +502,7 @@ class RateTests(Case):
                 c.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?)", (
                     "bulk-000001", "receipt", 0, ordinal, 1.0, 1000.0 - age, outcome, None, None, None))
         with closing(sqlite3.connect(self.db)) as c:
+            c.row_factory = sqlite3.Row  # as open_ledger reads it
             moving = progress.rates(c, 1000.0)
         self.assertEqual(moving["finished"], {"failed": {"60": 0, "300": 0, "900": 1},
                                               "succeeded": {"60": 1, "300": 2, "900": 2}})
