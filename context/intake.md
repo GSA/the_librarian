@@ -62,7 +62,8 @@ named stage. The ledger is operational recovery state, never corpus authority.
   atomically replacing the destination; a raising guard preserves the prior
   index. Inspection reports current availability separately from historical
   completion, including when a published index later becomes unreadable.
-- Standing-policy stages (`tools/intake/standing.py`) pin a private (0600)
+- Standing-policy stages (`tools/intake/standing.py`; the review event they record and bind is
+  in `standing_events.py`, the selection and manifest write in `standing_publication.py`) pin a private (0600)
   `standing-policy-v1` file by SHA-256 (id, version, active/revoked status,
   reviewer, receipt/audience scope, page/record/findings budgets, selection
   context) and an attributed `standing-findings-v2` (or legacy `-v1`) record for one exact
