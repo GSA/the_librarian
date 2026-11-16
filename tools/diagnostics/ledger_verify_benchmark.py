@@ -11,10 +11,8 @@ compare another checkout's ``tools`` package. Synthetic fixtures only; never poi
 import argparse
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import sqlite3
-import sys
 import tempfile
 import time
 
@@ -32,8 +30,8 @@ def main(argv=None):
     parser.add_argument("--passes", type=int, default=5)
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools.intake import store
     from tools.diagnostics.ledger_scale_benchmark import seed_ledger
     with tempfile.TemporaryDirectory() as temp:

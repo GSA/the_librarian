@@ -207,7 +207,9 @@ def main(argv=None):
     parser.add_argument("--sizes", default="5000,10000,15000")
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    tree = args.tree.resolve()
+    from _harness import use_tree
+    use_tree(Path(__file__).resolve().parents[2])
     for size in (int(n) for n in args.sizes.split(",")):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "instance"
@@ -215,7 +217,7 @@ def main(argv=None):
             start = time.perf_counter()
             build(root, size)
             built = time.perf_counter() - start
-            done = subprocess.run([sys.executable, "-c", CHILD, str(args.tree.resolve()), str(root), POLICY, MANIFEST],
+            done = subprocess.run([sys.executable, "-c", CHILD, str(tree), str(root), POLICY, MANIFEST],
                                   capture_output=True, text=True)
             if done.returncode:
                 sys.exit(done.stderr[-2000:])

@@ -18,7 +18,6 @@ Synthetic fixtures in a temporary workspace only; never point it at a real insta
 """
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -71,9 +70,8 @@ def main(argv=None):
     parser.add_argument("--holds", default="0.5,2.5,3.5,6.5", help="hold times as multiples of the wait")
     parser.add_argument("--max-attempts", type=int, default=3)
     args = parser.parse_args(argv)
-    tree = str(args.tree.resolve())
-    sys.path.insert(0, tree)
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(args.tree)
     print(json.dumps({"wait_s": args.wait, "max_attempts": args.max_attempts,
                       "trials": [trial(args.wait, float(h), args.max_attempts) for h in args.holds.split(",")]},
                      indent=1))

@@ -11,9 +11,7 @@ validate and rewrite path (``--full``) for comparison. Flat windows mean a const
 """
 import argparse
 import json
-import os
 from pathlib import Path
-import sys
 import tempfile
 import time
 
@@ -31,8 +29,8 @@ def main(argv=None):
     parser.add_argument("--window", type=int, default=1000)
     parser.add_argument("--full", action="store_true", help="measure the full rewrite path instead")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools import policy
     from tools.context_index import renditions
     from tools.intake import standing

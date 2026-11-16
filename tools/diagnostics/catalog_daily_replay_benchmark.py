@@ -26,20 +26,12 @@ waiting is needed. Synthetic fixtures only; never point it at a real instance.
 import argparse
 import json
 import multiprocessing
-import os
 from pathlib import Path
 import shutil
 import statistics
 import sys
 import time
 from datetime import timedelta
-
-
-def _tree(args):
-    tree = str(args.tree.resolve())
-    sys.path.insert(0, tree)
-    os.chdir(tree)
-    return tree
 
 
 def shift_clock(days=1):
@@ -211,8 +203,8 @@ def db_size(meta):
 
 
 def writer(tree, root, number, delay, count, start_at, queue):
-    sys.path.insert(0, tree)
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(tree)
     shift_clock()
     from tools.catalog import catalog_store as cs
     from tools.diagnostics.catalog_lock_benchmark import registration
@@ -266,8 +258,8 @@ def contend(args):
 
 
 def _inspect_once(tree, db, detail, queue):
-    sys.path.insert(0, tree)
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(tree)
     import resource
     from contextlib import closing
     from tools.catalog import catalog_store as cs
@@ -324,7 +316,8 @@ def main(argv=None):
     commands.choices["contend"].add_argument("--writers", type=int, default=3)
     commands.choices["contend"].add_argument("--per-writer", type=int, default=3)
     args = parser.parse_args(argv)
-    _tree(args)
+    from _harness import use_tree
+    args.tree = Path(use_tree(args.tree))
     if args.command == "seed":
         seed(args.dir, args.size)
     elif args.command == "profile":
