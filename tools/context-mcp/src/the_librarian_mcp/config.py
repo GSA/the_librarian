@@ -23,6 +23,7 @@ TOOLKIT_FILES = frozenset({
     "tools/context_index/__init__.py", "tools/context_index/context_index.py",
     "tools/context_index/cli.py", "tools/context_index/compact_records.py",
     "tools/context_index/renditions.py", "tools/context_index/qualification.py",
+    "tools/context_index/packets.py",
     "tools/review_events/__init__.py", "tools/review_events/event_reader.py",
     "tools/review_events/event_store.py", "tools/review_events/review_events.py",
     "tools/review_events/review-event-v1.schema.json",

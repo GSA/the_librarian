@@ -12,7 +12,7 @@ import unittest.mock
 from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
-from tools.context_index import renditions
+from tools.context_index import packets, renditions
 from tools.intake import cohort, model_review, runner, selection_manifest, standing, store, upload
 from tools.intake.contracts import IntakeError, LedgerBusy
 
@@ -678,14 +678,14 @@ class QualifyTests(QualifyCase):
         with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
             hits = index.search(db, "Fund codes", 10, None, root=self.root)["hits"]
             self.assertEqual(len(hits), 1)
-            got = index.packet(db, config, hits[0]["locator"], 60000, root=self.root)
+            got = packets.packet(db, config, hits[0]["locator"], 60000, root=self.root)
             rendition = got["renditions"][hits[0]["path"]]
             self.assertEqual(rendition["source"]["sha256"],
                              hashlib.sha256(CONFLUENCE).hexdigest())
             self.assertTrue(rendition["rendition_sha256"])
             self.assertTrue(got["pieces"][0]["source_hash"])
             self.assertEqual(got["pieces"][0]["locator"], hits[0]["locator"])
-            many = index.packet_many(db, config, [hits[0]["locator"]], 60000, root=self.root)
+            many = packets.packet_many(db, config, [hits[0]["locator"]], 60000, root=self.root)
             self.assertEqual(len(many["requests"]), 1)
             self.assertEqual(index.search(db, "Just text", 10, None, root=self.root)["hits"], [])
 

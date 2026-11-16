@@ -1,4 +1,4 @@
-"""Lossless, opt-in presentation for complete live coverage/catalog responses.
+"""Lossless, opt-in presentation for complete live catalog responses.
 
 The envelope preserves the original response under ``payload``. Only repeated
 JSON strings, objects or arrays are pooled, without interpreting their meaning.
@@ -13,7 +13,6 @@ import json
 import math
 
 
-COVERAGE_FORMAT = "coverage-shared-values-v1"
 CATALOG_FORMAT = "catalog-shared-values-v1"
 NOTICE = (
     "Lossless presentation only; authority and caveats remain in payload. "
@@ -61,7 +60,7 @@ def _validate_json(value, ancestors=None):
     ancestors.remove(identity)
 
 
-def _validate_response(payload, domain):
+def _validate_response(payload):
     _validate_json(payload)
     _require(type(payload) is dict, "Response must be an object")
     _require(type(payload.get("records")) is list, "Response records must be an array")
@@ -69,44 +68,20 @@ def _validate_response(payload, domain):
              "Response records must be objects")
     _require(type(payload.get("count")) is int and payload["count"] == len(payload["records"]),
              "Response count must equal the number of records")
-    if domain == "coverage":
-        _require(payload.get("command") == "coverage"
-                 and type(payload.get("contract_version")) is int
-                 and payload["contract_version"] in (2, 3)
-                 and payload.get("authority")
-                 == "live-review-events-with-maintained-markdown-context",
-                 "Expected live coverage contract v2 or v3")
-        for key in ("notice", "caveat"):
-            _require(type(payload.get(key)) is str, f"Coverage {key} must be a string")
-        for key in ("batches", "relationships"):
-            _require(type(payload.get(key)) is list
-                     and all(type(item) is dict for item in payload[key]),
-                     f"Coverage {key} must be an array of objects")
-        _require(type(payload.get("event_store_state")) is dict,
-                 "Coverage event_store_state must be an object")
-        if payload["contract_version"] == 3:
-            _require(type(payload.get("catalog_state")) is dict,
-                     "Coverage v3 catalog_state must be an object")
-        for key in ("evidence", "review_artifacts"):
-            if key in payload:
-                _require(type(payload[key]) is dict, f"Coverage {key} must be an object")
-        _require(all(type(record.get("receipt_id")) is str for record in payload["records"]),
-                 "Coverage records must have receipt_id strings")
-    else:
-        _require(payload.get("authority") == "catalog-metadata-only",
-                 "Expected a catalog metadata query")
-        _require(type(payload.get("state")) is dict, "Catalog state must be an object")
-        _require(type(payload.get("total_matching")) is int
-                 and payload["total_matching"] >= payload["count"],
-                 "Catalog total_matching must be an integer at least count")
-        _require("next_after" in payload
-                 and (payload["next_after"] is None or type(payload["next_after"]) is str),
-                 "Catalog next_after must be a string or null")
-        for record in payload["records"]:
-            _require(type(record.get("id")) is str
-                     and record.get("kind") in ("receipt", "source", "artifact", "relationship", "policy")
-                     and type(record.get("data")) is dict,
-                     "Expected a catalog record with id, supported kind and data object")
+    _require(payload.get("authority") == "catalog-metadata-only",
+             "Expected a catalog metadata query")
+    _require(type(payload.get("state")) is dict, "Catalog state must be an object")
+    _require(type(payload.get("total_matching")) is int
+             and payload["total_matching"] >= payload["count"],
+             "Catalog total_matching must be an integer at least count")
+    _require("next_after" in payload
+             and (payload["next_after"] is None or type(payload["next_after"]) is str),
+             "Catalog next_after must be a string or null")
+    for record in payload["records"]:
+        _require(type(record.get("id")) is str
+                 and record.get("kind") in ("receipt", "source", "artifact", "relationship", "policy")
+                 and type(record.get("data")) is dict,
+                 "Expected a catalog record with id, supported kind and data object")
 
 
 def _reserved(value):
@@ -147,8 +122,8 @@ def _encode(value, selected):
     return value
 
 
-def _compact(payload, domain, format_name):
-    _validate_response(payload, domain)
+def _compact(payload):
+    _validate_response(payload)
     selected, pool = {}, {}
     while True:
         counts, values = {}, {}
@@ -168,19 +143,19 @@ def _compact(payload, domain, format_name):
         selected[best] = reference
         pool[reference] = copy.deepcopy(values[best])
     return {
-        "format": format_name,
+        "format": CATALOG_FORMAT,
         "notice": NOTICE,
         "payload": _encode(payload, selected),
         "shared_values": pool,
     }
 
 
-def _expand(packet, domain, format_name):
+def _expand(packet):
     _validate_json(packet)
     _require(type(packet) is dict
              and set(packet) == {"format", "notice", "payload", "shared_values"},
              "Expected a complete shared-values envelope")
-    _require(packet["format"] == format_name, f"Expected format {format_name}")
+    _require(packet["format"] == CATALOG_FORMAT, f"Expected format {CATALOG_FORMAT}")
     _require(packet["notice"] == NOTICE, "Unsupported shared-values instructions")
     pool = packet["shared_values"]
     _require(type(pool) is dict, "shared_values must be an object")
@@ -206,25 +181,15 @@ def _expand(packet, domain, format_name):
 
     payload = expand(packet["payload"])
     _require(used == set(pool), "Unreferenced shared_values entries")
-    _validate_response(payload, domain)
+    _validate_response(payload)
     return payload
-
-
-def compact_coverage(payload):
-    """Project a complete live coverage v2/v3 response; never truncate it."""
-    return _compact(payload, "coverage", COVERAGE_FORMAT)
-
-
-def expand_coverage(packet):
-    """Reconstruct the full coverage response, rejecting malformed projections."""
-    return _expand(packet, "coverage", COVERAGE_FORMAT)
 
 
 def compact_catalog(payload):
     """Project a complete catalog query, including any history and pagination."""
-    return _compact(payload, "catalog", CATALOG_FORMAT)
+    return _compact(payload)
 
 
 def expand_catalog(packet):
     """Reconstruct the full catalog response, rejecting malformed projections."""
-    return _expand(packet, "catalog", CATALOG_FORMAT)
+    return _expand(packet)

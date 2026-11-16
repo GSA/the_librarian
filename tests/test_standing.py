@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index
+from tools.context_index import packets
 from tools.extraction import docling_bridge
 from tools.review_events import event_store as events
 from tools.intake import adapters, runner, standing, store
@@ -619,7 +620,7 @@ class StandingIntakeTests(StandingCase):
         self.assertEqual(event["outcome"], "reviewed")
         self.assertNotIn("verified", json.dumps(event).lower().replace("not verification", ""))
         with closing(index.readonly(self.root / DB)) as db:
-            packet = index.packet(db, self.config | json.loads(
+            packet = packets.packet(db, self.config | json.loads(
                 (self.root / "config/selection.json").read_text()), RENDITION + "#text-1", 60000, root=self.root)
         self.assertEqual(packet["renditions"][RENDITION]["confidence"], {"layout": 0.99})
         self.assertEqual(packet["renditions"][RENDITION]["qualification"]["review_event_ids"],
@@ -717,7 +718,7 @@ class StandingExtractTests(WorkspaceCase):
         self.assertEqual(manifest["renditions"][0]["review_event_ids"], ["rev-standing-text"])
         with closing(index.readonly(self.root / DB)) as db:
             hit = index.search(db, "Extract phrase", 10, None, root=self.root)["hits"][0]
-            packet = index.packet(db, manifest, hit["locator"], 60000, root=self.root)
+            packet = packets.packet(db, manifest, hit["locator"], 60000, root=self.root)
         qualified = packet["renditions"][self.rendition]["qualification"]
         self.assertEqual(qualified["review_event_ids"], ["rev-standing-text"])
         self.assertEqual(qualified["reviewed_content"], ["text"])
