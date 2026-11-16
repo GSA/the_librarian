@@ -6,6 +6,8 @@ PRAGMA user_version=1;
 CREATE TABLE requests (
  correlation_id TEXT PRIMARY KEY, correction_of TEXT REFERENCES requests(correlation_id),
  raw BLOB NOT NULL, request_sha256 TEXT NOT NULL, root TEXT NOT NULL);
+-- Kata 5m1h: every "who corrects this request" lookup (partial: most requests correct nothing).
+CREATE INDEX IF NOT EXISTS requests_correction ON requests(correction_of) WHERE correction_of IS NOT NULL;
 CREATE TABLE stages (
  correlation_id TEXT NOT NULL REFERENCES requests(correlation_id), stage_id TEXT NOT NULL,
  ordinal INTEGER NOT NULL, status TEXT NOT NULL, cycle INTEGER NOT NULL DEFAULT 0,
