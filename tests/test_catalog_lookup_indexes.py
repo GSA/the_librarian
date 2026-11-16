@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -107,6 +108,31 @@ class NewCatalogs(Case):
                 self.assertTrue(any(step.startswith("SEARCH") and ("lookup" in step or "refs" in step or "r USING PRIMARY" in step)
                                     for step in plan), plan)
 
+    def test_a_receipt_scoped_read_probes_the_indexes(self):
+        root = new_instance(self.temp.name)
+        for n in range(3):
+            submit(root, registration(n), f"r{n}")
+        statements = []
+        real = catalog.current_view
+
+        def traced(connection):
+            connection.set_trace_callback(statements.append)
+            real(connection)
+        with patch.object(catalog, "current_view", traced):
+            found = catalog.read_records(root, receipt="D1", limit=100)
+        self.assertEqual(found["total_matching"], found["count"])
+        self.assertTrue(found["records"])
+        with closing(catalog.connect(catalog.locations(root)[1])) as connection:
+            connection.execute("BEGIN")
+            catalog.current_view(connection)
+            probed = [sql for sql in statements if ("catalog_current" in sql or "versions v" in sql)
+                      and not sql.lstrip().startswith("CREATE")]
+            self.assertTrue(any("versions v" in sql for sql in probed))
+            for sql in probed:
+                plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + sql)]
+                self.assertFalse([step for step in plan if re.match(r"SCAN (c|v|versions|current_records)\b", step)],
+                                 (sql, plan))
+
 
 class Equivalence(Case):
     """Decisions with the indexes equal the ones without them and the full validate_graph."""
@@ -167,6 +193,9 @@ class Equivalence(Case):
                     lookups = catalog._CurrentRecords(connection)
                     self.assertEqual(sorted(r["id"] for r in lookups.referrers(ids)), truth_referrers)
                     self.assertEqual(sorted(r["id"] for r in lookups.claimants(paths)), truth_claimants)
+            for receipt_id in (f"D{n}" for n in universe):
+                scoped = [catalog.read_records(root, receipt=receipt_id, limit=100) for root in (indexed, legacy)]
+                self.assertEqual(*[(s["records"], s["total_matching"]) for s in scoped])
         self.assertGreater(accepted, 40)
         self.assertGreater(refused, 40)
         for root in (indexed, legacy):

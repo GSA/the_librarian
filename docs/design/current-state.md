@@ -175,6 +175,23 @@ restated here.
   `test_advisory_references_do_not_block_...`), `tests/test_model_review.py`
   (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
+- **Only an absent registration is `unregistered-rendition`.** The standing check reads a
+  receipt's registration from one catalog state. The catalog raises `MissingRecord` for an absent
+  record or receipt, and only that, or a malformed receipt ID, yields the `unregistered-rendition`
+  exception. A commit landing between the two reads is re-read up to three times, then is retryable
+  `catalog-stale-state`. A SQLite or filesystem error that the runner would retry (lock contention,
+  a transient errno) stays retryable. Any other catalog failure raises
+  `standing.CatalogUnavailable`, for example `Catalog validator changed after import` when the
+  checkout is updated under a running process, a malformed database or a permission error. It is not a `CatalogError`, so the adapters do not save it as a
+  `native-input` failure: it stops `qualify` (`{"error": "catalog_unavailable"}`, exit 2) and a
+  restarted run re-checks the same stage. `qualify` restages a review saved as
+  `unregistered-rendition` as a correction once `standing.registered` confirms the binding. The
+  correction reuses the saved findings, so it makes no model call, and a still-absent
+  registration is left as it is. Evidence: `tests/test_standing.py::test_only_an_absent_registration_is_unregistered`,
+  `tests/test_intake_cohort.py::test_unreadable_catalog_stops_qualify_without_saving_an_outcome`,
+  `::test_malformed_catalog_stops_qualify_without_saving_an_outcome`,
+  `::test_unpermitted_catalog_stops_qualify_without_saving_an_outcome`,
+  `::test_review_saved_as_unregistered_is_corrected_once_the_catalog_confirms_it`.
 - **Review throughput is bounded by the operator's cap and changes no outcome.** `qualify
   --concurrency N` is the most model calls (HTTP attempts: a retry takes a slot again after its backoff wait and
   none is held while waiting) ever in flight. Every attempt of a run passes one
@@ -231,7 +248,7 @@ restated here.
   backfill leaves it empty and the first default replay fills it, and a row's stat is kept only when
   the hash read at that time equals the retained original's.
   **Change detection is unchanged by default:** every file is still read and hashed. Only
-  `ingest --trust-stat` reports an extracted document straight from its row, without reading,
+  `ingest --trust-stat` (and `qualify --trust-stat`, which passes it to its ingest) reports an extracted document straight from its row, without reading,
   hashing or looking it up in the ledger, when its stat identity equals the row's; a same-size edit
   that restores the mtime still changes `ctime`, but a tool that also resets `ctime` is outside what
   stat can show, which is why the mode is opt-in (efz3 decision D8). A row never vouches for a chain
@@ -240,7 +257,8 @@ restated here.
   staging transaction and drops the old stat identity; none of these is trusted. Evidence:
   `tests/test_intake_docs.py` (recording, same-transaction rollback, correction repointing, backfill
   and audit, same-size edit with restored mtime, rename-over, truncate, append and touch with and
-  without `--trust-stat`, report equality with and without it).
+  without `--trust-stat`, report equality with and without it),
+  `tests/test_intake_cohort.py::test_a_trusted_qualify_replay_skips_unchanged_files_and_qualifies_alike`.
 - **Extraction parses each document once per ingest and re-checks it four times.**
   `extract.bundle` reads the receipt's catalog snapshot, reads and hashes the original,
   recomputes the extractor identity (code and policy) and parses. A first ingest ran it six
@@ -507,6 +525,13 @@ synthetic documents the two scans were about half of the time per document).
 - **Restore.** A snapshot taken after the migration carries the structures and restores as `indexed`; a
   snapshot from before it restores as `legacy` and works unchanged (slower) until `migrate-indexes` is run
   again. `audit` and `verify-backup` verify whichever shape they find.
+- **Receipt-scoped reads.** On an `indexed` catalog, `read_records(receipt=...)` (the standing
+  registration check reads one per review and select stage) computes the receipt's scope with the same
+  `EXISTS` probes on the lookup indexes and filters by that id set; a `legacy` or partial catalog keeps
+  the scan form. Both forms return the same records and totals. Measured on a 236,084-record production
+  catalog: about 450 ms per scoped read in the scan form, under 1 ms with the probes. Evidence:
+  `tests/test_catalog_lookup_indexes.py::test_a_receipt_scoped_read_probes_the_indexes` and the
+  receipt-scoped comparison in `test_random_histories_decide_alike_with_and_without_the_indexes`.
 - Measured on synthetic production-shaped catalogs (4 and 3 records per document; shared host, CPU time
   per document of a first ingest into a catalog already holding N documents): 130 to 103 ms at 2,000,
   296 to 126 ms at 10,000, 977 to 260 ms at 40,000; the catalog grows 10% at 40,000 (291 to 311 MB) and the migration

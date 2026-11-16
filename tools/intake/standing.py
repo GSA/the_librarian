@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import sqlite3
 import stat
 import tempfile
 
@@ -44,6 +45,16 @@ class Refusal(Exception):
     def __init__(self, category, code):
         self.category, self.code = category, code
         super().__init__(code)
+
+
+class CatalogUnavailable(RuntimeError):
+    """The catalog could not be read for a reason other than an absent record.
+
+    Deliberately not a ``CatalogError``: adapters save those as durable stage failures, and an
+    unreadable catalog (such as a validator changed under this process) says nothing about the
+    rendition, so it stops the run instead and a restarted run re-checks the same stage.
+    """
+    code = "catalog_unavailable"
 
 
 def _identifier(value, pattern=r"[a-z0-9][a-z0-9-]{0,99}"):
@@ -232,16 +243,52 @@ def _kind(value):
     return "extract" if "payload" in value else "docling"
 
 
+# Re-reads of one receipt when a commit lands between its two catalog reads.
+STALE_REREADS = 3
+
+
+def _registration_reads(root, receipt_id):
+    """The receipt's metadata and records from one catalog state, or None when it is not there.
+
+    Only an absent receipt or record means unregistered. A commit landing between the reads is
+    re-read and, if it persists, retryable; so is a SQLite or filesystem error the runner would
+    retry. Any other catalog failure (a changed validator, a malformed database, a permission
+    error) raises ``CatalogUnavailable`` instead of being recorded as an outcome.
+    """
+    try:
+        catalog.identifier(receipt_id, "receipt")
+    except catalog.CatalogError:
+        return None
+    for _ in range(STALE_REREADS):
+        try:
+            metadata = catalog.receipt_metadata(root, [receipt_id])
+            records = catalog.read_records(root, receipt=receipt_id, limit=100,
+                                           expected_state=metadata["state"]["state_token"])
+        except catalog.MissingRecord:
+            return None
+        except catalog.StaleState:
+            continue
+        except catalog.WriterBusy as error:
+            raise Refusal("retryable", error.code) from error
+        except catalog.CatalogError as error:
+            raise CatalogUnavailable(str(error)) from error
+        except (sqlite3.Error, OSError) as error:
+            from .runner import classify  # runner imports this module through adapters
+            if classify(error).category == "retryable":
+                raise
+            raise CatalogUnavailable(f"{type(error).__name__}: {error}") from error
+        return metadata, records
+    raise Refusal("retryable", catalog.StaleState.code)
+
+
 def _registered(root, value, args):
     """Confirm the catalog registration binds the exact rendition and original."""
     source = value["source"]
-    try:
-        metadata = catalog.receipt_metadata(root, [source["receipt_id"]])
-        original = metadata["registrations"][source["receipt_id"]]["artifact"]
-        records = catalog.read_records(root, receipt=source["receipt_id"], limit=100,
-                                       expected_state=metadata["state"]["state_token"])
-    except catalog.CatalogError:
+    reads = _registration_reads(root, source["receipt_id"])
+    if reads is None:
         return None, None
+    metadata, records = reads
+    original = metadata["registrations"][source["receipt_id"]]["artifact"]
     by_id = {record["id"]: record for record in records["records"]}
     child = by_id.get(f"A-{_kind(value)}-" + value["run_id"])
     relation = by_id.get(f"R-{_kind(value)}-" + value["run_id"], {}).get("data", {})
@@ -264,6 +311,17 @@ def _registered(root, value, args):
             or data["presence"] != "present" or data["coverage"] == "excluded"):
         return None, None
     return child, original
+
+
+def registered(root, rendition, rendition_sha256):
+    """Whether the catalog binds this exact, current rendition to its unchanged original now."""
+    root = Path(root)
+    args = {"rendition": rendition, "rendition_sha256": rendition_sha256}
+    try:
+        _, value, failure = _rendition(root, args, index.rendition_api(root))
+    except Refusal:
+        return False
+    return failure is None and _registered(root, value, args)[0] is not None
 
 
 def evaluate(root, args, snapshot=None):

@@ -900,6 +900,18 @@ def _inputs_changed(current):
             and review["attempts"][-1]["code"] == "changed-standing-inputs")
 
 
+def _registration_recovered(root, current, entry):
+    """A review saved as ``unregistered-rendition`` whose registration the catalog confirms now.
+
+    Before catalog reads distinguished an absent record from other failures, any catalog error
+    (such as a validator changed under a running process) was saved as this durable outcome.
+    """
+    review = current["stages"][0]
+    return (review["status"] == "blocked" and bool(review["attempts"])
+            and review["attempts"][-1]["code"] == "standing-exception-unregistered-rendition"
+            and standing.registered(root, entry["rendition"], entry["rendition_sha256"]))
+
+
 def _stage_correction(root, corr, active):
     """Restage a standing review whose pinned intent no longer matches its inputs as a
     correction of it: same review arguments and event, fresh request identities."""
@@ -1162,9 +1174,10 @@ def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, ma
     active = current["correlation_id"]
     if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
         current = runner.run(root, active, "review")
-    if _inputs_changed(current):
+    if _inputs_changed(current) or _registration_recovered(root, current, entry):
         # The saved review's pinned intent is stale (e.g. an earlier-version review it
-        # conflicted with is now supersedable); re-pin it under a correction request.
+        # conflicted with is now supersedable, or a registration a failed catalog read
+        # missed is confirmed now); re-pin it under a correction request.
         active = _stage_correction(root, corr, active)
         current = runner.run(root, active, "review")
     select = current["stages"][1]
@@ -1283,7 +1296,7 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
             context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
-            initial_concurrency=None, inspected_form="list"):
+            initial_concurrency=None, inspected_form="list", trust_stat=False):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
 
     ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
@@ -1292,6 +1305,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     exceeds ``concurrency``; ``adaptive=False`` holds it fixed. ``report["throughput"]`` is the
     effective rate. ``inspected_form`` (``list`` or ``ranges``) only changes how the reviewer is
     asked to write the inspected record indices; findings and outcomes are identical.
+    ``trust_stat`` is passed to ``ingest`` (opt-in; see there).
     """
     if type(concurrency) is not int or concurrency < 1:
         raise IntakeError("invalid_concurrency")
@@ -1305,7 +1319,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         # A maintained context document must be named; guessing one would not satisfy the policy.
         raise IntakeError("context_required")
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
-    report = ingest(root, inbox, system=system, actor=actor)
+    report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
     extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
@@ -1439,11 +1453,12 @@ def main(argv=None):
         if name in {"ingest", "qualify"}:
             command.add_argument("--system", required=True)
             command.add_argument("--actor", required=True)
-        if name == "ingest":
-            command.add_argument("--limit", type=int)
+        if name in {"ingest", "qualify"}:
             command.add_argument("--trust-stat", action="store_true",
                                  help="skip reading and hashing an extracted file whose stat identity "
                                       "equals its docs row (default: every file is hashed)")
+        if name == "ingest":
+            command.add_argument("--limit", type=int)
             command.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                                  help="documents whose catalog registrations share one revision "
                                       "(default %d; 1 commits each registration on its own)" % BATCH_SIZE)
@@ -1490,7 +1505,7 @@ def main(argv=None):
                 context=args.context, index_path=args.index_path,
                 concurrency=args.concurrency, adaptive=not args.no_adaptive,
                 initial_concurrency=args.initial_concurrency,
-                inspected_form=args.inspected_form)
+                inspected_form=args.inspected_form, trust_stat=args.trust_stat)
         elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                             limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
@@ -1500,6 +1515,10 @@ def main(argv=None):
                                  "disposition": dict(Counter(e["disposition"] for e in entries))},
                       "entries": entries}
     except IntakeError as error:
+        print(json.dumps({"error": error.code}), file=sys.stderr)
+        return 2
+    except standing.CatalogUnavailable as error:
+        # Nothing about the entry was saved; restart once the catalog is readable.
         print(json.dumps({"error": error.code}), file=sys.stderr)
         return 2
     if args.report:

@@ -906,6 +906,78 @@ class QualifyTests(QualifyCase):
                          [c + "-c1" for c in blocked])
         self.assertEqual(len(calls), 12)
 
+    def test_unreadable_catalog_stops_qualify_without_saving_an_outcome(self):
+        from tools.catalog import catalog_store
+        self._assert_unreadable_catalog_stops_qualify(catalog_store.CatalogError(
+            "Catalog validator changed after import; restart the reader"))
+
+    def test_malformed_catalog_stops_qualify_without_saving_an_outcome(self):
+        import sqlite3
+        self._assert_unreadable_catalog_stops_qualify(
+            sqlite3.DatabaseError("database disk image is malformed"))
+
+    def test_unpermitted_catalog_stops_qualify_without_saving_an_outcome(self):
+        self._assert_unreadable_catalog_stops_qualify(PermissionError(13, "Permission denied"))
+
+    def _assert_unreadable_catalog_stops_qualify(self, failure):
+        from unittest.mock import patch
+        from tools.catalog import catalog_store
+        from tools.intake import standing
+
+        class Unreadable:
+            def __getattr__(self, name):
+                return getattr(catalog_store, name)
+
+            def read_records(self, *args, **kwargs):
+                raise failure
+        transport, calls = self._transport()
+        with patch.object(standing, "catalog", Unreadable()):
+            with self.assertRaises(standing.CatalogUnavailable):
+                self._qualify(transport)
+        reviews = [s for r in store.list_requests(self.root)
+                   if r["correlation_id"].startswith("standing-") for s in r["stages"]]
+        self.assertTrue(reviews)
+        self.assertFalse([s for s in reviews if s["status"] in {"blocked", "dead-letter"}])
+        spent = len(calls)
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        # The review staged before the stop is resumed from its saved findings.
+        self.assertEqual(len(calls), spent + 5)
+
+    def test_a_trusted_qualify_replay_skips_unchanged_files_and_qualifies_alike(self):
+        from unittest.mock import patch
+        from tools.intake import upload
+        transport, calls = self._transport()
+        first = self._qualify(transport)
+        spent = len(calls)
+        with patch.object(upload, "stage_submission", wraps=upload.stage_submission) as staged:
+            again = self._qualify(transport, trust_stat=True)
+        self.assertEqual(staged.call_count, 0)
+        self.assertEqual(again["counts"]["qualification"], first["counts"]["qualification"])
+        self.assertEqual(len(calls), spent)
+
+    def test_review_saved_as_unregistered_is_corrected_once_the_catalog_confirms_it(self):
+        from unittest.mock import patch
+        from tools.intake import standing
+        transport, calls = self._transport()
+        # A catalog read that failed for any reason used to be saved as this durable outcome.
+        with patch.object(standing, "_registration_reads", return_value=None):
+            saved = self._qualify(transport)
+            self.assertEqual(saved["counts"]["qualification"], {"exception": 6})
+            # Still unregistered: nothing is restaged.
+            self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"exception": 6})
+        blocked = [r["correlation_id"] for r in store.list_requests(self.root)
+                   if r["correlation_id"].startswith("standing-")]
+        self.assertEqual(len(blocked), 6)
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(report["counts"]["published"], 1)
+        self.assertEqual([store.head(self.root, c)["correlation_id"] for c in blocked],
+                         [c + "-c1" for c in blocked])
+        # The saved findings are reused: no review is paid twice, and settled corrections stay.
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(calls), 6)
+
     def test_qualify_restores_a_selection_missing_from_the_manifest(self):
         transport, calls = self._transport()
         self._qualify(transport)

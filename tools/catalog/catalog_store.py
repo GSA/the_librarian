@@ -21,7 +21,7 @@ from tools import backups as snapshots, policy
 from tools.file_identity import file_identity
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, EXTRACTIONS, KEYS, KINDS, PRESENCES, ROLES,
-    CatalogError, ConflictingWrite, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
+    CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
     now, path_value, refs, require, safe_relative, text, validate_graph, GraphValidator,
     validate_record, validate_records, validate_delta, _references,
 )
@@ -1394,8 +1394,13 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
         current_view(connection)
         scopes = []
         parameters = {}
+        indexed = receipt is not None and lookup_shape(connection) == "indexed"
         for label, value in (("receipt", receipt), ("source", source)):
             if value is None:
+                continue
+            if label == "receipt" and indexed:
+                scopes.append("id IN (SELECT value FROM json_each(:receipt_scope))")
+                parameters["receipt_scope"] = json.dumps(sorted(_receipt_scope(connection, value)))
                 continue
             parameters[label] = value
             receipts = ("SELECT id FROM catalog_current WHERE kind='receipt' AND id=:receipt"
@@ -1451,6 +1456,31 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
         return {"authority": AUTHORITY, "state": state, "records": result, "count": len(result),
                 "total_matching": total,
                 "next_after": ids[-1] if len(page) > limit else None}
+
+
+def _receipt_scope(connection, receipt):
+    """The ids the receipt scope of ``read_records`` selects, probed through the lookup indexes.
+
+    The same set as the scan form: the current receipt, its source ids, the current artifacts
+    naming it as ``receipt_id``, and the current relationships from or to any of those that is a
+    current artifact or source. Only for an ``indexed`` catalog.
+    """
+    def current(field, value, kind):
+        return {row[0] for row in connection.execute(
+            f"SELECT v.record_id FROM versions v WHERE {_lookup_expression(field)}=? "
+            "AND json_extract(v.payload,'$.kind')=?" + _CurrentRecords.CURRENT, (value, kind))}
+    row = connection.execute("SELECT kind,payload FROM catalog_current WHERE id=?", (receipt,)).fetchone()
+    if row is None or row["kind"] != "receipt":
+        return set()
+    members = {receipt, *(value for value, in connection.execute(
+        "SELECT value FROM json_each(?,'$.data.source_ids')", (row["payload"],)))}
+    members |= current("receipt_id", receipt, "artifact")
+    endpoints = [row[0] for row in connection.execute(
+        "SELECT id FROM catalog_current WHERE kind IN ('artifact','source') "
+        "AND id IN (SELECT value FROM json_each(?))", (json.dumps(sorted(members)),))]
+    for endpoint in endpoints:
+        members |= current("from_id", endpoint, "relationship") | current("to_id", endpoint, "relationship")
+    return members
 
 
 def summarize_records(root, *, expected_state=None, limit=25):
@@ -1553,7 +1583,8 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
 
 def current_record(connection, record_id):
     row = connection.execute("SELECT payload FROM catalog_current WHERE id=?", (record_id,)).fetchone()
-    require(row is not None, "Record missing from authoritative catalog: " + record_id)
+    if row is None:
+        raise MissingRecord("Record missing from authoritative catalog: " + record_id)
     return decode(row["payload"])
 
 
@@ -1578,8 +1609,8 @@ def receipt_metadata(root, receipt_ids):
         selected = {}
         for receipt_id in receipt_ids:
             receipt = current_record(connection, receipt_id)
-            require(receipt["kind"] == "receipt",
-                    "Receipt missing from authoritative catalog: " + receipt_id)
+            if receipt["kind"] != "receipt":
+                raise MissingRecord("Receipt missing from authoritative catalog: " + receipt_id)
             selected[receipt_id] = {
                 "receipt": receipt, "artifact": current_record(connection, receipt["data"]["artifact_id"]),
                 "sources": [current_record(connection, sid) for sid in receipt["data"]["source_ids"]],
