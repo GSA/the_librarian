@@ -160,13 +160,18 @@ def schema_validate(bundle, schema=None, *, root=None):
     require(type(bundle["schema_version"]) is int, "schema_version must be an integer")
 
 
-def validate(bundle, root=ROOT, *, schema=None, stored=False):
+def validate(bundle, root=ROOT, *, schema=None, stored=False, known=None, taken=None):
+    """Validate ``bundle``. ``known(event_id)`` returns an already validated event, and
+    ``taken(event_id)`` the event that corrects it, so a delta of new events is checked against a
+    validated history without handing that history in again (Kata m0tg); without them the bundle
+    must stand alone."""
     root = safe_path(root)
     schema_validate(bundle, schema, root=root)
     events = {}
+    lookup = known or (lambda event_id: None)
     for event in bundle["events"]:
         event_id = event["event_id"]
-        require(event_id not in events, "Duplicate event ID")
+        require(event_id not in events and lookup(event_id) is None, "Duplicate event ID")
         events[event_id] = event
         source, scope, counts, provenance = (event[k] for k in ("source", "scope", "counts", "provenance"))
         relative(source["locator"])
@@ -249,15 +254,18 @@ def validate(bundle, root=ROOT, *, schema=None, stored=False):
     for event in events.values():
         for relation in event["relationships"]:
             target = relation["target_event_id"]
-            require(target in events and target != event["event_id"], "Unresolved/self duplicate relationship")
-            require(event["source"]["receipt_id"] != events[target]["source"]["receipt_id"],
+            related = events.get(target) or lookup(target)
+            require(related is not None and target != event["event_id"],
+                    "Unresolved/self duplicate relationship")
+            require(event["source"]["receipt_id"] != related["source"]["receipt_id"],
                     "Duplicate receipts must retain distinct receipt identities")
         require(bool(event["supersedes"]) == (event["correction_reason"] is not None), "Correction reason mismatch")
         for target in event["supersedes"]:
-            require(target in events and target != event["event_id"], "Unresolved/self correction")
-            require(target not in successors, "Conflicting correction branches")
+            prior = events.get(target) or lookup(target)
+            require(prior is not None and target != event["event_id"], "Unresolved/self correction")
+            require(target not in successors and not (taken and taken(target) is not None),
+                    "Conflicting correction branches")
             successors[target] = event["event_id"]
-            prior = events[target]
             require(all(event["source"][k] == prior["source"][k] for k in ("receipt_id", "source_id", "locator")),
                     "Correction crosses source identity")
             require(event["scope"] == prior["scope"], "Correction crosses declared scope")

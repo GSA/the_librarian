@@ -26,7 +26,8 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import adapters, cli, docs, docsync, model_review, runner, standing, store, throttle, upload, usage_log
+from . import (adapters, cli, docs, docsync, model_review, runner, selection_manifest, standing, store,
+               throttle, upload, usage_log)
 from . import contracts
 from .contracts import IntakeError, LedgerBusy
 
@@ -645,10 +646,21 @@ def _instance_file(root, name):
     return path
 
 
+def _recover_manifest(root, manifest):
+    """Finish an append a crashed writer left half written, before anything reads the manifest."""
+    try:
+        if os.path.lexists(selection_manifest.intent_path(root, manifest)):
+            with store.locked(root):
+                selection_manifest.recover(root, manifest)
+    except (index.IndexError_, OSError, ValueError) as error:
+        raise IntakeError("preflight_invalid") from error
+
+
 def _validate_inputs(root, policy_path, manifest, context, index_path, model):
     """Refuse bad paths and a missing maintained context before ingesting or writing anything."""
     _instance_file(root, policy_path)
     _instance_file(root, manifest)
+    _recover_manifest(root, manifest)
     try:
         # The ledger requires ASCII relative paths; refuse the same ones before any mutation.
         for name in (policy_path, manifest, index_path):
@@ -711,6 +723,8 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
     manifest_file = root / manifest
     # Another cohort's run may be selecting into this manifest: read and write under the ledger lock.
     with store.locked(root):
+        if manifest_file.is_file():
+            selection_manifest.recover(root, manifest)
         raw = (json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.is_file() else {
             "schema_version": 1,
             "audience": policy.for_root(root)[0]["audience"],
@@ -1015,6 +1029,7 @@ def _reconcile(root, manifest, system, current, cache, compose):
     _attribute(root, cache, [r for r in _manifest_renditions(root, manifest)
                              if r["path"] not in current])
     with store.locked(root):
+        selection_manifest.recover(root, manifest)
         listed = _manifest_renditions(root, manifest)
         # Entries another run added since the read above.
         _attribute(root, cache, [r for r in listed if r["path"] not in current])
@@ -1035,13 +1050,13 @@ def _reconcile(root, manifest, system, current, cache, compose):
 
 def _selection_room(root, manifest, rendition):
     """True when the manifest already selects ``rendition`` or has room for one more selection."""
-    selected = _manifest_renditions(root, manifest)
-    return len(selected) < renditions.MAX_SELECTIONS or any(r["path"] == rendition for r in selected)
+    known = selection_manifest.view(root, manifest)
+    return known.count < renditions.MAX_SELECTIONS or known.has(rendition)
 
 
 def _free_room(root, manifest):
     """Selections the shared manifest can still take (an exact read, advisory across processes)."""
-    return renditions.MAX_SELECTIONS - len(_manifest_renditions(root, manifest))
+    return renditions.MAX_SELECTIONS - selection_manifest.view(root, manifest).count
 
 
 def _held_back(root, entry, standing_policy, manifest):
@@ -1374,6 +1389,7 @@ def publish(root, *, policy_path, manifest, index_path=DEFAULT_INDEX):
             name.encode("ascii")
         contracts.relative(index_path)
         index.validate_db_path(root, root / index_path)
+        _recover_manifest(root, manifest)
         if not (root / policy_path).is_file() or not (root / manifest).is_file():
             raise IntakeError("publish_input_missing")
         policy_sha = hashlib.sha256((root / policy_path).read_bytes()).hexdigest()

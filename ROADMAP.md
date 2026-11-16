@@ -48,8 +48,10 @@ and observation are described as they work today in the
 claim. The numbered decision records that used to hold this are in git history. The
 configuration work they depended on (per-instance store homes, policy that follows
 the data root, index identity that does not bind an absolute host path) is
-implemented. The pinned lock file, image and installer, and a per-instance version
-record, are not built and are open product questions, not commitments.
+implemented. A fully pinned runtime (lock file, image, installer), a per-instance
+version record and a per-release compatibility note were considered and dropped
+(Kata 7jkt): measured dependency drift between instances has caused no incident, and
+the stores refuse a mismatched contract themselves.
 
 The October 21 update also renamed the review-event schema `$id` to
 `urn:the-librarian:review-events:1`, which changed the store contract hash and

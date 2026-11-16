@@ -13,7 +13,7 @@ from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import renditions
-from tools.intake import cohort, model_review, runner, standing, store, upload
+from tools.intake import cohort, model_review, runner, selection_manifest, standing, store, upload
 from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
@@ -1268,21 +1268,30 @@ class SharedManifestTests(QualifyCase):
     def test_an_interrupted_manifest_write_leaves_the_manifest_as_it_was(self):
         self.qualify("a")
         before = self.manifest.read_bytes()
-        real = os.replace
+        real_replace, real_pwrite = os.replace, os.pwrite
 
-        def fail(source, target, *args, **kwargs):
+        def fail_replace(source, target, *args, **kwargs):
             if Path(target) == self.manifest:
                 raise OSError(5, "simulated crash")
-            return real(source, target, *args, **kwargs)
-        with unittest.mock.patch.object(os, "replace", fail):
+            return real_replace(source, target, *args, **kwargs)
+
+        def fail_pwrite(descriptor, data, offset):
+            raise OSError(5, "simulated crash")
+        # Selections are appended in place (Kata m0tg), a replacement is an atomic rename; both fail.
+        # The process "dies" there, so nothing recovers the append until the next writer runs.
+        with unittest.mock.patch.object(os, "replace", fail_replace), \
+                unittest.mock.patch.object(os, "pwrite", fail_pwrite), \
+                unittest.mock.patch.object(selection_manifest, "recover", lambda *a: False):
             crashed = self.qualify("b")
-        # Never a partial or mixed manifest, and no temporary file left behind: A's entries stay.
+        # Never a partial or mixed manifest: A's entries stay, and the only trace is the append intent
+        # the next writer completes (a rename would leave no temporary file).
         self.assertEqual(crashed["counts"]["qualification"], {"pending-review": 2})
         self.assertEqual(self.manifest.read_bytes(), before)
         self.assertEqual([p.name for p in self.manifest.parent.iterdir()
-                          if p.name.startswith(".")], [])
+                          if p.name.startswith(".")], [".selection.local.json.append-intent"])
         self.calls.clear()
         self.assertEqual(self.qualify("b")["counts"]["qualification"], {"qualified": 2})
+        self.assertEqual([p.name for p in self.manifest.parent.iterdir() if p.name.startswith(".")], [])
         self.assertEqual((len(self.selections()), self.calls), (5, []))
 
     def test_the_manifest_is_rewritten_while_holding_the_ledger_writer_lock(self):

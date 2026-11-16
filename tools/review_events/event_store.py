@@ -198,14 +198,55 @@ def seal(path):
     fsync_directory(path.parent)
 
 
-# Validated results kept in memory, one per database file (Kata r71k). The trust model is that of
-# the catalog's read receipt (docs/design/current-state.md, "What a catalog write validates") without a file: a result is reused only for the
+class History:
+    """The validated, append-only review history behind a memoized store (Kata m0tg).
+
+    Shared read-only between callers. Positions are 1-based store sequences, so a reader holding
+    ``n`` events looks an event up with ``upto=n`` and never sees one appended after it read.
+    """
+
+    def __init__(self, events=()):
+        self.events, self.by_id, self.by_locator = [], {}, {}
+        self.successors, self.origins = {}, set()
+        for event in events:
+            self.add(event)
+
+    def add(self, event):
+        self.events.append(event)
+        sequence = len(self.events)
+        self.by_id[event["event_id"]] = sequence
+        self.by_locator.setdefault(event["source"]["locator"], []).append(sequence)
+        for target in event["supersedes"]:
+            self.successors[target] = event["event_id"]
+        key = origin_key(event)
+        if key is not None:
+            self.origins.add(key)
+
+    def event(self, event_id, upto=None):
+        sequence = self.by_id.get(event_id)
+        if sequence is None or upto is not None and sequence > upto:
+            return None
+        return self.events[sequence - 1]
+
+
+# Validated results kept in memory, one per database file (Kata r71k, m0tg). The trust model is that
+# of the catalog's read receipt (docs/design/current-state.md, "What a catalog write validates")
+# without a file: a result is reused only for the
 # identical file (device, inode, size, mtime, ctime and SQLite change counter), the same contract
 # and the same UTC day, after the chain heads re-derived from the file still equal the remembered
 # state; it is stored only when the identity is the same before and after the pass; it is never
 # written to disk, and a failed or partial validation is never stored. Callers get copies.
+#
+# When only SQLite's own commit moved the identity (same file, larger, a new change counter) and the
+# remembered chain heads are still in the file, only the rows past them are verified: their hash
+# chain from the remembered head, batch chain, payload hashes, contract and correction links, and
+# that nothing else changed in the correction index. Rows before the remembered head are not read
+# again until the next full check: an audit, a backup, a publication (``full=True``), the first
+# check of a new UTC day, a different contract, a swapped file, or any identity change SQLite did not
+# make (an out-of-band write leaves the change counter alone). Any failure of the delta falls back
+# to the full pass, which refuses with its exact message.
 _MEMO = {}
-_MEMO_LOCK = threading.Lock()
+_MEMO_LOCK = threading.RLock()
 _MEMO_LIMIT = 8
 
 
@@ -252,16 +293,39 @@ def _binding(connection):
     return path, identity
 
 
-def inspect(connection, root=None, *, reuse=False):
-    """Validate the whole history; with ``reuse`` an identical, unchanged file is served from memory.
+def _grew(old, new):
+    """True when ``new`` is what SQLite's own commits do to ``old``: same file, no smaller, and a
+    change counter that moved (a write that bypassed SQLite leaves the counter where it was)."""
+    return old[:2] == new[:2] and new[2] >= old[2] and old[5] != new[5]
 
-    ``reuse`` applies only to connections opened by ``connect``; any other connection, a journal
-    beside the file or a build without ``sqlite_dbpage`` validates in full and stores nothing.
-    The returned state and event list are fresh containers; the event dictionaries are shared with
-    the memo and are read-only by contract (no caller changes a validated event).
+
+def _served(state, history, materialize=True):
+    """Fresh containers for exactly the events ``state`` describes, even if the history has grown.
+
+    Without ``materialize`` only ``state`` and the shared ``history`` are returned (events and
+    successors are None): a caller that needs the state or indexed lookups pays nothing per event."""
+    if not materialize:
+        return dict(state), None, None, history
+    count = state["events"]
+    corrections = count - state["active_events"]
+    successors = history.successors
+    successors = (dict(successors) if len(successors) == corrections
+                  else {t: s for t, s in successors.items() if history.by_id[s] <= count})
+    return dict(state), history.events[:count], successors, history
+
+
+def view(connection, root=None, *, reuse=False, full=False, materialize=True):
+    """``(state, events, successors, history)`` of the validated store.
+
+    ``reuse`` serves an identical file from memory and verifies only a delta after SQLite's own
+    commits (see above); ``full`` skips both and replays the whole history, then remembers it.
+    ``history`` is the shared read-only index when the result was memoized and None otherwise.
+    ``materialize=False`` leaves ``events`` and ``successors`` None when ``history`` is returned, so
+    state-only and indexed-lookup callers do no work proportional to the history.
     """
     if not reuse:
-        return _inspect(connection, root)
+        state, events = _inspect(connection, root)
+        return state, events, _successors(events), None
     own = not connection.in_transaction
     if own:
         connection.execute("BEGIN")
@@ -270,39 +334,71 @@ def inspect(connection, root=None, *, reuse=False):
         connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
         binding = _binding(connection)
         if binding is None:
-            return _inspect(connection, root)
+            state, events = _inspect(connection, root)
+            return state, events, _successors(events), None
         path, identity = binding
         key = (identity, fingerprint(store_schema(root)), _today())
         with _MEMO_LOCK:
-            entry = _MEMO.get(path)
-        if entry is not None and entry[0] == key:
-            _, state, history = entry
-            if (connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
-                    and connection.execute("PRAGMA user_version").fetchone()[0] == VERSION
-                    and _heads(connection) == _state_heads(state)):
-                return dict(state), list(history)
-            forget(path)
-        result = _inspect(connection, root)
+            entry = None if full else _MEMO.get(path)
+            if entry is not None and entry[0] == key:
+                _, state, history = entry
+                if (connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
+                        and connection.execute("PRAGMA user_version").fetchone()[0] == VERSION
+                        and _heads(connection) == _state_heads(state)):
+                    return _served(state, history, materialize)
+                forget(path)
+            elif entry is not None and entry[0][1:] == key[1:] and _grew(entry[0][0], identity):
+                try:
+                    state, added = _extend(connection, root, entry[1], entry[2])
+                except (contract.ReviewError, sqlite3.Error, ValueError, KeyError, TypeError):
+                    state = None
+                if state is not None and _binding(connection) == binding:
+                    history = entry[2]
+                    for event in added:
+                        history.add(event)
+                    _MEMO[path] = (key, state, history)
+                    return _served(state, history, materialize)
+                _MEMO.pop(path, None)
+        state, events = _inspect(connection, root)
+        history = History(events)
         if _binding(connection) == binding:
             with _MEMO_LOCK:
                 if path not in _MEMO and len(_MEMO) >= _MEMO_LIMIT:
                     _MEMO.clear()
-                _MEMO[path] = (key, dict(result[0]), list(result[1]))
-        return result
+                _MEMO[path] = (key, dict(state), history)
+        return _served(state, history, materialize) if _binding(connection) == binding else (
+            state, events, _successors(events), None)
     finally:
         if own and connection.in_transaction:
             connection.execute("COMMIT")
 
 
-def _inspect(connection, root=None):
+def _successors(events):
+    return {target: event["event_id"] for event in events for target in event["supersedes"]}
+
+
+def inspect(connection, root=None, *, reuse=False, full=False):
+    """Validate the whole history; with ``reuse`` an identical, unchanged file is served from memory.
+
+    ``reuse`` applies only to connections opened by ``connect``; any other connection, a journal
+    beside the file or a build without ``sqlite_dbpage`` validates in full and stores nothing.
+    The returned state and event list are fresh containers; the event dictionaries are shared with
+    the memo and are read-only by contract (no caller changes a validated event).
+    """
+    state, events, _, _ = view(connection, root, reuse=reuse, full=full)
+    return state, events
+
+
+def _header(connection, root, deep):
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     require(application_id != SUPERSEDED_APPLICATION_ID,
             "Superseded FREV review-event identity; explicit migration or re-initialization is required")
     require(application_id == APPLICATION_ID, "Not a review-event store")
     require(connection.execute("PRAGMA user_version").fetchone()[0] == VERSION, "Unsupported store version")
-    require([r[0] for r in connection.execute("PRAGMA integrity_check")] == ["ok"],
-            "SQLite integrity check failed")
-    require(not list(connection.execute("PRAGMA foreign_key_check")), "Foreign-key integrity check failed")
+    if deep:
+        require([r[0] for r in connection.execute("PRAGMA integrity_check")] == ["ok"],
+                "SQLite integrity check failed")
+        require(not list(connection.execute("PRAGMA foreign_key_check")), "Foreign-key integrity check failed")
     metadata = dict(connection.execute("SELECT key,value FROM metadata"))
     base_keys = {"store_id", "created_at", "contract_hash", "authority"}
     require(set(metadata) == base_keys, "Invalid store metadata")
@@ -316,12 +412,13 @@ def _inspect(connection, root=None):
             name = f"immutable_{table}_{action}"
             row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
             require(row is not None and row[0] == trigger_sql(table, action), "Append-only trigger missing or changed")
-    batches = [dict(r) for r in connection.execute("SELECT * FROM batches ORDER BY revision")]
-    rows = [dict(r) for r in connection.execute("SELECT * FROM events ORDER BY sequence")]
-    by_revision = {}
-    events = []
-    previous = ""
-    for sequence, row in enumerate(rows, 1):
+    return metadata
+
+
+def _chain(rows, previous, first):
+    """Decode ``rows`` (consecutive from sequence ``first``) and check their hash chain from ``previous``."""
+    by_revision, events = {}, []
+    for sequence, row in enumerate(rows, first):
         require(row["sequence"] == sequence and row["previous_hash"] == previous, "Broken event sequence/hash chain")
         event = json.loads(row["payload"], object_pairs_hook=contract.pairs)
         require(row["payload"] == canonical(event) and row["payload_hash"] == fingerprint(event),
@@ -333,8 +430,12 @@ def _inspect(connection, root=None):
         previous = row["entry_hash"]
         events.append(event)
         by_revision.setdefault(row["revision"], []).append(row)
-    previous_batch = ""
-    for revision, row in enumerate(batches, 1):
+    return events, by_revision, previous
+
+
+def _batches(batches, by_revision, previous_batch, first):
+    """Check ``batches`` (consecutive from revision ``first``) against the rows that cite them."""
+    for revision, row in enumerate(batches, first):
         require(row["revision"] == revision and row["previous_hash"] == previous_batch, "Broken batch chain")
         members = by_revision.get(revision, [])
         require(len(members) == row["event_count"] and members, "Batch event count mismatch")
@@ -350,6 +451,15 @@ def _inspect(connection, root=None):
             if event["provenance"]["origin"] == "agent_review":
                 require(event["reviewer"] == row["actor"], "Native reviewer differs from batch attribution")
         previous_batch = row["batch_hash"]
+    return previous_batch
+
+
+def _inspect(connection, root=None):
+    metadata = _header(connection, root, deep=True)
+    batches = [dict(r) for r in connection.execute("SELECT * FROM batches ORDER BY revision")]
+    rows = [dict(r) for r in connection.execute("SELECT * FROM events ORDER BY sequence")]
+    events, by_revision, previous = _chain(rows, "", 1)
+    previous_batch = _batches(batches, by_revision, "", 1)
     require(all(1 <= r["revision"] <= len(batches) for r in rows), "Event references invalid batch")
     validate_history(events, root)
     expected_corrections = {(target, event["event_id"]) for event in events for target in event["supersedes"]}
@@ -363,6 +473,49 @@ def _inspect(connection, root=None):
     return state, events
 
 
+def validate_delta(history, events, root=None, upto=None):
+    """Validate ``events`` as the next ones after the first ``upto`` of the validated ``history``."""
+    if events:
+        schema = store_schema(root)
+        schema["properties"]["events"]["maxItems"] = max(256, len(events))
+        contract.validate(bundle(events, root), root if root is not None else contract.ROOT, schema=schema,
+                          stored=True, known=lambda event_id: history.event(event_id, upto),
+                          taken=lambda target: _successor(history, target, upto))
+
+
+def _successor(history, target, upto):
+    successor = history.successors.get(target)
+    return successor if successor is not None and history.event(successor, upto) is not None else None
+
+
+def _extend(connection, root, state, history):
+    """``(state, events)`` after verifying only what the file holds past the remembered ``state``."""
+    metadata = _header(connection, root, deep=False)
+    count, head, revision, batch_head, corrections = _state_heads(state)
+    require(metadata["store_id"] == state["store_id"], "Store identity changed")
+    last = connection.execute("SELECT entry_hash FROM events WHERE sequence=?", (count,)).fetchone() if count else None
+    require((last[0] if last else "") == head, "Remembered chain head is not in the file")
+    last = connection.execute("SELECT batch_hash FROM batches WHERE revision=?", (revision,)).fetchone() if revision else None
+    require((last[0] if last else "") == batch_head, "Remembered batch head is not in the file")
+    rows = [dict(r) for r in connection.execute("SELECT * FROM events WHERE sequence>? ORDER BY sequence", (count,))]
+    batches = [dict(r) for r in connection.execute("SELECT * FROM batches WHERE revision>? ORDER BY revision", (revision,))]
+    events, by_revision, previous = _chain(rows, head, count + 1)
+    previous_batch = _batches(batches, by_revision, batch_head, revision + 1)
+    require(set(by_revision) <= {b["revision"] for b in batches}
+            and connection.execute("SELECT count(*) FROM events WHERE revision>?", (revision,)).fetchone()[0] == len(rows),
+            "Event references invalid batch")
+    validate_delta(history, events, root, count)
+    expected = {(target, event["event_id"]) for event in events for target in event["supersedes"]}
+    total = connection.execute("SELECT count(*) FROM corrections").fetchone()[0]
+    require(total == corrections + len(expected)
+            and all(connection.execute("SELECT 1 FROM corrections WHERE predecessor=? AND successor=?", pair).fetchone()
+                    for pair in expected),
+            "Correction index differs from preserved history")
+    fresh = {"store_id": state["store_id"], "revision": revision + len(batches), "events": count + len(events),
+             "active_events": count + len(events) - total, "head_hash": previous,
+             "batch_head_hash": previous_batch, "authority": AUTHORITY, "contract_hash": state["contract_hash"]}
+    fresh["state_token"] = fingerprint({k: v for k, v in fresh.items() if k != "state_token"})
+    return fresh, events
 
 
 def trigger_sql(table, action):
@@ -466,7 +619,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
     input_hash = fingerprint(incoming)
     home, db, backups = locations(root)
     with writer_lock(home), closing(connect(db, write=True)) as connection:
-        state, existing = inspect(connection, root, reuse=True)
+        state, existing, _, history = view(connection, root, reuse=True, materialize=False)
         prior = connection.execute("SELECT * FROM batches WHERE request_id=?", (request_id,)).fetchone()
         if prior is not None:
             require(prior["actor"] == actor and prior["input_hash"] == input_hash,
@@ -475,16 +628,25 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
                     "backup": None, "retention": None}
         require(state["revision"] == expected_revision and state["state_token"] == expected_state,
                 "Stale revision or state token; re-read state before writing")
-        ids = {e["event_id"] for e in existing}
-        origins = {origin_key(e) for e in existing if origin_key(e) is not None}
+        # With the memoized history only the incoming events are checked against it; without one
+        # (an unbindable file) the whole history is validated, as before.
+        known = (lambda event_id: history.event(event_id, state["events"]) is not None) if history else (
+            lambda event_id, ids={e["event_id"] for e in existing}: event_id in ids)
+        origins = history.origins if history else {origin_key(e) for e in existing if origin_key(e) is not None}
+        origins = set(origins)
+        ids = set()
         for event in incoming:
-            require(event["event_id"] not in ids, "Event ID already exists; use original request ID for retries")
+            require(event["event_id"] not in ids and not known(event["event_id"]),
+                    "Event ID already exists; use original request ID for retries")
             ids.add(event["event_id"])
             key = origin_key(event)
             require(key is None or key not in origins, "Historical review already imported")
             if key is not None:
                 origins.add(key)
-        validate_history(existing + incoming, root)
+        if history:
+            validate_delta(history, incoming, root, state["events"])
+        else:
+            validate_history(existing + incoming, root)
         taken, retention = snapshots.daily_snapshot(
             backups, store_id=state["store_id"], take=lambda: snapshot(connection, backups, "daily", root),
             verify=lambda path: verified_snapshot(path, root), errors=(contract.ReviewError,),
@@ -522,7 +684,7 @@ def append(root, value, actor, request_id, expected_revision, expected_state):
                     "Do not resubmit as a new request; retry the same request or run backup."
                 ) from error
             raise
-        return {"command": "append", "idempotent": False, **inspect(connection, root, reuse=True)[0],
+        return {"command": "append", "idempotent": False, **view(connection, root, reuse=True, materialize=False)[0],
                 "backup": taken, "retention": retention}
 
 
@@ -621,13 +783,18 @@ def status(root, event_id=None, audit=False):
         connection.execute("BEGIN")
         if audit:
             forget(str(db))
-        state, events = inspect(connection, root, reuse=not audit)
+        state, events, successors, history = view(connection, root, reuse=not audit,
+                                                  materialize=False)
         if event_id is None:
             return {"command": "status", **state}
-        matches = [e for e in events if e["event_id"] == event_id]
-        require(len(matches) == 1, "Unknown event ID")
-        successors = {p: e["event_id"] for e in events for p in e["supersedes"]}
-        return {"command": "get", **state, "event": matches[0], "superseded_by": successors.get(event_id)}
+        if history is not None:
+            found = history.event(event_id, state["events"])
+            successor = _successor(history, event_id, state["events"])
+        else:
+            found = next((e for e in events if e["event_id"] == event_id), None)
+            successor = successors.get(event_id)
+        require(found is not None, "Unknown event ID")
+        return {"command": "get", **state, "event": found, "superseded_by": successor}
 
 
 def main(argv=None):

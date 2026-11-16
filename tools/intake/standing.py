@@ -23,6 +23,7 @@ from tools.context_index import qualification
 from tools.context_index import renditions
 from tools.review_events import event_reader
 from tools.review_events import event_store as events
+from . import selection_manifest
 from .contracts import IntakeError, canonical, pairs
 
 POLICY_SCHEMA = "standing-policy-v1"
@@ -265,7 +266,7 @@ def _registered(root, value, args):
     return child, original
 
 
-def evaluate(root, args):
+def evaluate(root, args, snapshot=None):
     """Classify one pinned rendition under one pinned standing policy; never writes."""
     root = Path(root)
     standing = load_policy(root, args["policy_path"], args["policy_sha256"])
@@ -350,26 +351,30 @@ def evaluate(root, args):
         return outcome("exception", "budget-exceeded")
     if findings["correction_of"] is not None or findings["new_mapping"]:
         return outcome("pending-review", "independent-review-required")
-    try:
-        snapshot = event_reader.read_snapshot(root)
-    except events.contract.ReviewError as error:
-        raise Refusal("blocked", "review-store-unavailable") from error
+    if callable(snapshot):
+        snapshot = snapshot()  # a shared lazy read (adapters.OneRead)
+    elif snapshot is None:
+        try:
+            snapshot = event_reader.read_snapshot(root)
+        except events.contract.ReviewError as error:
+            raise Refusal("blocked", "review-store-unavailable") from error
     qualified = {"source": source, "content": content,
                  "format": value["payload"]["format"] if _kind(value) == "extract" else "docling",
                  "reviewer": standing["reviewer"], "context": standing["selection"]["context"]}
     # This policy's own earlier-version reviews of the same source and scope are
     # replaced by this review; ones it already superseded stay listed so a
     # crash-after-commit retry rebuilds the identical event.
-    earlier = sorted(e["event_id"] for e in snapshot.events
+    # Only events on this rendition can matter (both checks below require its locator), found by index.
+    same = snapshot.at(args["rendition"])
+    earlier = sorted(e["event_id"] for e in same
                      if e["event_id"] != args["event_id"]
-                     and snapshot.successors.get(e["event_id"], args["event_id"]) == args["event_id"]
+                     and (snapshot.superseded_by(e["event_id"]) or args["event_id"]) == args["event_id"]
                      and _earlier_standing_review(e, standing, source, qualified, args))
     if earlier:
         qualified["supersedes"] = earlier
     candidate = {**result, **qualified}
     # Only this exact standing event (a crash-after-commit retry) is exempt.
-    others = [e for e in snapshot.events if e["source"]["locator"] == args["rendition"]
-              and e["event_id"] not in snapshot.successors
+    others = [e for e in same if snapshot.superseded_by(e["event_id"]) is None
               and e["event_id"] not in earlier
               and not _matches(e, candidate, args)]
     if others:
@@ -468,14 +473,18 @@ def _earlier_standing_review(event, standing, source, qualified, args):
                  or (reason or "").startswith(f"Re-reviewed under standing policy {policy_id} v{version},")))
 
 
-def bound_event(root, result, args):
-    """Return the stored active event when it binds exactly this qualification."""
+def bound_event(root, result, args, snapshot=None):
+    """Return the stored active event when it binds exactly this qualification.
+
+    ``snapshot`` is a read taken after the event could have been committed; without one the store
+    is read here."""
     try:
-        found = events.status(root, args["event_id"])
+        if snapshot is None:
+            snapshot = event_reader.read_snapshot(root)
     except events.contract.ReviewError:
         return None
-    event = found["event"]
-    if found["superseded_by"] is not None or not _matches(event, result, args):
+    event = snapshot.event(args["event_id"])
+    if event is None or snapshot.superseded_by(args["event_id"]) is not None or not _matches(event, result, args):
         return None
     return event
 
@@ -507,15 +516,15 @@ def authorize_publication(root, manifest_name, standing, pinned):
         index.load_manifest(path, root)
         raw = json.loads(path.read_bytes().decode("utf-8"),
                          object_pairs_hook=index.strict_object)
-        snapshot = event_reader.read_snapshot(root)
+        # Publication re-validates the whole history it authorizes, not just what changed.
+        snapshot = event_reader.read_snapshot(root, full=True)
     except (OSError, UnicodeError, ValueError, index.IndexError_,
             events.contract.ReviewError) as error:
         raise Refusal("blocked", "standing-selection-unauthorized") from error
-    by_id = {event["event_id"]: event for event in snapshot.events}
     expected = (pinned["policy_id"], str(pinned["version"]), pinned["sha256"])
     for item in raw.get("renditions", []):
         for event_id in item.get("review_event_ids") or []:
-            event = by_id.get(event_id)
+            event = snapshot.event(event_id)
             quotes = [e.get("quote") or "" for e in (event or {}).get("evidence", [])]
             claims = [m.groups() for q in quotes for m in [STANDING_STATEMENT.fullmatch(q)] if m]
             if not claims:
@@ -553,8 +562,20 @@ def write_manifest(root, name, entry, replaces=()):
     """Atomically add one selection entry to the manifest; idempotent for retries.
 
     An existing entry for the same path is replaced only when every review it
-    cites is one this review supersedes (``replaces``)."""
+    cites is one this review supersedes (``replaces``). A new path is appended in
+    constant time (``selection_manifest``); a replacement, an empty list or a file
+    the append cannot extend in place takes the full read, validate and rewrite.
+    The caller holds the ledger writer lock."""
     path = index.no_symlinks(Path(root) / name)
+    selection_manifest.recover(root, name)
+    known = selection_manifest.view(root, name)
+    if not known.has(entry["path"]):
+        if known.count >= renditions.MAX_SELECTIONS:
+            raise Refusal("blocked", "selection-capacity")
+        digest = selection_manifest.append(root, name, entry, known)
+        if digest is not None:
+            return digest
+    selection_manifest.forget(path)
     config, _ = index.load_manifest(path, root)
     raw = json.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=index.strict_object)
     selected = raw.setdefault("renditions", [])
