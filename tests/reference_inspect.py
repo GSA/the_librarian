@@ -6,7 +6,7 @@ fails. Do not optimize this copy.
 """
 import uuid
 
-from tools.catalog.catalog_store import (
+from tools.catalog.storage import (
     APPLICATION_ID, AUTHORITY, SUPERSEDED_APPLICATION_ID, VERSION, decode, make_state, timestamp, trigger_sql)
 from tools.catalog.contracts import (
     CatalogError, GraphValidator, canonical, exact, fingerprint, require, text, validate_record)

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from tools import backups, policy
 from tools.catalog import catalog_store as catalog
+from tools.catalog import backups as catalog_backups
 from tools.review_events import event_store as events
 from tests.support import WorkspaceCase
 
@@ -133,7 +134,7 @@ class DailySnapshots(unittest.TestCase):
         self.write("S1")
         self.clock.advance(days=30)
         before = set(self.backups.iterdir())
-        with patch.object(catalog, "verify_backup", side_effect=catalog.CatalogError("bad")):
+        with patch.object(catalog_backups, "verify_backup", side_effect=catalog.CatalogError("bad")):
             result = self.write("S2")
         self.assertIsNotNone(result["backup"])
         self.assertIn("refused", result["retention"])
@@ -143,7 +144,7 @@ class DailySnapshots(unittest.TestCase):
         self.write("S1")
         self.clock.advance(days=1)
         state = catalog.status(self.root)["state_token"]
-        with patch.object(catalog, "_snapshot_in_transaction", side_effect=OSError("disk full")):
+        with patch.object(catalog_backups, "_snapshot_in_transaction", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 catalog.submit(self.root, [source("S2")], actor="t", request_id="req-S2",
                                expected_state=state, reason="Daily snapshot test")

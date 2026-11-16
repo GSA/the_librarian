@@ -16,6 +16,7 @@ from unittest import mock
 
 from tests.support import default_policy_hash
 from tools.catalog import catalog_store as catalog
+from tools.catalog import storage
 from tools.intake import contracts, progress, store
 
 SECRET = "SECRET-BODY-TEXT"
@@ -404,7 +405,7 @@ class CatalogTests(Case):
         store.initialize(self.root)
         from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
         seed_catalog(self.root, 30)
-        catalog._VALID_PAYLOADS.clear()
+        storage._VALID_PAYLOADS.clear()
         full = progress.read_catalog(self.root)
         self.assertEqual((full["receipts"], full["artifacts"], full["sources"]), (30, 60, 30))
         self.assertEqual(full["coverage"]["pending-extraction"], 30)
