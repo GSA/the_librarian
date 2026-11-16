@@ -376,13 +376,8 @@ def _member_record(member):
     return record, payload
 
 
-def inspect(connection, detail=True):
-    """Verify physical integrity, every historical payload/graph, chain, and current projection.
-
-    Returns ``(state, current, histories, batches, committed_states)``. History is streamed, so
-    with ``detail=False`` nothing is retained beyond the checks and only ``state`` is filled in
-    (the other four are None); callers that need the records or revisions ask for the detail.
-    """
+def _check_store(connection):
+    """Physical integrity, store metadata and immutable triggers; returns ``(metadata, lookup shape)``."""
     application_id = connection.execute("PRAGMA application_id").fetchone()[0]
     require(application_id != SUPERSEDED_APPLICATION_ID,
             "Superseded FCAT catalog identity; explicit migration or re-initialization is required")
@@ -410,67 +405,101 @@ def inspect(connection, detail=True):
     require({row[0] for row in connection.execute("SELECT DISTINCT revision FROM versions")}
             == {row[0] for row in connection.execute("SELECT revision FROM revisions")},
             "Invalid revision membership")
-    expected_refs = set()  # what the payloads imply for the lookup table, when the catalog has one
-    batches = [] if detail else None
-    current, projection, histories, committed_states = ({}, {}, {}, {}) if detail else (None, {}, None, None)
-    graph = GraphValidator()  # same refusals as validate_graph(current), without re-walking history
-    previous, revision = "", 0
+    return metadata, shape
+
+
+def _revisions(connection):
+    """Stream ``(revision number, revision row, its version rows)`` in order, one revision at a time."""
     members_cursor = connection.execute("SELECT * FROM versions ORDER BY revision,ordinal")
     ahead = members_cursor.fetchone()
     for revision, batch in enumerate(connection.execute("SELECT * FROM revisions ORDER BY revision"), 1):
-        batch = dict(batch)
-        require(batch["revision"] == revision and batch["previous_hash"] == previous, "Broken revision chain")
-        text(batch["actor"], "Actor", 200)
-        text(batch["request_id"], "Request ID", 200)
-        text(batch["reason"], "Revision reason")
-        timestamp(batch["committed_at"])
         members = []
         while ahead is not None and ahead["revision"] == revision:
             members.append(ahead)
             ahead = members_cursor.fetchone()
-        require(batch["record_count"] == len(members) and members, "Revision count mismatch")
-        records, payloads = [], []
-        for ordinal, member in enumerate(members):
-            require(member["ordinal"] == ordinal, "Broken revision ordinal")
-            record, payload = _member_record(member)
-            require(member["record_id"] == record["id"], "Record identity mismatch")
-            records.append(record)
-            payloads.append(payload)
-            projection[record["id"]] = (revision, ordinal)
-            if shape == "indexed" and record["kind"] == "receipt":
-                expected_refs.update((source_id, revision, ordinal) for source_id in record["data"]["source_ids"])
-            if detail:
-                current[record["id"]] = record
-                histories.setdefault(record["id"], []).append({
-                    "revision": revision, "request_id": batch["request_id"], "actor": batch["actor"],
-                    "reason": batch["reason"], "committed_at": batch["committed_at"], "record": record,
-                })
-        # Each record was validated above; only validate_records' list checks remain.
-        require(bool(records), "records must be a nonempty list")
-        require(len({record["id"] for record in records}) == len(records), "Duplicate IDs in submission")
-        graph.apply(records)
-        # The canonical text of {"actor","reason","records"} with the (verified canonical) payloads in place.
-        require(batch["input_hash"] == hashlib.sha256((
-            f'{{"actor":{canonical(batch["actor"])},"reason":{canonical(batch["reason"])},'
-            f'"records":[{",".join(payloads)}]}}').encode("utf-8")).hexdigest(),
-            "Revision input hash mismatch")
-        require(batch["revision_hash"] == fingerprint({k: v for k, v in batch.items() if k != "revision_hash"}),
-                "Revision chain hash mismatch")
-        previous = batch["revision_hash"]
-        if detail:
-            batches.append(batch)
-            committed_states[revision] = make_state(metadata, revision, previous, len(projection))
-    count = len(projection)
+        yield revision, dict(batch), members
+
+
+def _check_revision(batch, revision, previous, members):
+    require(batch["revision"] == revision and batch["previous_hash"] == previous, "Broken revision chain")
+    text(batch["actor"], "Actor", 200)
+    text(batch["request_id"], "Request ID", 200)
+    text(batch["reason"], "Revision reason")
+    timestamp(batch["committed_at"])
+    require(batch["record_count"] == len(members) and members, "Revision count mismatch")
+
+
+def _revision_records(members):
+    """The validated records of one revision's version rows and their (verified canonical) payload texts."""
+    records, payloads = [], []
+    for ordinal, member in enumerate(members):
+        require(member["ordinal"] == ordinal, "Broken revision ordinal")
+        record, payload = _member_record(member)
+        require(member["record_id"] == record["id"], "Record identity mismatch")
+        records.append(record)
+        payloads.append(payload)
+    # Each record was validated above and the revision is nonempty; only the duplicate-ID check remains.
+    require(len({record["id"] for record in records}) == len(records), "Duplicate IDs in submission")
+    return records, payloads
+
+
+def _check_revision_hashes(batch, payloads):
+    # The canonical text of {"actor","reason","records"} with the (verified canonical) payloads in place.
+    require(batch["input_hash"] == hashlib.sha256((
+        f'{{"actor":{canonical(batch["actor"])},"reason":{canonical(batch["reason"])},'
+        f'"records":[{",".join(payloads)}]}}').encode("utf-8")).hexdigest(),
+        "Revision input hash mismatch")
+    require(batch["revision_hash"] == fingerprint({k: v for k, v in batch.items() if k != "revision_hash"}),
+            "Revision chain hash mismatch")
+
+
+def _check_projection(connection, projection, shape, expected_refs):
+    """``current_records`` and (when present) ``refs`` must equal what the replayed history implies."""
     rows = 0
     for row in connection.execute("SELECT * FROM current_records"):
         rows += 1
         require(projection.get(row["record_id"]) == (row["revision"], row["ordinal"]),
                 "Current records differ from immutable revision history")
-    require(rows == count, "Current records differ from immutable revision history")
+    require(rows == len(projection), "Current records differ from immutable revision history")
     if shape == "indexed":
         require({tuple(row) for row in connection.execute("SELECT ref,revision,ordinal FROM refs")} == expected_refs,
                 LOOKUP_REFUSAL)
-    state = make_state(metadata, revision, previous, count)
+
+
+def inspect(connection, detail=True):
+    """Verify physical integrity, every historical payload/graph, chain, and current projection.
+
+    Returns ``(state, current, histories, batches, committed_states)``. History is streamed, so
+    with ``detail=False`` nothing is retained beyond the checks and only ``state`` is filled in
+    (the other four are None); callers that need the records or revisions ask for the detail.
+    """
+    metadata, shape = _check_store(connection)
+    expected_refs = set()  # what the payloads imply for the lookup table, when the catalog has one
+    projection = {}
+    current, histories, batches, committed_states = ({}, {}, [], {}) if detail else (None, None, None, None)
+    graph = GraphValidator()  # same refusals as validate_graph(current), without re-walking history
+    previous, revision = "", 0
+    for revision, batch, members in _revisions(connection):
+        _check_revision(batch, revision, previous, members)
+        records, payloads = _revision_records(members)
+        for ordinal, record in enumerate(records):
+            projection[record["id"]] = (revision, ordinal)
+            if shape == "indexed" and record["kind"] == "receipt":
+                expected_refs.update((source_id, revision, ordinal) for source_id in record["data"]["source_ids"])
+        graph.apply(records)
+        _check_revision_hashes(batch, payloads)
+        previous = batch["revision_hash"]
+        if detail:
+            for record in records:
+                current[record["id"]] = record
+                histories.setdefault(record["id"], []).append({
+                    "revision": revision, "request_id": batch["request_id"], "actor": batch["actor"],
+                    "reason": batch["reason"], "committed_at": batch["committed_at"], "record": record,
+                })
+            batches.append(batch)
+            committed_states[revision] = make_state(metadata, revision, previous, len(projection))
+    _check_projection(connection, projection, shape, expected_refs)
+    state = make_state(metadata, revision, previous, len(projection))
     return state, current, histories, batches, committed_states
 
 

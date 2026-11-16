@@ -557,8 +557,7 @@ def _select_members(pending, records_of, old, results):
 
 def marker_present(root, marker):
     """Whether the catalog holds a first version of record ``marker`` (read in one validated snapshot)."""
-    identifier_text = text  # the marker is any record ID; validate_record has checked its shape on write
-    identifier_text(marker, "Marker", 200)
+    text(marker, "Marker", 200)  # any record ID; validate_record has checked its shape on write
     home, db, _ = locations(root)
     require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
     with closing(connect(db)) as connection:
@@ -821,8 +820,9 @@ def rebase_index(root):
     return tokens, last_writer
 
 
-def read_records(root, *, kind=None, receipt=None, source=None, path=None, coverage=None,
-                 audience=None, after=None, limit=25, expected_state=None, include_history=False):
+def _check_read_arguments(kind, receipt, source, path, coverage, audience, after, limit, expected_state,
+                          include_history):
+    """Validate ``read_records`` arguments; returns the normalized path."""
     require(type(limit) is int and limit > 0, "limit must be a positive integer")
     require(type(include_history) is bool, "include_history must be boolean")
     for value, choices, name in ((kind, KINDS, "kind"), (coverage, COVERAGES, "coverage"),
@@ -838,33 +838,19 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
     if after is not None:
         text(after, "Paging cursor", 200)
         require(expected_state is not None, "Paging after requires a pinned expected_state")
-    home, db, _ = locations(root)
-    require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
-    with closing(connect(db)) as connection:
-        connection.execute("BEGIN")
-        state = validated_state(connection, home)
-        if expected_state is not None and expected_state != state["state_token"]:
-            raise StaleState("Stale query state")
-        current_view(connection)
-        scopes = []
-        parameters = {}
-        indexed = receipt is not None and lookup_shape(connection) == "indexed"
-        for label, value in (("receipt", receipt), ("source", source)):
-            if value is None:
-                continue
-            if label == "receipt" and indexed:
-                scopes.append("id IN (SELECT value FROM json_each(:receipt_scope))")
-                parameters["receipt_scope"] = json.dumps(sorted(_receipt_scope(connection, value)))
-                continue
-            parameters[label] = value
-            receipts = ("SELECT id FROM catalog_current WHERE kind='receipt' AND id=:receipt"
-                        if label == "receipt" else
-                        "SELECT id FROM catalog_current WHERE kind='receipt' AND EXISTS "
-                        "(SELECT 1 FROM json_each(payload,'$.data.source_ids') WHERE value=:source)")
-            sources = ("SELECT value FROM catalog_current,json_each(payload,'$.data.source_ids') "
-                       "WHERE catalog_current.id IN (SELECT id FROM linked_receipts)" if label == "receipt"
-                       else "SELECT :source")
-            scopes.append(f"""id IN (
+    return path
+
+
+def _linked_scope(label):
+    """The scan form of the receipt or source scope: linked receipts, their members and relationships."""
+    receipts = ("SELECT id FROM catalog_current WHERE kind='receipt' AND id=:receipt"
+                if label == "receipt" else
+                "SELECT id FROM catalog_current WHERE kind='receipt' AND EXISTS "
+                "(SELECT 1 FROM json_each(payload,'$.data.source_ids') WHERE value=:source)")
+    sources = ("SELECT value FROM catalog_current,json_each(payload,'$.data.source_ids') "
+               "WHERE catalog_current.id IN (SELECT id FROM linked_receipts)" if label == "receipt"
+               else "SELECT :source")
+    return f"""id IN (
                 WITH linked_receipts AS ({receipts}), members AS (
                     SELECT id FROM linked_receipts UNION {sources}
                     UNION SELECT id FROM catalog_current WHERE kind='artifact'
@@ -876,14 +862,54 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
                 SELECT * FROM members UNION SELECT id FROM catalog_current WHERE kind='relationship'
                 AND (json_extract(payload,'$.data.from_id') IN (SELECT id FROM endpoints)
                   OR json_extract(payload,'$.data.to_id') IN (SELECT id FROM endpoints))
-            )""")
-        if kind is not None:
-            scopes.append("kind=:kind")
-            parameters["kind"] = kind
-        for key, value in (("path", path), ("coverage", coverage), ("audience", audience)):
-            if value is not None:
-                scopes.append(f"(kind='artifact' AND json_extract(payload,'$.data.{key}')=:{key})")
-                parameters[key] = value
+            )"""
+
+
+def _read_filters(connection, kind, receipt, source, path, coverage, audience):
+    """The ``WHERE`` clauses and named parameters for the ``read_records`` filters."""
+    scopes = []
+    parameters = {}
+    if receipt is not None and lookup_shape(connection) == "indexed":
+        scopes.append("id IN (SELECT value FROM json_each(:receipt_scope))")
+        parameters["receipt_scope"] = json.dumps(sorted(_receipt_scope(connection, receipt)))
+    elif receipt is not None:
+        scopes.append(_linked_scope("receipt"))
+        parameters["receipt"] = receipt
+    if source is not None:
+        scopes.append(_linked_scope("source"))
+        parameters["source"] = source
+    if kind is not None:
+        scopes.append("kind=:kind")
+        parameters["kind"] = kind
+    for key, value in (("path", path), ("coverage", coverage), ("audience", audience)):
+        if value is not None:
+            scopes.append(f"(kind='artifact' AND json_extract(payload,'$.data.{key}')=:{key})")
+            parameters[key] = value
+    return scopes, parameters
+
+
+def _record_versions(connection, record_id):
+    return [{
+        "revision": row["revision"], "request_id": row["request_id"], "actor": row["actor"],
+        "reason": row["reason"], "committed_at": row["committed_at"], "record": decode(row["payload"]),
+    } for row in connection.execute(
+        "SELECT r.*,v.payload FROM versions v JOIN revisions r USING(revision) "
+        "WHERE v.record_id=? ORDER BY revision", (record_id,))]
+
+
+def read_records(root, *, kind=None, receipt=None, source=None, path=None, coverage=None,
+                 audience=None, after=None, limit=25, expected_state=None, include_history=False):
+    path = _check_read_arguments(kind, receipt, source, path, coverage, audience, after, limit, expected_state,
+                                 include_history)
+    home, db, _ = locations(root)
+    require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
+    with closing(connect(db)) as connection:
+        connection.execute("BEGIN")
+        state = validated_state(connection, home)
+        if expected_state is not None and expected_state != state["state_token"]:
+            raise StaleState("Stale query state")
+        current_view(connection)
+        scopes, parameters = _read_filters(connection, kind, receipt, source, path, coverage, audience)
         where = " AND ".join(scopes) or "1"
         query = "SELECT id FROM catalog_current WHERE " + where
         if after is not None:
@@ -900,12 +926,7 @@ def read_records(root, *, kind=None, receipt=None, source=None, path=None, cover
         for record_id in ids:
             record = current_record(connection, record_id)
             if include_history:
-                record["versions"] = [{
-                    "revision": row["revision"], "request_id": row["request_id"], "actor": row["actor"],
-                    "reason": row["reason"], "committed_at": row["committed_at"], "record": decode(row["payload"]),
-                } for row in connection.execute(
-                    "SELECT r.*,v.payload FROM versions v JOIN revisions r USING(revision) "
-                    "WHERE v.record_id=? ORDER BY revision", (record_id,))]
+                record["versions"] = _record_versions(connection, record_id)
             result.append(record)
         return {"authority": AUTHORITY, "state": state, "records": result, "count": len(result),
                 "total_matching": total,
