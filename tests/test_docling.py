@@ -663,5 +663,35 @@ class WorkerRequirements(unittest.TestCase):
             self.assertEqual(lock.get(name), version, name)
 
 
+class LimitContract(unittest.TestCase):
+    """The worker stays self-contained, so the parent's mirrored limits are pinned here."""
+
+    def test_parent_limits_match_worker_and_readme(self):
+        from tools.extraction import extract
+        spec = importlib.util.spec_from_file_location(
+            "docling_worker_limits", ROOT / "tools/extraction/docling_worker.py")
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        limits, mib = worker.LIMITS, 1024 * 1024
+        self.assertEqual(bridge.MAX_SOURCE, limits["source_bytes"])
+        self.assertEqual(adapter.MAX_RESULT, limits["result_bytes"])
+        self.assertEqual(adapter.MAX_DIAGNOSTIC, limits["diagnostic_bytes"])
+        self.assertEqual(adapter.WALL_SECONDS, limits["wall_seconds"])
+        self.assertLess(extract.MAX_SOURCE, bridge.MAX_SOURCE)
+        readme = " ".join((ROOT / "tools/extraction/README.md").read_text().split())
+        documented = (
+            f"Docling source limit is {limits['source_bytes'] // mib} MiB; "
+            f"PDFs allow at most {limits['pdf_pages']} pages and "
+            f"{limits['page_pixels']:,} pixels per page. Worker and final results are "
+            f"limited to {limits['result_bytes'] // mib} MiB, diagnostics to "
+            f"{limits['diagnostic_bytes'] // 1024} KiB, address space to "
+            f"{limits['address_space_bytes'] // 1024 ** 3} GiB, and wall time to "
+            f"{limits['wall_seconds']} seconds.",
+            f"their source limit is lower: {extract.MAX_SOURCE // mib} MiB, with "
+            f"renditions limited to {extract.MAX_EXPANDED // mib} MiB.")
+        for sentence in documented:
+            self.assertIn(sentence, readme)
+
+
 if __name__ == "__main__":
     unittest.main()
