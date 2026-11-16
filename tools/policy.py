@@ -433,9 +433,17 @@ def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=Fal
     if (cached is not None and cached[0] == SETTINGS
             and cached[2] == tuple(_stat_id(path) for path in cached[1])):
         return dict(cached[3])
+    # Snapshot before validating and cache only if nothing moved meanwhile, so a change that races the
+    # validation is revalidated on the next call instead of becoming the accepted baseline.
+    try:
+        before = _watched(instance_root, storage_roots(instance_root))
+        before_ids = tuple(_stat_id(path) for path in before)
+    except ValueError:
+        before = None
     roots = _validate_instance_roots(instance_root, allow_missing, ignore_migration_lock)
-    watched = _watched(instance_root, roots)
-    _VALIDATED[key] = (deepcopy(SETTINGS), watched, tuple(_stat_id(path) for path in watched), dict(roots))
+    if before is not None and _watched(instance_root, roots) == before and before_ids == tuple(
+            _stat_id(path) for path in before):
+        _VALIDATED[key] = (deepcopy(SETTINGS), before, before_ids, dict(roots))
     return roots
 
 

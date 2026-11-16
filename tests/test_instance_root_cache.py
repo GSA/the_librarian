@@ -58,6 +58,20 @@ class InstanceRootCache(unittest.TestCase):
         lock.unlink()
         catalog.locations(self.root)
 
+    def test_change_racing_validation_is_not_cached(self):
+        policy._VALIDATED.clear()
+        real = policy._validate_instance_roots
+
+        def validate_then_lock(*args):
+            roots = real(*args)
+            (self.root / policy.MIGRATION_FILE).write_text("{}")
+            return roots
+
+        with patch.object(policy, "_validate_instance_roots", validate_then_lock):
+            catalog.locations(self.root)
+        with self.assertRaisesRegex(catalog.CatalogError, "Interrupted store migration"):
+            catalog.locations(self.root)
+
     def test_storage_roots_changing_in_policy_is_detected(self):
         (self.root / "config/policy.local.json").write_text(
             json.dumps({"storage_roots": {"intake_home": ".local/moved-intake"}}))
