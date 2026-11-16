@@ -210,7 +210,7 @@ the intake commands do not cover.
    ```
 3. **Register** the file in the catalog. Write a records file with a source
    (`S*`), a receipt (`D*`), and an artifact (`A-*`) that includes the file's
-   `path`, `sha256`, and `bytes`. See `registration()` in `tests/test_kit.py`
+   `path`, `sha256`, and `bytes`. See `WorkspaceCase.registration()` in `tests/support.py`
    for a working example. Then submit it:
    ```sh
    TOKEN=$(.venv/bin/python -m tools.catalog.catalog_store status | python3 -c 'import json,sys;print(json.load(sys.stdin)["state_token"])')

@@ -17,8 +17,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests import test_kit
-from tests.support import clone_release
+from tests.support import WorkspaceCase, clone_release
 from tools.review_events import event_reader
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
@@ -41,7 +40,7 @@ class ReviewEventContractRefusal(unittest.TestCase):
         self.db = events.locations(self.root)[1]
 
     def pending(self):
-        return test_kit.WorkspaceCase.pending(self)
+        return WorkspaceCase.pending(self)
 
     def retag_stored_hash(self, value, *, keep_identity=False):
         """Rewrite the stored contract_hash as an out-of-band edit would, keeping the triggers intact."""

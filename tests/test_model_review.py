@@ -12,7 +12,7 @@ from tools.extraction import extract
 from tools.intake import model_review, standing, store
 from tools.review_events import event_store as events
 
-import test_kit
+from tests.support import WorkspaceCase
 
 
 def reply(decision="accept", records=(0, 1), warnings=("#/payload/warnings/0",), **extra):
@@ -34,7 +34,7 @@ class Transport:
         return value
 
 
-class ReviewCase(test_kit.WorkspaceCase):
+class ReviewCase(WorkspaceCase):
     def setUp(self):
         super().setUp()
         store.initialize(self.root)
@@ -64,7 +64,7 @@ class PromptTests(ReviewCase):
         self.assertIn("untrusted", task["messages"][0]["content"].lower())
 
 
-class OdtPromptTests(test_kit.WorkspaceCase):
+class OdtPromptTests(WorkspaceCase):
     def test_odt_prompt_carries_every_node_field(self):
         import io
         from zipfile import ZipFile

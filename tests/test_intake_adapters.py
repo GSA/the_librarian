@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests.support import default_policy_hash
+from tests.support import WorkspaceCase, default_policy_hash
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
@@ -68,8 +68,7 @@ class NativeTests(unittest.TestCase):
         self.assert_lock_recovery(catalog.writer_lock(catalog.locations(self.root)[0]), "catalog-busy", charged=False)
 
     def test_review_lock_is_retryable(self):
-        import test_kit
-        event = test_kit.WorkspaceCase.pending(self)
+        event = WorkspaceCase.pending(self)
         state = events.initialize(self.root)
         args = {"value": events.bundle([event]), "actor": "test-runner", "request_id": "req-review",
                 "expected_revision": 0, "expected_state": state["state_token"]}
@@ -106,8 +105,7 @@ class NativeTests(unittest.TestCase):
         import sqlite3 as database
         import subprocess
         import sys
-        import test_kit
-        event = test_kit.WorkspaceCase.pending(self)
+        event = WorkspaceCase.pending(self)
         state = events.initialize(self.root)
         events.append(self.root, events.bundle([event]), "test-runner", "req-prior", 0, state["state_token"])
         other = deepcopy(event)
@@ -252,8 +250,7 @@ class NativeTests(unittest.TestCase):
         self.assertIsNone(evidence["backup"])  # initialisation already covered today
 
     def test_review_commit_lost_ack_reconciles_original_revision(self):
-        import test_kit
-        event = test_kit.WorkspaceCase.pending(self)
+        event = WorkspaceCase.pending(self)
         state = events.initialize(self.root)
         args = {"value": events.bundle([event]), "actor": "test-runner", "request_id": "req-review",
                 "expected_revision": 0, "expected_state": state["state_token"]}

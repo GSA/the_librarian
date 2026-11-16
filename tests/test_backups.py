@@ -10,7 +10,7 @@ from unittest.mock import patch
 from tools import backups, policy
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
-from tests.test_kit import WorkspaceCase
+from tests.support import WorkspaceCase
 
 DAY = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
 

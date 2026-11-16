@@ -25,7 +25,7 @@ restated here.
   `the_librarian_mcp`, commands `librarian-mcp`, `librarian-preflight`,
   `librarian-audit`, MCP server name `the-librarian`. The earlier
   `qualified-context-*` names have no aliases. Evidence:
-  `tools/context-mcp/pyproject.toml`; `tests/test_kit.py::test_librarian_identity_and_role_documents_are_packaged`.
+  `tools/context-mcp/pyproject.toml`; `tests/test_documentation.py::test_librarian_identity_and_role_documents_are_packaged`.
 - **Three kinds of store**, all SQLite under a per-instance data root:
 
   | Kind | Stores | Rule of thumb |
@@ -34,14 +34,14 @@ restated here.
   | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
-  Evidence: `tests/test_kit.py::test_new_application_ids_and_superseded_refusal`
+  Evidence: `tests/test_workspace.py::test_new_application_ids_and_superseded_refusal`
   (superseded `FCAT`/`FREV`/`FCTX` identities refuse with a migration message),
   `::test_initialize_refuses_an_unmigrated_legacy_index`,
   `tests/test_catalog_inspect_equivalence.py` (about 100 tamperings of catalog
   rows, triggers, metadata and application id refuse),
-  `tests/test_kit.py::test_native_review_correction_retry_and_restore`
+  `tests/test_workspace.py::test_native_review_correction_retry_and_restore`
   (`DELETE FROM events` aborts), `tests/test_intake.py::test_wrong_identity_modes_and_missing_store_refuse`,
-  `tests/test_kit.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
+  `tests/test_workspace.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
   The review-event `contract_hash` refusal is pinned by
   `tests/test_review_event_contract.py`: an out-of-band edit of the stored hash
   and a change to the installed schema each make `status`, `audit`, `append`,
@@ -79,7 +79,7 @@ restated here.
   explicit-migration message. The derived index is assumed to need a rebuild
   after any code change, because its fingerprint covers the reader and policy
   module bytes (`context_index.engine_fingerprint`,
-  `tests/test_kit.py::test_qualification_code_is_bound_into_engine_fingerprint`).
+  `tests/test_workspace.py::test_qualification_code_is_bound_into_engine_fingerprint`).
   Schema snapshots in `tools/schemas/*.sql` are not backups.
 - **Store locations** are instance configuration (`storage_roots` in
   `config/policy*.json`), recorded with instance and store ids in
@@ -89,7 +89,7 @@ restated here.
   binds a *logical* root (instance id, store ids, storage roots), so moving the
   instance directory keeps it fresh while substituting another instance's
   database file is refused. Evidence:
-  `tests/test_kit.py::test_portable_roots_relocation_substitution_and_migration_recovery`
+  `tests/test_workspace.py::test_portable_roots_relocation_substitution_and_migration_recovery`
   and `::test_portable_roots_edge_cases_and_instance_policy_propagation`.
 - **Instance-root validation is memoized per process (Kata ck02).**
   `policy.validate_instance_roots` (policy read, symlink and ambiguity checks,
@@ -120,7 +120,7 @@ restated here.
 - **Packaging** is an explicit allowlist, `release-files.json`, built by
   `tools/package.py`. It excludes `.local`, `.venv`, databases, `data`, `sources`,
   `documents`, `*.local.*` files and symlinks. Evidence:
-  `tests/test_kit.py::test_clean_copy_and_policy_freshness` (the archive equals
+  `tests/test_workspace.py::test_clean_copy_and_policy_freshness` (the archive equals
   the allowlist and omits `policy.local.json`), `::test_release_paths_rejects_missing_and_symlinked_files`,
   `::test_package_rejects_symlinked_output_parent`, `::test_empty_initialization`
   (the shipped toolkit seeds zero records).
@@ -133,7 +133,7 @@ restated here.
   tracked, existing file and none may match an exclusion. The check runs only in a
   Git checkout whose top level is the toolkit root and skips in packaged kits,
   which carry no `.git`. Evidence:
-  `tests/test_kit.py::PackageTests::test_manifest_covers_every_tracked_file`.
+  `tests/test_packaging.py::PackageTests::test_manifest_covers_every_tracked_file`.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
@@ -840,7 +840,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   read-to-search ratio is reported, because the counts cannot tell an
   unconvincing excerpt from an agent that read enough in the excerpt. Nothing reads
   the log to change selection, ranking or qualification. Evidence:
-  `tests/test_kit.py` (`test_absence_never_echoes_query_terms_or_source_text`,
+  `tests/test_retrieval_diagnostics.py` (`test_absence_never_echoes_query_terms_or_source_text`,
   `test_refuses_query_text_and_unknown_fields`, `test_reads_are_counted_but_never_attributed`,
   `test_report_counts_reads_without_deriving_a_ratio`, `test_rejects_unsafe_log_paths`),
   `tests/test_mcp.py::test_diagnostics_*`.
@@ -855,7 +855,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   Evidence: `tests/test_mcp_audit.py` (about 20 tests, including
   `test_audit_failure_withholds_the_result`, `test_rotation_preserves_every_record_without_overwriting`,
   `test_paths_outside_local_symlinks_and_unsafe_modes_are_refused`); `.local`
-  exclusion: `tests/test_kit.py` (`index.eligible(".local/database.md")` is false).
+  exclusion: `tests/test_workspace.py` (`index.eligible(".local/database.md")` is false).
   The diagnostics log and the audit log are deliberately separate files and formats.
 - **The MCP adapter is read-only** and exposes six tools (`status`, `search`,
   `get`, `get_many`, `catalog`, `review_events`); `tests/test_mcp.py` asserts that

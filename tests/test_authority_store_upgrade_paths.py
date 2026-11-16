@@ -18,8 +18,7 @@ import sys
 import tempfile
 import unittest
 
-from tests import test_kit
-from tests.support import clone_release
+from tests.support import WorkspaceCase, clone_release
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_store as events
@@ -87,7 +86,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
         catalog.submit(root, [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}],
                        actor="test-runner", request_id="req-populate", expected_state=state["state_token"],
                        reason="Populate the synthetic catalog")
-        pending = test_kit.WorkspaceCase.pending(type("Stub", (), {"root": root})())
+        pending = WorkspaceCase.pending(type("Stub", (), {"root": root})())
         review = events.status(root)
         events.append(root, events.bundle([pending]), "test-runner", "req-populate",
                       review["revision"], review["state_token"])

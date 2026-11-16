@@ -12,7 +12,7 @@ from tools.extraction import docling_bridge
 from tools.review_events import event_store as events
 from tools.intake import adapters, runner, standing, store
 
-import test_kit
+from tests.support import WorkspaceCase
 from test_intake_adapters import stage, stage_request
 
 RUN = "a" * 64
@@ -24,7 +24,7 @@ def sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-class StandingCase(test_kit.WorkspaceCase):
+class StandingCase(WorkspaceCase):
     def setUp(self):
         super().setUp()
         store.initialize(self.root)
@@ -626,7 +626,7 @@ class StandingIntakeTests(StandingCase):
                          ["rev-standing"])
 
 
-class StandingExtractTests(test_kit.WorkspaceCase):
+class StandingExtractTests(WorkspaceCase):
     """Standing review of strict text renditions inspects every record and warning."""
 
     def setUp(self):
