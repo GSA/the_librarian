@@ -542,6 +542,22 @@ sample token usage to the admitted count and bytes. Record the chosen model,
 rationale and estimate privately before any bulk review (and a budget ceiling, if
 the owner sets one), and actual usage after it.
 
+**Per-document state (`docs`).** The ledger keeps a derived row per cohort document, written in the
+same transaction as the stage updates that change it. Requests stay authoritative; the table can be
+dropped and rebuilt. For an existing ledger:
+
+    python -m tools.intake.cohort backfill-docs --root ROOT           # dry run: rows that would be added
+    python -m tools.intake.cohort backfill-docs --root ROOT --apply   # create the table, add missing rows
+    python -m tools.intake.cohort audit-docs --root ROOT              # recompute from requests; report differences
+    python -m tools.intake.cohort docs-status --root ROOT             # documents per state, one indexed query
+
+`audit-docs` reports body-free `missing`, `extra` and `differing` row counts (and each path under
+`differences`) and never writes; a nonzero count means rebuild (drop `docs`, `backfill-docs --apply`)
+or investigate. `ingest` and `qualify` never create the table by themselves. By default every
+replay still reads and hashes every file. `ingest --trust-stat` skips the read and hash of an
+extracted file whose stat identity equals its row (the first replay after a backfill fills the
+identities), so use it only where no tool resets `ctime`; any other change is caught either way.
+
 **Recovering a registration blocked as `changed-extraction-identity`.** The extractor's identity
 is a hash of its code (`tools/extraction/extract.py`, plus `mhtml.py` for MIME HTML, and the
 instance policy) and is pinned in the stage's saved intent when the stage first prepares. A

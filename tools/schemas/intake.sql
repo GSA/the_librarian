@@ -25,3 +25,16 @@ CREATE TABLE acknowledgments (
  correlation_id TEXT NOT NULL, stage_id TEXT NOT NULL, payload TEXT NOT NULL,
  payload_sha256 TEXT NOT NULL, PRIMARY KEY(correlation_id,stage_id),
  FOREIGN KEY(correlation_id,stage_id) REFERENCES stages(correlation_id,stage_id));
+-- Derived (Kata e22r): one row per cohort document, recomputable from the requests above.
+CREATE TABLE docs (
+ system TEXT NOT NULL, path TEXT NOT NULL, format TEXT NOT NULL,
+ submission_id TEXT NOT NULL, suffix TEXT NOT NULL DEFAULT '', sha256 TEXT NOT NULL,
+ receipt_id TEXT NOT NULL, original TEXT NOT NULL, state TEXT NOT NULL,
+ conflicts INTEGER NOT NULL DEFAULT 0, rendition TEXT, rendition_sha256 TEXT,
+ extract_head TEXT, register_head TEXT,
+ dev INTEGER, ino INTEGER, size INTEGER, mtime_ns INTEGER, ctime_ns INTEGER, last_run REAL,
+ PRIMARY KEY(system, path)) WITHOUT ROWID;
+CREATE INDEX docs_state ON docs(state);
+CREATE INDEX docs_upload ON docs(submission_id);
+CREATE INDEX docs_extract ON docs(extract_head);
+CREATE INDEX docs_register ON docs(register_head);

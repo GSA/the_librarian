@@ -212,6 +212,35 @@ restated here.
   `ingest_benchmark.py --replay`: 11 to 5 ms per file, identical report digest.
   Evidence: `tests/test_intake_cohort.py::ReplayTests`,
   `tests/test_policy_isolation.py::StorageRootChecksAreCheapButNotWeaker`.
+- **A derived `docs` table answers "what is left" and lets a replay skip stat-identical files
+  (Kata e22r).** The intake ledger holds one `docs` row per cohort document (system and
+  inbox-relative path; format, submission id, SHA-256, receipt, retained original, rendition and its
+  hash, state, conflict count, the heads of its extraction and registration chains, the file's
+  `(dev, ino, size, mtime_ns, ctime_ns)` and the last run). The requests stay authoritative: every
+  ledger-derived column is a function of requests, stages and attempts. `runner` refreshes the rows
+  that follow a request in the same transaction as each stage update (running, failed, succeeded,
+  replay), `store.stage` repoints them when a correction is staged, and `ingest` writes a row only
+  when it differs from what it would write, so replaying an unchanged inbox writes nothing.
+  `cohort docs-status` is `GROUP BY state` on an index; `cohort audit-docs` recomputes every row from
+  the requests (the cohort and path come from the catalog-pinned submission sidecar) and reports
+  `missing`, `extra` and `differing` rows without writing; `cohort backfill-docs [--apply]` creates the
+  table and adds the missing rows for an existing ledger. The table is additive and optional: the
+  ledger schema version stays 1, the five authoritative tables are never written by the backfill, a
+  ledger without `docs` runs exactly as before and is never migrated by `ingest`, and dropping the
+  table loses nothing (`backfill-docs --apply` rebuilds it). Stat identity is an observation, so the
+  backfill leaves it empty and the first default replay fills it, and a row's stat is kept only when
+  the hash read at that time equals the retained original's.
+  **Change detection is unchanged by default:** every file is still read and hashed. Only
+  `ingest --trust-stat` reports an extracted document straight from its row, without reading,
+  hashing or looking it up in the ledger, when its stat identity equals the row's; a same-size edit
+  that restores the mtime still changes `ctime`, but a tool that also resets `ctime` is outside what
+  stat can show, which is why the mode is opt-in (efz3 decision D8). A row never vouches for a chain
+  `ingest` would refuse: a head that does not repeat the document's operation, receipt and format is
+  state `mismatch`, a branching chain is `ambiguous`, and an upload correction repoints the row in the
+  staging transaction and drops the old stat identity; none of these is trusted. Evidence:
+  `tests/test_intake_docs.py` (recording, same-transaction rollback, correction repointing, backfill
+  and audit, same-size edit with restored mtime, rename-over, truncate, append and touch with and
+  without `--trust-stat`, report equality with and without it).
 - **Extraction parses each document once per ingest and re-checks it four times.**
   `extract.bundle` reads the receipt's catalog snapshot, reads and hashes the original,
   recomputes the extractor identity (code and policy) and parses. A first ingest ran it six
