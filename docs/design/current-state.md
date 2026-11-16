@@ -143,6 +143,13 @@ restated here.
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
   The reader needs none of it.
+- **Continuous integration** (`.github/workflows/ci.yml`) runs on pull requests
+  and pushes to `main` with Python 3.14: it installs `tools/context-mcp` into a
+  fresh `.venv`, then runs `ruff check`, the schema snapshot `--check` and the
+  unittest suite. `ruff.toml` pins the ruff version and enforces only pyflakes
+  (`F`), bugbear (`B`, minus `B007`/`B905`) and `SIM115`; formatting and line
+  length are not enforced. Ruff is a CI/development tool, not a runtime
+  dependency.
 - The first proof-of-concept installation is closed; this repository does not
   maintain or port from it. Its clean-copy tests only prove this repository's
   packaging and policy boundary.
