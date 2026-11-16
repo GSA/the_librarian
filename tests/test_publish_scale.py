@@ -45,20 +45,32 @@ class PublishScaleTests(unittest.TestCase):
         large = self.count_calls(24, policy, "for_root")
         self.assertEqual(small, large)
 
-    def test_review_event_index_is_built_once_per_snapshot(self):
-        small = self.count_calls(8, event_reader.Snapshot, "_index_events")
-        large = self.count_calls(24, event_reader.Snapshot, "_index_events")
-        self.assertEqual((small, large), (1, 1))
+    def test_lookups_on_a_snapshot_without_history_index_the_events_once(self):
+        events = [{"event_id": f"rev-{n}", "source": {"locator": f"l{n}"}} for n in range(50)]
+        snapshot = event_reader.Snapshot({"state_token": "t" * 64, "events": 50}, events, {})
+        with mock.patch.object(event_reader.Snapshot, "_index_events",
+                               autospec=True, side_effect=event_reader.Snapshot._index_events) as built:
+            for n in range(50):
+                self.assertIs(snapshot.event(f"rev-{n}"), events[n])
+            self.assertIsNone(snapshot.event("rev-missing"))
+        self.assertEqual(built.call_count, 1)
 
-    def test_snapshot_index_follows_the_events_it_holds(self):
+    def test_a_snapshot_index_follows_the_events_it_holds(self):
         first = {"event_id": "rev-a"}
         snapshot = event_reader.Snapshot({"state_token": "t" * 64}, [first], {})
-        self.assertIs(snapshot.event_index()["rev-a"], first)
+        self.assertIs(snapshot.event("rev-a"), first)
         second = {"event_id": "rev-b"}
         snapshot.events.append(second)
-        self.assertIs(snapshot.event_index()["rev-b"], second)
-        snapshot.events = [second]
-        self.assertEqual(set(snapshot.event_index()), {"rev-b"})
+        self.assertIs(snapshot.event("rev-b"), second)
+        snapshot._events = [second]
+        self.assertIsNone(snapshot.event("rev-a"))
+
+    def test_a_memoized_snapshot_serves_lookups_from_its_history(self):
+        temp, root = self.build(6)
+        self.addCleanup(temp.cleanup)
+        snapshot = event_reader.read_snapshot(root)
+        with mock.patch.object(event_reader.Snapshot, "_index_events", side_effect=AssertionError):
+            self.assertEqual(snapshot.event("rev-bench-3")["event_id"], "rev-bench-3")
 
     def test_a_cohort_sized_manifest_is_accepted_and_one_more_than_the_cap_is_not(self):
         self.assertGreaterEqual(renditions.MAX_SELECTIONS, 20000)
