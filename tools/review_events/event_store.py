@@ -14,8 +14,9 @@ import sys
 import threading
 import uuid
 
-from tools import backups as snapshots
-from tools.file_identity import file_identity
+from tools import backups as snapshots, durable
+from tools.durable import fsync_directory
+from tools.file_identity import KeyedConnection, file_identity, file_key
 from tools.review_events import review_events as contract
 
 
@@ -59,11 +60,7 @@ def fingerprint(value):
 
 
 def file_hash(path):
-    digest = hashlib.sha256()
-    with contract.safe_path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return durable.sha256_file(contract.safe_path(path))
 
 
 def now():
@@ -96,14 +93,6 @@ def validate_history(events, root=None):
 
 def origin_key(event):
     return None
-
-
-def fsync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def private_directory(path):
@@ -154,22 +143,11 @@ def writer_lock(home):
         os.close(descriptor)
 
 
-class _Connection(sqlite3.Connection):
-    """Remembers the (device, inode) it opened, so a memoized validation is never bound to a
-    different file that was moved into the path afterwards."""
-    opened = None
-
-
-def _file_key(path):
-    info = os.stat(path)
-    return (info.st_dev, info.st_ino)
-
-
 def connect(path, write=False):
     private_file(path)
-    before = _file_key(path)
+    before = file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=0, isolation_level=None, factory=_Connection)
+                                 uri=True, timeout=0, isolation_level=None, factory=KeyedConnection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -179,7 +157,7 @@ def connect(path, write=False):
             require(connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete",
                     "Unsupported journal mode; do not change storage pragmas")
         # The statements above opened the file; the path must still be the same file.
-        require(_file_key(path) == before, "Review-event file replaced while opening; retry")
+        require(file_key(path) == before, "Review-event file replaced while opening; retry")
         connection.opened = before
     except (contract.ReviewError, OSError, sqlite3.Error):
         connection.close()
@@ -188,13 +166,11 @@ def connect(path, write=False):
 
 
 def reserve(path):
-    descriptor = os.open(contract.safe_path(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    os.close(descriptor)
+    durable.reserve(contract.safe_path(path))
 
 
 def seal(path):
-    with path.open("rb") as stream:
-        os.fsync(stream.fileno())
+    durable.fsync_file(path)
     fsync_directory(path.parent)
 
 
@@ -554,11 +530,7 @@ def snapshot(connection, backups, reason, root=None):
                   "sha256": digest, "bytes": temporary.stat().st_size, "state": state}
         os.replace(temporary, final)
         fsync_directory(backups)
-        descriptor = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(canonical(record) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        durable.write_new_private(receipt, (canonical(record) + "\n").encode("utf-8"))
         fsync_directory(backups)
         return {"snapshot": str(final), "receipt": str(receipt), "revision": state["revision"]}
     finally:

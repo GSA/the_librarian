@@ -19,7 +19,7 @@ AUDIT_DEFAULT = "derive-from-agent-label"
 TOOLKIT_FILES = frozenset({
     "release-files.json", "config/policy.json", "config/selection.json",
     "tools/__init__.py",
-    "tools/policy.py",
+    "tools/policy.py", "tools/backups.py", "tools/durable.py", "tools/file_identity.py",
     "tools/context_index/__init__.py", "tools/context_index/context_index.py",
     "tools/context_index/cli.py", "tools/context_index/compact_records.py",
     "tools/context_index/renditions.py", "tools/context_index/qualification.py",

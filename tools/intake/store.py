@@ -11,6 +11,7 @@ import stat
 import time
 
 from tools import policy
+from tools.durable import fsync_directory, reserve
 from tools.file_identity import file_identity
 from . import docs
 from .contracts import IntakeError, LedgerBusy, decode, decode_request, digest, request_layout, request_shape, require
@@ -91,14 +92,6 @@ def private(path, directory=False):
     return path
 
 
-def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def initialize(root):
     root, home, db = locations(root)
     require(not home.exists(), "already_initialized")
@@ -111,15 +104,14 @@ def initialize(root):
     home.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     for created in reversed(missing):
         created.chmod(0o700)
-        sync_directory(created.parent)
+        fsync_directory(created.parent)
     home.mkdir(mode=0o700)
-    fd = os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    os.close(fd)
+    reserve(db)
     with closing(sqlite3.connect(db)) as c, c:
         c.execute("PRAGMA synchronous=FULL")
         c.executescript(f"PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={SCHEMA};" + DDL)
-    sync_directory(home)
-    sync_directory(home.parent)
+    fsync_directory(home)
+    fsync_directory(home.parent)
     return {"initialized": True, "schema": SCHEMA}
 
 

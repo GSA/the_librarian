@@ -19,6 +19,7 @@ import stat
 import tempfile
 
 from tools.catalog import catalog_store as catalog
+from tools.durable import fsync_directory
 from tools.context_index import context_index as index
 from tools.context_index import qualification
 from tools.context_index import renditions
@@ -665,11 +666,7 @@ def write_manifest(root, name, entry, replaces=()):
         if os.path.exists(temporary):
             os.unlink(temporary)
         raise
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    fsync_directory(path.parent)
     return index.digest(data)
 
 

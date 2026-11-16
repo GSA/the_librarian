@@ -17,8 +17,8 @@ import sys
 import unicodedata
 import uuid
 
-from tools import backups as snapshots, policy
-from tools.file_identity import file_identity
+from tools import backups as snapshots, durable, policy
+from tools.file_identity import KeyedConnection, file_identity, file_key
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, KINDS, CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
     now, require, safe_relative, text, validate_graph, GraphValidator,
@@ -134,25 +134,16 @@ def locations(root, *, allow_missing=False):
 
 
 def fsync_directory(path):
-    descriptor = os.open(safe_path(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    durable.fsync_directory(safe_path(path))
 
 
 def seal(path):
-    descriptor = os.open(safe_path(path), os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    durable.fsync_file(safe_path(path))
     fsync_directory(path.parent)
 
 
 def reserve(path):
-    descriptor = os.open(safe_path(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    os.close(descriptor)
+    durable.reserve(safe_path(path))
 
 
 # Seconds a writer waits for another process's catalog lock before WriterBusy.
@@ -254,17 +245,6 @@ def _journal_state(path):
         os.close(descriptor)
 
 
-class _Connection(sqlite3.Connection):
-    """Remembers the (device, inode) it opened, so a validation is never bound to a different
-    file that a concurrent restore moved into the path afterwards."""
-    opened = None
-
-
-def _file_key(path):
-    info = os.stat(path)
-    return (info.st_dev, info.st_ino)
-
-
 def connect(path, write=False):
     path = private_file(path)
     if not write:
@@ -282,10 +262,10 @@ def connect(path, write=False):
         if time.monotonic() >= deadline:
             raise WriterBusy("Another catalog writer is active; retry later")
         time.sleep(0.02)
-    before = _file_key(path)
+    before = file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
                                  uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
-                                 factory=_Connection)
+                                 factory=KeyedConnection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -295,7 +275,7 @@ def connect(path, write=False):
         if write:
             connection.execute("PRAGMA synchronous=FULL")
         # The pragmas above opened the file; the path must still be the same file.
-        require(_file_key(path) == before, "Catalog file replaced while opening; retry")
+        require(file_key(path) == before, "Catalog file replaced while opening; retry")
         connection.opened = before
     except (CatalogError, OSError, sqlite3.Error):
         connection.close()
@@ -513,12 +493,7 @@ def inspect(connection, detail=True):
 
 
 def file_hash(path):
-    digest = hashlib.sha256()
-    descriptor = os.open(private_file(path), os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return durable.sha256_file(private_file(path))
 
 
 def _daily_snapshot(root, connection, backups, state, inspected=False):
@@ -602,11 +577,7 @@ def _snapshot_in_transaction(connection, backups, reason, image=False, inspected
         os.link(partial, final, follow_symlinks=False)
         partial.unlink()
         fsync_directory(backups)
-        descriptor = os.open(safe_path(receipt), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(canonical(record) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        durable.write_new_private(safe_path(receipt), (canonical(record) + "\n").encode("utf-8"))
         fsync_directory(backups)
         return {"snapshot": str(final), "receipt": str(receipt), "sha256": record["sha256"], "state": state}
     finally:

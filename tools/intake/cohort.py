@@ -24,6 +24,7 @@ from urllib.parse import quote
 from tools import policy
 from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
+from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
 from . import (adapters, cli, docs, docsync, model_review, runner, selection_manifest, standing, store,
@@ -625,11 +626,7 @@ def _replace_json(path, value, mode=0o644):
         if os.path.exists(temporary):
             os.unlink(temporary)
         raise
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    fsync_directory(path.parent)
 
 
 def _instance_file(root, name):

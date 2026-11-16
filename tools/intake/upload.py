@@ -22,6 +22,7 @@ import zipfile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.durable import fsync_directory
 from tools.extraction import mhtml
 from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store
@@ -168,14 +169,6 @@ def check_type(raw, format_name, name):
         require("\0" not in decoded, "type_mismatch")
 
 
-def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def private_directory(root, relative, owned):
     """Create missing directories below root; the last ``owned`` levels must be 0700."""
     parts = Path(relative).parts
@@ -185,7 +178,7 @@ def private_directory(root, relative, owned):
         require(not cursor.is_symlink(), "unsafe_path")
         if not cursor.exists():
             cursor.mkdir(mode=0o700)
-            sync_directory(cursor.parent)
+            fsync_directory(cursor.parent)
         require(cursor.is_dir(), "unsafe_path")
         if index >= len(parts) - owned:
             require(stat.S_IMODE(cursor.stat(follow_symlinks=False).st_mode) == 0o700, "not_private")
@@ -222,10 +215,10 @@ def publish(directory, name, raw):
             os.link(partial, final)
         except FileExistsError as error:
             raise IntakeError("destination_conflict") from error
-        sync_directory(directory)
+        fsync_directory(directory)
     finally:
         partial.unlink(missing_ok=True)
-        sync_directory(directory)
+        fsync_directory(directory)
     return True
 
 
