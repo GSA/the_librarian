@@ -172,13 +172,12 @@ def classify(root, inbox, trusted=None, keep_stat=False):
     return sorted(entries, key=lambda e: e["relative"])
 
 
-def _request(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
-    """Stage one single-stage request unless it exists; return its chain head's stage summary.
+def _staged(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
+    """Stage one single-stage request unless it exists; return the summary of its chain head.
 
     A request that was corrected is represented by the newest request of its validated
     ``correction_of`` chain, whatever it is named (``heads`` shares one chain index across a
-    run). The head is settled and reported like any other request: succeeded, blocked, or still
-    staged. It must repeat this request's operation and the ``identity`` arguments (receipt and
+    run). The head must repeat this request's operation and the ``identity`` arguments (receipt and
     format), or ``correction_mismatch`` refuses it. ``arguments`` may be a callable, evaluated
     only when the request must be staged.
     """
@@ -195,6 +194,15 @@ def _request(root, correlation_id, stage_id, operation, arguments, identity=None
             "retry": {"max_attempts": 3, "backoff_seconds": 0},
             "stages": [{"id": stage_id, "kind": "extraction", "operation": operation,
                         "arguments": arguments() if callable(arguments) else arguments}]}).encode())
+    return current
+
+
+def _request(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
+    """``_staged``, then settle the stage when it can still run; return the stage summary.
+
+    The head is settled and reported like any other request: succeeded, blocked, or still staged.
+    """
+    current = _staged(root, correlation_id, stage_id, operation, arguments, identity, heads)
     stage = current["stages"][0]
     if stage["status"] in {"staged", "running", "retryable"}:
         stage = runner.settle(root, current["correlation_id"], stage["id"])["stages"][0]
@@ -240,12 +248,15 @@ def _failure(stage_id, stage):
             "attempts": len(stage["attempts"])}
 
 
-def _process(root, inbox, entry, system, actor, heads=None):
+def _identify(root, entry, system, known):
+    """The submission identity of one entry (``entry`` gains it) and the request it supersedes, if any.
+
+    ``known`` maps correlation IDs to the saved ``(request, summary)`` read earlier. Dropped, with the
+    identity replaced, as soon as the file's bytes differ from the saved original. Returns
+    ``(superseded, known)``.
+    """
     identity = submission(entry["relative"], system, entry["format"])
     superseded = None
-    # One ledger open yields the saved receipt request and its stage summary; submit and the receipt
-    # check below reuse them for a succeeded receipt. Dropped as soon as the file's bytes differ.
-    known = upload.known_requests(root, [upload.correlation(identity["submission_id"])])
     prior = next((request for request, _ in known.values()), None)
     if prior is not None:
         orig = next((r for r in upload.submit_records(prior)
@@ -263,13 +274,24 @@ def _process(root, inbox, entry, system, actor, heads=None):
         if upload.ledger_request(root, upload.correlation(earlier)) is not None:
             superseded = earlier
     entry.update(identity)
+    return superseded, known
+
+
+def _descriptor(entry, system, actor, superseded):
+    return upload.descriptor(
+        submission_id=entry["submission_id"], format_name=entry["format"], correction_of=superseded,
+        name=entry["name"], actor=actor, reason=REASON, origin_kind="local-path",
+        origin_system=system, origin_locator=entry["locator"], expected_sha256=entry["sha256"])
+
+
+def _process(root, inbox, entry, system, actor, heads=None):
+    # One ledger open yields the saved receipt request and its stage summary; submit and the receipt
+    # check below reuse them for a succeeded receipt.
+    known = upload.known_requests(root, [upload.correlation(submission(entry["relative"], system, entry["format"])["submission_id"])])
+    superseded, known = _identify(root, entry, system, known)
     try:
-        ack = upload.submit(root, Path(inbox) / entry["relative"], upload.descriptor(
-            submission_id=identity["submission_id"], format_name=entry["format"],
-            correction_of=superseded,
-            name=identity["name"], actor=actor, reason=REASON, origin_kind="local-path",
-            origin_system=system, origin_locator=identity["locator"],
-            expected_sha256=entry["sha256"]), known=known)
+        ack = upload.submit(root, Path(inbox) / entry["relative"], _descriptor(entry, system, actor, superseded),
+                            known=known)
     except LedgerBusy:
         raise  # retried by _settled, never reported as a receipt refusal
     except IntakeError as error:
@@ -362,8 +384,152 @@ def _record(root, system, pending, heads):
                 docs.upsert(c, system, entry["relative"], entry["format"], derived, keep, now)
 
 
-def ingest(root, inbox, *, system, actor, limit=None, trust_stat=False):
+# Documents whose catalog registrations share one revision, per stage (the receipt, then the extraction
+# registration). 1 keeps the one-revision-per-registration path.
+BATCH_SIZE = 50
+BUSY_FAILURE = {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
+                "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
+
+
+def _process_batch(root, inbox, entries, system, actor, heads):
+    """``_process`` for a chunk of entries: their receipts commit as one catalog revision, then
+    their extraction registrations as one. Each entry gets exactly the outcome ``_process`` would give.
+
+    Every step is idempotent by request identity (and the catalog's per-document marker records), so a
+    crash or refusal anywhere is completed by running the chunk again; a refused entry never stops
+    the others. Returns ``{relative path: outcome}``.
+    """
+    outcomes = {}
+    with extract.keeping_parsed(len(entries)):
+        correlations = {e["relative"]: upload.correlation(
+            submission(e["relative"], system, e["format"])["submission_id"]) for e in entries}
+        try:
+            known_all = upload.known_requests(root, list(correlations.values()))
+        except LedgerBusy:
+            return {e["relative"]: dict(BUSY_FAILURE) for e in entries}
+        staged = []  # (entry, correlation ID, existing, known)
+        for entry in entries:
+            try:
+                known = {c: v for c, v in known_all.items() if c == correlations[entry["relative"]]}
+                superseded, known = _identify(root, entry, system, known)
+                correlation_id, existing = upload.stage_submission(
+                    root, Path(inbox) / entry["relative"], _descriptor(entry, system, actor, superseded), known=known)
+                staged.append((entry, correlation_id, existing, known))
+            except LedgerBusy:
+                entry["conflicts"] = entry.get("conflicts", 0) + 1
+                outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+            except IntakeError as error:
+                outcomes[entry["relative"]] = {
+                    "outcome": "changed-since-intake" if error.code == "changed_input" else "failed",
+                    "stage": "receipt", "code": error.code}
+        pending = [(corr, "receipt") for _, corr, _, known in staged if upload.settled(known, corr) is None]
+        try:
+            summaries = runner.settle_batch(root, pending) if pending else {}
+            fresh = upload.known_requests(root, [corr for _, corr, _, _ in staged])
+        except LedgerBusy:
+            for entry, *_ in staged:
+                outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+            return outcomes
+        registering = []
+        for entry, corr, existing, known in staged:
+            try:
+                request, summary = known[corr] if upload.settled(known, corr) else fresh[corr]
+                ack = upload.acknowledgment(root, corr, existing, (request, summary))
+            except (IntakeError, OSError) as error:
+                outcomes[entry["relative"]] = {"outcome": "failed", "stage": "receipt",
+                                               "code": error.code if isinstance(error, IntakeError) else "os-error"}
+                continue
+            entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
+            receipt = summary["stages"][0]
+            entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(receipt)
+            if ack["receipt"]["state"] != "committed":
+                outcomes[entry["relative"]] = _failure("receipt", receipt)
+                continue
+            entry["received"] = True
+            registering.append(entry)
+        outcomes.update(_extract_batch(root, registering, actor, heads))
+    return outcomes
+
+
+def _extract_batch(root, entries, actor, heads):
+    """``_extract`` for a chunk: each document prepared in turn, their registrations committed together."""
+    outcomes, registers = {}, []  # registers: (entry, version, step summary, identity)
+    for entry in entries:
+        base = {"receipt": entry["receipt_id"], "format_name": entry["format"]}
+        version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
+        try:
+            stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare",
+                             "extract-prepare", base, base, heads)
+            entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
+            if stage["status"] != "succeeded":
+                outcomes[entry["relative"]] = _failure(stage["id"], stage)
+                continue
+            registers.append((entry, version, base))
+        except LedgerBusy:
+            entry["conflicts"] = entry.get("conflicts", 0) + 1
+            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+        except IntakeError as error:
+            if error.code not in {"ambiguous_correction", "correction_mismatch"}:
+                raise
+            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "prepare", "code": error.code}
+    heads_of = []  # (entry, correlation ID, stage ID)
+    state = None
+    for entry, version, base in registers:
+        try:
+            def arguments():
+                nonlocal state
+                # One state read pins every registration staged now; each is rebased on its own.
+                state = state or catalog.status(root)["state_token"]
+                return {**base, "actor": actor, "expected_state": state}
+            current = _staged(root, "register-" + entry["submission_id"] + version, "register",
+                              "extract-register", arguments, base, heads)
+        except LedgerBusy:
+            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+            continue
+        except IntakeError as error:
+            if error.code not in {"ambiguous_correction", "correction_mismatch"}:
+                raise
+            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "register", "code": error.code}
+            continue
+        heads_of.append((entry, current["correlation_id"], current["stages"][0]["id"]))
+    try:
+        pending = [(corr, stage_id) for _, corr, stage_id in heads_of]
+        summaries = runner.settle_batch(root, pending) if pending else {}
+    except LedgerBusy:
+        for entry, *_ in heads_of:
+            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+        return outcomes
+    for entry, corr, stage_id in heads_of:
+        stage = next(s for s in summaries[corr]["stages"] if s["id"] == stage_id)
+        entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
+        if stage["status"] != "succeeded":
+            outcomes[entry["relative"]] = _failure(stage_id, stage)
+        else:
+            evidence = stage["evidence"]
+            outcomes[entry["relative"]] = {"outcome": "extracted", "rendition": evidence["rendition"],
+                                           "rendition_sha256": evidence["rendition_sha256"]}
+    return outcomes
+
+
+def _settled_batch(root, inbox, chunk, system, actor, heads):
+    """``_settled`` for a chunk: a busy ledger repeats the chunk (every step is idempotent), then fails
+    only the entries it left busy, visibly and retryable, and the run continues."""
+    todo, results = list(chunk), {}
+    for attempt in range(runner.BUSY_RETRIES):
+        outcomes = _process_batch(root, inbox, todo, system, actor, heads)
+        results.update(outcomes)
+        todo = [e for e in todo if outcomes[e["relative"]].get("code") == "ledger_busy"]
+        if not todo:
+            break
+    return results
+
+
+def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False):
     """Classify the inbox, then submit and extract admitted files; return the report.
+
+    Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
+    the extraction registration) each commit as one revision; ``batch_size=1`` commits every
+    registration on its own. Each document's outcome is its own whichever way it is processed.
 
     Every file is read and hashed, so a changed file is always found, unless ``trust_stat`` is set:
     then an extracted document whose file still has the (device, inode, size, mtime, ctime) its
@@ -372,35 +538,43 @@ def ingest(root, inbox, *, system, actor, limit=None, trust_stat=False):
     it; a filesystem or copy tool that sets ctime back is outside what stat can show, which is why
     this is opt-in. Without the ``docs`` table (or a recorded stat) nothing is trusted.
     """
+    contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
     trusted = {}
     if trust_stat:
         with store.locked(root) as c:
             trusted = docs.load(c, system)
     entries = classify(root, inbox, trusted, True)
-    for entry in entries:
-        if entry["disposition"] != "admit":
-            entry.pop("_stat", None)
     admitted = [e for e in entries if e["disposition"] == "admit"]
     outcome = Counter({name: 0 for name in OUTCOMES})
     # One correction-chain index serves every entry, so following chains never rescans the ledger.
     heads = store.Heads()
-    pending = []
-    for number, entry in enumerate(admitted):
-        stat, fast = entry.pop("_stat", None), entry.pop("_fast", False)
-        if limit is not None and number >= limit:
-            entry["outcome"] = "not-processed"
-            outcome["not-processed"] += 1
-            continue
-        if fast:
-            entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
-        else:
-            entry.update(_settled(root, inbox, entry, system, actor, heads))
-            pending.append((entry, stat))
-            if len(pending) >= FLUSH:
-                _record(root, system, pending, heads)
-                pending = []
+    # Private stat fields never reach the report: take them off every entry now.
+    seen = {e["relative"]: (e.pop("_stat", None), e.pop("_fast", False)) for e in entries}
+    todo = admitted if limit is None else admitted[:limit]
+    for entry in admitted[len(todo):]:
+        entry["outcome"] = "not-processed"
+        outcome["not-processed"] += 1
+    fast = [e for e in todo if seen[e["relative"]][1]]
+    for entry in fast:
+        entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
         outcome["received"] += bool(entry.get("received"))
         outcome[entry["outcome"]] += 1
+    todo = [e for e in todo if not seen[e["relative"]][1]]
+    chunks = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)] if batch_size > 1 else [[e] for e in todo]
+    pending = []
+    for chunk in chunks:
+        if batch_size == 1:
+            results = {chunk[0]["relative"]: _settled(root, inbox, chunk[0], system, actor, heads)}
+        else:
+            results = _settled_batch(root, inbox, chunk, system, actor, heads)
+        for entry in chunk:
+            entry.update(results[entry["relative"]])
+            outcome["received"] += bool(entry.get("received"))
+            outcome[entry["outcome"]] += 1
+            pending.append((entry, seen[entry["relative"]][0]))
+        if len(pending) >= FLUSH:
+            _record(root, system, pending, heads)
+            pending = []
     _record(root, system, pending, heads)
     retried = [e for e in admitted if e.get("conflicts")]
     counts = {"files": len(entries),
@@ -1254,6 +1428,9 @@ def main(argv=None):
             command.add_argument("--trust-stat", action="store_true",
                                  help="skip reading and hashing an extracted file whose stat identity "
                                       "equals its docs row (default: every file is hashed)")
+            command.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                                 help="documents whose catalog registrations share one revision "
+                                      "(default %d; 1 commits each registration on its own)" % BATCH_SIZE)
         if name == "qualify":
             command.add_argument("--policy", required=True, dest="policy_path")
             command.add_argument("--manifest", required=True)
@@ -1300,7 +1477,7 @@ def main(argv=None):
                 inspected_form=args.inspected_form)
         elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
-                            limit=args.limit, trust_stat=args.trust_stat)
+                            limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
         else:
             entries = classify(args.root, args.inbox)
             report = {"counts": {"files": len(entries),
