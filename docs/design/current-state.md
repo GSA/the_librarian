@@ -399,7 +399,11 @@ restated here.
 ## 4. Backups
 
 - Catalog and review-event writes take a verified `daily` snapshot before the
-  commit only when the store has no intact snapshot for the current UTC day; an
+  commit only when the store has no snapshot for the current UTC day whose receipt is
+  well formed, names this store and database, and whose file size equals the receipt's `bytes`;
+  the per-write gate never reads the snapshot body, so it does not detect same-size
+  corruption or tampering (the SHA-256 and validator are checked when the snapshot is taken,
+  before retention deletes anything, and by `restore`/audit); an
   idempotent retry takes none, post-write snapshots are not taken, and
   `init`, `backup` and restore keep their own snapshots. Snapshots, receipts and
   `.partial` files older than `backup_retention_days` (default 7, minimum 1) are
@@ -416,8 +420,9 @@ restated here.
   unless its hash equals the image (`catalog_store.py`, "Backup bytes mismatch").
   Fresh verification checks fields, size, SHA-256 and receipt state instead of a
   third replay; every older snapshot is still fully verified before it counts.
-- Evidence: `tests/test_backups.py` (daily gate, corrupt or same-length-corrupt
-  snapshots do not count, window pruning, never deleting the only verified
+- Evidence: `tests/test_backups.py` (daily gate reads no snapshot body, truncated or
+  malformed/foreign-receipt snapshots do not count, a same-size corrupt snapshot passes the gate
+  but fails `verify_backup`, window pruning, never deleting the only verified
   snapshot, dry-run default, protected snapshots, restore, review events follow
   the same rule), `tests/test_catalog_daily_snapshot.py`.
 - Not covered: offsite copies, scheduled backups, snapshots of the intake ledger
