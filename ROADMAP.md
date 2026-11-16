@@ -81,7 +81,7 @@ the stores refuse a mismatched contract themselves.
 
 **Delivered.** The optional offline PDF/PNG/JPEG Docling extraction lifecycle (`tools/extraction/docling_extract.py`, `docling_adapter.py`, `docling_bridge.py`, `docling_worker.py`, and `tools/extraction/README.md`):
 - Prepare twice with independent offline conversions, verify identical rendition bytes, and register deferred renditions in the catalog with idempotent retry.
-- Clean-copy tests (`tests/test_kit.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries.
+- Clean-copy tests (`tests/test_packaging.py`, `tests/test_workspace.py`, `tests/test_docling.py`, `tests/test_worker_contracts.py`) verify packaging, policy isolation, and store-identity boundaries.
 - Qualified retrieval can explicitly select exact-rendition, substantively reviewed Docling text and table records, with retained-byte, JSON-pointer, and page provenance. Unsupported content collections fail closed.
 - Parser success alone never qualifies content. Real-document OCR accuracy remains unmeasured.
 

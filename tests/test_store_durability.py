@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from tests.test_intake import request
-from tests.test_kit import WorkspaceCase
+from tests.support import WorkspaceCase
 from tools.catalog import catalog_store as catalog
 from tools.intake import store as intake
 from tools.review_events import event_store as events
