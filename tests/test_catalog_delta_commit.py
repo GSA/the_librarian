@@ -1,5 +1,5 @@
 """Catalog writes validate only their delta on a trusted head (fg46), keeping every integrity gate."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 import itertools
 import os
 from pathlib import Path
@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from tools import backups as snapshots
-from tools.catalog import catalog_store as catalog
+from tools.catalog import backups as catalog_backups, catalog_store as catalog
 from tools.catalog.contracts import CatalogError, validate_delta, validate_graph
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
@@ -151,7 +151,12 @@ class Case(unittest.TestCase):
         def counting(*args, **kwargs):
             calls.append(1)
             return real(*args, **kwargs)
-        return calls, patch.object(catalog, "inspect", counting)
+
+        @contextmanager
+        def patched():
+            with patch.object(catalog, "inspect", counting), patch.object(catalog_backups, "inspect", counting):
+                yield
+        return calls, patched()
 
     def mutate(self, sql, *params):
         """Edit the database outside the writer, as an attacker or a bad restore would."""

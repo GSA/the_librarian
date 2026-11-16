@@ -11,7 +11,7 @@ import sys
 HOME = Path(__file__).resolve().parent
 ROOT = HOME.parents[1]
 SOURCES = {
-    "catalog.sql": ("tools/catalog/catalog_store.py", "SQL", "VERSION"),
+    "catalog.sql": ("tools/catalog/storage.py", "SQL", "VERSION"),
     "review-events.sql": ("tools/review_events/event_store.py", "SQL", "VERSION"),
     "context-index.sql": ("tools/context_index/context_index.py", "DDL", "SCHEMA"),
     "intake.sql": ("tools/intake/store.py", "DDL", "SCHEMA"),
@@ -29,8 +29,8 @@ def snapshot(source: Path, symbol: str, version_symbol: str) -> str:
     if not isinstance(ddl, str) or type(version) is not int:
         raise ValueError("Expected literal DDL and integer schema version")
     if symbol == "SQL":
-        if source.name == "catalog_store.py":
-            from tools.catalog import catalog_store as module
+        if source.name == "storage.py":
+            from tools.catalog import storage as module
         else:
             from tools.review_events import event_store as module
         ddl = module.schema_sql()

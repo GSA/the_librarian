@@ -20,6 +20,7 @@ from zipfile import ZipFile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.catalog import storage
 from tools.context_index import compact_records
 from tools.context_index import context_index as index
 from tools.context_index import qualification
@@ -54,7 +55,7 @@ class DiscoveryTests(unittest.TestCase):
 
 class StoreIdentity(unittest.TestCase):
     def test_new_application_ids_and_superseded_refusal(self):
-        self.assertEqual(catalog.APPLICATION_ID, 0x4C434154)
+        self.assertEqual(storage.APPLICATION_ID, 0x4C434154)
         self.assertEqual(events.APPLICATION_ID, 0x4C524556)
         self.assertEqual(index.APPLICATION_ID, 0x4C435458)
         for module, old, message in (

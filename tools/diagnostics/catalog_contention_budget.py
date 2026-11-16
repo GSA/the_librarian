@@ -30,9 +30,9 @@ HOLDER = ("import fcntl,os,sys,time\nfd=os.open(sys.argv[1],os.O_RDWR)\nfcntl.fl
 
 def trial(wait, multiple, max_attempts):
     from tools import policy
-    from tools.catalog import catalog_store as catalog
+    from tools.catalog import catalog_store as catalog, storage
     from tools.intake import runner, store
-    catalog.WRITER_WAIT_SECONDS = wait
+    storage.WRITER_WAIT_SECONDS = wait
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp) / "instance"
         root.mkdir()

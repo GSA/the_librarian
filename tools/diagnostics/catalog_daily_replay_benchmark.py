@@ -79,6 +79,7 @@ def caller(depth=2):
 
 def instrument(cs, snapshots, marks):
     """Time the phases of one ``submit``; calls are appended to ``marks['calls']`` as (name, label, seconds)."""
+    from tools.catalog import backups as catalog_backups
     saved = []
 
     def wrap(module, name, label=None):
@@ -94,10 +95,11 @@ def instrument(cs, snapshots, marks):
         saved.append((module, name, original))
         setattr(module, name, timed)
 
-    for name in ("inspect", "file_hash", "_binding", "validate_delta", "_attest_commit", "seal", "verify_backup",
-                 "_snapshot_in_transaction", "_daily_snapshot", "_trusted_state"):
-        if hasattr(cs, name):
-            wrap(cs, name)
+    for module in (cs, catalog_backups):
+        for name in ("inspect", "file_hash", "_binding", "validate_delta", "_attest_commit", "seal", "verify_backup",
+                     "_snapshot_in_transaction", "_daily_snapshot", "_trusted_state"):
+            if hasattr(module, name):
+                wrap(module, name)
     for name in ("prune", "has_snapshot_today", "_fresh_ok", "scan"):
         wrap(snapshots, name, "backups." + name)
     original_lock = cs.writer_lock

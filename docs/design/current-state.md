@@ -468,7 +468,7 @@ restated here.
   backups (35 GB) for a 12.7 MB catalog.
 - On the first write of a UTC day the snapshot is the serialized image of the
   transaction that was just fully inspected, written, fsynced, re-read and refused
-  unless its hash equals the image (`catalog_store.py`, "Backup bytes mismatch").
+  unless its hash equals the image (`tools/catalog/backups.py`, "Backup bytes mismatch").
   Fresh verification checks fields, size, SHA-256 and receipt state instead of a
   third replay; every older snapshot is still fully verified before it counts.
 - Evidence: `tests/test_backups.py` (daily gate reads no snapshot body, truncated or
@@ -490,7 +490,8 @@ is what matters; the chain of how it got here is in git history and the Katas
 1. **Receipt.** A validation receipt in `<catalog home>/.local/read-validation.json`
    records the state a full validation produced and a *binding*: for a plain
    rollback-journal database, the file identity (device, inode, size, mtime_ns,
-   ctime_ns, SQLite change counter) plus the validator-file hash and runtime
+   ctime_ns, SQLite change counter) plus the validator-file hash (`VALIDATOR_FILES`:
+   `catalog_store.py`, `storage.py`, `backups.py` and `contracts.py`) and runtime
    versions; otherwise (journal or WAL present, or no `sqlite_dbpage`) the SHA-256
    of the exact database bytes. An identity-bound receipt is trusted only on the
    UTC date of the full validation it descends from (`validated_on`); the first
@@ -548,7 +549,7 @@ the batch moves (`claimants`). They used to be `instr(payload, ?)` scans over ev
 record, so each write cost O(catalog) and a first ingest grew quadratically (at 40,000
 synthetic documents the two scans were about half of the time per document).
 
-- **Structures** (`LOOKUP_OBJECTS` in `catalog_store.py`, mirrored in `tools/schemas/catalog.sql`):
+- **Structures** (`LOOKUP_OBJECTS` in `tools/catalog/storage.py`, mirrored in `tools/schemas/catalog.sql`):
   partial expression indexes on `versions` for `$.data.path`, `receipt_id`, `parent_id`,
   `artifact_id`, `from_id` and `to_id`, and `refs(ref, revision, ordinal)`, one row per
   `source_ids` entry of every *receipt version*, kept by an `AFTER INSERT` trigger on `versions`.
@@ -804,8 +805,9 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   counter is seen at the next UTC-day check). Digests of requests and artifacts
   already proven are kept by SHA-256 (no raw bytes, no failures) and a hit still
   hashes the bytes in hand and compares the stored digest. Its catalog read never
-  writes a receipt: it trusts a receipt covering this exact file or this process's
-  own full inspection today. `progress-serve` renders one page at a time, shares the
+  writes a receipt (`catalog_store.observed_state`): it trusts a receipt covering this exact file or
+  this process's own full inspection today, and an unreadable receipt is ignored, never reported,
+  so the full inspection decides. `progress-serve` renders one page at a time, shares the
   result with requests that arrive meanwhile and reuses one younger than a second;
   the report adds finished-attempt rates (1/5/15 min) and attention grouped by
   cause. A 125,000-request synthetic ledger rendered in 11 s and 1.5 GB before and

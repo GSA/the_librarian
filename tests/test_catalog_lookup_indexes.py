@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.catalog import catalog_store as catalog
+from tools.catalog import catalog_store as catalog, storage
 from tools.catalog.contracts import CatalogError, _references, validate_graph, validate_records
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
@@ -72,7 +72,7 @@ class Case(unittest.TestCase):
 class NewCatalogs(Case):
     def test_init_creates_the_lookup_structures_and_they_verify(self):
         root = new_instance(self.temp.name)
-        self.assertEqual(lookup_names(root), {f"versions_lookup_{field}" for field in catalog.LOOKUP_FIELDS}
+        self.assertEqual(lookup_names(root), {f"versions_lookup_{field}" for field in storage.LOOKUP_FIELDS}
                          | {"refs", "versions_lookup_refs"})
         submit(root, registration(0), "r0")
         self.assertEqual(self.audit(root)["revision"], 1)
@@ -265,7 +265,7 @@ class TamperDetection(Case):
                 action()
 
     def test_each_dropped_index_is_refused(self):
-        for field in catalog.LOOKUP_FIELDS:
+        for field in storage.LOOKUP_FIELDS:
             with self.subTest(field):
                 edit(self.root, lambda c, f=field: c.execute(f"DROP INDEX versions_lookup_{f}"))
                 self.assert_refused()
@@ -519,7 +519,7 @@ class Migration(Case):
         self.assertTrue(json.loads(done.stdout)["migrated"])
         again = run("tools/initialize.py", "--root", str(kit), "--migrate-catalog-indexes")
         self.assertFalse(json.loads(again.stdout)["migrated"])
-        self.assertEqual(lookup_names(kit), set(catalog.LOOKUP_OBJECTS))
+        self.assertEqual(lookup_names(kit), set(storage.LOOKUP_OBJECTS))
         self.assertEqual(self.audit(kit)["revision"], 1)
 
 

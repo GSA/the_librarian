@@ -371,22 +371,7 @@ def catalog_state(catalog, connection, home):
     inspection of the identical binding does the same; otherwise the whole history is inspected.
     A receipt that cannot be read is ignored, never trusted.
     """
-    try:
-        binding = catalog._binding(connection)
-        marker = json.dumps([binding, catalog._today()], sort_keys=True)
-        trusted = catalog._trusted_state(connection, home, binding)
-    except (catalog.CatalogError, OSError, ValueError):
-        binding = marker = trusted = None
-    if trusted is not None:
-        return trusted[0]
-    if marker is not None and _catalog_seen.get("marker") == marker \
-            and _catalog_seen["head"] == catalog._head_state(connection):
-        return _catalog_seen["state"]
-    state = catalog.inspect(connection, detail=False)[0]
-    if marker is not None and binding["version"] == 2:
-        _catalog_seen.clear()
-        _catalog_seen.update(marker=marker, head=catalog._head_state(connection), state=state)
-    return state
+    return catalog.observed_state(connection, home, _catalog_seen)
 
 
 def read_catalog(root):

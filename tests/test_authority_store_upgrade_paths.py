@@ -21,6 +21,7 @@ import unittest
 from tests.support import WorkspaceCase, clone_release
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.catalog import storage
 from tools.review_events import event_store as events
 
 CATALOG_USER_VERSION = "Unsupported catalog version"
@@ -51,7 +52,7 @@ def bump_user_version(store):
 def retag_catalog_contract(db):
     edit(db, ("DROP TRIGGER immutable_metadata_update",),
          ("UPDATE metadata SET value='2' WHERE key='contract_version'",),
-         (catalog.trigger_sql("metadata", "update"),))
+         (storage.trigger_sql("metadata", "update"),))
 
 
 def retag_review_contract(db):
