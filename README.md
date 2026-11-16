@@ -3,9 +3,15 @@
 > **Status: untested on real data.** So far it has only been tested on
 > synthetic fixtures in temporary workspaces.
 >
-> **No automated ingestion yet.** Documents are registered by hand with the steps
-> below. Automated ingestion (connectors, scheduled discovery) is the next
-> milestone after MVP. See [ROADMAP.md](ROADMAP.md#automation-pipeline).
+> **Ingestion is automated but operator-run.** The intake pipeline
+> (`tools.intake`) stages and registers documents you supply (one file, a marked
+> drop folder, or a whole read-only inbox folder) through a durable ledger that
+> resumes after interruption. For an inbox folder, one command also extracts,
+> reviews with a configured model against a standing policy, and selects and
+> publishes what qualifies. Nothing fetches documents or runs on a schedule:
+> remote connectors, scheduled discovery and return transport are still
+> planned. See [Ingesting files](#ingesting-files) and
+> [ROADMAP.md](ROADMAP.md#automation-pipeline).
 
 The Librarian is a local toolkit for a program's business documents. It catalogs
 the source files, can extract text from them, records reviews, and serves
@@ -33,6 +39,9 @@ If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 `python3 -m pip --python .venv/bin/python install ./tools/context-mcp`.
 
 ### Development and agent worktrees
+
+This section is the canonical setup and troubleshooting guide for development
+checkouts; [AGENTS.md](AGENTS.md) repeats only the essential commands.
 
 Every clone or Git worktree needs its own `.venv`; the main checkout's
 environment is not copied. Create the environment and install
@@ -82,7 +91,20 @@ The first write of each UTC day replays the history once for its daily snapshot
 (profile it with
 `tools/diagnostics/catalog_daily_replay_benchmark.py`).
 
-## Ingesting files (current manual method)
+## Ingesting files
+
+Every path below is started by an operator. The intake commands record each
+step in a durable ledger so a run can be retried, resumed or replayed; nothing
+watches folders or runs on a schedule.
+
+| Input | Command | Then |
+| --- | --- | --- |
+| One file | `tools.intake.cli submit-file` | Steps 4–7 of [registering by hand](#registering-a-file-by-hand) (extract, write, select, rebuild) |
+| A marked drop folder | `tools.intake.cli drop-scan` / `drop-submit` | As for one file |
+| A read-only inbox folder (text, Gemini TXT, MHTML, ODT) | `tools.intake.cohort qualify` | Nothing: it ingests, extracts, reviews, selects and publishes what qualifies; the rest stay visibly pending |
+| PDF or images | `submit-file`, then Docling stages | See [tools/extraction/README.md](tools/extraction/README.md) |
+
+### One file or a drop folder
 
 To stage and register a file in one step, use the upload intake (see
 [context/intake.md](context/intake.md#manual-upload-and-local-drop)):
@@ -93,7 +115,12 @@ To stage and register a file in one step, use the upload intake (see
   --submission-id memo-001 --format pdf --actor "$USER" --reason "Register memo"
 ```
 
-It replaces steps 1–3 below and leaves extraction to step 4.
+It replaces steps 1–3 of [registering by hand](#registering-a-file-by-hand)
+and leaves extraction to step 4. `drop-submit --drop DIR` does the same for each
+file in a folder marked with `.librarian-drop` that has a
+`NAME.submission.json` descriptor beside it (`drop-scan` only lists them).
+
+### A read-only inbox folder
 
 To take in a whole read-only folder, classify it and then ingest the admitted
 files through upload and extraction (see
@@ -159,6 +186,8 @@ evidence), is idempotent (an unchanged manifest with a fresh index is reused), p
 published (for example `standing-selection-unauthorized` after a standing-policy version bump
 that has not been requalified). Run `qualify` again afterwards to resume reviewing.
 
+### Watching a run
+
 To watch a run, use the read-only, body-free progress view (CLI or a
 loopback-only page that refreshes itself; see
 [context/intake.md](context/intake.md#progress-view)):
@@ -167,6 +196,11 @@ loopback-only page that refreshes itself; see
 .venv/bin/python -m tools.intake.cli --root . progress --format text
 .venv/bin/python -m tools.intake.cli --root . progress-serve   # http://127.0.0.1:8765/
 ```
+
+### Registering a file by hand
+
+Hand registration is still supported, for example for a format or record shape
+the intake commands do not cover.
 
 1. **Drop** the original file under `sources/` (for example `sources/memo.pdf`).
 2. **Discover** what has not been registered yet:
@@ -183,7 +217,7 @@ loopback-only page that refreshes itself; see
      --request-id intake-001 --expected-state "$TOKEN" --reason "Register memo"
    ```
 4. **Extract** text (optional):
-   - For UTF-8 text, Gemini transcripts, or ODT (`--format {text,gemini-txt,odt}`):
+   - For UTF-8 text, Gemini transcripts, MHTML, or ODT (`--format {text,gemini-txt,mhtml,odt}`):
      `.venv/bin/python -m tools.extraction.extract {prepare,verify,register} D1 --format odt ...`
    - For PDF or images (`--format {pdf,image}`): use Docling (`{inspect,prepare,verify,register}`).
      See [tools/extraction/README.md](tools/extraction/README.md). Docling needs its
@@ -207,10 +241,10 @@ loopback-only page that refreshes itself; see
 Registering a file does not make it retrievable. Only documents and renditions
 listed in the selection file are indexed.
 
-**Optional: durable intake.** `python -m tools.intake.cli` can run catalog
-registration, Docling extraction, review recording, and the index rebuild as a
-staged job that can be retried, resumed, or replayed. You still supply every
-file and record, and nothing is fetched or scheduled. See
+**Staged jobs.** `python -m tools.intake.cli stage` and `run` can perform any of
+these steps (catalog registration, extraction including Docling, review
+recording, and the index rebuild) as a staged job that can be retried, resumed,
+or replayed. You still supply every file and record. See
 [context/intake.md](context/intake.md).
 
 ## Interfaces
@@ -227,7 +261,8 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.event_store` | Review store: `init`, `status`, `audit`, `schema`, `get`, `append`, `backup`, `verify-backup`, `restore` |
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
-| `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge` |
+| `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `progress`, `progress-serve` |
+| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `backfill-docs`, `audit-docs`, `docs-status` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
