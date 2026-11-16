@@ -329,20 +329,16 @@ def source(root, receipt, format_name):
 # a source read: ``bundle`` still reads and hashes the original on every call.
 _PARSED = OrderedDict()
 _KEEP, _KEEP_BYTES = 1, 32 * 1024 * 1024
-_PARSED_BYTES = 0
 
 
 def forget_parsed():
-    global _PARSED_BYTES
     _PARSED.clear()
-    _PARSED_BYTES = 0
 
 
 def _trim_parsed():
-    global _PARSED_BYTES
-    while len(_PARSED) > _KEEP or (len(_PARSED) > 1 and _PARSED_BYTES > _KEEP_BYTES):
-        _, (_, size) = _PARSED.popitem(last=False)
-        _PARSED_BYTES -= size
+    while len(_PARSED) > _KEEP or (len(_PARSED) > 1
+                                   and sum(size for _, size in _PARSED.values()) > _KEEP_BYTES):
+        _PARSED.popitem(last=False)
 
 
 @contextmanager
@@ -364,14 +360,12 @@ def keeping_parsed(count):
 
 
 def parse(format_name, raw, root, key):
-    global _PARSED_BYTES
     if key in _PARSED:
         _PARSED.move_to_end(key)
         return _PARSED[key][0]
     payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "mhtml": mime_html,
                "odt": odt}[format_name](raw)
     _PARSED[key] = (payload, len(raw))
-    _PARSED_BYTES += len(raw)
     _trim_parsed()
     return payload
 
