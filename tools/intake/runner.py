@@ -4,7 +4,7 @@ import sqlite3
 import time
 
 from tools import policy
-from . import adapters, store
+from . import adapters, docs, store
 from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, require
 
 
@@ -105,6 +105,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
                 with c:
                     c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)", (correlation_id, stage_id, saved["cycle"], ordinal, started))
                     c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
+                    docs.refresh(c, correlation_id)
 
         def failed(error):
             failure, status = failure_status(request, attempts, ordinal, error)
@@ -112,6 +113,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             with c:
                 c.execute("UPDATE attempts SET ended=?,outcome='failed',category=?,code=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (ended, failure.category, failure.code, ended + request["retry"]["backoff_seconds"], correlation_id, stage_id, saved["cycle"], ordinal))
                 c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
+                docs.refresh(c, correlation_id)
             return store.summary(c, correlation_id)
 
         # Separate native preparation from ledger transactions: a failed ledger
@@ -137,6 +139,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             save_artifact(c, correlation_id, stage_id, "evidence", evidence)
             c.execute("UPDATE attempts SET ended=?,outcome=?,eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?", (ended, status, ended, correlation_id, stage_id, saved["cycle"], ordinal))
             c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
+            docs.refresh(c, correlation_id)
         return store.summary(c, correlation_id)
 
 
@@ -192,6 +195,7 @@ def run_batch(root, items, *, clock=None):
                                   (item["correlation_id"], item["stage_id"], item["saved"]["cycle"], item["ordinal"], started))
                         c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?",
                                   (item["correlation_id"], item["stage_id"]))
+                        docs.refresh(c, item["correlation_id"])
             ready = [item for item in live if item["error"] is None]
             if ready:
                 outcomes = adapters.execute_batch(store.safe(root), [
@@ -212,11 +216,13 @@ def run_batch(root, items, *, clock=None):
                               (ended, failure.category, failure.code, ended + item["request"]["retry"]["backoff_seconds"],
                                correlation_id, stage_id, saved["cycle"], item["ordinal"]))
                     c.execute("UPDATE stages SET status=? WHERE correlation_id=? AND stage_id=?", (status, correlation_id, stage_id))
+                    docs.refresh(c, correlation_id)
                 else:
                     save_artifact(c, correlation_id, stage_id, "evidence", item["evidence"])
                     c.execute("UPDATE attempts SET ended=?,outcome='succeeded',eligible_at=? WHERE correlation_id=? AND stage_id=? AND cycle=? AND ordinal=?",
                               (ended, ended, correlation_id, stage_id, saved["cycle"], item["ordinal"]))
                     c.execute("UPDATE stages SET status='succeeded' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
+                    docs.refresh(c, correlation_id)
         return {correlation_id: store.summary(c, correlation_id) for correlation_id, _ in items}
 
 
@@ -319,6 +325,7 @@ def replay(root, correlation_id, stage_id, *, now=None):
         with c:
             c.execute("INSERT INTO replays VALUES (?,?,?,?)", (correlation_id, stage_id, cycle, now))
             c.execute("UPDATE stages SET status='staged',cycle=? WHERE correlation_id=? AND stage_id=?", (cycle, correlation_id, stage_id))
+            docs.refresh(c, correlation_id)
         return store.summary(c, correlation_id)
 
 
@@ -347,6 +354,7 @@ def acknowledge(root, correlation_id, stage_id, acknowledgment):
             c.execute("INSERT INTO acknowledgments VALUES (?,?,?,?)", (correlation_id, stage_id, raw, digest(raw.encode())))
             save_artifact(c, correlation_id, stage_id, "evidence", {"boundary": "delivered", "acknowledgment": acknowledgment, "basis": "explicit-transport-acknowledgment"})
             c.execute("UPDATE stages SET status='succeeded' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
+            docs.refresh(c, correlation_id)
         return store.summary(c, correlation_id)
 
 

@@ -17,6 +17,7 @@ import re
 import stat
 import sys
 import tempfile
+import time
 import unicodedata
 from urllib.parse import quote
 
@@ -25,8 +26,8 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index, renditions
 from tools.extraction import extract, mhtml
-from . import (adapters, cli, model_review, runner, selection_manifest, standing, store, throttle,
-               upload, usage_log)
+from . import (adapters, cli, docs, docsync, model_review, runner, selection_manifest, standing, store,
+               throttle, upload, usage_log)
 from . import contracts
 from .contracts import IntakeError, LedgerBusy
 
@@ -82,12 +83,31 @@ def _format(path, relative, raw, root):
     return None, None
 
 
-def _disposition(root, inbox, path, relative):
+def _stat(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _disposition(root, inbox, path, relative, trusted=None):
+    """One file's disposition.
+
+    ``trusted`` (``{relative: ledger row}``, only under ``--trust-stat``) lets a file whose stat
+    identity equals its extracted row's skip the read and hash: the row's format and SHA-256 stand in
+    for them, and the entry is marked ``_fast``. Every entry carries its stat identity as ``_stat``, taken
+    before the read, so a file that changes while it is read is recorded with the older identity and
+    is hashed again next run. ``ingest`` removes both private keys before it reports.
+    """
     entry = {"relative": relative, "disposition": None, "format": None}
     name, suffix = path.name, path.suffix.lower()
     if path.is_symlink() or not path.is_file():
         return {**entry, "disposition": "unsafe-path"}
-    size = path.stat(follow_symlinks=False).st_size
+    info = path.stat(follow_symlinks=False)
+    size = info.st_size
+    entry["_stat"] = _stat(info)
+    row = (trusted or {}).get(relative)
+    if (row is not None and row["state"] == "extracted" and row["ino"] is not None
+            and _stat(info) == tuple(row[k] for k in docs.STAT) and size > 0):
+        return {**entry, "format": row["format"], "bytes": size, "sha256": row["sha256"],
+                "disposition": "admit", "_fast": True}
     entry["bytes"] = size
     if ":" in name:
         # Windows alternate-data-stream sidecars (Zone.Identifier, DLP tags).
@@ -126,8 +146,11 @@ def _disposition(root, inbox, path, relative):
     return {**entry, "disposition": "admit"}
 
 
-def classify(root, inbox):
-    """Return one explicit disposition per inbox file; never writes the inbox."""
+def classify(root, inbox, trusted=None, keep_stat=False):
+    """Return one explicit disposition per inbox file; never writes the inbox.
+
+    ``ingest`` passes ``keep_stat`` to keep each entry's private ``_stat`` (and ``_fast``) fields.
+    """
     root, inbox = Path(root).resolve(), Path(inbox).resolve()
     if root == inbox or inbox in root.parents:
         raise IntakeError("instance_inside_inbox")
@@ -142,7 +165,11 @@ def classify(root, inbox):
         for name in [*files, *(n for n in names if (here / n).is_symlink())]:
             path = here / name
             relative = path.relative_to(inbox).as_posix()
-            entries.append(_disposition(root, inbox, path, relative))
+            entry = _disposition(root, inbox, path, relative, trusted)
+            if not keep_stat:
+                entry.pop("_stat", None)
+                entry.pop("_fast", None)
+            entries.append(entry)
     return sorted(entries, key=lambda e: e["relative"])
 
 
@@ -297,6 +324,67 @@ def _settled(root, inbox, entry, system, actor, heads=None):
             "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
 
 
+def _trusted_entry(entry, row, system):
+    """The report entry of an extracted document whose file still has the stat identity its row recorded.
+
+    Everything but the ledger-side facts is a function of the path and format; those come from the row.
+    The result equals what ``_process`` returns for the same unchanged document.
+    """
+    identity = submission(entry["relative"], system, entry["format"])
+    entry.update(submission_id=row["submission_id"], name=identity["name"], locator=identity["locator"],
+                 original=row["original"], receipt_id=row["receipt_id"], conflicts=row["conflicts"],
+                 received=True)
+    return {"outcome": "extracted", "rendition": row["rendition"], "rendition_sha256": row["rendition_sha256"]}
+
+
+FLUSH = 500  # documents whose rows are written (or confirmed) in one ledger open
+
+
+def _record(root, system, pending, heads):
+    """Write or refresh the ``docs`` rows of ``pending`` entries in one ledger open.
+
+    Each row is a function of the saved requests (``docs.derive``) plus the file's stat identity. The
+    identity is kept only when the file's hash equals the retained original's, so a changed file can
+    never be trusted by its old row. A row that already equals what would be written is left alone, so
+    replaying an unchanged inbox writes nothing. A ledger without the table is not migrated.
+    """
+    if not pending:
+        return
+    now = time.time()
+    with store.locked(root) as c:
+        if not docs.present(c):
+            return
+        saved = docs.load(c, system, [entry["relative"] for entry, _ in pending])
+        with c:
+            for entry, stat in pending:
+                if not entry.get("submission_id"):
+                    continue
+                suffix = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
+                sid = entry["submission_id"]
+                if c.execute("SELECT 1 FROM requests WHERE correlation_id=?", ("upload-" + sid,)).fetchone() is None:
+                    continue
+                row = saved.get(entry["relative"])
+                try:
+                    extract = heads.resolve(c, "extract-" + sid + suffix)
+                    register = heads.resolve(c, "register-" + sid + suffix)
+                    if row and row["submission_id"] == sid and row["suffix"] == suffix:
+                        derived = {k: row[k] for k in ("submission_id", "suffix", "receipt_id", "original", "sha256")}
+                        derived.update(extract_head=extract, register_head=register,
+                                       **docs.measure(c, sid, suffix, entry["format"], row["receipt_id"],
+                                                      extract, register))
+                    else:
+                        derived = docs.derive(c, sid, suffix, entry["format"], extract, register)
+                except IntakeError as error:
+                    if error.code != "ambiguous_correction":
+                        raise
+                    derived = docs.ambiguous(c, sid, suffix, entry["format"])
+                keep = stat if entry.get("sha256") == derived["sha256"] else None
+                wanted = {**derived, "format": entry["format"], **dict(zip(docs.STAT, keep or (None,) * 5))}
+                if row and all(row[k] == wanted[k] for k in (*docs.DERIVED, *docs.STAT)):
+                    continue
+                docs.upsert(c, system, entry["relative"], entry["format"], derived, keep, now)
+
+
 # Documents whose catalog registrations share one revision, per stage (the receipt, then the extraction
 # registration). 1 keeps the one-revision-per-registration path.
 BATCH_SIZE = 50
@@ -437,24 +525,44 @@ def _settled_batch(root, inbox, chunk, system, actor, heads):
     return results
 
 
-def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE):
+def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False):
     """Classify the inbox, then submit and extract admitted files; return the report.
 
     Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
     the extraction registration) each commit as one revision; ``batch_size=1`` commits every
     registration on its own. Each document's outcome is its own whichever way it is processed.
+
+    Every file is read and hashed, so a changed file is always found, unless ``trust_stat`` is set:
+    then an extracted document whose file still has the (device, inode, size, mtime, ctime) its
+    ``docs`` row recorded is reported from that row without being read, hashed or looked up in the
+    ledger. ``ctime`` moves on every write, so an in-place edit that restores size and mtime changes
+    it; a filesystem or copy tool that sets ctime back is outside what stat can show, which is why
+    this is opt-in. Without the ``docs`` table (or a recorded stat) nothing is trusted.
     """
     contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
-    entries = classify(root, inbox)
+    trusted = {}
+    if trust_stat:
+        with store.locked(root) as c:
+            trusted = docs.load(c, system)
+    entries = classify(root, inbox, trusted, True)
     admitted = [e for e in entries if e["disposition"] == "admit"]
     outcome = Counter({name: 0 for name in OUTCOMES})
     # One correction-chain index serves every entry, so following chains never rescans the ledger.
     heads = store.Heads()
+    # Private stat fields never reach the report: take them off every entry now.
+    seen = {e["relative"]: (e.pop("_stat", None), e.pop("_fast", False)) for e in entries}
     todo = admitted if limit is None else admitted[:limit]
     for entry in admitted[len(todo):]:
         entry["outcome"] = "not-processed"
         outcome["not-processed"] += 1
+    fast = [e for e in todo if seen[e["relative"]][1]]
+    for entry in fast:
+        entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
+        outcome["received"] += bool(entry.get("received"))
+        outcome[entry["outcome"]] += 1
+    todo = [e for e in todo if not seen[e["relative"]][1]]
     chunks = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)] if batch_size > 1 else [[e] for e in todo]
+    pending = []
     for chunk in chunks:
         if batch_size == 1:
             results = {chunk[0]["relative"]: _settled(root, inbox, chunk[0], system, actor, heads)}
@@ -464,6 +572,11 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE):
             entry.update(results[entry["relative"]])
             outcome["received"] += bool(entry.get("received"))
             outcome[entry["outcome"]] += 1
+            pending.append((entry, seen[entry["relative"]][0]))
+        if len(pending) >= FLUSH:
+            _record(root, system, pending, heads)
+            pending = []
+    _record(root, system, pending, heads)
     retried = [e for e in admitted if e.get("conflicts")]
     counts = {"files": len(entries),
               "disposition": dict(Counter(e["disposition"] for e in entries)),
@@ -1303,6 +1416,15 @@ def main(argv=None):
         help="Report (or with --apply correct) registrations blocked as changed-extraction-identity")
     recover.add_argument("--root", required=True, type=Path)
     recover.add_argument("--apply", action="store_true")
+    backfill = commands.add_parser(
+        "backfill-docs", allow_abbrev=False,
+        help="Report (or with --apply create) the derived docs table and its missing rows from the requests")
+    backfill.add_argument("--root", required=True, type=Path)
+    backfill.add_argument("--apply", action="store_true")
+    for name, text in (("audit-docs", "Recompute the docs table from the requests and report differences"),
+                       ("docs-status", "Count documents per state from the docs table")):
+        command = commands.add_parser(name, allow_abbrev=False, help=text)
+        command.add_argument("--root", required=True, type=Path)
     command = commands.add_parser("publish", allow_abbrev=False, help=publish.__doc__.split("\n")[0])
     command.add_argument("--root", required=True, type=Path)
     command.add_argument("--policy", required=True, dest="policy_path")
@@ -1319,6 +1441,9 @@ def main(argv=None):
             command.add_argument("--actor", required=True)
         if name == "ingest":
             command.add_argument("--limit", type=int)
+            command.add_argument("--trust-stat", action="store_true",
+                                 help="skip reading and hashing an extracted file whose stat identity "
+                                      "equals its docs row (default: every file is hashed)")
             command.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                                  help="documents whose catalog registrations share one revision "
                                       "(default %d; 1 commits each registration on its own)" % BATCH_SIZE)
@@ -1344,6 +1469,12 @@ def main(argv=None):
         if args.command == "recover-identity":
             print(json.dumps(recover_identity(args.root, apply=args.apply), sort_keys=True))
             return 0
+        if args.command in {"backfill-docs", "audit-docs", "docs-status"}:
+            root = args.root.resolve()
+            report = (docsync.backfill(root, apply=args.apply) if args.command == "backfill-docs"
+                      else docsync.audit(root) if args.command == "audit-docs" else docsync.status(root))
+            print(json.dumps(report, sort_keys=True))
+            return 0
         if args.command == "publish":
             report = publish(args.root, policy_path=args.policy_path, manifest=args.manifest,
                              index_path=args.index_path)
@@ -1362,7 +1493,7 @@ def main(argv=None):
                 inspected_form=args.inspected_form)
         elif args.command == "ingest":
             report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
-                            limit=args.limit, batch_size=args.batch_size)
+                            limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
         else:
             entries = classify(args.root, args.inbox)
             report = {"counts": {"files": len(entries),

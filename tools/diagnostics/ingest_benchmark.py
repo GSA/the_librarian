@@ -193,12 +193,12 @@ def bytes_read():
         return None
 
 
-def replay(cohort, root, inbox, files, repeats):
+def replay(cohort, root, inbox, files, repeats, trust_stat=False):
     """Re-ingest the unchanged inbox ``repeats`` times; report the median run and the report digest."""
     runs = []
     for _ in range(repeats):
         before, start, cpu = bytes_read(), time.perf_counter(), time.process_time()
-        report = cohort.ingest(root, inbox, system="bench", actor="bench")
+        report = cohort.ingest(root, inbox, system="bench", actor="bench", **({"trust_stat": True} if trust_stat else {}))
         wall, cpu, after = time.perf_counter() - start, time.process_time() - cpu, bytes_read()
         runs.append((wall, cpu, None if before is None else after - before, report))
     runs.sort(key=lambda run: run[0])
@@ -213,7 +213,7 @@ def replay(cohort, root, inbox, files, repeats):
     }
 
 
-def run_replay(size, work, repeats, padding, kind):
+def run_replay(size, work, repeats, padding, kind, trust_stat=False):
     """Build (or reuse) a fully ingested instance, then time replays of its unchanged inbox."""
     from tools.catalog import catalog_store as catalog
     from tools.intake import cohort, store
@@ -238,7 +238,10 @@ def run_replay(size, work, repeats, padding, kind):
         marker.write_text(json.dumps(wanted, sort_keys=True))
     inbox_bytes = sum(path.stat().st_size for path in inbox.rglob("*") if path.is_file())
     result = {"files": size, "reused": built, "inbox_bytes": inbox_bytes,
-              "replay": replay(cohort, root, inbox, size, repeats)}
+              "replay": replay(cohort, root, inbox, size, repeats, trust_stat)}
+    if hasattr(cohort, "docsync"):
+        start = time.perf_counter()
+        result["docs_status"] = {**cohort.docsync.status(root), "wall_s": round(time.perf_counter() - start, 4)}
     if result["replay"]["bytes_read"] is not None:
         result["replay"]["read_x_inbox"] = round(result["replay"]["bytes_read"] / inbox_bytes, 2)
     return result
@@ -284,6 +287,8 @@ def main(argv=None):
     parser.add_argument("--fixture", choices=("text", "mixed", "mime"), default="text",
                         help="with --replay: plain markdown (default), a third MIME HTML and Gemini-style "
                              "transcripts, or all MIME HTML")
+    parser.add_argument("--trust-stat", action="store_true",
+                        help="with --replay: replay with ingest(trust_stat=True) (Kata e22r; default hashes every file)")
     parser.add_argument("--reuse", type=Path,
                         help="with --replay, keep and reuse the instance and inbox under this directory")
     parser.add_argument("--label", default="")
@@ -297,10 +302,10 @@ def main(argv=None):
             if args.reuse:
                 work = args.reuse / str(size)
                 work.mkdir(parents=True, exist_ok=True)
-                results.append(run_replay(size, work, args.repeats, args.padding, args.fixture))
+                results.append(run_replay(size, work, args.repeats, args.padding, args.fixture, args.trust_stat))
             else:
                 with tempfile.TemporaryDirectory(dir=args.keep) as temp:
-                    results.append(run_replay(size, Path(temp), args.repeats, args.padding, args.fixture))
+                    results.append(run_replay(size, Path(temp), args.repeats, args.padding, args.fixture, args.trust_stat))
             print(json.dumps({"label": args.label, "partial": results[-1]}, sort_keys=True),
                   file=sys.stderr, flush=True)
             continue

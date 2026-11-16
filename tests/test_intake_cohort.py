@@ -541,7 +541,8 @@ class ReplayTests(CohortCase):
         with unittest.mock.patch.object(store, "locked", wraps=store.locked) as locked, \
                 unittest.mock.patch.object(store, "inspect", wraps=store.inspect) as inspected:
             cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", batch_size=1)
-        self.assertEqual(locked.call_count, 3 * admitted)
+        # Plus one open to confirm the docs rows (Kata e22r) for the whole inbox (500 entries per open).
+        self.assertEqual(locked.call_count, 3 * admitted + 1)
         inspected.assert_not_called()
 
     def test_batched_replay_opens_the_ledger_no_more_often_and_never_inspects(self):
