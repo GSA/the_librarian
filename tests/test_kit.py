@@ -7,7 +7,6 @@ import hashlib
 import io
 import importlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -133,7 +132,7 @@ class StoreIdentity(unittest.TestCase):
                 (events, 0x46524556, "Superseded FREV")):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                state = module.initialize(root)
+                module.initialize(root)
                 database = module.locations(root)[1]
                 with sqlite3.connect(database) as connection:
                     connection.execute(f"PRAGMA application_id={old}")
@@ -1431,7 +1430,7 @@ class WorkspaceTests(WorkspaceCase):
 
         # 1. Initialize instance + deeply nested intake_home (.local/queues/recovery/intake)
         run_in(kit, "tools/initialize.py")
-        intake_init = intake_store.initialize(kit)
+        intake_store.initialize(kit)
         self.assertTrue((kit / ".local/queues/recovery/intake/intake.sqlite3").is_file())
         self.assertEqual(stat.S_IMODE((kit / ".local/queues/recovery").stat().st_mode), 0o700)
 

@@ -13,7 +13,7 @@ import time
 from tools import policy
 from tools.file_identity import file_identity
 from . import docs
-from .contracts import IntakeError, LedgerBusy, canonical, decode, decode_request, digest, request_layout, request_shape, require
+from .contracts import IntakeError, LedgerBusy, decode, decode_request, digest, request_layout, request_shape, require
 
 APPLICATION_ID = 0x4C494E54
 SCHEMA = 1

@@ -8,7 +8,7 @@ page, text record, table and warning (Docling) or every extraction record and
 warning (text, transcript, ODT) of the exact rendition can qualify it.  Every other result stays a visible, unpublished
 outcome with explicit reasons.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 import os

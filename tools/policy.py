@@ -8,7 +8,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import stat
 import uuid
 
 

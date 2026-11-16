@@ -1,7 +1,6 @@
 """Include lightweight worker contracts in ordinary toolkit discovery."""
 import importlib.util
 from pathlib import Path
-import unittest
 
 
 def load_tests(loader, tests, pattern):

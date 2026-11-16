@@ -29,7 +29,7 @@ def timed(function, *args):
 
 def profile(catalog_size, ledger_size, samples, work):
     from tools.catalog import catalog_store as catalog
-    from tools.diagnostics.catalog_lock_benchmark import registration, seed
+    from tools.diagnostics.catalog_lock_benchmark import seed
     from tools.diagnostics.ledger_scale_benchmark import seed_uploads
     from tools.intake import store, upload
     root = work / "instance"

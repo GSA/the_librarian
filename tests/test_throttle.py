@@ -3,7 +3,6 @@ import json
 import threading
 import time
 import unittest
-from collections import Counter
 
 from tools.intake import model_review, throttle
 from tools.intake.model_review import TransportError

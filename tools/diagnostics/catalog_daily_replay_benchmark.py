@@ -195,7 +195,6 @@ def profile(args):
         # a third write whose request id repeats the first (idempotent retry) costs only the lookups
         rows.append({"first_of_day": first, "second_write": second})
         print(json.dumps(rows[-1], sort_keys=True), file=sys.stderr, flush=True)
-        db = cs.locations(root)[1]
         backups = sorted(p.stat().st_size for p in cs.locations(root)[2].glob("*.sqlite3"))
         shutil.rmtree(work)
     med = lambda key, part: round(statistics.median(r[part][key] for r in rows), 1)
@@ -302,7 +301,7 @@ def inspect_profile(args):
                     except Exception:
                         proc.join()
                         raise SystemExit(f"inspect sample failed: worker exited with code {proc.exitcode} "
-                                         "without a result (out of memory?)")
+                                         "without a result (out of memory?)") from None
         rows.append(row)
         proc.join()
     print(json.dumps({"seed": json.loads((Path(args.dir) / "seed.json").read_text()), "detail": args.detail,

@@ -170,7 +170,7 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
             raise IntakeError("ledger_unavailable") from error
         except sqlite3.DatabaseError as error:
             raise IntakeError("corrupt_store") from error
-        counts, overall, per_run = Counter(), Counter(), {name: Counter() for name in runs or {}}
+        counts, per_run = Counter(), {name: Counter() for name in runs or {}}
         latest = {name: None for name in per_run}
         newest = None
         recent, groups = Best(limit), {}
@@ -217,7 +217,7 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
                             latest[name] = updated
                 order = (-(updated or 0), correlation_id)
 
-                def build(row=row, layout=layout, correlation_id=correlation_id):
+                def build(row=row, correlation_id=correlation_id, stages_of=stages_of, attempts_of=attempts_of):
                     return candidate(row, stages_of[correlation_id], attempts_of)
                 recent.offer(order, build)
                 if state in ATTENTION:

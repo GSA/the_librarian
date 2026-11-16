@@ -1,5 +1,6 @@
 """Fixed native stage adapters; no executable request-defined callbacks."""
 from contextlib import closing, nullcontext
+from datetime import timedelta
 import errno
 import json
 from pathlib import Path
@@ -127,7 +128,7 @@ def _prepare(root, stage):
                 recorded = standing.datetime.now(standing.timezone.utc).replace(microsecond=0)
                 for predecessor in intent.get("supersedes", ()):
                     prior = standing.datetime.fromisoformat(snapshot().event(predecessor)["recorded_at"])
-                    recorded = max(recorded, prior.replace(microsecond=0) + standing.timedelta(seconds=1))
+                    recorded = max(recorded, prior.replace(microsecond=0) + timedelta(seconds=1))
                 intent["recorded_at"] = recorded.isoformat()
             return intent
         if operation == "standing-publish":
