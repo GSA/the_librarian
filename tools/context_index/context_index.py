@@ -20,7 +20,6 @@ from tools.context_index import renditions
 SCHEMA = 1
 APPLICATION_ID = 0x4C435458
 SUPERSEDED_APPLICATION_ID = 0x46435458
-AUDIENCE = policy.SETTINGS["audience"]
 NOTICE = (
     "Local retrieval for already-authorized local users only. This label is "
     "not access authorization, release permission, verification, or operational acceptance. "
@@ -721,14 +720,8 @@ def reference_definitions(text):
     return definitions
 
 
-def arguments(argv=None):
-    """Transitional lazy delegation to the command adapter."""
-    from tools.context_index.cli import arguments as parse
-    return parse(argv)
-
-
 def main(argv=None):
-    """Transitional lazy delegation to the command adapter."""
+    """Lazy delegation to the command adapter, which the MCP server runs as this module."""
     from tools.context_index.cli import main as run
     return run(argv)
 
