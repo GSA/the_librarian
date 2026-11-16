@@ -44,8 +44,9 @@ This section is the canonical setup and troubleshooting guide for development
 checkouts; [AGENTS.md](AGENTS.md) repeats only the essential commands.
 
 Every clone or Git worktree needs its own `.venv`; the main checkout's
-environment is not copied. Create the environment and install
-`./tools/context-mcp` as above before running tests. Reinstall when dependency
+environment is not copied. Create the environment and install the adapter
+editable (`.venv/bin/python -m pip install -e ./tools/context-mcp`) before running
+tests, so they import this checkout's adapter source. Reinstall when dependency
 declarations change. Tests use temporary workspaces, so development-only
 checkouts do not need store initialization or preflight.
 

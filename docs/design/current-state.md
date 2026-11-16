@@ -137,7 +137,11 @@ restated here.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
-  (`tests/test_mcp.py`). The runtime probe refuses, with a non-zero exit and an
+  (`tests/test_mcp.py`). The adapter never imports the toolkit as a package: it
+  runs the reader CLIs with `cwd=--root` and loads `tools/policy.py` and the
+  diagnostics writer by file path. The files it relies on are one set,
+  `the_librarian_mcp.config.TOOLKIT_FILES`, which the root's `release-files.json`
+  must contain (`tests/test_mcp.py::test_paths_are_derived_from_the_toolkit_root`). The runtime probe refuses, with a non-zero exit and an
   explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
   and missing FTS5, and reports the Python, SQLite and `mcp` versions and
   `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
@@ -507,7 +511,9 @@ before the last speedup. Reproduce with the tools in `tools/diagnostics/`
 `catalog_daily_replay_benchmark.py`, `ingest_benchmark.py`,
 `ledger_scale_benchmark.py`, `upload_planning_benchmark.py`,
 `ledger_verify_benchmark.py`, `progress_benchmark.py`, `catalog_contention_budget.py`). Use synthetic
-fixtures only.
+fixtures only. Each runs as a script and, through `tools/diagnostics/_harness.py`, imports `tools`
+from the checkout given by `--tree` (default: its own), so two revisions can be compared on the same
+fixtures.
 
 Evidence: `tests/test_catalog_delta_commit.py` (randomized and named equivalence
 with `validate_graph`, tamper classes, forged receipts, crash after commit,

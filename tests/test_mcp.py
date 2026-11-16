@@ -9,13 +9,12 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools/context-mcp/src"))
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from tests.support import clone_release
-from the_librarian_mcp.config import Config, parser
+from the_librarian_mcp.config import TOOLKIT_FILES, Config, parser
 
 
 class MCPConfig(unittest.TestCase):
@@ -25,6 +24,7 @@ class MCPConfig(unittest.TestCase):
         self.assertEqual(config.context_module, "tools.context_index.context_index")
         self.assertEqual(config.event_module, "tools.review_events.event_reader")
         self.assertEqual(config.diagnostics_path, ROOT / "tools/diagnostics/retrieval_log.py")
+        self.assertLessEqual(TOOLKIT_FILES, set(json.loads((ROOT / "release-files.json").read_text())))
 
     def test_incomplete_clone_missing_new_dependencies_is_rejected(self):
         for missing in ("tools/context_index/cli.py", "tools/catalog/contracts.py"):

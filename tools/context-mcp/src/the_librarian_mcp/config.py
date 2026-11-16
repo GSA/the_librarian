@@ -13,11 +13,33 @@ from . import audit
 AUDIT_DEFAULT = "derive-from-agent-label"
 
 
-def _load_policy(toolkit_root: Path):
-    path = toolkit_root / "tools/policy.py"
-    spec = importlib.util.spec_from_file_location("librarian_instance_policy", path)
+# The toolkit is not importable from this package's environment: the server runs its CLIs with
+# ``cwd=--root`` and loads the few modules it calls in-process by file path. Every file it relies on must
+# be listed in the root's release-files.json, so Config refuses a root whose manifest omits one.
+TOOLKIT_FILES = frozenset({
+    "release-files.json", "config/policy.json", "config/selection.json",
+    "tools/__init__.py",
+    "tools/policy.py",
+    "tools/context_index/__init__.py", "tools/context_index/context_index.py",
+    "tools/context_index/cli.py", "tools/context_index/compact_records.py",
+    "tools/context_index/renditions.py", "tools/context_index/qualification.py",
+    "tools/review_events/__init__.py", "tools/review_events/event_reader.py",
+    "tools/review_events/event_store.py", "tools/review_events/review_events.py",
+    "tools/review_events/review-event-v1.schema.json",
+    "tools/catalog/__init__.py", "tools/catalog/catalog_store.py",
+    "tools/catalog/contracts.py",
+    "tools/diagnostics/__init__.py", "tools/diagnostics/retrieval_log.py",
+    "tools/schemas/__init__.py", "tools/schemas/export_schemas.py",
+    "tools/schemas/catalog.sql", "tools/schemas/context-index.sql",
+    "tools/schemas/review-events.sql",
+})
+
+
+def load_toolkit_module(path: Path, name: str):
+    """Execute one toolkit file from the validated root without putting the toolkit on sys.path."""
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise ValueError(f"Policy module unavailable at {path}")
+        raise ValueError(f"Toolkit module unavailable at {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -52,23 +74,6 @@ class Config:
     def __post_init__(self):
         if not self.root.is_absolute() or not self.root.is_dir():
             raise ValueError("--root must be an absolute, existing instance directory")
-        mandatory = {
-            "release-files.json", "config/policy.json", "config/selection.json",
-            "tools/__init__.py",
-            "tools/policy.py",
-            "tools/context_index/__init__.py", "tools/context_index/context_index.py",
-            "tools/context_index/cli.py", "tools/context_index/compact_records.py",
-            "tools/context_index/renditions.py", "tools/context_index/qualification.py",
-            "tools/review_events/__init__.py", "tools/review_events/event_reader.py",
-            "tools/review_events/event_store.py", "tools/review_events/review_events.py",
-            "tools/review_events/review-event-v1.schema.json",
-            "tools/catalog/__init__.py", "tools/catalog/catalog_store.py",
-            "tools/catalog/contracts.py",
-            "tools/diagnostics/__init__.py", "tools/diagnostics/retrieval_log.py",
-            "tools/schemas/__init__.py", "tools/schemas/export_schemas.py",
-            "tools/schemas/catalog.sql", "tools/schemas/context-index.sql",
-            "tools/schemas/review-events.sql",
-        }
         try:
             manifest = json.loads((self.toolkit_root / "release-files.json").read_text())
         except (OSError, TypeError, ValueError):
@@ -78,7 +83,7 @@ class Config:
                 or len(manifest) != len(set(manifest))):
             raise ValueError("--root must identify a complete trusted toolkit clone")
         names = set(manifest)
-        if not mandatory <= names:
+        if not TOOLKIT_FILES <= names:
             raise ValueError("--root must identify a complete trusted toolkit clone")
         for name in names:
             if (not isinstance(name, str) or not name or "\\" in name
@@ -90,7 +95,7 @@ class Config:
                           for end in range(1, len(relative.parts) + 1)]
             if not path.is_file() or any(component.is_symlink() for component in components):
                 raise ValueError("--root must identify a complete trusted toolkit clone")
-        policy_mod = _load_policy(self.toolkit_root)
+        policy_mod = load_toolkit_module(self.toolkit_root / "tools/policy.py", "librarian_instance_policy")
         roots = policy_mod.validate_instance_roots(self.root)
         if self.manifest == Path("config/selection.json"):
             resolved_manifest = policy_mod.selection_path(self.root).relative_to(self.toolkit_root)
