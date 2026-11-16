@@ -647,7 +647,8 @@ Every read of the review-event history (`event_reader.read_snapshot`, `event_sto
 index. `qualify` did that about nine times per entry, so its serial toolkit cost grew about
 1.1 ms per prior event (Kata r71k, from efz3).
 
-- **Memo.** `event_store.inspect(..., reuse=True)` keeps the last validated result per
+- **Memo.** `event_history.inspect(..., reuse=True)` (`tools/review_events/event_history.py`,
+  which also holds the store's SQL and validation) keeps the last validated result per
   database file **in process memory** (never written to disk, at most eight files). It is
   reused only when the file's identity (device, inode, size, mtime_ns, ctime_ns, SQLite
   change counter, from `tools/file_identity.py`), the installed contract hash and the UTC
@@ -673,7 +674,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   removes those; below).
 - **Delta verification** (Kata m0tg). When the file's identity moved only the way SQLite's own
   commit moves it (same device and inode, not smaller, a new change counter) and the remembered
-  chain heads are still in the file, `event_store.view` verifies only the rows past them:
+  chain heads are still in the file, `event_history.view` verifies only the rows past them:
   their hash chain from the remembered head, batch chain and membership, payload hashes,
   the contract and the correction links (`validate_delta`, which checks the new events against
   the memoized `History` index through the `known`/`taken` hooks of `review_events.validate`),

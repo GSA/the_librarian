@@ -52,13 +52,13 @@ def main(argv=None):
     use_tree(args.tree)
     from tools import policy
     from tools.catalog import catalog_store as catalog
-    from tools.review_events import event_reader, event_store as events
+    from tools.review_events import event_history, event_reader, event_store as events
     if args.no_delta:
-        real = events.view
+        real = event_history.view
 
         def replaying(connection, root=None, *, reuse=False, full=False):
             return real(connection, root, reuse=reuse, full=True)
-        events.view = replaying
+        event_history.view = replaying
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         catalog.initialize(root)
@@ -71,7 +71,7 @@ def main(argv=None):
                 size = min(args.batch, count)
                 state = events.status(root)
                 items = [make(root, policy, total + k) for k in range(size)]
-                events.append(root, events.bundle(items), ACTOR, f"req-scale-{total}",
+                events.append(root, event_history.bundle(items), ACTOR, f"req-scale-{total}",
                               state["revision"], state["state_token"])
                 total, count = total + size, count - size
 
@@ -88,7 +88,7 @@ def main(argv=None):
                 spent["lookup_ms"] += time.perf_counter() - start
                 state = snapshot.state
                 start = time.perf_counter()
-                events.append(root, events.bundle([make(root, policy, total)]), ACTOR, f"req-scale-{total}",
+                events.append(root, event_history.bundle([make(root, policy, total)]), ACTOR, f"req-scale-{total}",
                               state["revision"], state["state_token"])
                 spent["append_ms"] += time.perf_counter() - start
                 total += 1

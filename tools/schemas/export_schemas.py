@@ -12,7 +12,7 @@ HOME = Path(__file__).resolve().parent
 ROOT = HOME.parents[1]
 SOURCES = {
     "catalog.sql": ("tools/catalog/catalog_store.py", "SQL", "VERSION"),
-    "review-events.sql": ("tools/review_events/event_store.py", "SQL", "VERSION"),
+    "review-events.sql": ("tools/review_events/event_history.py", "SQL", "VERSION"),
     "context-index.sql": ("tools/context_index/context_index.py", "DDL", "SCHEMA"),
     "intake.sql": ("tools/intake/store.py", "DDL", "SCHEMA"),
 }
@@ -32,7 +32,7 @@ def snapshot(source: Path, symbol: str, version_symbol: str) -> str:
         if source.name == "catalog_store.py":
             from tools.catalog import catalog_store as module
         else:
-            from tools.review_events import event_store as module
+            from tools.review_events import event_history as module
         ddl = module.schema_sql()
     else:
         application_id = values["APPLICATION_ID"]

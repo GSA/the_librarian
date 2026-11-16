@@ -21,6 +21,7 @@ import unittest
 from tests.support import WorkspaceCase, clone_release
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 
 CATALOG_USER_VERSION = "Unsupported catalog version"
@@ -57,7 +58,7 @@ def retag_catalog_contract(db):
 def retag_review_contract(db):
     edit(db, ("DROP TRIGGER immutable_metadata_update",),
          ("UPDATE metadata SET value=? WHERE key='contract_hash'", ("0" * 64,)),
-         (events.trigger_sql("metadata", "update"),))
+         (event_history.trigger_sql("metadata", "update"),))
 
 
 # name -> (store, tamper, expected refusal). "catalog"/"review" pick the store the marker lives in.
@@ -88,7 +89,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
                        reason="Populate the synthetic catalog")
         pending = WorkspaceCase.pending(type("Stub", (), {"root": root})())
         review = events.status(root)
-        events.append(root, events.bundle([pending]), "test-runner", "req-populate",
+        events.append(root, event_history.bundle([pending]), "test-runner", "req-populate",
                       review["revision"], review["state_token"])
         self.assertEqual((catalog.status(root)["revision"], events.status(root)["events"]), (1, 1))
         self.pending = pending
@@ -119,7 +120,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
         submission.write_text(json.dumps({"records": [
             {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}}]}))
         bundle = aux / "bundle.json"
-        bundle.write_text(json.dumps(events.bundle([dict(self.pending, event_id="rev-second")])))
+        bundle.write_text(json.dumps(event_history.bundle([dict(self.pending, event_id="rev-second")])))
         module = {"catalog": "tools.catalog.catalog_store", "review": "tools.review_events.event_store"}[store]
         yield ("initialize", ("tools/initialize.py",))
         yield ("initialize --recover-migration", ("tools/initialize.py", "--recover-migration"))

@@ -93,6 +93,7 @@
   "tools/extraction/extract.py",
   "tools/extraction/mhtml.py",
   "tools/review_events/__init__.py",
+  "tools/review_events/event_history.py",
   "tools/review_events/event_reader.py",
   "tools/review_events/event_store.py",
   "tools/review_events/review_events.py",

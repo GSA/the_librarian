@@ -131,10 +131,10 @@ def build(root, count):
 
 def seed_events(root, rows):
     """Append ``rows`` in batches of ``BATCH`` events, as ``event_store.append`` stores them."""
-    from tools.review_events import event_store as events
+    from tools.review_events import event_history, event_store as events
     home, db, _ = events.locations(root)
     with closing(events.connect(db, write=True)) as connection:
-        state, _ = events.inspect(connection, root)
+        state, _ = event_history.inspect(connection, root)
         connection.execute("BEGIN IMMEDIATE")
         revision, sequence, previous = state["revision"], state["events"], state["head_hash"]
         batch_previous = state["batch_head_hash"]
@@ -142,16 +142,16 @@ def seed_events(root, rows):
             incoming = rows[start:start + BATCH]
             revision += 1
             batch = {"revision": revision, "request_id": f"req-bench-{revision}", "actor": REVIEWER,
-                     "committed_at": events.now(), "input_hash": events.fingerprint(incoming),
+                     "committed_at": events.now(), "input_hash": event_history.fingerprint(incoming),
                      "event_count": len(incoming), "previous_hash": batch_previous}
-            batch["batch_hash"] = batch_previous = events.fingerprint(batch)
+            batch["batch_hash"] = batch_previous = event_history.fingerprint(batch)
             connection.execute("INSERT INTO batches VALUES (?,?,?,?,?,?,?,?)", tuple(batch.values()))
             for event in incoming:
                 sequence += 1
                 row = {"sequence": sequence, "event_id": event["event_id"], "revision": revision,
-                       "origin_key": None, "payload": events.canonical(event),
-                       "payload_hash": events.fingerprint(event), "previous_hash": previous}
-                row["entry_hash"] = previous = events.fingerprint(row)
+                       "origin_key": None, "payload": event_history.canonical(event),
+                       "payload_hash": event_history.fingerprint(event), "previous_hash": previous}
+                row["entry_hash"] = previous = event_history.fingerprint(row)
                 connection.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", tuple(row.values()))
         connection.execute("COMMIT")
     events.seal(db)

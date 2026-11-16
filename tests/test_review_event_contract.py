@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 from tests.support import WorkspaceCase, clone_release
 from tools.review_events import event_reader
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
 
@@ -48,7 +49,7 @@ class ReviewEventContractRefusal(unittest.TestCase):
         with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
             connection.execute("DROP TRIGGER immutable_metadata_update")
             connection.execute("UPDATE metadata SET value=? WHERE key='contract_hash'", (value,))
-            connection.execute(events.trigger_sql("metadata", "update"))
+            connection.execute(event_history.trigger_sql("metadata", "update"))
         if keep_identity:
             os.utime(self.db, ns=(before.st_atime_ns, before.st_mtime_ns))
             after = self.db.stat()
@@ -65,7 +66,7 @@ class ReviewEventContractRefusal(unittest.TestCase):
         with self.assertRaisesRegex(contract.ReviewError, REFUSAL):
             events.backup(self.root)
         with self.assertRaisesRegex(contract.ReviewError, REFUSAL):
-            events.append(self.root, events.bundle([self.pending()]), "test-runner", "req-refused",
+            events.append(self.root, event_history.bundle([self.pending()]), "test-runner", "req-refused",
                           self.state["revision"], self.state["state_token"])
         self.assertEqual(digest(self.db), before)
         for command in ("status", "audit") if cli else ():
@@ -97,13 +98,13 @@ class ReviewEventContractRefusal(unittest.TestCase):
         self.assertEqual(event_reader.read_snapshot(self.root).query()["records"], [])
 
     def test_matching_contract_is_accepted_before_and_after_a_populated_append(self):
-        events.append(self.root, events.bundle([self.pending()]), "test-runner", "req-first",
+        events.append(self.root, event_history.bundle([self.pending()]), "test-runner", "req-first",
                       self.state["revision"], self.state["state_token"])
         self.assertEqual(events.status(self.root)["events"], 1)
         self.assertEqual(len(event_reader.read_snapshot(self.root).query()["records"]), 1)
 
     def test_changed_stored_contract_hash_requires_explicit_migration(self):
-        events.append(self.root, events.bundle([self.pending()]), "test-runner", "req-first",
+        events.append(self.root, event_history.bundle([self.pending()]), "test-runner", "req-first",
                       self.state["revision"], self.state["state_token"])
         self.state = events.status(self.root)  # warm any per-process validation before the edit
         self.assertEqual(self.state["events"], 1)
@@ -125,7 +126,7 @@ class ReviewEventContractRefusal(unittest.TestCase):
         with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
             connection.execute("DROP TRIGGER immutable_metadata_delete")
             connection.execute("DELETE FROM metadata WHERE key='contract_hash'")
-            connection.execute(events.trigger_sql("metadata", "delete"))
+            connection.execute(event_history.trigger_sql("metadata", "delete"))
         with self.assertRaisesRegex(contract.ReviewError, "Invalid store metadata"):
             events.status(self.root)
 

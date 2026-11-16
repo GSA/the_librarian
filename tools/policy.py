@@ -561,7 +561,7 @@ def logical_corpus_root(root):
 def migrate_storage(root, *, interrupt_after=None, interrupt_before_journal=None):
     """Transactionally relocate configured storage roots within an instance."""
     from tools.catalog import catalog_store as catalog
-    from tools.review_events import event_store as events
+    from tools.review_events import event_history, event_store as events
 
     instance_root = _no_symlinks(root)
     migration_path = instance_root / MIGRATION_FILE
@@ -587,7 +587,7 @@ def migrate_storage(root, *, interrupt_after=None, interrupt_before_journal=None
     with closing(catalog.connect(cat_db)) as conn:
         cat_state = catalog.inspect(conn, detail=False)[0]
     with closing(events.connect(rev_db)) as conn:
-        rev_state = events.inspect(conn, instance_root)[0]
+        rev_state = event_history.inspect(conn, instance_root)[0]
     if (cat_state["store_id"] != instance["catalog_store_id"]
             or rev_state["store_id"] != instance["review_store_id"]):
         raise ValueError("Cross-instance or substituted authority store detected before migration")
@@ -654,7 +654,7 @@ def migrate_storage(root, *, interrupt_after=None, interrupt_before_journal=None
 def recover_migration(root):
     """Roll back an interrupted storage migration and verify authority store lineage."""
     from tools.catalog import catalog_store as catalog
-    from tools.review_events import event_store as events
+    from tools.review_events import event_history, event_store as events
 
     instance_root = _no_symlinks(root)
     migration_path = instance_root / MIGRATION_FILE
@@ -688,7 +688,7 @@ def recover_migration(root):
     with closing(catalog.connect(cat_db)) as conn:
         cat_state = catalog.inspect(conn, detail=False)[0]
     with closing(events.connect(rev_db)) as conn:
-        rev_state = events.inspect(conn, instance_root)[0]
+        rev_state = event_history.inspect(conn, instance_root)[0]
     if (cat_state["state_token"] != journal["catalog_state_token"]
             or rev_state["state_token"] != journal["review_state_token"]):
         raise ValueError("Recovered store state does not match pre-migration journal")

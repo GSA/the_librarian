@@ -11,7 +11,7 @@ from zipfile import BadZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_reader
-from tools.review_events import event_store as events
+from tools.review_events import event_history, event_store as events
 from tools.extraction import docling_adapter as docling
 from tools.extraction import extract
 from tools.context_index import context_index as index
@@ -203,7 +203,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             event = standing.review_event(result, review_args,
                                           standing.datetime.fromisoformat(intent["recorded_at"]))
             state = snapshot().state
-            committed = events.append(root, events.bundle([event]), result["reviewer"], args["request_id"],
+            committed = events.append(root, event_history.bundle([event]), result["reviewer"], args["request_id"],
                                       state["revision"], state["state_token"])
             if standing.bound_event(root, result, review_args) is None:
                 raise StageFailure("blocked", "review-event-mismatch")
@@ -278,7 +278,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             result = events.append(root, **args)
             # The current store revision is not the original request revision.
             with events.writer_lock(events.locations(root)[0]), closing(events.connect(events.locations(root)[1])) as c:
-                events.inspect(c, root, reuse=True)
+                event_history.inspect(c, root, reuse=True)
                 batch = c.execute("SELECT revision FROM batches WHERE request_id=?", (args["request_id"],)).fetchone()
                 revision = batch[0]
             return {"boundary": "review-committed", "committed_revision": revision,
