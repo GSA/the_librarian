@@ -17,7 +17,7 @@ import sys
 import unicodedata
 import uuid
 
-from tools import backups as snapshots, policy
+from tools import backups as snapshots, durable, policy
 from tools.file_identity import KeyedConnection, file_identity, file_key
 from tools.catalog.contracts import (
     AUDIENCES, COVERAGES, KINDS, CatalogError, ConflictingWrite, MissingRecord, StaleState, WriterBusy, canonical, choice, exact, fingerprint, hash_value, identifier,
@@ -134,25 +134,16 @@ def locations(root, *, allow_missing=False):
 
 
 def fsync_directory(path):
-    descriptor = os.open(safe_path(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    durable.fsync_directory(safe_path(path))
 
 
 def seal(path):
-    descriptor = os.open(safe_path(path), os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    durable.fsync_file(safe_path(path))
     fsync_directory(path.parent)
 
 
 def reserve(path):
-    descriptor = os.open(safe_path(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    os.close(descriptor)
+    durable.reserve(safe_path(path))
 
 
 # Seconds a writer waits for another process's catalog lock before WriterBusy.
@@ -502,12 +493,7 @@ def inspect(connection, detail=True):
 
 
 def file_hash(path):
-    digest = hashlib.sha256()
-    descriptor = os.open(private_file(path), os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return durable.sha256_file(private_file(path))
 
 
 def _daily_snapshot(root, connection, backups, state, inspected=False):
@@ -591,11 +577,7 @@ def _snapshot_in_transaction(connection, backups, reason, image=False, inspected
         os.link(partial, final, follow_symlinks=False)
         partial.unlink()
         fsync_directory(backups)
-        descriptor = os.open(safe_path(receipt), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(canonical(record) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        durable.write_new_private(safe_path(receipt), (canonical(record) + "\n").encode("utf-8"))
         fsync_directory(backups)
         return {"snapshot": str(final), "receipt": str(receipt), "sha256": record["sha256"], "state": state}
     finally:

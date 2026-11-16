@@ -15,6 +15,8 @@ import sqlite3
 import stat
 import sys
 
+from tools.durable import fsync_directory
+
 DEFAULT_RETENTION_DAYS = 7
 RECEIPT_FIELDS = {"backup_version", "created_at", "reason", "database", "sha256", "bytes", "state"}
 MAX_RECEIPT_BYTES = 1_000_000
@@ -45,14 +47,6 @@ def _regular(path):
         return stat.S_ISREG(os.lstat(path).st_mode)
     except OSError:
         return False
-
-
-def _fsync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 class Entry:
@@ -224,7 +218,7 @@ def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, 
                 if path is not None and _regular(path):
                     os.unlink(path)
     if apply and doomed:
-        _fsync_directory(backups)
+        fsync_directory(backups)
     gone = {e.stem for e in doomed}
     remaining = [e for e in entries if e.stem not in gone]
     report.update(applied=bool(apply), kept=len(remaining), deleted=len(doomed), bytes_freed=freed,

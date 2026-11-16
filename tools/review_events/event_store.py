@@ -14,7 +14,8 @@ import sys
 import threading
 import uuid
 
-from tools import backups as snapshots
+from tools import backups as snapshots, durable
+from tools.durable import fsync_directory
 from tools.file_identity import KeyedConnection, file_identity, file_key
 from tools.review_events import review_events as contract
 
@@ -59,11 +60,7 @@ def fingerprint(value):
 
 
 def file_hash(path):
-    digest = hashlib.sha256()
-    with contract.safe_path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return durable.sha256_file(contract.safe_path(path))
 
 
 def now():
@@ -96,14 +93,6 @@ def validate_history(events, root=None):
 
 def origin_key(event):
     return None
-
-
-def fsync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def private_directory(path):
@@ -177,13 +166,11 @@ def connect(path, write=False):
 
 
 def reserve(path):
-    descriptor = os.open(contract.safe_path(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    os.close(descriptor)
+    durable.reserve(contract.safe_path(path))
 
 
 def seal(path):
-    with path.open("rb") as stream:
-        os.fsync(stream.fileno())
+    durable.fsync_file(path)
     fsync_directory(path.parent)
 
 
@@ -543,11 +530,7 @@ def snapshot(connection, backups, reason, root=None):
                   "sha256": digest, "bytes": temporary.stat().st_size, "state": state}
         os.replace(temporary, final)
         fsync_directory(backups)
-        descriptor = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(canonical(record) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        durable.write_new_private(receipt, (canonical(record) + "\n").encode("utf-8"))
         fsync_directory(backups)
         return {"snapshot": str(final), "receipt": str(receipt), "revision": state["revision"]}
     finally:
