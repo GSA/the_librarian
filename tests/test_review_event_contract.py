@@ -186,5 +186,13 @@ class ReviewEventContractRefusal(unittest.TestCase):
         self.assertNotEqual(events.status(self.root)["contract_hash"], self.state["contract_hash"])
 
 
+    def test_cli_refuses_abbreviated_options(self):
+        for argv in (["--root", str(self.root), "--max-c", "60000", "status"],
+                     ["--root", str(self.root), "restore", str(self.db), "--expected", "x"]):
+            with self.subTest(argv=argv), patch("sys.stderr"), self.assertRaises(SystemExit) as raised:
+                events.main(argv)
+            self.assertEqual(raised.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -352,24 +352,24 @@ def status(root, event_id=None, audit=False):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--root", type=Path, default=contract.ROOT)
     parser.add_argument("--max-chars", type=int, default=60000)
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "status", "audit", "backup", "schema"):
-        sub.add_parser(name)
-    get = sub.add_parser("get")
+        sub.add_parser(name, allow_abbrev=False)
+    get = sub.add_parser("get", allow_abbrev=False)
     get.add_argument("event_id")
-    command = sub.add_parser("append")
+    command = sub.add_parser("append", allow_abbrev=False)
     command.add_argument("input", type=Path)
     command.add_argument("--actor", required=True)
     command.add_argument("--request-id", required=True)
     command.add_argument("--expected-revision", required=True, type=int)
     command.add_argument("--expected-state", required=True)
-    command = sub.add_parser("restore")
+    command = sub.add_parser("restore", allow_abbrev=False)
     command.add_argument("snapshot", type=Path)
     command.add_argument("--expected-state")
-    command = sub.add_parser("verify-backup")
+    command = sub.add_parser("verify-backup", allow_abbrev=False)
     command.add_argument("snapshot", type=Path)
     args = parser.parse_args(argv)
     try:
