@@ -62,7 +62,8 @@ named stage. The ledger is operational recovery state, never corpus authority.
   atomically replacing the destination; a raising guard preserves the prior
   index. Inspection reports current availability separately from historical
   completion, including when a published index later becomes unreadable.
-- Standing-policy stages (`tools/intake/standing.py`) pin a private (0600)
+- Standing-policy stages (`tools/intake/standing.py`; the review event they record and bind is
+  in `standing_events.py`, the selection and manifest write in `standing_publication.py`) pin a private (0600)
   `standing-policy-v1` file by SHA-256 (id, version, active/revoked status,
   reviewer, receipt/audience scope, page/record/findings budgets, selection
   context) and an attributed `standing-findings-v2` (or legacy `-v1`) record for one exact
@@ -280,6 +281,8 @@ counts rather than third digits.
 they never stage, run, replay, repair or initialize anything, and a missing,
 locked, public or corrupt ledger, catalog, review-event store or index is
 reported as that source being unavailable with its error class, never a crash.
+`tools/intake/progress.py` reads the sources into one report, `progress_render.py`
+renders it as text or HTML and `progress_serve.py` serves it.
 
 ```sh
 .venv/bin/python -m tools.intake.cli --root . progress [--format text] [--run bulk=upload-bulk-]
@@ -330,9 +333,10 @@ reported as that source being unavailable with its error class, never a crash.
   operation, status, funnel state and last attempt outcome/category/code and
   times only; request arguments, intents, evidence and document text are never
   read into the report. `--run NAME=PREFIX` groups correlation IDs by prefix.
-- `progress-serve` serves `/` (HTML, `meta refresh`, no scripts or external
-  assets) and `/progress.json`, GET/HEAD only, with `Cache-Control: no-store`
-  and a deny-all CSP. It binds `127.0.0.1` by default, rejects non-loopback
+- `progress-serve` serves `/` (HTML, `meta refresh`, no external assets, and
+  one inline script that shows times in local time) and `/progress.json`,
+  GET/HEAD only, with `Cache-Control: no-store` and a `default-src 'none'` CSP
+  that allows only that script by its SHA-256 hash. It binds `127.0.0.1` by default, rejects non-loopback
   `Host` headers, and refuses any non-loopback `--host` with
   `non_loopback_bind` unless `--allow-non-loopback` records explicit approval.
 
@@ -586,4 +590,4 @@ writing, as with `recover-conflicts`.
 Model calls made by `qualify` and `model_review evaluate` are recorded body-free (model and token
 counts only, never prompts, documents or replies) as one session file per run in
 `$AGENTSVIEW_DIRECT_API_DIR`, default `~/.agentsview/direct-api`, for AgentsView's Direct API agent.
-A failure to write them never affects the run.
+A failure to write them never affects the run; it prints one stderr line naming only the exception type.

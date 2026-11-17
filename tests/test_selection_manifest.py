@@ -10,7 +10,7 @@ from tools import policy
 from tools.context_index import context_index as index
 from tools.context_index import renditions
 from tools.intake import selection_manifest as manifest
-from tools.intake import standing
+from tools.intake import standing, standing_publication
 
 NAME = "config/selection.json"
 CONTEXT = ["documents/context.md"]
@@ -45,7 +45,7 @@ class ManifestCase(unittest.TestCase):
         return (json.dumps(raw, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
 
     def add(self, item):
-        return standing.write_manifest(self.root, NAME, item)
+        return standing_publication.write_manifest(self.root, NAME, item)
 
     def disk(self):
         return json.loads(self.path.read_text())["renditions"]
@@ -91,7 +91,7 @@ class AppendEquivalence(ManifestCase):
     def test_capacity_is_refused_from_the_view(self):
         self.write([entry(1), entry(2)])
         small = type("R", (), {**vars(renditions), "MAX_SELECTIONS": 2})
-        with patch.object(standing, "renditions", small):
+        with patch.object(standing_publication, "renditions", small):
             with self.assertRaises(standing.Refusal) as caught:
                 self.add(entry(3))
         self.assertEqual(caught.exception.code, "selection-capacity")

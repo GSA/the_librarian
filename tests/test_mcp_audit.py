@@ -13,7 +13,6 @@ import unittest
 import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools/context-mcp/src"))
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client

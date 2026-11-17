@@ -6,7 +6,7 @@ extractions, one standing-authorized review event each, and the manifest, all wr
 large sizes build quickly) and times, in a fresh process per size: ``load_manifest`` (selection
 validation), ``renditions.inputs`` (one call, the dominant per-publish cost) and the first and the
 unchanged ``cohort.publish`` (the second one reuses the saved publication) and, last, one
-``standing.write_manifest`` select (the whole-manifest rewrite every selection pays). Reports body-free JSON,
+``standing_publication.write_manifest`` select (the whole-manifest rewrite every selection pays). Reports body-free JSON,
 including how many times ``renditions.inputs`` ran per publish and the engine's peak RSS. Synthetic
 fixtures only; never point it at a real instance.
 
@@ -16,9 +16,7 @@ import argparse
 from contextlib import closing
 import hashlib
 import json
-import os
 from pathlib import Path
-import resource
 import subprocess
 import sys
 import tempfile
@@ -133,10 +131,10 @@ def build(root, count):
 
 def seed_events(root, rows):
     """Append ``rows`` in batches of ``BATCH`` events, as ``event_store.append`` stores them."""
-    from tools.review_events import event_store as events
+    from tools.review_events import event_history, event_store as events
     home, db, _ = events.locations(root)
     with closing(events.connect(db, write=True)) as connection:
-        state, _ = events.inspect(connection, root)
+        state, _ = event_history.inspect(connection, root)
         connection.execute("BEGIN IMMEDIATE")
         revision, sequence, previous = state["revision"], state["events"], state["head_hash"]
         batch_previous = state["batch_head_hash"]
@@ -144,16 +142,16 @@ def seed_events(root, rows):
             incoming = rows[start:start + BATCH]
             revision += 1
             batch = {"revision": revision, "request_id": f"req-bench-{revision}", "actor": REVIEWER,
-                     "committed_at": events.now(), "input_hash": events.fingerprint(incoming),
+                     "committed_at": events.now(), "input_hash": event_history.fingerprint(incoming),
                      "event_count": len(incoming), "previous_hash": batch_previous}
-            batch["batch_hash"] = batch_previous = events.fingerprint(batch)
+            batch["batch_hash"] = batch_previous = event_history.fingerprint(batch)
             connection.execute("INSERT INTO batches VALUES (?,?,?,?,?,?,?,?)", tuple(batch.values()))
             for event in incoming:
                 sequence += 1
                 row = {"sequence": sequence, "event_id": event["event_id"], "revision": revision,
-                       "origin_key": None, "payload": events.canonical(event),
-                       "payload_hash": events.fingerprint(event), "previous_hash": previous}
-                row["entry_hash"] = previous = events.fingerprint(row)
+                       "origin_key": None, "payload": event_history.canonical(event),
+                       "payload_hash": event_history.fingerprint(event), "previous_hash": previous}
+                row["entry_hash"] = previous = event_history.fingerprint(row)
                 connection.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", tuple(row.values()))
         connection.execute("COMMIT")
     events.seal(db)
@@ -185,12 +183,12 @@ out["published"] = report["counts"]["published"]
 calls[0] = 0
 out["republish_s"], again = timed(lambda: cohort.publish(root, policy_path=policy_path, manifest=manifest))
 out["republish_inputs_calls"] = calls[0]
-from tools.intake import standing
+from tools.intake import standing, standing_publication
 last = dict(config["renditions"][-1])
 last["path"] = last["path"].rsplit("/", 2)[0] + "/" + "f" * 64 + "/extraction.json"
 start = time.perf_counter()
 try:
-    standing.write_manifest(root, manifest, last)
+    standing_publication.write_manifest(root, manifest, last)
     out["select_write_s"] = round(time.perf_counter() - start, 3)
 except standing.Refusal as refusal:
     out["select_write_s"] = refusal.code  # the manifest is already at the cap
@@ -207,7 +205,9 @@ def main(argv=None):
     parser.add_argument("--sizes", default="5000,10000,15000")
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    tree = args.tree.resolve()
+    from _harness import use_tree
+    use_tree(Path(__file__).resolve().parents[2])
     for size in (int(n) for n in args.sizes.split(",")):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "instance"
@@ -215,7 +215,7 @@ def main(argv=None):
             start = time.perf_counter()
             build(root, size)
             built = time.perf_counter() - start
-            done = subprocess.run([sys.executable, "-c", CHILD, str(args.tree.resolve()), str(root), POLICY, MANIFEST],
+            done = subprocess.run([sys.executable, "-c", CHILD, str(tree), str(root), POLICY, MANIFEST],
                                   capture_output=True, text=True)
             if done.returncode:
                 sys.exit(done.stderr[-2000:])

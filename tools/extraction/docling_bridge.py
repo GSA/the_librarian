@@ -13,6 +13,8 @@ from tools import policy
 from tools.catalog import catalog_store as catalog
 
 
+# Docling (PDF/image) source cap; equals docling_worker.LIMITS["source_bytes"] (pinned by tests).
+# Larger than extract.MAX_SOURCE because conversion runs in the rlimited worker, not this process.
 MAX_SOURCE = 64 * 1024 * 1024
 LOADED_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 POLICY_CODE_SHA256 = hashlib.sha256(Path(policy.__file__).read_bytes()).hexdigest()

@@ -9,10 +9,12 @@ import sys
 
 from tools import policy
 from tools.context_index.context_index import (
-    IndexError_, build, compact_packet, count_index, engine_fingerprint, envelope,
-    fail, freshness, load_catalog, load_compaction, load_manifest, no_symlinks,
-    packet, packet_many, publication_lock, readonly, render_result, search,
-    validate_db_path, validate_many_limits,
+    IndexError_, build, count_index, engine_fingerprint, envelope, fail, freshness,
+    load_catalog, load_compaction, load_manifest, no_symlinks, publication_lock, readonly,
+    search, validate_db_path,
+)
+from tools.context_index.packets import (
+    compact_packet, packet, packet_many, render_result, validate_many_limits,
 )
 
 

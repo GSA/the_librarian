@@ -17,9 +17,7 @@ Synthetic fixtures only; never point it at a real instance.
 import argparse
 from contextlib import closing
 import json
-import os
 from pathlib import Path
-import resource
 import sqlite3
 import subprocess
 import sys
@@ -103,7 +101,8 @@ def main(argv=None):
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
     tree = args.tree.resolve()
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from _harness import use_tree
+    use_tree(Path(__file__).resolve().parents[2])
     for size in (int(n) for n in args.requests.split(",")):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "instance"

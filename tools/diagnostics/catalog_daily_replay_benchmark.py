@@ -26,20 +26,12 @@ waiting is needed. Synthetic fixtures only; never point it at a real instance.
 import argparse
 import json
 import multiprocessing
-import os
 from pathlib import Path
 import shutil
 import statistics
 import sys
 import time
 from datetime import timedelta
-
-
-def _tree(args):
-    tree = str(args.tree.resolve())
-    sys.path.insert(0, tree)
-    os.chdir(tree)
-    return tree
 
 
 def shift_clock(days=1):
@@ -87,6 +79,7 @@ def caller(depth=2):
 
 def instrument(cs, snapshots, marks):
     """Time the phases of one ``submit``; calls are appended to ``marks['calls']`` as (name, label, seconds)."""
+    from tools.catalog import backups as catalog_backups
     saved = []
 
     def wrap(module, name, label=None):
@@ -102,10 +95,11 @@ def instrument(cs, snapshots, marks):
         saved.append((module, name, original))
         setattr(module, name, timed)
 
-    for name in ("inspect", "file_hash", "_binding", "validate_delta", "_attest_commit", "seal", "verify_backup",
-                 "_snapshot_in_transaction", "_daily_snapshot", "_trusted_state"):
-        if hasattr(cs, name):
-            wrap(cs, name)
+    for module in (cs, catalog_backups):
+        for name in ("inspect", "file_hash", "_binding", "validate_delta", "_attest_commit", "seal", "verify_backup",
+                     "_snapshot_in_transaction", "_daily_snapshot", "_trusted_state"):
+            if hasattr(module, name):
+                wrap(module, name)
     for name in ("prune", "has_snapshot_today", "_fresh_ok", "scan"):
         wrap(snapshots, name, "backups." + name)
     original_lock = cs.writer_lock
@@ -195,7 +189,6 @@ def profile(args):
         # a third write whose request id repeats the first (idempotent retry) costs only the lookups
         rows.append({"first_of_day": first, "second_write": second})
         print(json.dumps(rows[-1], sort_keys=True), file=sys.stderr, flush=True)
-        db = cs.locations(root)[1]
         backups = sorted(p.stat().st_size for p in cs.locations(root)[2].glob("*.sqlite3"))
         shutil.rmtree(work)
     med = lambda key, part: round(statistics.median(r[part][key] for r in rows), 1)
@@ -211,8 +204,8 @@ def db_size(meta):
 
 
 def writer(tree, root, number, delay, count, start_at, queue):
-    sys.path.insert(0, tree)
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(tree)
     shift_clock()
     from tools.catalog import catalog_store as cs
     from tools.diagnostics.catalog_lock_benchmark import registration
@@ -266,8 +259,8 @@ def contend(args):
 
 
 def _inspect_once(tree, db, detail, queue):
-    sys.path.insert(0, tree)
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(tree)
     import resource
     from contextlib import closing
     from tools.catalog import catalog_store as cs
@@ -302,7 +295,7 @@ def inspect_profile(args):
                     except Exception:
                         proc.join()
                         raise SystemExit(f"inspect sample failed: worker exited with code {proc.exitcode} "
-                                         "without a result (out of memory?)")
+                                         "without a result (out of memory?)") from None
         rows.append(row)
         proc.join()
     print(json.dumps({"seed": json.loads((Path(args.dir) / "seed.json").read_text()), "detail": args.detail,
@@ -324,7 +317,8 @@ def main(argv=None):
     commands.choices["contend"].add_argument("--writers", type=int, default=3)
     commands.choices["contend"].add_argument("--per-writer", type=int, default=3)
     args = parser.parse_args(argv)
-    _tree(args)
+    from _harness import use_tree
+    args.tree = Path(use_tree(args.tree))
     if args.command == "seed":
         seed(args.dir, args.size)
     elif args.command == "profile":

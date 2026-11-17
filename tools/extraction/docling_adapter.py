@@ -13,7 +13,6 @@ import threading
 import stat
 import subprocess
 import tempfile
-import time
 import uuid
 
 from tools.extraction import docling_bridge as bridge
@@ -23,9 +22,12 @@ LOADED_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 VERSION = 1
 HOME = Path("data/extractions/.local")
 WORKER = Path(__file__).with_name("docling_worker.py")
+# Mirrors of docling_worker.LIMITS (result_bytes, diagnostic_bytes, wall_seconds). The worker
+# runs in its own interpreter and is not imported here, so tests/test_docling.py pins equality.
 MAX_RESULT = 64 * 1024 * 1024
 MAX_DIAGNOSTIC = 64 * 1024
 WALL_SECONDS = 600
+MAX_WORKER_CODE = 2 * 1024 * 1024
 TERM_GRACE_SECONDS = 2
 BOUNDARY = ("Machine OCR/layout rendition only; not review, indexing, retrieval selection, "
             "independent evidence or publication authorization.")
@@ -148,9 +150,9 @@ def _worker_snapshot():
         opened = os.fstat(stream.fileno())
         require((before.st_dev, before.st_ino) == (opened.st_dev, opened.st_ino),
                 "Docling worker changed while being opened")
-        raw = stream.read(2 * 1024 * 1024 + 1)
+        raw = stream.read(MAX_WORKER_CODE + 1)
         after = os.fstat(stream.fileno())
-    require(len(raw) <= 2 * 1024 * 1024, "Docling worker exceeds code-size limit")
+    require(len(raw) <= MAX_WORKER_CODE, "Docling worker exceeds code-size limit")
     require((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
              opened.st_ctime_ns) ==
             (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,

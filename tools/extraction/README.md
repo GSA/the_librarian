@@ -47,10 +47,15 @@ PIP_ONLY_BINARY=:all: tools/extraction/.local/venv-docling/bin/python -m pip ins
 tools/extraction/.local/venv-docling/bin/python -m pip check
 ```
 
-These pins describe the Python 3.14 Linux CPU environment, including
-`pypdfium2==5.14.0`; do not install a separate overriding PDFium version.
-Follow the requirement file's current two-step comments if its pins change.
-Never substitute another project's environment.
+`requirements-docling.in` lists the direct dependencies, pinned exactly because
+they define the accepted conversion profile. `requirements-docling.txt` is the
+full resolved lock for Python 3.14 on Linux x86_64 CPU, including
+`pypdfium2==5.14.0`; do not install a separate overriding PDFium version. The
+worker reads the lock and refuses (`runtime_mismatch`/`missing_dependency`) any
+installed version that differs. To change a pin, edit the `.in` file, then
+regenerate the lock with the procedure in its header. Other platforms or Python
+versions need their own resolved lock. Never substitute another project's
+environment.
 
 ## Model assets
 
@@ -161,10 +166,12 @@ policy, hash-consistent, and within its inherited audience and handling rules.
 
 ## Limits and failures
 
-The source limit is 64 MiB; PDFs allow at most 100 pages and 32,000,000 pixels
-per page. Worker and final results are limited to 64 MiB, diagnostics to 64
-KiB, address space to 16 GiB, and wall time to 600 seconds. Conversion always
-runs in `unshare -Urn` with offline model flags.
+The Docling source limit is 64 MiB; PDFs allow at most 100 pages and
+32,000,000 pixels per page. Worker and final results are limited to 64 MiB,
+diagnostics to 64 KiB, address space to 16 GiB, and wall time to 600 seconds.
+Conversion always runs in `unshare -Urn` with offline model flags. Native
+(stdlib) formats parse inside the toolkit process without that sandbox, so
+their source limit is lower: 16 MiB, with renditions limited to 64 MiB.
 
 Common codes are actionable: `missing_dependency` means provision the dedicated
 interpreter; `missing_assets` or `invalid_assets` means provision and verify the

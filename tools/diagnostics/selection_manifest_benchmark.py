@@ -2,7 +2,7 @@
 """Per-select cost of the shared selection manifest from 1k to 13k entries (synthetic, body-free).
 
 Seeds an empty manifest in a temporary workspace, then adds ``--selections`` synthetic selections
-through ``standing.write_manifest`` (what ``standing-select`` calls) and prints the mean milliseconds
+through ``standing_publication.write_manifest`` (what ``standing-select`` calls) and prints the mean milliseconds
 per select for each window of ``--window`` selections, plus the same figure for the full read,
 validate and rewrite path (``--full``) for comparison. Flat windows mean a constant-time append; use
 ``--tree`` to measure another checkout's tools package. Never point it at a real instance.
@@ -11,9 +11,7 @@ validate and rewrite path (``--full``) for comparison. Flat windows mean a const
 """
 import argparse
 import json
-import os
 from pathlib import Path
-import sys
 import tempfile
 import time
 
@@ -31,11 +29,11 @@ def main(argv=None):
     parser.add_argument("--window", type=int, default=1000)
     parser.add_argument("--full", action="store_true", help="measure the full rewrite path instead")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools import policy
     from tools.context_index import renditions
-    from tools.intake import standing
+    from tools.intake import standing_publication
     renditions.MAX_SELECTIONS = max(renditions.MAX_SELECTIONS, args.selections + 1)
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -51,7 +49,7 @@ def main(argv=None):
         windows, spent, began = [], 0.0, time.perf_counter()
         for n in range(1, args.selections + 1):
             start = time.perf_counter()
-            standing.write_manifest(root, "config/selection.json", entry(n))
+            standing_publication.write_manifest(root, "config/selection.json", entry(n))
             spent += time.perf_counter() - start
             if n % args.window == 0:
                 windows.append({"selections": n, "mean_ms_per_select": round(spent / args.window * 1000, 3)})

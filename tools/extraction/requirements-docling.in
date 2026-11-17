@@ -1,0 +1,10 @@
+# Direct dependencies of the optional Docling worker (docling_worker.py).
+# Exact pins: these versions are the accepted conversion profile; changing one
+# needs renewed acceptance. Install torch/torchvision from the PyTorch CPU index
+# first (see README.md), then resolve the rest and refreeze
+# requirements-docling.txt as described in its header.
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu
+docling-slim[convert-core,format-pdf,models-local,feat-ocr-rapidocr-onnx,cli]==2.140.0
+rapidocr==3.10.0
+onnxruntime==1.31.0

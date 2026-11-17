@@ -10,7 +10,7 @@ import re
 import sqlite3
 import sys
 
-from tools.review_events import event_store as store
+from tools.review_events import event_history, event_store as store
 from tools.review_events import review_events as contract
 
 
@@ -29,7 +29,7 @@ def bounded(output, max_chars):
 
 def json_output(packet):
     """The query wire format, including its terminating newline."""
-    return store.canonical(packet) + "\n"
+    return event_history.canonical(packet) + "\n"
 
 
 class Snapshot:
@@ -110,7 +110,7 @@ class Snapshot:
                              name + " must be an exact " + prefix + " identifier")
         receipt_id = receipt_id.upper() if receipt_id is not None else None
         source_id = source_id.upper() if source_id is not None else None
-        properties = store.store_schema()["$defs"]["event"]["properties"]
+        properties = event_history.store_schema()["$defs"]["event"]["properties"]
         scope_properties = properties["scope"]["properties"]
         enums = {
             "outcome": properties["outcome"]["enum"],
@@ -154,7 +154,7 @@ class Snapshot:
         settings = contract.policy.for_root(self.root)[0]
         packet = {
             "contract_version": 1, "audience": settings["audience"],
-            "authority": store.AUTHORITY, "notice": NOTICE,
+            "authority": event_history.AUTHORITY, "notice": NOTICE,
             "handling": settings["handling"], "generated_at": store.now(),
             "state": deepcopy(self.state), "filters": filters,
             "records": [{"sequence": sequence, "event": deepcopy(event),
@@ -177,7 +177,7 @@ def read_snapshot(root, *, full=False):
         contract.require(db.exists(), "Review-event database is missing; no legacy fallback")
         with closing(store.connect(db)) as connection:
             connection.execute("BEGIN")
-            state, events, successors, history = store.view(connection, root, reuse=True, full=full,
+            state, events, successors, history = event_history.view(connection, root, reuse=True, full=full,
                                                             materialize=False)
         return Snapshot(state, events, successors, root, history)
     except contract.ReviewError:

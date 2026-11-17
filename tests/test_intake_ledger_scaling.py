@@ -13,8 +13,7 @@ import unittest
 from unittest import mock
 
 from tests.support import default_policy_hash
-from tools import policy
-from tools.intake import cohort, contracts, progress, runner, store
+from tools.intake import cohort, cohort_ingest, contracts, progress, runner, store
 
 WAIT_ENV = "LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS"
 
@@ -204,11 +203,11 @@ class BusyTests(Case):
             if len(calls) == 1:
                 raise busy
             return {"outcome": "extracted"}
-        with mock.patch.object(cohort, "_process", side_effect=process):
-            self.assertEqual(cohort._settled(self.root, None, entry, "s", "a")["outcome"], "extracted")
+        with mock.patch.object(cohort_ingest, "_process", side_effect=process):
+            self.assertEqual(cohort_ingest._settled(self.root, None, entry, "s", "a")["outcome"], "extracted")
             self.assertEqual(entry["conflicts"], 1)
-        with mock.patch.object(cohort, "_process", side_effect=busy):
-            failed = cohort._settled(self.root, None, {"relative": "b.md"}, "s", "a")
+        with mock.patch.object(cohort_ingest, "_process", side_effect=busy):
+            failed = cohort_ingest._settled(self.root, None, {"relative": "b.md"}, "s", "a")
         self.assertEqual((failed["outcome"], failed["code"], failed["category"]),
                          ("failed", "ledger_busy", "retryable"))
 

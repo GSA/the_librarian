@@ -14,7 +14,6 @@ never point it at a real instance.
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import statistics
 import sys
@@ -171,8 +170,8 @@ def main(argv=None):
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     results = []
     for size in (int(s) for s in args.sizes.split(",")):
         with tempfile.TemporaryDirectory() as temp:

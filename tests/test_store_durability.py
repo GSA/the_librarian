@@ -15,9 +15,10 @@ import unittest
 from unittest.mock import patch
 
 from tests.test_intake import request
-from tests.test_kit import WorkspaceCase
+from tests.support import WorkspaceCase
 from tools.catalog import catalog_store as catalog
 from tools.intake import store as intake
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 
 FULL = 2
@@ -114,7 +115,7 @@ class ReviewEventStore(DurabilityCase, WorkspaceCase):
         with Watcher().active() as watcher:
             self.registration()
             state = events.initialize(self.root)
-            events.append(self.root, events.bundle([self.pending()]), "test-runner", "req-durability",
+            events.append(self.root, event_history.bundle([self.pending()]), "test-runner", "req-durability",
                           0, state["state_token"])
             events.backup(self.root)
             self.assertDurable(watcher, {events.locations(self.root)[1].name})

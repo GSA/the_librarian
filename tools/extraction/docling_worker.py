@@ -20,6 +20,8 @@ import warnings
 
 
 MIB = 1024**2
+# Self-contained (runs as `python -I` in the Docling venv); the parent mirrors source, result,
+# diagnostic and wall limits in docling_bridge/docling_adapter, pinned by tests/test_docling.py.
 LIMITS = {
     "source_bytes": 64 * MIB, "pdf_pages": 100, "page_pixels": 32_000_000,
     "result_bytes": 64 * MIB, "address_space_bytes": 16 * 1024**3,

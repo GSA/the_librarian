@@ -1,5 +1,6 @@
 """Fixed native stage adapters; no executable request-defined callbacks."""
 from contextlib import closing, nullcontext
+from datetime import timedelta
 import errno
 import json
 from pathlib import Path
@@ -10,11 +11,11 @@ from zipfile import BadZipFile
 
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_reader
-from tools.review_events import event_store as events
+from tools.review_events import event_history, event_store as events
 from tools.extraction import docling_adapter as docling
 from tools.extraction import extract
 from tools.context_index import context_index as index
-from . import standing
+from . import standing, standing_events, standing_publication
 from .contracts import IntakeError, identifier, require
 
 
@@ -86,7 +87,7 @@ def standing_publish_guard(root, args):
         raise standing.Refusal("blocked", "standing-exception-policy-revoked")
     pinned = {"policy_id": policy["policy_id"], "version": policy["version"],
               "sha256": args["policy_sha256"]}
-    standing.authorize_publication(root, args["manifest"], policy, pinned)
+    standing_publication.authorize_publication(root, args["manifest"], policy, pinned)
     return pinned
 
 
@@ -124,10 +125,10 @@ def _prepare(root, stage):
                 # Fixed once in the saved intent so a crash-after-commit retry
                 # resubmits the identical event under the same request ID. A
                 # correction must be recorded strictly after what it supersedes.
-                recorded = standing.datetime.now(standing.timezone.utc).replace(microsecond=0)
+                recorded = standing_events.datetime.now(standing_events.timezone.utc).replace(microsecond=0)
                 for predecessor in intent.get("supersedes", ()):
-                    prior = standing.datetime.fromisoformat(snapshot().event(predecessor)["recorded_at"])
-                    recorded = max(recorded, prior.replace(microsecond=0) + standing.timedelta(seconds=1))
+                    prior = standing_events.datetime.fromisoformat(snapshot().event(predecessor)["recorded_at"])
+                    recorded = max(recorded, prior.replace(microsecond=0) + timedelta(seconds=1))
                 intent["recorded_at"] = recorded.isoformat()
             return intent
         if operation == "standing-publish":
@@ -199,12 +200,12 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             # after it each read what they must see (Kata m0tg).
             snapshot = OneRead(root)
             review_args, result = _standing_result(root, stage, intent, snapshot)
-            event = standing.review_event(result, review_args,
-                                          standing.datetime.fromisoformat(intent["recorded_at"]))
+            event = standing_events.review_event(
+                result, review_args, standing_events.datetime.fromisoformat(intent["recorded_at"]))
             state = snapshot().state
-            committed = events.append(root, events.bundle([event]), result["reviewer"], args["request_id"],
+            committed = events.append(root, event_history.bundle([event]), result["reviewer"], args["request_id"],
                                       state["revision"], state["state_token"])
-            if standing.bound_event(root, result, review_args) is None:
+            if standing_events.bound_event(root, result, review_args) is None:
                 raise StageFailure("blocked", "review-event-mismatch")
             return {"boundary": "review-committed", "outcome": "qualified",
                     "event_ids": [args["event_id"]], "request_id": args["request_id"],
@@ -212,15 +213,15 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
         if operation == "standing-select":
             snapshot = OneRead(root)
             review_args, result = _standing_result(root, stage, intent, snapshot)
-            if standing.bound_event(root, result, review_args, snapshot()) is None:
+            if standing_events.bound_event(root, result, review_args, snapshot()) is None:
                 raise StageFailure("blocked", "review-event-missing")
-            child = standing.selected_child(result, review_args)
+            child = standing_publication.selected_child(result, review_args)
             submitted = catalog.submit(
                 root, [child], actor=result["reviewer"], request_id=args["request_id"],
                 expected_state=catalog.status(root)["state_token"],
                 reason=child["data"]["reason"])
-            entry = standing.selection_entry(result, review_args)
-            manifest_sha = standing.write_manifest(root, args["manifest"], entry,
+            entry = standing_publication.selection_entry(result, review_args)
+            manifest_sha = standing_publication.write_manifest(root, args["manifest"], entry,
                                                    result.get("supersedes", ()))
             return {"boundary": "selection-committed", "outcome": "qualified",
                     "catalog_revision": submitted["committed_revision"],
@@ -277,7 +278,7 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             result = events.append(root, **args)
             # The current store revision is not the original request revision.
             with events.writer_lock(events.locations(root)[0]), closing(events.connect(events.locations(root)[1])) as c:
-                events.inspect(c, root, reuse=True)
+                event_history.inspect(c, root, reuse=True)
                 batch = c.execute("SELECT revision FROM batches WHERE request_id=?", (args["request_id"],)).fetchone()
                 revision = batch[0]
             return {"boundary": "review-committed", "committed_revision": revision,

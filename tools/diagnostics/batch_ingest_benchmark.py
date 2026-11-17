@@ -3,7 +3,7 @@
 
 Seeds a production-shaped instance with ``--seed`` documents already ingested (two catalog revisions and
 three ledger requests each, written directly so large seeds build quickly), copies it, and ingests
-``--files`` new synthetic documents through ``tools.intake.cohort.ingest``, once per ``--batch-sizes``
+``--files`` new synthetic documents through ``tools.intake.cohort_ingest.ingest``, once per ``--batch-sizes``
 entry (1 is the one-revision-per-registration path; a tree without ``batch_size`` runs as 1). Reports body-free
 JSON per run: wall and CPU ms per document, fsync and fdatasync calls per document (counted by a small
 LD_PRELOAD shim compiled with gcc when available), catalog revisions written and bytes written per
@@ -141,8 +141,8 @@ def seed(root, documents):
 
 
 def build_seed(tree, destination, documents):
-    sys.path.insert(0, str(tree))
-    os.chdir(tree)
+    from _harness import use_tree
+    use_tree(tree)
     from tools.catalog import catalog_store as catalog
     from tools.intake import store
     destination.mkdir(parents=True)
@@ -155,8 +155,8 @@ def build_seed(tree, destination, documents):
 
 def measure(args):
     """Child process: ingest ``--files`` documents into a copy of the seed and print one JSON line."""
-    sys.path.insert(0, str(args.tree))
-    os.chdir(args.tree)
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools.catalog import catalog_store as catalog
     from tools.diagnostics.ingest_benchmark import fixture
     from tools.intake import cohort, store
@@ -175,7 +175,7 @@ def measure(args):
         store.inspect(root, "upload-inbox-" + hashlib.sha256(b"0").hexdigest()[:24]) if args.seed else None
         revisions = lambda: sqlite3.connect(root / ".local/catalog/catalog.sqlite3").execute(
             "SELECT count(*) FROM revisions").fetchone()[0]
-        before_revisions, before_io = revisions(), open("/proc/self/io").read()
+        before_revisions, before_io = revisions(), Path("/proc/self/io").read_text()
         sync0 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
         start, cpu = time.perf_counter(), time.process_time()
         parameters = inspect.signature(cohort.ingest).parameters
@@ -183,7 +183,7 @@ def measure(args):
         report = cohort.ingest(root, inbox, system="bench", actor="bench", **kwargs)
         wall, cpu = time.perf_counter() - start, time.process_time() - cpu
         sync1 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
-        io = dict(line.split(": ") for line in open("/proc/self/io").read().splitlines())
+        io = dict(line.split(": ") for line in Path("/proc/self/io").read_text().splitlines())
         io0 = dict(line.split(": ") for line in before_io.splitlines())
         files = args.files
         result = {"tree": args.tree.name, "batch_size": args.batch_size if kwargs else 1, "seed": args.seed,

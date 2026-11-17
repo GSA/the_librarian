@@ -7,603 +7,37 @@ durable ledger. Extraction is not review: renditions stay deferred until a
 standing-policy review qualifies them. Printed output is body-free counts.
 """
 import argparse
-from collections import Counter, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections import Counter
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 import sys
 import tempfile
-import time
-import unicodedata
-from urllib.parse import quote
 
 from tools import policy
 from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
+from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
-from tools.extraction import extract, mhtml
-from . import (adapters, cli, docs, docsync, model_review, runner, selection_manifest, standing, store,
+from . import (cli, cohort_review, docsync, model_review, runner, selection_manifest, standing, store,
                throttle, upload, usage_log)
 from . import contracts
-from .contracts import IntakeError, LedgerBusy
+from .cohort_ingest import BATCH_SIZE, classify, ingest
+from .cohort_recovery import recover_identity
+from .contracts import IntakeError
 
-ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
-RUNTIME_FORMATS = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
-EXPANDED_DIRECTORY = "_extracted"
 DEFAULT_INDEX = "tools/context_index/.local/index.sqlite3"
-REASON = "Read-only local cohort intake; copy only, not extraction review or qualification."
-OUTCOMES = ("received", "extracted", "failed", "changed-since-intake", "not-processed")
-
-
-def submission(relative, system, fmt=None, content_sha256=None):
-    """Stable ASCII-safe submission identity, name and locator for one inbox path.
-
-    Files read as MIME HTML get a distinct identity from the plain-text identity an
-    earlier toolkit version may have used, so they are received and extracted again.
-    When an inbox file's bytes change after intake, ``content_sha256`` derives a new
-    submission identity that supersedes the prior one via ``correction_of``.
-    """
-    salt = ("\0" + fmt if fmt == "mhtml" else "") + ("\0" + content_sha256 if content_sha256 else "")
-    key = hashlib.sha256((system + "\0" + relative + salt).encode("utf-8")).hexdigest()[:24]
-    base = unicodedata.normalize("NFKD", relative.rsplit("/", 1)[-1])
-    base = base.encode("ascii", "ignore").decode("ascii")
-    stem, dot, suffix = base.rpartition(".") if "." in base else (base, "", "")
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "file"
-    suffix = re.sub(r"[^A-Za-z0-9]+", "", suffix)
-    name = (stem[:180] + (dot + suffix if suffix else "")).lstrip("-._")
-    if name.endswith(upload.DESCRIPTOR_SUFFIX) or name == upload.SIDECAR:
-        name = "file-" + name
-    return {"submission_id": "inbox-" + key, "name": name,
-            "locator": quote(relative, safe="/")}
-
-
-def _format(path, relative, raw, root):
-    """Return (format, refusal code); MIME content wins over any text suffix."""
-    suffix = path.suffix.lower()
-    if suffix == ".odt":
-        return "odt", None
-    if suffix in extract.TEXT_SUFFIXES and mhtml.recognised(raw):
-        try:
-            mhtml.payload(raw)
-        except mhtml.MhtmlError as error:
-            return None, error.code
-        return "mhtml", None
-    if suffix == ".txt":
-        try:
-            extract.gemini(raw, root)
-            return "gemini-txt", None
-        except (extract.ExtractionError, UnicodeDecodeError):
-            return "text", None
-    if suffix in extract.TEXT_SUFFIXES:
-        return "text", None
-    return None, None
-
-
-def _stat(info):
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-
-def _disposition(root, inbox, path, relative, trusted=None):
-    """One file's disposition.
-
-    ``trusted`` (``{relative: ledger row}``, only under ``--trust-stat``) lets a file whose stat
-    identity equals its extracted row's skip the read and hash: the row's format and SHA-256 stand in
-    for them, and the entry is marked ``_fast``. Every entry carries its stat identity as ``_stat``, taken
-    before the read, so a file that changes while it is read is recorded with the older identity and
-    is hashed again next run. ``ingest`` removes both private keys before it reports.
-    """
-    entry = {"relative": relative, "disposition": None, "format": None}
-    name, suffix = path.name, path.suffix.lower()
-    if path.is_symlink() or not path.is_file():
-        return {**entry, "disposition": "unsafe-path"}
-    info = path.stat(follow_symlinks=False)
-    size = info.st_size
-    entry["_stat"] = _stat(info)
-    row = (trusted or {}).get(relative)
-    if (row is not None and row["state"] == "extracted" and row["ino"] is not None
-            and _stat(info) == tuple(row[k] for k in docs.STAT) and size > 0):
-        return {**entry, "format": row["format"], "bytes": size, "sha256": row["sha256"],
-                "disposition": "admit", "_fast": True}
-    entry["bytes"] = size
-    if ":" in name:
-        # Windows alternate-data-stream sidecars (Zone.Identifier, DLP tags).
-        return {**entry, "disposition": "skipped-artifact"}
-    if suffix in ASSET_SUFFIXES:
-        return {**entry, "disposition": "skipped-asset"}
-    if suffix == ".zip":
-        expanded = path.parent / EXPANDED_DIRECTORY / path.stem
-        return {**entry, "disposition": "archive-expanded" if expanded.is_dir() else "needs-reader"}
-    if size == 0:
-        return {**entry, "disposition": "empty"}
-    if suffix in RUNTIME_FORMATS:
-        fmt = RUNTIME_FORMATS[suffix]
-        over = size > upload.FORMATS[fmt][1]
-        return {**entry, "format": fmt, "disposition": "over-limit" if over else "needs-runtime"}
-    if suffix not in extract.TEXT_SUFFIXES | {".odt"}:
-        return {**entry, "disposition": "needs-reader"}
-    limit = max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "mhtml", "odt"))
-    if size > limit:
-        return {**entry, "disposition": "over-limit"}
-    try:
-        raw = upload.read_file(path, limit)
-    except IntakeError as error:
-        return {**entry, "disposition": "unsafe-path", "code": error.code}
-    fmt, refusal = _format(path, relative, raw, root)
-    entry.update(format=fmt, sha256=hashlib.sha256(raw).hexdigest())
-    if refusal:
-        # MIME that cannot be read strictly is never admitted as raw encoded text.
-        return {**entry, "disposition": "needs-reader", "code": refusal}
-    if size > upload.FORMATS[fmt][1]:
-        return {**entry, "disposition": "over-limit"}
-    try:
-        upload.check_type(raw, fmt, name)
-    except IntakeError as error:
-        return {**entry, "disposition": "unreadable", "code": error.code}
-    return {**entry, "disposition": "admit"}
-
-
-def classify(root, inbox, trusted=None, keep_stat=False):
-    """Return one explicit disposition per inbox file; never writes the inbox.
-
-    ``ingest`` passes ``keep_stat`` to keep each entry's private ``_stat`` (and ``_fast``) fields.
-    """
-    root, inbox = Path(root).resolve(), Path(inbox).resolve()
-    if root == inbox or inbox in root.parents:
-        raise IntakeError("instance_inside_inbox")
-    if not inbox.is_dir():
-        raise IntakeError("inbox_unavailable")
-
-    def unavailable(error):
-        raise IntakeError("inbox_unavailable") from error
-    entries = []
-    for directory, names, files in os.walk(inbox, onerror=unavailable, followlinks=False):
-        here = Path(directory)
-        for name in [*files, *(n for n in names if (here / n).is_symlink())]:
-            path = here / name
-            relative = path.relative_to(inbox).as_posix()
-            entry = _disposition(root, inbox, path, relative, trusted)
-            if not keep_stat:
-                entry.pop("_stat", None)
-                entry.pop("_fast", None)
-            entries.append(entry)
-    return sorted(entries, key=lambda e: e["relative"])
-
-
-def _staged(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
-    """Stage one single-stage request unless it exists; return the summary of its chain head.
-
-    A request that was corrected is represented by the newest request of its validated
-    ``correction_of`` chain, whatever it is named (``heads`` shares one chain index across a
-    run). The head must repeat this request's operation and the ``identity`` arguments (receipt and
-    format), or ``correction_mismatch`` refuses it. ``arguments`` may be a callable, evaluated
-    only when the request must be staged.
-    """
-    current = _head(root, correlation_id, heads)
-    if current is not None and current["correlation_id"] != correlation_id:
-        saved = store.request(root, current["correlation_id"])["stages"]
-        if (len(saved) != 1 or saved[0]["operation"] != operation
-                or any(saved[0]["arguments"].get(k) != v for k, v in (identity or {}).items())):
-            raise IntakeError("correction_mismatch")
-    if current is None:
-        current = store.stage(root, json.dumps({
-            "version": 1, "correlation_id": correlation_id, "correction_of": None,
-            "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-            "retry": {"max_attempts": 3, "backoff_seconds": 0},
-            "stages": [{"id": stage_id, "kind": "extraction", "operation": operation,
-                        "arguments": arguments() if callable(arguments) else arguments}]}).encode())
-    return current
-
-
-def _request(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
-    """``_staged``, then settle the stage when it can still run; return the stage summary.
-
-    The head is settled and reported like any other request: succeeded, blocked, or still staged.
-    """
-    current = _staged(root, correlation_id, stage_id, operation, arguments, identity, heads)
-    stage = current["stages"][0]
-    if stage["status"] in {"staged", "running", "retryable"}:
-        stage = runner.settle(root, current["correlation_id"], stage["id"])["stages"][0]
-    return stage
-
-
-def _extract(root, entry, actor, heads=None):
-    base = {"receipt": entry["receipt_id"], "format_name": entry["format"]}
-    # The reader version is part of the request identity: a new MIME reader version extracts again.
-    version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
-    step = "prepare"
-    try:
-        stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare",
-                         "extract-prepare", base, base, heads)
-        entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
-        if stage["status"] == "succeeded":
-            step = "register"
-            # Registration pins the catalog state when staged, immediately before it runs;
-            # a repeated registration is idempotent by its saved request.
-            # The catalog state is read only when a new registration is staged.
-            stage = _request(root, "register-" + entry["submission_id"] + version, "register",
-                             "extract-register", lambda: {
-                                 **base, "actor": actor,
-                                 "expected_state": catalog.status(root)["state_token"]}, base, heads)
-            entry["conflicts"] += runner.conflicts(stage)
-    except IntakeError as error:
-        if error.code not in {"ambiguous_correction", "correction_mismatch"}:
-            raise
-        # A chain the store cannot follow to one valid head fails its entry, not the run.
-        return {"outcome": "failed", "stage": step, "code": error.code}
-    if stage["status"] != "succeeded":
-        return _failure(stage["id"], stage)
-    evidence = stage["evidence"]
-    return {"outcome": "extracted", "rendition": evidence["rendition"],
-            "rendition_sha256": evidence["rendition_sha256"]}
-
-
-def _failure(stage_id, stage):
-    """A failed entry with its stage, status, category, code and attempt count (no private text)."""
-    last = stage["attempts"][-1] if stage["attempts"] else {}
-    return {"outcome": "failed", "stage": stage_id, "status": stage["status"],
-            "category": last.get("category"), "code": last.get("code") or stage["status"],
-            "attempts": len(stage["attempts"])}
-
-
-def _identify(root, entry, system, known):
-    """The submission identity of one entry (``entry`` gains it) and the request it supersedes, if any.
-
-    ``known`` maps correlation IDs to the saved ``(request, summary)`` read earlier. Dropped, with the
-    identity replaced, as soon as the file's bytes differ from the saved original. Returns
-    ``(superseded, known)``.
-    """
-    identity = submission(entry["relative"], system, entry["format"])
-    superseded = None
-    prior = next((request for request, _ in known.values()), None)
-    if prior is not None:
-        orig = next((r for r in upload.submit_records(prior)
-                     if r["kind"] == "artifact" and r["data"].get("role") == "original"), None)
-        if orig is not None and orig["data"]["sha256"] != entry["sha256"]:
-            superseded = identity["submission_id"]
-            identity = submission(entry["relative"], system, entry["format"], entry["sha256"])
-            known = {}
-        elif prior.get("correction_of"):
-            # An existing identity keeps the correction it was first submitted with.
-            superseded = prior["correction_of"].removeprefix("upload-")
-    elif entry["format"] == "mhtml":
-        # An entry ingested before MIME recognition (as plain text) is corrected, not kept.
-        earlier = submission(entry["relative"], system)["submission_id"]
-        if upload.ledger_request(root, upload.correlation(earlier)) is not None:
-            superseded = earlier
-    entry.update(identity)
-    return superseded, known
-
-
-def _descriptor(entry, system, actor, superseded):
-    return upload.descriptor(
-        submission_id=entry["submission_id"], format_name=entry["format"], correction_of=superseded,
-        name=entry["name"], actor=actor, reason=REASON, origin_kind="local-path",
-        origin_system=system, origin_locator=entry["locator"], expected_sha256=entry["sha256"])
-
-
-def _process(root, inbox, entry, system, actor, heads=None):
-    # One ledger open yields the saved receipt request and its stage summary; submit and the receipt
-    # check below reuse them for a succeeded receipt.
-    known = upload.known_requests(root, [upload.correlation(submission(entry["relative"], system, entry["format"])["submission_id"])])
-    superseded, known = _identify(root, entry, system, known)
-    try:
-        ack = upload.submit(root, Path(inbox) / entry["relative"], _descriptor(entry, system, actor, superseded),
-                            known=known)
-    except LedgerBusy:
-        raise  # retried by _settled, never reported as a receipt refusal
-    except IntakeError as error:
-        outcome = "changed-since-intake" if error.code == "changed_input" else "failed"
-        return {"outcome": outcome, "stage": "receipt", "code": error.code}
-    entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
-    receipt = (upload.settled_summary(known, ack["correlation_id"])
-               or store.inspect(root, ack["correlation_id"]))["stages"][0]
-    entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(receipt)
-    if ack["receipt"]["state"] != "committed":
-        return _failure("receipt", receipt)
-    entry["received"] = True
-    return _extract(root, entry, actor, heads)
-
-
-def _settled(root, inbox, entry, system, actor, heads=None):
-    """Process one entry, retrying a busy ledger within the entry's attempt budget.
-
-    Every step is idempotent by request identity, so repeating the entry is safe. An
-    entry that is still busy after the budget fails visibly as retryable ``ledger_busy``
-    and the run continues; the next run resumes it.
-    """
-    for attempt in range(runner.BUSY_RETRIES):
-        try:
-            return _process(root, inbox, entry, system, actor, heads)
-        except LedgerBusy:
-            entry["conflicts"] = entry.get("conflicts", 0) + 1
-    return {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
-            "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
-
-
-def _trusted_entry(entry, row, system):
-    """The report entry of an extracted document whose file still has the stat identity its row recorded.
-
-    Everything but the ledger-side facts is a function of the path and format; those come from the row.
-    The result equals what ``_process`` returns for the same unchanged document.
-    """
-    identity = submission(entry["relative"], system, entry["format"])
-    entry.update(submission_id=row["submission_id"], name=identity["name"], locator=identity["locator"],
-                 original=row["original"], receipt_id=row["receipt_id"], conflicts=row["conflicts"],
-                 received=True)
-    return {"outcome": "extracted", "rendition": row["rendition"], "rendition_sha256": row["rendition_sha256"]}
-
-
-FLUSH = 500  # documents whose rows are written (or confirmed) in one ledger open
-
-
-def _record(root, system, pending, heads):
-    """Write or refresh the ``docs`` rows of ``pending`` entries in one ledger open.
-
-    Each row is a function of the saved requests (``docs.derive``) plus the file's stat identity. The
-    identity is kept only when the file's hash equals the retained original's, so a changed file can
-    never be trusted by its old row. A row that already equals what would be written is left alone, so
-    replaying an unchanged inbox writes nothing. A ledger without the table is not migrated.
-    """
-    if not pending:
-        return
-    now = time.time()
-    with store.locked(root) as c:
-        if not docs.present(c):
-            return
-        saved = docs.load(c, system, [entry["relative"] for entry, _ in pending])
-        with c:
-            for entry, stat in pending:
-                if not entry.get("submission_id"):
-                    continue
-                suffix = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
-                sid = entry["submission_id"]
-                if c.execute("SELECT 1 FROM requests WHERE correlation_id=?", ("upload-" + sid,)).fetchone() is None:
-                    continue
-                row = saved.get(entry["relative"])
-                try:
-                    extract = heads.resolve(c, "extract-" + sid + suffix)
-                    register = heads.resolve(c, "register-" + sid + suffix)
-                    if row and row["submission_id"] == sid and row["suffix"] == suffix:
-                        derived = {k: row[k] for k in ("submission_id", "suffix", "receipt_id", "original", "sha256")}
-                        derived.update(extract_head=extract, register_head=register,
-                                       **docs.measure(c, sid, suffix, entry["format"], row["receipt_id"],
-                                                      extract, register))
-                    else:
-                        derived = docs.derive(c, sid, suffix, entry["format"], extract, register)
-                except IntakeError as error:
-                    if error.code != "ambiguous_correction":
-                        raise
-                    derived = docs.ambiguous(c, sid, suffix, entry["format"])
-                keep = stat if entry.get("sha256") == derived["sha256"] else None
-                wanted = {**derived, "format": entry["format"], **dict(zip(docs.STAT, keep or (None,) * 5))}
-                if row and all(row[k] == wanted[k] for k in (*docs.DERIVED, *docs.STAT)):
-                    continue
-                docs.upsert(c, system, entry["relative"], entry["format"], derived, keep, now)
-
-
-# Documents whose catalog registrations share one revision, per stage (the receipt, then the extraction
-# registration). 1 keeps the one-revision-per-registration path.
-BATCH_SIZE = 50
-BUSY_FAILURE = {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
-                "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
-
-
-def _process_batch(root, inbox, entries, system, actor, heads):
-    """``_process`` for a chunk of entries: their receipts commit as one catalog revision, then
-    their extraction registrations as one. Each entry gets exactly the outcome ``_process`` would give.
-
-    Every step is idempotent by request identity (and the catalog's per-document marker records), so a
-    crash or refusal anywhere is completed by running the chunk again; a refused entry never stops
-    the others. Returns ``{relative path: outcome}``.
-    """
-    outcomes = {}
-    with extract.keeping_parsed(len(entries)):
-        correlations = {e["relative"]: upload.correlation(
-            submission(e["relative"], system, e["format"])["submission_id"]) for e in entries}
-        try:
-            known_all = upload.known_requests(root, list(correlations.values()))
-        except LedgerBusy:
-            return {e["relative"]: dict(BUSY_FAILURE) for e in entries}
-        staged = []  # (entry, correlation ID, existing, known)
-        for entry in entries:
-            try:
-                known = {c: v for c, v in known_all.items() if c == correlations[entry["relative"]]}
-                superseded, known = _identify(root, entry, system, known)
-                correlation_id, existing = upload.stage_submission(
-                    root, Path(inbox) / entry["relative"], _descriptor(entry, system, actor, superseded), known=known)
-                staged.append((entry, correlation_id, existing, known))
-            except LedgerBusy:
-                entry["conflicts"] = entry.get("conflicts", 0) + 1
-                outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-            except IntakeError as error:
-                outcomes[entry["relative"]] = {
-                    "outcome": "changed-since-intake" if error.code == "changed_input" else "failed",
-                    "stage": "receipt", "code": error.code}
-        pending = [(corr, "receipt") for _, corr, _, known in staged if upload.settled(known, corr) is None]
-        try:
-            summaries = runner.settle_batch(root, pending) if pending else {}
-            fresh = upload.known_requests(root, [corr for _, corr, _, _ in staged])
-        except LedgerBusy:
-            for entry, *_ in staged:
-                outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-            return outcomes
-        registering = []
-        for entry, corr, existing, known in staged:
-            try:
-                request, summary = known[corr] if upload.settled(known, corr) else fresh[corr]
-                ack = upload.acknowledgment(root, corr, existing, (request, summary))
-            except (IntakeError, OSError) as error:
-                outcomes[entry["relative"]] = {"outcome": "failed", "stage": "receipt",
-                                               "code": error.code if isinstance(error, IntakeError) else "os-error"}
-                continue
-            entry.update(original=ack["original"]["path"], receipt_id=ack["records"]["receipt_id"])
-            receipt = summary["stages"][0]
-            entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(receipt)
-            if ack["receipt"]["state"] != "committed":
-                outcomes[entry["relative"]] = _failure("receipt", receipt)
-                continue
-            entry["received"] = True
-            registering.append(entry)
-        outcomes.update(_extract_batch(root, registering, actor, heads))
-    return outcomes
-
-
-def _extract_batch(root, entries, actor, heads):
-    """``_extract`` for a chunk: each document prepared in turn, their registrations committed together."""
-    outcomes, registers = {}, []  # registers: (entry, version, step summary, identity)
-    for entry in entries:
-        base = {"receipt": entry["receipt_id"], "format_name": entry["format"]}
-        version = "-m%d" % mhtml.METHOD_VERSION if entry["format"] == "mhtml" else ""
-        try:
-            stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare",
-                             "extract-prepare", base, base, heads)
-            entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
-            if stage["status"] != "succeeded":
-                outcomes[entry["relative"]] = _failure(stage["id"], stage)
-                continue
-            registers.append((entry, version, base))
-        except LedgerBusy:
-            entry["conflicts"] = entry.get("conflicts", 0) + 1
-            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-        except IntakeError as error:
-            if error.code not in {"ambiguous_correction", "correction_mismatch"}:
-                raise
-            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "prepare", "code": error.code}
-    heads_of = []  # (entry, correlation ID, stage ID)
-    state = None
-    for entry, version, base in registers:
-        try:
-            def arguments():
-                nonlocal state
-                # One state read pins every registration staged now; each is rebased on its own.
-                state = state or catalog.status(root)["state_token"]
-                return {**base, "actor": actor, "expected_state": state}
-            current = _staged(root, "register-" + entry["submission_id"] + version, "register",
-                              "extract-register", arguments, base, heads)
-        except LedgerBusy:
-            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-            continue
-        except IntakeError as error:
-            if error.code not in {"ambiguous_correction", "correction_mismatch"}:
-                raise
-            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "register", "code": error.code}
-            continue
-        heads_of.append((entry, current["correlation_id"], current["stages"][0]["id"]))
-    try:
-        pending = [(corr, stage_id) for _, corr, stage_id in heads_of]
-        summaries = runner.settle_batch(root, pending) if pending else {}
-    except LedgerBusy:
-        for entry, *_ in heads_of:
-            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-        return outcomes
-    for entry, corr, stage_id in heads_of:
-        stage = next(s for s in summaries[corr]["stages"] if s["id"] == stage_id)
-        entry["conflicts"] = entry.get("conflicts", 0) + runner.conflicts(stage)
-        if stage["status"] != "succeeded":
-            outcomes[entry["relative"]] = _failure(stage_id, stage)
-        else:
-            evidence = stage["evidence"]
-            outcomes[entry["relative"]] = {"outcome": "extracted", "rendition": evidence["rendition"],
-                                           "rendition_sha256": evidence["rendition_sha256"]}
-    return outcomes
-
-
-def _settled_batch(root, inbox, chunk, system, actor, heads):
-    """``_settled`` for a chunk: a busy ledger repeats the chunk (every step is idempotent), then fails
-    only the entries it left busy, visibly and retryable, and the run continues."""
-    todo, results = list(chunk), {}
-    for attempt in range(runner.BUSY_RETRIES):
-        outcomes = _process_batch(root, inbox, todo, system, actor, heads)
-        results.update(outcomes)
-        todo = [e for e in todo if outcomes[e["relative"]].get("code") == "ledger_busy"]
-        if not todo:
-            break
-    return results
-
-
-def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False):
-    """Classify the inbox, then submit and extract admitted files; return the report.
-
-    Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
-    the extraction registration) each commit as one revision; ``batch_size=1`` commits every
-    registration on its own. Each document's outcome is its own whichever way it is processed.
-
-    Every file is read and hashed, so a changed file is always found, unless ``trust_stat`` is set:
-    then an extracted document whose file still has the (device, inode, size, mtime, ctime) its
-    ``docs`` row recorded is reported from that row without being read, hashed or looked up in the
-    ledger. ``ctime`` moves on every write, so an in-place edit that restores size and mtime changes
-    it; a filesystem or copy tool that sets ctime back is outside what stat can show, which is why
-    this is opt-in. Without the ``docs`` table (or a recorded stat) nothing is trusted.
-    """
-    contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
-    trusted = {}
-    if trust_stat:
-        with store.locked(root) as c:
-            trusted = docs.load(c, system)
-    entries = classify(root, inbox, trusted, True)
-    admitted = [e for e in entries if e["disposition"] == "admit"]
-    outcome = Counter({name: 0 for name in OUTCOMES})
-    # One correction-chain index serves every entry, so following chains never rescans the ledger.
-    heads = store.Heads()
-    # Private stat fields never reach the report: take them off every entry now.
-    seen = {e["relative"]: (e.pop("_stat", None), e.pop("_fast", False)) for e in entries}
-    todo = admitted if limit is None else admitted[:limit]
-    for entry in admitted[len(todo):]:
-        entry["outcome"] = "not-processed"
-        outcome["not-processed"] += 1
-    fast = [e for e in todo if seen[e["relative"]][1]]
-    for entry in fast:
-        entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
-        outcome["received"] += bool(entry.get("received"))
-        outcome[entry["outcome"]] += 1
-    todo = [e for e in todo if not seen[e["relative"]][1]]
-    chunks = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)] if batch_size > 1 else [[e] for e in todo]
-    pending = []
-    for chunk in chunks:
-        if batch_size == 1:
-            results = {chunk[0]["relative"]: _settled(root, inbox, chunk[0], system, actor, heads)}
-        else:
-            results = _settled_batch(root, inbox, chunk, system, actor, heads)
-        for entry in chunk:
-            entry.update(results[entry["relative"]])
-            outcome["received"] += bool(entry.get("received"))
-            outcome[entry["outcome"]] += 1
-            pending.append((entry, seen[entry["relative"]][0]))
-        if len(pending) >= FLUSH:
-            _record(root, system, pending, heads)
-            pending = []
-    _record(root, system, pending, heads)
-    retried = [e for e in admitted if e.get("conflicts")]
-    counts = {"files": len(entries),
-              "disposition": dict(Counter(e["disposition"] for e in entries)),
-              "format": dict(Counter(e["format"] for e in admitted)),
-              "outcome": dict(outcome),
-              # Entries that lost a race with another writer and were retried; those that
-              # then succeeded are not failures.
-              "retried_after_conflict": {
-                  "entries": len(retried),
-                  "succeeded": sum(e["outcome"] != "failed" for e in retried),
-                  "attempts": sum(e["conflicts"] for e in retried)},
-              "failed_by_code": dict(Counter(
-                  "%s/%s" % (e["stage"], e["code"]) for e in admitted if e.get("outcome") == "failed"))}
-    return {"counts": counts, "entries": entries}
-
-
-def _write_json(path, value, mode=0o644):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
-    os.fchmod(descriptor, mode)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
-        stream.write("\n")
 
 
 def _write_private(path, value):
-    _write_json(path, value, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
+        stream.write("\n")
 
 
 def _replace_json(path, value, mode=0o644):
@@ -624,11 +58,7 @@ def _replace_json(path, value, mode=0o644):
         if os.path.exists(temporary):
             os.unlink(temporary)
         raise
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    fsync_directory(path.parent)
 
 
 def _instance_file(root, name):
@@ -661,30 +91,23 @@ def _validate_inputs(root, policy_path, manifest, context, index_path, model):
     _instance_file(root, policy_path)
     _instance_file(root, manifest)
     _recover_manifest(root, manifest)
+    locators = context
     try:
         # The ledger requires ASCII relative paths; refuse the same ones before any mutation.
         for name in (policy_path, manifest, index_path):
             contracts.relative(name)
             name.encode("ascii")
-        contracts.relative(index_path)
         index.validate_db_path(root, root / index_path)
         if (root / manifest).is_file():
             index.load_manifest(index.no_symlinks(root / manifest), root)
         if (root / policy_path).is_file():
-            raw = standing._read(root, policy_path, standing.LIMIT)[1]
+            raw = standing.read_private(root, policy_path, standing.LIMIT)
             loaded = standing.load_policy(root, policy_path, hashlib.sha256(raw).hexdigest())
             if loaded["reviewer"] != f"{model_review.PROVIDER}:{model}":
                 raise IntakeError("policy_reviewer_mismatch")
+            locators = loaded["selection"]["context"]
     except (index.IndexError_, standing.Refusal, IntakeError, OSError, UnicodeError) as error:
-        raise IntakeError(getattr(error, "code", None) if isinstance(error, IntakeError)
-                          else "preflight_invalid") from error
-    locators = context
-    policy_file = root / policy_path
-    if policy_file.is_file():
-        try:
-            locators = json.loads(policy_file.read_text(encoding="utf-8"))["selection"]["context"]
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            raise IntakeError("context_invalid") from error
+        raise IntakeError(error.code if isinstance(error, IntakeError) else "preflight_invalid") from error
     try:
         for locator in locators:
             canonical = index.canonical_locator(locator, root)
@@ -732,207 +155,17 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
             "context_rules": {},
             "renditions": [],
         })
-        docs = {d["path"] for d in raw.setdefault("documents", [])}
+        listed = {d["path"] for d in raw.setdefault("documents", [])}
         changed = not manifest_file.is_file()
         for locator in standing_policy["selection"]["context"]:
             doc = locator.split("#", 1)[0]
-            if doc not in docs:
+            if doc not in listed:
                 raw["documents"].append({"path": doc, "role": "context", "context": []})
-                docs.add(doc)
+                listed.add(doc)
                 changed = True
         if changed:
             _replace_json(manifest_file, raw)
     return standing_policy, policy_sha
-
-
-def _standing_outcome(stage):
-    code = stage["attempts"][-1]["code"] if stage["attempts"] else stage["status"]
-    for name in ("pending-review", "rejected", "deferred", "exception"):
-        if code.startswith("standing-" + name + "-"):
-            return name, code
-    return "pending-review", code
-
-
-def _stage_request(root, corr, stages, correction_of=None):
-    store.stage(root, json.dumps({
-        "version": 1, "correlation_id": corr, "correction_of": correction_of,
-        "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-        "retry": {"max_attempts": 3, "backoff_seconds": 0},
-        "stages": stages,
-    }).encode())
-
-
-def _head(root, corr, heads=None):
-    try:
-        return (heads.head if heads is not None else store.head)(root, corr)
-    except IntakeError as error:
-        if error.code != "unknown_request":
-            raise
-        return None
-
-
-def _root_of(root, corr):
-    """The first request of ``corr``'s correction chain (its own name when it corrects nothing)."""
-    seen = {corr}
-    while (parent := store.request(root, corr)["correction_of"]) is not None and parent not in seen:
-        corr = parent
-        seen.add(corr)
-    return corr
-
-
-def _identity_blocked(root):
-    """Chain heads that are blocked ``extract-register`` stages refused as a changed identity."""
-    found = []
-    with store.locked(root) as c:
-        rows = c.execute("SELECT s.correlation_id, s.ordinal, r.raw FROM stages s "
-                         "JOIN requests r USING(correlation_id) WHERE s.status='blocked' "
-                         "ORDER BY s.correlation_id").fetchall()
-        for row in rows:
-            stage = contracts.decode_request(row["raw"])["stages"][row["ordinal"]]
-            if stage["operation"] != "extract-register":
-                continue
-            if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
-                continue  # not the head: a correction follows it
-            last = c.execute("SELECT code FROM attempts WHERE correlation_id=? AND stage_id=? "
-                             "ORDER BY cycle DESC, ordinal DESC LIMIT 1",
-                             (row["correlation_id"], stage["id"])).fetchone()
-            if last is not None and last[0] == "changed-extraction-identity":
-                found.append((row["correlation_id"], stage))
-    return found
-
-
-def recover_identity(root, *, apply=False):
-    """Report, and with ``apply`` correct, registrations blocked as ``changed-extraction-identity``.
-
-    The extractor identity (its code and policy) is pinned when a stage first prepares, and a
-    replay keeps that pin, so the stage can never register after the toolkit changed. The supported
-    repair is the one the store already validates: a correction request with a fresh pin. For each
-    chain whose head is such a blocked ``extract-register``, ``apply`` stages a correction of the
-    paired ``extract-prepare`` chain (unless its head already prepared under today's extractor)
-    and then of the registration (a fresh catalog pin), and settles both. Both corrections repeat
-    the original operation and arguments, so ``prepare == intent``, the catalog pin and the
-    source-hash checks all apply to them unchanged; a source or extractor that moves again blocks
-    again. ``ingest`` finds the result by following ``correction_of``, never by name. The pairing
-    uses the ingest's own ``extract-``/``register-`` names only to find the prepare chain, and
-    checks the receipt and format against it. A chain not recoverable is counted in ``skipped``.
-    """
-    root = Path(root).resolve()
-    heads = store.Heads()
-    found, skipped, work = [], Counter(), []
-    for corr, stage in _identity_blocked(root):
-        base = _root_of(root, corr)
-        args = stage["arguments"]
-        prefix = "register-"
-        prepare = _head(root, "extract-" + base[len(prefix):], heads) if base.startswith(prefix) else None
-        saved = store.request(root, prepare["correlation_id"])["stages"] if prepare else []
-        if (len(saved) != 1 or saved[0]["operation"] != "extract-prepare"
-                or any(saved[0]["arguments"].get(k) != args[k] for k in ("receipt", "format_name"))):
-            skipped["prepare-mismatch"] += 1
-            continue
-        reuse = None
-        if prepare["stages"][0]["status"] == "succeeded":
-            try:
-                fresh = adapters.prepare(store.safe(root), saved[0])
-            except (adapters.StageFailure, OSError):
-                # A removed, unreadable or no longer valid source: counted, not fatal to the rest.
-                skipped["source-unavailable"] += 1
-                continue
-            reuse = prepare["stages"][0]["evidence"]["run_id"] == fresh["run_id"]
-        elif prepare["stages"][0]["status"] not in {"staged", "running", "retryable"}:
-            skipped["prepare-blocked"] += 1
-            continue
-        found.append(corr)
-        work.append((corr, base, prepare, reuse))
-    counts = {"extract-register/changed-extraction-identity": len(found)} if found else {}
-    report = {"apply": apply, "candidates": len(found), "by_operation_code": counts,
-              "skipped": dict(skipped)}
-    if not apply:
-        return report
-    results = Counter()
-    for corr, base, prepare, reuse in work:
-        try:
-            if reuse is not True:
-                if reuse is False:
-                    prepare_id = _correct(root, prepare)
-                else:
-                    prepare_id = prepare["correlation_id"]
-                done = runner.settle(root, prepare_id, prepare["stages"][0]["id"])["stages"][0]
-                if done["status"] != "succeeded":
-                    results["prepare-" + done["status"]] += 1
-                    continue
-            fixed = _correct(root, store.inspect(root, corr), lambda a: {
-                **a, "expected_state": catalog.status(root)["state_token"]})
-            done = runner.settle(root, fixed, store.inspect(root, fixed)["stages"][0]["id"])["stages"][0]
-            results[done["status"]] += 1
-        except IntakeError as error:
-            results[error.code] += 1
-    report["results"] = dict(results)
-    return report
-
-
-def _correct(root, head, rewrite=lambda arguments: arguments):
-    """Stage, and return the ID of, a correction of ``head`` repeating its single stage."""
-    request = store.request(root, head["correlation_id"])
-    base = _root_of(root, head["correlation_id"])
-    number = 1
-    while _exists(root, f"{base}-c{number}"):
-        number += 1
-    corrected = f"{base}-c{number}"
-    (stage,) = request["stages"]
-    _stage_request(root, corrected, [{**stage, "arguments": rewrite(stage["arguments"])}],
-                   correction_of=head["correlation_id"])
-    return corrected
-
-
-def _exists(root, corr):
-    try:
-        store.request(root, corr)
-    except IntakeError as error:
-        if error.code != "unknown_request":
-            raise
-        return False
-    return True
-
-
-def _inputs_changed(current):
-    review = current["stages"][0]
-    return (review["status"] == "blocked" and bool(review["attempts"])
-            and review["attempts"][-1]["code"] == "changed-standing-inputs")
-
-
-def _registration_recovered(root, current, entry):
-    """A review saved as ``unregistered-rendition`` whose registration the catalog confirms now.
-
-    Before catalog reads distinguished an absent record from other failures, any catalog error
-    (such as a validator changed under a running process) was saved as this durable outcome.
-    """
-    review = current["stages"][0]
-    return (review["status"] == "blocked" and bool(review["attempts"])
-            and review["attempts"][-1]["code"] == "standing-exception-unregistered-rendition"
-            and standing.registered(root, entry["rendition"], entry["rendition_sha256"]))
-
-
-def _stage_correction(root, corr, active):
-    """Restage a standing review whose pinned intent no longer matches its inputs as a
-    correction of it: same review arguments and event, fresh request identities."""
-    number = 1
-    while _exists(root, f"{corr}-c{number}"):
-        number += 1
-    corrected = f"{corr}-c{number}"
-    stages = store.request(root, active)["stages"]
-    _stage_request(root, corrected, [
-        {**s, "arguments": {**s["arguments"], "request_id": f"req-{corrected}-{s['id']}"}}
-        for s in stages], correction_of=active)
-    return corrected
-
-
-def _inspect(root, corr):
-    try:
-        return store.inspect(root, corr)
-    except IntakeError as error:
-        if error.code != "unknown_request":
-            raise
-        return None
 
 
 def _manifest_renditions(root, manifest):
@@ -1060,207 +293,6 @@ def _reconcile(root, manifest, system, current, cache, compose):
             "orphaned": sum(orphan(r) for r in listed)}
 
 
-def _selection_room(root, manifest, rendition):
-    """True when the manifest already selects ``rendition`` or has room for one more selection."""
-    known = selection_manifest.view(root, manifest)
-    return known.count < renditions.MAX_SELECTIONS or known.has(rendition)
-
-
-def _free_room(root, manifest):
-    """Selections the shared manifest can still take (an exact read, advisory across processes)."""
-    return renditions.MAX_SELECTIONS - selection_manifest.view(root, manifest).count
-
-
-def _held_back(root, entry, standing_policy, manifest):
-    """True when a model review would be paid for an entry that cannot be selected.
-
-    The manifest has no room for the rendition and the policy scope does not already refuse it
-    (a refused entry ends ``prohibited-scope`` without a call, as before). The check reads the
-    manifest and never writes it; ``standing-select`` stays the authority on capacity.
-    """
-    return (not _selection_room(root, manifest, entry["rendition"])
-            and not standing.refused_scope(root, standing_policy, entry["rendition"],
-                                           entry["rendition_sha256"]))
-
-
-def _standing_token(entry, policy_sha):
-    return "%s-%s-%s" % (entry["submission_id"], entry["rendition_sha256"][:12], policy_sha[:8])
-
-
-def _live_events(snapshot):
-    """Event IDs in ``snapshot`` that no later event supersedes."""
-    return {e["event_id"] for e in snapshot.events if e["event_id"] not in snapshot.successors}
-
-
-def _review(root, entry, standing_policy, model, transport, inspected_form="list"):
-    """Model-review one rendition, unless the policy scope refuses it: that costs no model call.
-
-    A refused entry is staged with an empty findings pin that is never written; the
-    ``standing-review`` adapter then ends it as ``prohibited-scope`` by its own scope check.
-    """
-    if standing.refused_scope(root, standing_policy, entry["rendition"], entry["rendition_sha256"]):
-        home = policy.validate_instance_roots(root)["intake_home"]
-        return {"status": "reviewed", "skipped": "scope",
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-                "findings_path": f"{home}/findings/out-of-scope/{entry['rendition_sha256'][:24]}.json",
-                "findings_sha256": hashlib.sha256(b"").hexdigest()}
-    return model_review.review(root, entry["rendition"], standing_policy, model, transport,
-                               inspected_form=inspected_form)
-
-
-def _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                       model, transport, usage, snapshot=None, prefetched=None,
-                       heads=None, live=None, inspected_form="list"):
-    """Review and select one extracted rendition; identity is bound to the exact rendition.
-
-    ``prefetched`` optionally returns the model review already started for this entry
-    on a worker thread; every ledger step still runs here, on the calling thread.
-    ``heads`` shares one correction-chain index across the run and ``live`` the live event
-    IDs of ``snapshot``, so a settled entry costs neither a ledger scan nor an event scan.
-    """
-    token = _standing_token(entry, policy_sha)
-    corr, event_id = "standing-" + token, "rev-" + token
-    reviewed, failure = None, None
-    if prefetched is not None:
-        # Wait for the prefetched review before the ledger lookup, so a request another
-        # writer staged while the model call ran is found and staging follows at once.
-        try:
-            reviewed = prefetched()
-        except Exception as error:
-            failure = error
-    current = _head(root, corr, heads)
-    if current is None:
-        if failure is not None:
-            raise failure
-        if reviewed is None:
-            if _held_back(root, entry, standing_policy, manifest):
-                # Nothing is reviewed or staged: a later run reviews it once when room appears.
-                entry.update(qualification="pending-review", review_code="selection-capacity",
-                             capacity_call_skipped=True)
-                return
-            reviewed = _review(root, entry, standing_policy, model, transport, inspected_form)
-        entry["model_call_skipped"] = reviewed.get("skipped") == "scope"
-        usage.update(reviewed["usage"])
-        if reviewed["status"] != "reviewed":
-            entry.update(qualification="pending-review", review_status=reviewed["status"])
-            return
-        review_args = {
-            "policy_path": policy_path, "policy_sha256": policy_sha,
-            "rendition": entry["rendition"], "rendition_sha256": entry["rendition_sha256"],
-            "findings_path": reviewed["findings_path"],
-            "findings_sha256": reviewed["findings_sha256"], "event_id": event_id,
-        }
-        _stage_request(root, corr, [
-            {"id": "review", "kind": "review", "operation": "standing-review",
-             "arguments": {**review_args, "request_id": "req-" + corr + "-review"}},
-            {"id": "select", "kind": "publication", "operation": "standing-select",
-             "arguments": {**review_args, "request_id": "req-" + corr + "-select",
-                           "manifest": manifest}}])
-        current = store.inspect(root, corr)
-    elif reviewed is not None:
-        # Another writer staged this review meanwhile; keep only the tokens actually spent.
-        usage.update(reviewed["usage"])
-    settled = all(st["status"] == "succeeded" for st in current["stages"])
-    if settled and snapshot is not None:
-        if live is None:
-            live = _live_events(snapshot)
-        # An event absent from the run-start snapshot may come from another writer during
-        # this run; only a fresh read can show that it was superseded.
-        if event_id not in live and event_id not in _live_events(event_reader.read_snapshot(root)):
-            # An operator superseded this review; never resurrect its selection.
-            entry.update(qualification="pending-review", review_code="review-superseded",
-                         superseded_event=event_id)
-            return
-    active = current["correlation_id"]
-    if current["stages"][0]["status"] in {"staged", "running", "retryable"}:
-        current = runner.run(root, active, "review")
-    if _inputs_changed(current) or _registration_recovered(root, current, entry):
-        # The saved review's pinned intent is stale (e.g. an earlier-version review it
-        # conflicted with is now supersedable, or a registration a failed catalog read
-        # missed is confirmed now); re-pin it under a correction request.
-        active = _stage_correction(root, corr, active)
-        current = runner.run(root, active, "review")
-    select = current["stages"][1]
-    if (select["status"] == "blocked" and select["attempts"]
-            and select["attempts"][-1]["code"] == "selection-capacity"
-            and _selection_room(root, manifest, entry["rendition"])):
-        # The manifest was full when this was selected and has room now: resume it.
-        current = runner.replay(root, active, "select")
-        select = current["stages"][1]
-    if current["stages"][0]["status"] == "succeeded" and select["status"] in {
-            "staged", "running", "retryable"}:
-        if not _selection_room(root, manifest, entry["rendition"]):
-            # Shared with other cohorts, the manifest is full: leave the saved review's select
-            # stage unrun so a later qualify selects it once room appears, without a model call.
-            entry.update(qualification="pending-review", review_code="selection-capacity")
-            return
-        current = runner.run(root, active, "select")
-    if all(s["status"] == "succeeded" for s in current["stages"]):
-        selection = current["stages"][1]["evidence"]["selection"]
-        if (selection["path"] != entry["rendition"]
-                or selection["sha256"] != entry["rendition_sha256"]):
-            entry.update(qualification="exception", review_code="selection-evidence-mismatch")
-            return
-        entry.update(qualification="qualified", review_event_id=event_id, selection=selection)
-    else:
-        failed = next(s for s in current["stages"] if s["status"] != "succeeded")
-        outcome_name, code = _standing_outcome(failed)
-        entry.update(qualification=outcome_name, review_code=code)
-
-
-def _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
-                model, transport, usage, snapshot, concurrency, inspected_form="list"):
-    """Review and select each entry in input order, with up to ``concurrency`` model calls in flight.
-
-    Only model_review.review runs on worker threads, and only for entries without a
-    standing request; staging, runs, selection and usage stay on this thread in input
-    order, so the outcome does not depend on completion order.
-    """
-    def review(entry):
-        return _review(root, entry, standing_policy, model, transport, inspected_form)
-
-    # One correction-chain index and one live-event set serve every entry of the run.
-    shared = {"heads": store.Heads(), "live": _live_events(snapshot), "inspected_form": inspected_form}
-    if concurrency == 1:
-        for entry in extracted:
-            _review_and_select(root, entry, standing_policy, policy_path, policy_sha, manifest,
-                               model, transport, usage, snapshot, **shared)
-        return
-    # Requests saved before this run need no model call; one read covers the run.
-    # A request another writer stages later is still found by the fresh per-entry
-    # read in _review_and_select, which then discards the unused review.
-    existing = store.correlation_ids(root)
-    window = deque()
-    upcoming = iter(extracted)
-    with ThreadPoolExecutor(max_workers=concurrency,
-                            thread_name_prefix="cohort-review") as pool:
-        try:
-            while True:
-                # At most `concurrency` calls run; a bounded lookahead keeps workers busy
-                # while this thread finishes the ledger work for the oldest entry.
-                while len(window) < 2 * concurrency:
-                    entry = next(upcoming, None)
-                    if entry is None:
-                        break
-                    corr = "standing-" + _standing_token(entry, policy_sha)
-                    # A review is started ahead only while the manifest has room for every entry
-                    # still in the window; any other entry is checked exactly, in turn, in
-                    # _review_and_select, so no call is paid for an entry that cannot be selected.
-                    ahead = corr not in existing and _free_room(root, manifest) > len(window)
-                    window.append((entry, pool.submit(review, entry) if ahead else None))
-                if not window:
-                    return
-                entry, future = window.popleft()
-                _review_and_select(root, entry, standing_policy, policy_path, policy_sha,
-                                   manifest, model, transport, usage, snapshot,
-                                   future.result if future is not None else None, **shared)
-        except BaseException:
-            for _, future in window:
-                if future is not None:
-                    future.cancel()
-            raise
-
-
 def _publish(root, policy_path, policy_sha, manifest, index_path):
     """Return the publish stage, staging a fresh request when saved success is stale."""
     manifest_sha = hashlib.sha256((root / manifest).read_bytes()).hexdigest()[:16]
@@ -1269,18 +301,10 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
     previous = None
     for number in range(100):
         corr = base if number == 0 else f"{base}-r{number}"
-        current = _inspect(root, corr)
-        if current is None:
-            store.stage(root, json.dumps({
-                "version": 1, "correlation_id": corr, "correction_of": previous,
-                "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-                "retry": {"max_attempts": 3, "backoff_seconds": 0},
-                "stages": [{"id": "publish", "kind": "publication",
-                            "operation": "standing-publish",
-                            "arguments": {"policy_path": policy_path, "policy_sha256": policy_sha,
-                                          "manifest": manifest, "db": str(index_path)}}],
-            }).encode())
-            current = store.inspect(root, corr)
+        current = store.find(root, corr) or store.stage_request(root, corr, [{
+            "id": "publish", "kind": "publication", "operation": "standing-publish",
+            "arguments": {"policy_path": policy_path, "policy_sha256": policy_sha,
+                          "manifest": manifest, "db": str(index_path)}}], correction_of=previous)
         stage = current["stages"][0]
         if stage["status"] in {"staged", "running", "retryable"}:
             stage = runner.run(root, corr, "publish")["stages"][0]
@@ -1292,6 +316,61 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
             return stage, inspected
         previous = corr
     raise IntakeError("publication_revisions_exhausted")
+
+
+def _check_options(concurrency, initial_concurrency, inspected_form, context):
+    if type(concurrency) is not int or concurrency < 1:
+        raise IntakeError("invalid_concurrency")
+    if initial_concurrency is not None and (
+            type(initial_concurrency) is not int or not 1 <= initial_concurrency <= concurrency):
+        raise IntakeError("invalid_concurrency")
+    if inspected_form not in model_review.FORMS:
+        raise IntakeError("invalid_inspected_form")
+    if not context:
+        # A maintained context document must be named; guessing one would not satisfy the policy.
+        raise IntakeError("context_required")
+
+
+def _reconcile_qualified(root, manifest, system, current, cohorts, extracted):
+    """Reconcile the cohort's manifest entries to exactly its qualified renditions.
+
+    Selections come from validated review evidence, keeping an operator's explicit selection whose
+    saved review was superseded. Returns ``_reconcile``'s counts.
+    """
+    qualified = [e for e in extracted if e.get("qualification") == "qualified"]
+    stale = {e["superseded_event"] for e in extracted if "superseded_event" in e}
+    kept = {e["rendition"] for e in extracted if e.get("review_code") == "review-superseded"}
+
+    def reconciled(own, room):
+        own = [r for r in own if not stale & set(r.get("review_event_ids") or [])]
+        chosen = [r for r in own if r["path"] in kept] + [e["selection"] for e in qualified]
+        # A selection restored from saved evidence cannot exceed what the manifest can hold
+        # next to other cohorts' entries; the surplus stays visibly pending, never invalid.
+        surplus = {r["path"] for r in chosen[room:]}
+        for entry in qualified:
+            if entry["rendition"] in surplus:
+                entry.update(qualification="pending-review", review_code="selection-capacity")
+        return chosen[:room]
+    return _reconcile(root, manifest, system, current, cohorts, reconciled)
+
+
+def _qualification_counts(report, extracted, others, published):
+    counts = report["counts"]
+    counts["qualification"] = dict(
+        Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
+    if others["selections"] or others["orphaned"]:
+        # ``selections`` belong to other cohorts or to none provable (``unattributed``) and were
+        # left as they were; ``orphaned`` named a receipt the catalog does not hold and were dropped.
+        counts["other_cohorts"] = others
+    refused = [e for e in extracted if e.get("review_code") == "standing-exception-prohibited-scope"]
+    # Entries the policy scope refuses, and how many of them this run reached without a model call.
+    counts["out_of_scope"] = {
+        "entries": len(refused), "model_calls_skipped": sum(bool(e.get("model_call_skipped")) for e in refused)}
+    # Entries left pending for manifest capacity, and how many of them cost no model call at all.
+    counts["selection_capacity"] = {
+        "entries": sum(e.get("review_code") == "selection-capacity" for e in extracted),
+        "model_calls_skipped": sum(bool(e.get("capacity_call_skipped")) for e in extracted)}
+    counts["published"] = int(published)
 
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
@@ -1307,17 +386,8 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     asked to write the inspected record indices; findings and outcomes are identical.
     ``trust_stat`` is passed to ``ingest`` (opt-in; see there).
     """
-    if type(concurrency) is not int or concurrency < 1:
-        raise IntakeError("invalid_concurrency")
-    if initial_concurrency is not None and (
-            type(initial_concurrency) is not int or not 1 <= initial_concurrency <= concurrency):
-        raise IntakeError("invalid_concurrency")
-    if inspected_form not in model_review.FORMS:
-        raise IntakeError("invalid_inspected_form")
+    _check_options(concurrency, initial_concurrency, inspected_form, context)
     root = Path(root).resolve()
-    if not context:
-        # A maintained context document must be named; guessing one would not satisfy the policy.
-        raise IntakeError("context_required")
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
     report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat)
     standing_policy, policy_sha = _ensure_standing_inputs(
@@ -1337,44 +407,15 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     retried = Counter(retries) if retries is not None else None
     limiter = throttle.Limiter(concurrency, initial=initial_concurrency, adaptive=adaptive)
     with limiter.gating(transport) as gated:
-        _review_all(root, extracted, standing_policy, policy_path, policy_sha, manifest,
-                    model, gated, usage, snapshot, concurrency, inspected_form)
-    qualified = [e for e in extracted if e.get("qualification") == "qualified"]
-    # Reconcile the cohort's manifest entries to exactly its qualified renditions from validated
-    # review evidence, keeping an operator's explicit selection whose saved review was superseded.
-    stale = {e["superseded_event"] for e in extracted if "superseded_event" in e}
-    kept = {e["rendition"] for e in extracted if e.get("review_code") == "review-superseded"}
-
-    def reconciled(own, room):
-        own = [r for r in own if not stale & set(r.get("review_event_ids") or [])]
-        chosen = [r for r in own if r["path"] in kept] + [e["selection"] for e in qualified]
-        # A selection restored from saved evidence cannot exceed what the manifest can hold
-        # next to other cohorts' entries; the surplus stays visibly pending, never invalid.
-        surplus = {r["path"] for r in chosen[room:]}
-        for entry in qualified:
-            if entry["rendition"] in surplus:
-                entry.update(qualification="pending-review", review_code="selection-capacity")
-        return chosen[:room]
-    others = _reconcile(root, manifest, system, current, cohorts, reconciled)
+        cohort_review.review_all(root, extracted, {
+            "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
+            "manifest": manifest, "model": model, "transport": gated, "usage": usage,
+            "snapshot": snapshot, "inspected_form": inspected_form}, concurrency)
+    others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
-    report["counts"]["qualification"] = dict(
-        Counter(e["qualification"] for e in report["entries"] if "qualification" in e))
     others["orphaned"] = pruned["orphaned"]
-    if others["selections"] or others["orphaned"]:
-        # ``selections`` belong to other cohorts or to none provable (``unattributed``) and were
-        # left as they were; ``orphaned`` named a receipt the catalog does not hold and were dropped.
-        report["counts"]["other_cohorts"] = others
-    refused = [e for e in extracted if e.get("review_code") == "standing-exception-prohibited-scope"]
-    # Entries the policy scope refuses, and how many of them this run reached without a model call.
-    report["counts"]["out_of_scope"] = {
-        "entries": len(refused), "model_calls_skipped": sum(bool(e.get("model_call_skipped")) for e in refused)}
-    # Entries left pending for manifest capacity, and how many of them cost no model call at all.
-    report["counts"]["selection_capacity"] = {
-        "entries": sum(e.get("review_code") == "selection-capacity" for e in extracted),
-        "model_calls_skipped": sum(bool(e.get("capacity_call_skipped")) for e in extracted)}
-    report["counts"]["published"] = int(
-        pub["status"] == "succeeded"
-        and bool(inspected.get("availability", {}).get("available")))
+    _qualification_counts(report, extracted, others, pub["status"] == "succeeded"
+                          and bool(inspected.get("availability", {}).get("available")))
     report["usage"] = {"prompt_tokens": usage["prompt_tokens"],
                        "completion_tokens": usage["completion_tokens"]}
     # Body-free effective model-call rate and what the adaptive limit did; timing-dependent, so
@@ -1422,7 +463,7 @@ def publish(root, *, policy_path, manifest, index_path=DEFAULT_INDEX):
             "publication": publication}
 
 
-def main(argv=None):
+def _parser():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
     recover = commands.add_parser(
@@ -1453,7 +494,6 @@ def main(argv=None):
         if name in {"ingest", "qualify"}:
             command.add_argument("--system", required=True)
             command.add_argument("--actor", required=True)
-        if name in {"ingest", "qualify"}:
             command.add_argument("--trust-stat", action="store_true",
                                  help="skip reading and hashing an extracted file whose stat identity "
                                       "equals its docs row (default: every file is hashed)")
@@ -1479,46 +519,55 @@ def main(argv=None):
             command.add_argument("--inspected-form", choices=model_review.FORMS, default="list",
                                  help="ask the reviewer for inspected records as every index "
                                       "(list, default) or as ranges (ranges)")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _maintenance(args):
+    """The report of a ledger maintenance command (identity recovery or the docs table)."""
+    if args.command == "recover-identity":
+        return recover_identity(args.root, apply=args.apply)
+    root = args.root.resolve()
+    if args.command == "backfill-docs":
+        return docsync.backfill(root, apply=args.apply)
+    return docsync.audit(root) if args.command == "audit-docs" else docsync.status(root)
+
+
+def _inbox_report(args):
+    """The report of an inbox command: ``qualify``, ``ingest`` or ``classify``."""
+    if args.command == "qualify":
+        return qualify(
+            args.root, args.inbox, system=args.system, actor=args.actor,
+            policy_path=args.policy_path, manifest=args.manifest, model=args.model,
+            transport=model_review.usai_transport(
+                args.models_config,
+                recorder=usage_log.Recorder("librarian intake", model_review.PROVIDER)),
+            context=args.context, index_path=args.index_path,
+            concurrency=args.concurrency, adaptive=not args.no_adaptive,
+            initial_concurrency=args.initial_concurrency,
+            inspected_form=args.inspected_form, trust_stat=args.trust_stat)
+    if args.command == "ingest":
+        return ingest(args.root, args.inbox, system=args.system, actor=args.actor,
+                      limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
+    entries = classify(args.root, args.inbox)
+    return {"counts": {"files": len(entries),
+                       "disposition": dict(Counter(e["disposition"] for e in entries))},
+            "entries": entries}
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
     try:
-        if args.command == "recover-identity":
-            print(json.dumps(recover_identity(args.root, apply=args.apply), sort_keys=True))
-            return 0
-        if args.command in {"backfill-docs", "audit-docs", "docs-status"}:
-            root = args.root.resolve()
-            report = (docsync.backfill(root, apply=args.apply) if args.command == "backfill-docs"
-                      else docsync.audit(root) if args.command == "audit-docs" else docsync.status(root))
-            print(json.dumps(report, sort_keys=True))
+        if args.command in {"recover-identity", "backfill-docs", "audit-docs", "docs-status"}:
+            print(json.dumps(_maintenance(args), sort_keys=True))
             return 0
         if args.command == "publish":
             report = publish(args.root, policy_path=args.policy_path, manifest=args.manifest,
                              index_path=args.index_path)
             print(json.dumps(report, sort_keys=True))
             return 0 if report["counts"]["published"] else 1
-        if args.command == "qualify":
-            report = qualify(
-                args.root, args.inbox, system=args.system, actor=args.actor,
-                policy_path=args.policy_path, manifest=args.manifest, model=args.model,
-                transport=model_review.usai_transport(
-                    args.models_config,
-                    recorder=usage_log.Recorder("librarian intake", model_review.PROVIDER)),
-                context=args.context, index_path=args.index_path,
-                concurrency=args.concurrency, adaptive=not args.no_adaptive,
-                initial_concurrency=args.initial_concurrency,
-                inspected_form=args.inspected_form, trust_stat=args.trust_stat)
-        elif args.command == "ingest":
-            report = ingest(args.root, args.inbox, system=args.system, actor=args.actor,
-                            limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
-        else:
-            entries = classify(args.root, args.inbox)
-            report = {"counts": {"files": len(entries),
-                                 "disposition": dict(Counter(e["disposition"] for e in entries))},
-                      "entries": entries}
-    except IntakeError as error:
-        print(json.dumps({"error": error.code}), file=sys.stderr)
-        return 2
-    except standing.CatalogUnavailable as error:
-        # Nothing about the entry was saved; restart once the catalog is readable.
+        report = _inbox_report(args)
+    except (IntakeError, standing.CatalogUnavailable) as error:
+        # After CatalogUnavailable nothing about the entry was saved; restart once the catalog is readable.
         print(json.dumps({"error": error.code}), file=sys.stderr)
         return 2
     if args.report:
