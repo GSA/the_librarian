@@ -1221,7 +1221,7 @@ class RecoverUnresolvedEvidenceTests(QualifyCase):
     def test_recovery_qualifies_only_unresolved_evidence_reviews_without_a_model_call(self):
         with self.blocked_as_before():
             transport = self.transport()
-            report = self._qualify(transport)
+            self._qualify(transport)
         blocked = self.blocked_codes()
         self.assertEqual(set(blocked.values()), {"standing-pending-review-unresolved-evidence"})
         self.assertEqual(len(blocked), 3)
