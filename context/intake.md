@@ -333,9 +333,10 @@ renders it as text or HTML and `progress_serve.py` serves it.
   operation, status, funnel state and last attempt outcome/category/code and
   times only; request arguments, intents, evidence and document text are never
   read into the report. `--run NAME=PREFIX` groups correlation IDs by prefix.
-- `progress-serve` serves `/` (HTML, `meta refresh`, no scripts or external
-  assets) and `/progress.json`, GET/HEAD only, with `Cache-Control: no-store`
-  and a deny-all CSP. It binds `127.0.0.1` by default, rejects non-loopback
+- `progress-serve` serves `/` (HTML, `meta refresh`, no external assets, and
+  one inline script that shows times in local time) and `/progress.json`,
+  GET/HEAD only, with `Cache-Control: no-store` and a `default-src 'none'` CSP
+  that allows only that script by its SHA-256 hash. It binds `127.0.0.1` by default, rejects non-loopback
   `Host` headers, and refuses any non-loopback `--host` with
   `non_loopback_bind` unless `--allow-non-loopback` records explicit approval.
 
