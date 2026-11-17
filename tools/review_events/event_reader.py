@@ -178,7 +178,7 @@ def read_snapshot(root, *, full=False):
         with closing(store.connect(db)) as connection:
             connection.execute("BEGIN")
             state, events, successors, history = store.view(connection, root, reuse=True, full=full,
-                                                            materialize=False)
+                                                            materialize=False, release=True)
         return Snapshot(state, events, successors, root, history)
     except contract.ReviewError:
         raise

@@ -618,6 +618,22 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   the pass, so a commit that lands during validation is never remembered; a failed
   validation is never stored. Callers receive fresh state and event-list containers (the
   event dictionaries are shared and read-only by contract).
+- **Read locks and busy waits (Kata xeb8).** Review-event connections used SQLite's busy
+  timeout 0, and a full replay (a cold `progress` render, a publication or the index
+  freshness check's `read_snapshot(full=True)`) held its read transaction, and so its
+  SHARED lock, for the whole O(history) validation (6.5 s at 13,000 events). A running
+  `progress-serve` therefore made concurrent review-event appends fail at once with
+  `sqlite3.OperationalError`, which intake records as retryable `sqlite-operational`.
+  Now `event_store.BUSY_TIMEOUT_SECONDS` (10 s, as the catalog's) is the busy wait of
+  every review-event connection, and `event_reader.read_snapshot` passes `release=True`,
+  so a full pass reads every row inside one transaction and commits it before any
+  validation; its longest hold at 13,000 events fell from 6.5 s to 0.04 s. The result is
+  still one snapshot, memoized only if the file identity is unchanged afterwards (the
+  rule above). Journal mode, `synchronous` and the identity proofs are unchanged. Tests:
+  `tests/test_progress_contention.py` (a writer with a 0.4 s wait commits throughout a
+  1.5 s replay, in `read_snapshot(full=True)` and in the cold `progress` read; a writer
+  waits out a reader's brief hold). Measured holds for the other stores, which did not
+  cause the failures, are under "Intake ledger" and `progress` below.
 - **Invalidation.** Any commit (by this or another process), restore, swapped file,
   same-size edit (even with a restored mtime, because `utime` moves ctime), changed
   contract or new UTC day misses and revalidates everything with the unchanged
