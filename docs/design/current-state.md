@@ -790,7 +790,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values refuse)
   and the same value is the SQLite busy timeout. Exceeding it, or a transient SQLite
   BUSY/LOCKED during a stage, raises retryable `ledger_busy`; nothing was written.
-  `settle` and cohort ingest retry up to three times. `progress` reads the ledger in
+  `settle` and cohort ingest retry up to three times. `progress` (`progress.read_ledger`) reads the ledger in
   keyset pages of 5,000 requests, each in its own short read transaction, and
   verifies each page afterwards (`store.verify_page`, sharing `store.check_request`
   with `store.verify`), so it cannot hold a read lock across O(ledger) work and its
@@ -807,7 +807,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   hashes the bytes in hand and compares the stored digest. Its catalog read never
   writes a receipt (`catalog_store.observed_state`): it trusts a receipt covering this exact file or
   this process's own full inspection today, and an unreadable receipt is ignored, never reported,
-  so the full inspection decides. `progress-serve` renders one page at a time, shares the
+  so the full inspection decides. `progress-serve` (`progress_serve.Latest`) renders one page at a time, shares the
   result with requests that arrive meanwhile and reuses one younger than a second;
   the report adds finished-attempt rates (1/5/15 min) and attention grouped by
   cause. A 125,000-request synthetic ledger rendered in 11 s and 1.5 GB before and

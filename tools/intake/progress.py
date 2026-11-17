@@ -8,7 +8,7 @@ serves it over loopback HTTP.
 """
 from bisect import insort
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import os
 import sqlite3
@@ -51,7 +51,6 @@ def failure(error):
 PAGE = 5000  # requests per short read transaction
 WINDOWS = (60, 300, 900)  # seconds for the "is it moving" attempt rates
 CODED = {"blocked", "dead-letter", "retryable"}  # statuses whose last attempt code is reported
-ATTENTION = CODED
 
 # Verification state reused across renders in this process. ``_memo`` holds SHA-256 digests of
 # request and artifact bytes already proven (store.PageMemo); ``_cached`` holds the one finished
@@ -124,6 +123,115 @@ def stage_signature(layout, statuses):
     return funnel, statuses[current][0], statuses[current][1]
 
 
+@contextmanager
+def ledger_errors():
+    """Map SQLite failures of a ledger read to the reported intake error codes."""
+    try:
+        yield
+    except sqlite3.OperationalError as error:
+        raise IntakeError("ledger_unavailable") from error
+    except sqlite3.DatabaseError as error:
+        raise IntakeError("corrupt_store") from error
+
+
+def first_identity(c, db):
+    """The ledger file identity inside the open read transaction (header fallback outside a lock)."""
+    before = file_identity(db, c)
+    if before is None:
+        c.execute("COMMIT")  # no SQLite lock is held while the header is read directly
+        before = header_identity(db)
+        c.execute("BEGIN")
+    return before
+
+
+def last_identity(c, db, before):
+    """The file identity and attempt rates after the last page."""
+    try:
+        c.execute("BEGIN")
+        after = file_identity(db, c)
+        moving = rates(c, time.time())
+        c.execute("COMMIT")
+        if after is None and before is not None:
+            after = header_identity(db)
+    except sqlite3.DatabaseError as error:
+        raise IntakeError("ledger_unavailable") from error
+    return after, moving
+
+
+def newer(current, value):
+    return value if current is None or (value is not None and value > current) else current
+
+
+def request_state(correlation_id, stages, layout, attempts_of):
+    """Each stage's (status, last attempt code when coded) and the newest attempt time of one request."""
+    statuses, updated = [], None
+    for saved, (stage_id, _, _) in zip(stages, layout):
+        history = attempts_of.get((correlation_id, stage_id), [])
+        for attempt in history:
+            updated = newer(newer(updated, attempt["started"]), attempt["ended"])
+        code = None
+        if saved["status"] in CODED:
+            current = [a for a in history if a["cycle"] == saved["cycle"]]
+            code = current[-1]["code"] if current else None
+        statuses.append((saved["status"], code))
+    return tuple(statuses), updated
+
+
+def scan(c, root, limit, runs):
+    """Verify every page and fold it into signature counts, newest times and the entries kept to show."""
+    counts, per_run = Counter(), {name: Counter() for name in runs}
+    latest = dict.fromkeys(per_run)
+    newest, recent, groups, info, after = None, Best(limit), {}, {}, None
+    while True:
+        with ledger_errors():
+            c.execute("BEGIN")
+            rows = store.snapshot(c, after, PAGE)
+            c.execute("COMMIT")
+        requests, stages_of, attempts_of, _ = rows
+        if not requests:
+            break
+        layouts = store.verify_page(rows, root, _memo)
+        for row, layout in zip(requests, layouts):
+            correlation_id = row["correlation_id"]
+            statuses, updated = request_state(correlation_id, stages_of[correlation_id], layout,
+                                              attempts_of)
+            signature = (layout, statuses)
+            if signature not in info:
+                info[signature] = stage_signature(layout, statuses)
+            funnel, state, code = info[signature]
+            counts[signature] += 1
+            newest = newer(newest, updated)
+            for name, prefix in runs.items():
+                if correlation_id.startswith(prefix):
+                    per_run[name][signature] += 1
+                    latest[name] = newer(latest[name], updated)
+            order = (-(updated or 0), correlation_id)
+
+            def build(row=row, stages=stages_of[correlation_id], attempts_of=attempts_of):
+                return candidate(row, stages, attempts_of)
+            recent.offer(order, build)
+            if state in CODED:
+                group = groups.setdefault((state, funnel, code), [0, Best(limit)])
+                group[0] += 1
+                group[1].offer(order, build)
+        after = requests[-1]["correlation_id"]
+    return counts, per_run, latest, newest, recent, groups
+
+
+def summarize(counts, per_run, latest, newest, recent, groups, limit):
+    return {
+        "overall": aggregate(counts, newest),
+        "runs": {name: aggregate(per_run[name], latest[name]) for name in per_run},
+        "recent": [public(make_item(entry)) for _, entry in recent.entries],
+        "attention_groups": [
+            {"state": state, "funnel": funnel, "code": code, "count": count}
+            for (state, funnel, code), (count, _) in sorted(
+                groups.items(), key=lambda g: (-g[1][0], tuple(str(x) for x in g[0])))],
+        "attention_total": sum(count for count, _ in groups.values()),
+        "attention": [public(make_item(entry)) for entry in spread(groups, limit)],
+    }
+
+
 def read_ledger(root, timeout=2.0, limit=50, runs=None):
     """Verify the whole ledger a page at a time and reduce it to counts and the few items shown.
 
@@ -132,104 +240,24 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
     the ``limit`` newest items per list is kept, so memory follows the page, not the ledger.
     """
     started = time.perf_counter()
+    runs = runs or {}
     root, db, c = open_ledger(root, timeout)
     with closing(c):
-        try:
+        with ledger_errors():
             c.execute("BEGIN")
-            before = file_identity(db, c)
-            if before is None:
-                c.execute("COMMIT")  # no SQLite lock is held while the header is read directly
-                before = header_identity(db)
-                c.execute("BEGIN")
-            key = (str(root), before, limit, tuple(sorted((runs or {}).items())),
+            before = first_identity(c, db)
+            key = (str(root), before, limit, tuple(sorted(runs.items())),
                    datetime.now(timezone.utc).date().isoformat())
             if before is not None and _cached.get("key") == key:
-                summary = _cached["summary"]
                 moving = rates(c, time.time())
                 c.execute("COMMIT")
-                return {**summary, "rates": moving, "cached": True,
+                return {**_cached["summary"], "rates": moving, "cached": True,
                         "seconds": round(time.perf_counter() - started, 3)}
             store.check_identity(c)
             c.execute("COMMIT")
-        except sqlite3.OperationalError as error:
-            raise IntakeError("ledger_unavailable") from error
-        except sqlite3.DatabaseError as error:
-            raise IntakeError("corrupt_store") from error
-        counts, per_run = Counter(), {name: Counter() for name in runs or {}}
-        latest = {name: None for name in per_run}
-        newest = None
-        recent, groups = Best(limit), {}
-        info, after = {}, None
-        while True:
-            try:
-                c.execute("BEGIN")
-                rows = store.snapshot(c, after, PAGE)
-                c.execute("COMMIT")
-            except sqlite3.OperationalError as error:
-                raise IntakeError("ledger_unavailable") from error
-            except sqlite3.DatabaseError as error:
-                raise IntakeError("corrupt_store") from error
-            requests, stages_of, attempts_of, _ = rows
-            if not requests:
-                break
-            layouts = store.verify_page(rows, root, _memo)
-            for row, layout in zip(requests, layouts):
-                correlation_id = row["correlation_id"]
-                statuses, updated = [], None
-                for saved, (stage_id, _, _) in zip(stages_of[correlation_id], layout):
-                    history = attempts_of.get((correlation_id, stage_id), [])
-                    for attempt in history:
-                        for field in ("started", "ended"):
-                            if attempt[field] is not None and (updated is None or attempt[field] > updated):
-                                updated = attempt[field]
-                    code = None
-                    if saved["status"] in CODED:
-                        current = [a for a in history if a["cycle"] == saved["cycle"]]
-                        code = current[-1]["code"] if current else None
-                    statuses.append((saved["status"], code))
-                signature = (layout, tuple(statuses))
-                if signature not in info:
-                    info[signature] = stage_signature(layout, signature[1])
-                _, state, code = info[signature]
-                funnel = info[signature][0]
-                counts[signature] += 1
-                if updated is not None and (newest is None or updated > newest):
-                    newest = updated
-                for name, prefix in (runs or {}).items():
-                    if correlation_id.startswith(prefix):
-                        per_run[name][signature] += 1
-                        if updated is not None and (latest[name] is None or updated > latest[name]):
-                            latest[name] = updated
-                order = (-(updated or 0), correlation_id)
-
-                def build(row=row, correlation_id=correlation_id, stages_of=stages_of, attempts_of=attempts_of):
-                    return candidate(row, stages_of[correlation_id], attempts_of)
-                recent.offer(order, build)
-                if state in ATTENTION:
-                    group = groups.setdefault((state, funnel, code), [0, Best(limit)])
-                    group[0] += 1
-                    group[1].offer(order, build)
-            after = requests[-1]["correlation_id"]
-        try:
-            c.execute("BEGIN")
-            after_identity = file_identity(db, c)
-            moving = rates(c, time.time())
-            c.execute("COMMIT")
-            if after_identity is None and before is not None:
-                after_identity = header_identity(db)
-        except sqlite3.DatabaseError as error:
-            raise IntakeError("ledger_unavailable") from error
-    summary = {
-        "overall": aggregate(counts, newest),
-        "runs": {name: aggregate(per_run[name], latest[name]) for name in per_run},
-        "recent": [public(make_item(c_)) for _, c_ in recent.entries],
-        "attention_groups": [
-            {"state": state, "funnel": funnel, "code": code, "count": count}
-            for (state, funnel, code), (count, _) in sorted(
-                groups.items(), key=lambda g: (-g[1][0], tuple(str(x) for x in g[0])))],
-        "attention_total": sum(count for count, _ in groups.values()),
-    }
-    summary["attention"] = [public(make_item(c_)) for c_ in spread(groups, limit)]
+        tally = scan(c, root, limit, runs)
+        after_identity, moving = last_identity(c, db, before)
+    summary = summarize(*tally, limit)
     # Stored only when the file was exactly the same before the first and after the last page: no
     # commit landed between pages, so the summary describes one verified file state.
     if before is not None and after_identity == before:
@@ -348,17 +376,6 @@ def public(value):
 _catalog_seen = {}  # canonical binding -> state of a full inspection this process has done today
 
 
-def catalog_state(catalog, connection, home):
-    """The catalog's validated state without writing anything (no receipt is ever written here).
-
-    A read-validation receipt that covers exactly this file ("What a catalog write validates" in docs/design/current-state.md) vouches for a state
-    that a writer or reader already validated in full today, and this process's own earlier full
-    inspection of the identical binding does the same; otherwise the whole history is inspected.
-    A receipt that cannot be read is ignored, never trusted.
-    """
-    return catalog.observed_state(connection, home, _catalog_seen)
-
-
 def read_catalog(root):
     from tools.catalog import catalog_store as catalog, contracts
     try:
@@ -368,7 +385,7 @@ def read_catalog(root):
                         "Catalog home missing or not private")
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
-            state = catalog_state(catalog, connection, home)
+            state = catalog.observed_state(connection, home, _catalog_seen)
             catalog.current_view(connection)
             # One scan of the current records for all three breakdowns.
             kinds, coverage, extraction = Counter(), Counter(), Counter()
