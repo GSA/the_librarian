@@ -281,6 +281,8 @@ counts rather than third digits.
 they never stage, run, replay, repair or initialize anything, and a missing,
 locked, public or corrupt ledger, catalog, review-event store or index is
 reported as that source being unavailable with its error class, never a crash.
+`tools/intake/progress.py` reads the sources into one report, `progress_render.py`
+renders it as text or HTML and `progress_serve.py` serves it.
 
 ```sh
 .venv/bin/python -m tools.intake.cli --root . progress [--format text] [--run bulk=upload-bulk-]
