@@ -16,6 +16,7 @@ from tools import backups as snapshots
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_reader
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
 from tests.test_file_identity_locks import needs_dbpage
@@ -50,7 +51,7 @@ def event(root, n, **changes):
 
 def add(root, n):
     state = events.status(root)
-    return events.append(root, events.bundle([event(root, n)]), ACTOR, f"req-memo-{n}",
+    return events.append(root, event_history.bundle([event(root, n)]), ACTOR, f"req-memo-{n}",
                          state["revision"], state["state_token"])
 
 
@@ -63,20 +64,20 @@ class MemoCase(unittest.TestCase):
         catalog.initialize(self.root)
         events.initialize(self.root)
         self.home, self.db, _ = events.locations(self.root)
-        events.clear_memo()
-        self.addCleanup(events.clear_memo)
+        event_history.clear_memo()
+        self.addCleanup(event_history.clear_memo)
         for n in range(3):
             add(self.root, n)
 
     def full_passes(self):
         """Count the full history validations a block of work performs."""
         calls = []
-        real = events.validate_history
+        real = event_history.validate_history
 
         def counting(*args, **kwargs):
             calls.append(1)
             return real(*args, **kwargs)
-        return calls, patch.object(events, "validate_history", counting)
+        return calls, patch.object(event_history, "validate_history", counting)
 
     def read(self):
         return event_reader.read_snapshot(self.root)
@@ -119,7 +120,7 @@ class MemoReuse(MemoCase):
 
     def test_a_hit_returns_what_a_fresh_validation_returns(self):
         memoized = self.read()
-        events.clear_memo()
+        event_history.clear_memo()
         fresh = self.read()
         self.assertEqual((memoized.state, memoized.events), (fresh.state, fresh.events))
 
@@ -143,12 +144,12 @@ class MemoReuse(MemoCase):
     def test_an_audit_evicts_so_a_refusing_audit_leaves_nothing_to_serve(self):
         self.read()
         self.raw_edit(restore_mtime=False)
-        identity = events.file_identity
+        identity = event_history.file_identity
         stored = {}
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
             stored["identity"] = identity(self.db, connection)
-        with patch.object(events, "file_identity", lambda path, connection: stored["identity"]):
+        with patch.object(event_history, "file_identity", lambda path, connection: stored["identity"]):
             with self.assertRaises(contract.ReviewError):
                 events.status(self.root, audit=True)
             self.refused()
@@ -172,25 +173,25 @@ class MemoReuse(MemoCase):
 
     def test_reuse_is_per_contract_and_a_changed_contract_is_a_miss_and_a_refusal(self):
         self.read()
-        schema = events.store_schema(self.root)
+        schema = event_history.store_schema(self.root)
         schema["description"] = "A different installed contract."
-        with patch.object(events, "store_schema", lambda root=None: schema):
+        with patch.object(event_history, "store_schema", lambda root=None: schema):
             self.refused("Stored contract differs")
 
     def test_a_journal_beside_the_file_falls_back_to_full_validation(self):
         self.read()
         calls, patched = self.full_passes()
-        with patched, patch.object(events, "file_identity", lambda path, connection: None):
+        with patched, patch.object(event_history, "file_identity", lambda path, connection: None):
             self.read()
             self.read()
         self.assertEqual(len(calls), 2)
 
     def test_a_connection_not_opened_by_the_store_is_never_memoized(self):
-        events.clear_memo()
+        event_history.clear_memo()
         with closing(sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, isolation_level=None)) as raw:
             raw.row_factory = sqlite3.Row
             raw.execute("BEGIN")
-            events.inspect(raw, self.root, reuse=True)
+            event_history.inspect(raw, self.root, reuse=True)
         calls, patched = self.full_passes()
         with patched:
             self.read()
@@ -256,7 +257,7 @@ class MemoTamper(MemoCase):
             os.replace(copy, self.db)
             calls, patched = self.full_passes()
             with patched:
-                events.inspect(old, self.root, reuse=True)
+                event_history.inspect(old, self.root, reuse=True)
             self.assertEqual(len(calls), 1)  # the old file's bytes are validated, not the path's memo
 
     def test_a_sqlite_edit_that_defeats_the_triggers_is_refused(self):
@@ -274,14 +275,14 @@ class MemoTamper(MemoCase):
         self.read()
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
-            identity = events.file_identity(self.db, connection)
+            identity = event_history.file_identity(self.db, connection)
         with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
             for table in ("metadata", "batches", "events", "corrections"):
                 for action in ("update", "delete"):
                     connection.execute(f"DROP TRIGGER immutable_{table}_{action}")
             connection.execute("UPDATE events SET entry_hash='0' WHERE sequence=3")
         os.chmod(self.db, 0o600)
-        with patch.object(events, "file_identity", lambda path, connection: identity):
+        with patch.object(event_history, "file_identity", lambda path, connection: identity):
             self.refused()
 
     def test_residual_identity_restoring_edit_is_served_until_an_audit_or_the_next_utc_day(self):
@@ -290,9 +291,9 @@ class MemoTamper(MemoCase):
         self.read()
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
-            identity = events.file_identity(self.db, connection)
+            identity = event_history.file_identity(self.db, connection)
         self.raw_edit(restore_mtime=False)
-        with patch.object(events, "file_identity", lambda path, connection: identity):
+        with patch.object(event_history, "file_identity", lambda path, connection: identity):
             self.assertEqual(self.read().state["events"], 3)
             with self.assertRaises(contract.ReviewError):
                 events.status(self.root, audit=True)
@@ -302,9 +303,9 @@ class MemoTamper(MemoCase):
         self.read()
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
-            identity = events.file_identity(self.db, connection)
+            identity = event_history.file_identity(self.db, connection)
         self.raw_edit(restore_mtime=False)
-        with patch.object(events, "file_identity", lambda path, connection: identity):
+        with patch.object(event_history, "file_identity", lambda path, connection: identity):
             self.assertEqual(self.read().state["events"], 3)
             with self.day_after():
                 self.refused("Event payload hash mismatch")
@@ -335,15 +336,15 @@ class MemoConcurrentWriter(MemoCase):
 
     def test_a_pass_that_overlaps_a_commit_is_not_remembered(self):
         """A commit between the identity taken before and after the pass stores nothing."""
-        events.clear_memo()
-        real = events.file_identity
+        event_history.clear_memo()
+        real = event_history.file_identity
         seen = []
 
         def moving(path, connection):
             seen.append(1)
             identity = real(path, connection)
             return identity if len(seen) == 1 else [*identity[:5], "ffffffff"]
-        with patch.object(events, "file_identity", moving):
+        with patch.object(event_history, "file_identity", moving):
             self.read()
         calls, patched = self.full_passes()
         with patched:
@@ -356,15 +357,15 @@ class DeltaVerification(MemoCase):
 
     def deltas(self):
         seen = []
-        real = events.validate_delta
+        real = event_history.validate_delta
 
         def counting(history, incoming, root=None, upto=None):
             seen.append(len(incoming))
             return real(history, incoming, root, upto)
-        return seen, patch.object(events, "validate_delta", counting)
+        return seen, patch.object(event_history, "validate_delta", counting)
 
     def fresh_state(self):
-        events.clear_memo()
+        event_history.clear_memo()
         return self.read()
 
     def test_an_append_validates_only_its_incoming_events_not_the_history(self):
@@ -392,7 +393,7 @@ class DeltaVerification(MemoCase):
         correction["source"] = first["source"]
         correction["scope"] = first["scope"]
         state = events.status(self.root)
-        events.append(self.root, events.bundle([correction]), ACTOR, "req-memo-50",
+        events.append(self.root, event_history.bundle([correction]), ACTOR, "req-memo-50",
                       state["revision"], state["state_token"])
         got = self.read()
         self.assertEqual(got.successors, {"rev-memo-0": "rev-memo-50"})
@@ -402,18 +403,18 @@ class DeltaVerification(MemoCase):
         again["source"], again["scope"] = first["source"], first["scope"]
         state = events.status(self.root)
         with self.assertRaisesRegex(contract.ReviewError, "Conflicting correction branches"):
-            events.append(self.root, events.bundle([again]), ACTOR, "req-memo-51",
+            events.append(self.root, event_history.bundle([again]), ACTOR, "req-memo-51",
                           state["revision"], state["state_token"])
 
     def test_append_refuses_a_duplicate_event_id_and_an_unresolved_correction(self):
         self.read()
         state = events.status(self.root)
         with self.assertRaisesRegex(contract.ReviewError, "Event ID already exists"):
-            events.append(self.root, events.bundle([event(self.root, 1)]), ACTOR, "req-dup",
+            events.append(self.root, event_history.bundle([event(self.root, 1)]), ACTOR, "req-dup",
                           state["revision"], state["state_token"])
         ghost = event(self.root, 60, supersedes=["rev-nowhere"], correction_reason="Synthetic.")
         with self.assertRaisesRegex(contract.ReviewError, "Unresolved/self correction"):
-            events.append(self.root, events.bundle([ghost]), ACTOR, "req-ghost",
+            events.append(self.root, event_history.bundle([ghost]), ACTOR, "req-ghost",
                           state["revision"], state["state_token"])
 
     def test_a_reader_older_than_a_commit_never_sees_events_past_its_state(self):
@@ -492,9 +493,9 @@ class DeltaVerification(MemoCase):
         self.read()
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
-            identity = events.file_identity(self.db, connection)
+            identity = event_history.file_identity(self.db, connection)
         self.raw_edit(restore_mtime=False)
-        with patch.object(events, "file_identity", lambda path, connection: identity):
+        with patch.object(event_history, "file_identity", lambda path, connection: identity):
             self.assertEqual(self.read().state["events"], 3)  # same identity: the documented residual
             with self.assertRaisesRegex(contract.ReviewError, "Event payload hash mismatch"):
                 event_reader.read_snapshot(self.root, full=True)
@@ -502,9 +503,9 @@ class DeltaVerification(MemoCase):
     def test_a_changed_contract_is_refused_on_the_delta_path(self):
         self.read()
         add(self.root, 3)
-        schema = events.store_schema(self.root)
+        schema = event_history.store_schema(self.root)
         schema["description"] = "A different installed contract."
-        with patch.object(events, "store_schema", lambda root=None: schema):
+        with patch.object(event_history, "store_schema", lambda root=None: schema):
             self.refused("Stored contract differs")
 
     def test_a_dropped_trigger_is_refused_on_the_delta_path(self):
@@ -530,11 +531,11 @@ class QualifyEquivalence(QualifyCase):
     """The memo changes cost only: the same run leaves the same manifest, event ids and report."""
 
     def run_qualify(self, memoized):
-        events.clear_memo()
-        real = events.inspect
+        event_history.clear_memo()
+        real = event_history.inspect
         unmemoized = lambda connection, root=None, *, reuse=False: real(connection, root)
         transport, calls = self._transport(incomplete_text="Just text")
-        with patch.object(events, "inspect", real if memoized else unmemoized):
+        with patch.object(event_history, "inspect", real if memoized else unmemoized):
             report = self._qualify(transport)
         manifest = (self.root / "config/selection.local.json").read_bytes()
         snapshot = event_reader.read_snapshot(self.root)

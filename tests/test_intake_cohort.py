@@ -805,7 +805,7 @@ class QualifyTests(QualifyCase):
 
     def test_superseded_review_is_not_resurrected_by_a_later_qualify(self):
         from copy import deepcopy
-        from tools.review_events import event_reader, event_store as events
+        from tools.review_events import event_history, event_reader, event_store as events
         transport, calls = self._transport()
         report = self._qualify(transport)
         notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
@@ -816,7 +816,7 @@ class QualifyTests(QualifyCase):
                      correction_reason="Operator corrected this standing review.",
                      recorded_at="2099-01-01T00:00:00+00:00")
         state = events.status(self.root)
-        events.append(self.root, events.bundle([newer]), old["reviewer"], "req-operator-fix",
+        events.append(self.root, event_history.bundle([newer]), old["reviewer"], "req-operator-fix",
                       state["revision"], state["state_token"])
         calls.clear()
         again = self._qualify(transport)
@@ -1103,20 +1103,20 @@ class QualifyTests(QualifyCase):
     def test_memoised_store_validation_still_refuses_changed_content(self):
         from copy import deepcopy
         import sqlite3
-        from tools.review_events import event_reader, event_store as events
+        from tools.review_events import event_history, event_reader, event_store as events
         from tools.review_events.review_events import ReviewError
         transport, _ = self._transport()
         self._qualify(transport)
         # Every event is now known valid; a changed event or envelope is still refused.
         known = event_reader.read_snapshot(self.root).events
-        events.validate_history(known, self.root)
+        event_history.validate_history(known, self.root)
         changed = deepcopy(known)
         changed[-1]["unexpected"] = True
         with self.assertRaises(ReviewError):
-            events.validate_history(changed, self.root)
+            event_history.validate_history(changed, self.root)
         with self.assertRaises(ReviewError):
-            events.contract.schema_validate({**events.bundle(known, self.root), "authority": "x"},
-                                            events.store_schema(self.root), root=self.root)
+            events.contract.schema_validate({**event_history.bundle(known, self.root), "authority": "x"},
+                                            event_history.store_schema(self.root), root=self.root)
         # A tampered ledger artifact or request is refused although its peers were memoised.
         db = self.root / ".local/intake/intake.sqlite3"
         store.list_requests(self.root)

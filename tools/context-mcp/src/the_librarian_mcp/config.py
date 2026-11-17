@@ -24,7 +24,8 @@ TOOLKIT_FILES = frozenset({
     "tools/context_index/cli.py", "tools/context_index/compact_records.py",
     "tools/context_index/renditions.py", "tools/context_index/qualification.py",
     "tools/context_index/packets.py",
-    "tools/review_events/__init__.py", "tools/review_events/event_reader.py",
+    "tools/review_events/__init__.py", "tools/review_events/event_history.py",
+    "tools/review_events/event_reader.py",
     "tools/review_events/event_store.py", "tools/review_events/review_events.py",
     "tools/review_events/review-event-v1.schema.json",
     "tools/catalog/__init__.py", "tools/catalog/catalog_store.py",
@@ -76,27 +77,13 @@ class Config:
     def __post_init__(self):
         if not self.root.is_absolute() or not self.root.is_dir():
             raise ValueError("--root must be an absolute, existing instance directory")
-        try:
-            manifest = json.loads((self.toolkit_root / "release-files.json").read_text())
-        except (OSError, TypeError, ValueError):
-            manifest = None
-        if (not isinstance(manifest, list) or not manifest
-                or any(not isinstance(name, str) for name in manifest)
-                or len(manifest) != len(set(manifest))):
+        if not _trusted_clone(self.toolkit_root):
             raise ValueError("--root must identify a complete trusted toolkit clone")
-        names = set(manifest)
-        if not TOOLKIT_FILES <= names:
-            raise ValueError("--root must identify a complete trusted toolkit clone")
-        for name in names:
-            if (not isinstance(name, str) or not name or "\\" in name
-                    or Path(name).is_absolute() or any(part in ("", ".", "..") for part in name.split("/"))):
-                raise ValueError("--root must identify a complete trusted toolkit clone")
-            path = self.toolkit_root / name
-            relative = path.relative_to(self.toolkit_root)
-            components = [self.toolkit_root.joinpath(*relative.parts[:end])
-                          for end in range(1, len(relative.parts) + 1)]
-            if not path.is_file() or any(component.is_symlink() for component in components):
-                raise ValueError("--root must identify a complete trusted toolkit clone")
+        self._resolve_store_paths()
+        self._check_logs()
+        self._check_limits()
+
+    def _resolve_store_paths(self):
         policy_mod = load_toolkit_module(self.toolkit_root / "tools/policy.py", "librarian_instance_policy")
         roots = policy_mod.validate_instance_roots(self.root)
         if self.manifest == Path("config/selection.json"):
@@ -105,31 +92,29 @@ class Config:
         if self.db == Path("tools/context_index/.local/index.sqlite3"):
             object.__setattr__(self, "db", Path(roots["context_index_db"]))
         for name in ("manifest", "db"):
-            value = getattr(self, name)
-            path = value if value.is_absolute() else self.root / value
-            if ".." in path.parts or not path.is_relative_to(self.root):
+            if not _within(self.root, getattr(self, name)):
                 raise ValueError(f"--{name} must stay within --root")
-        if self.diagnostics_log is not None:
-            path = (self.diagnostics_log if self.diagnostics_log.is_absolute()
-                    else self.root / self.diagnostics_log)
-            if ".." in path.parts or not path.is_relative_to(self.root):
+
+    def _check_logs(self):
+        diagnostics = None if self.diagnostics_log is None else _under(self.root, self.diagnostics_log)
+        if diagnostics is not None:
+            if not _within(self.root, diagnostics):
                 raise ValueError("--diagnostics-log must stay within --root")
-            if path.suffix != ".jsonl":
+            if diagnostics.suffix != ".jsonl":
                 raise ValueError("--diagnostics-log must be a .jsonl file")
         if self.audit_log is None:
             if self.agent_label is not None:
                 raise ValueError("--agent-label only labels an enabled --audit-log")
-        else:
-            if self.agent_label is None:
-                raise ValueError("--audit-log requires --agent-label")
-            audit.label(self.agent_label)
-            if str(self.audit_log) == AUDIT_DEFAULT:
-                object.__setattr__(self, "audit_log", audit.default_path(self.agent_label))
-            path = audit.log_path(self.root, Path(self.audit_log))
-            if self.diagnostics_log is not None and path == (
-                    self.diagnostics_log if self.diagnostics_log.is_absolute()
-                    else self.root / self.diagnostics_log):
-                raise ValueError("--audit-log must not be the body-free --diagnostics-log")
+            return
+        if self.agent_label is None:
+            raise ValueError("--audit-log requires --agent-label")
+        audit.label(self.agent_label)
+        if str(self.audit_log) == AUDIT_DEFAULT:
+            object.__setattr__(self, "audit_log", audit.default_path(self.agent_label))
+        if audit.log_path(self.root, Path(self.audit_log)) == diagnostics:
+            raise ValueError("--audit-log must not be the body-free --diagnostics-log")
+
+    def _check_limits(self):
         for name in ("max_source_chars", "max_output_chars", "max_results"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -138,6 +123,40 @@ class Config:
             raise ValueError("--max-results cannot exceed the reader's search limit of 50")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("--timeout-seconds must be finite and positive")
+
+
+def _under(root: Path, value: Path) -> Path:
+    return value if value.is_absolute() else root / value
+
+
+def _within(root: Path, value: Path) -> bool:
+    path = _under(root, value)
+    return ".." not in path.parts and path.is_relative_to(root)
+
+
+def _trusted_clone(root: Path) -> bool:
+    """Whether ``root`` holds a well-formed release manifest naming every toolkit file as a regular file."""
+    try:
+        manifest = json.loads((root / "release-files.json").read_text())
+    except (OSError, TypeError, ValueError):
+        return False
+    if (not isinstance(manifest, list) or not manifest
+            or any(not isinstance(name, str) for name in manifest)
+            or len(manifest) != len(set(manifest))):
+        return False
+    names = set(manifest)
+    return TOOLKIT_FILES <= names and all(_trusted_file(root, name) for name in names)
+
+
+def _trusted_file(root: Path, name: str) -> bool:
+    """A plain relative path to a regular file with no symlink anywhere below ``root``."""
+    if (not name or "\\" in name or Path(name).is_absolute()
+            or any(part in ("", ".", "..") for part in name.split("/"))):
+        return False
+    path = root / name
+    parts = path.relative_to(root).parts
+    return path.is_file() and not any(root.joinpath(*parts[:end]).is_symlink()
+                                      for end in range(1, len(parts) + 1))
 
 
 def parser(description: str) -> argparse.ArgumentParser:

@@ -28,6 +28,7 @@ from tools.context_index import qualification
 from tools.diagnostics import retrieval_log as diagnostics
 from tools.extraction import docling_bridge, extract
 from tools.review_events import event_reader
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
 from tests.support import ROOT, WorkspaceCase, clone_release
@@ -57,7 +58,7 @@ class DiscoveryTests(unittest.TestCase):
 class StoreIdentity(unittest.TestCase):
     def test_new_application_ids_and_superseded_refusal(self):
         self.assertEqual(storage.APPLICATION_ID, 0x4C434154)
-        self.assertEqual(events.APPLICATION_ID, 0x4C524556)
+        self.assertEqual(event_history.APPLICATION_ID, 0x4C524556)
         self.assertEqual(index.APPLICATION_ID, 0x4C435458)
         for module, old, message in (
                 (catalog, 0x46434154, "Superseded FCAT"),
@@ -201,9 +202,9 @@ class WorkspaceTests(WorkspaceCase):
         self.registration()
         state = events.initialize(self.root)
         event = self.pending()
-        result = events.append(self.root, events.bundle([event]), "test-runner", "req-pending",
+        result = events.append(self.root, event_history.bundle([event]), "test-runner", "req-pending",
                                0, state["state_token"])
-        retry = events.append(self.root, events.bundle([event]), "test-runner", "req-pending",
+        retry = events.append(self.root, event_history.bundle([event]), "test-runner", "req-pending",
                               0, state["state_token"])
         self.assertTrue(retry["idempotent"])
         updated = deepcopy(event)
@@ -211,7 +212,7 @@ class WorkspaceTests(WorkspaceCase):
                        correction_reason="Clarify pending reason without asserting review.",
                        reason="This remains pending after the structural test.",
                        recorded_at=(datetime.fromisoformat(event["recorded_at"]) + timedelta(seconds=1)).isoformat())
-        result = events.append(self.root, events.bundle([updated]), "test-runner", "req-correction",
+        result = events.append(self.root, event_history.bundle([updated]), "test-runner", "req-correction",
                                1, result["state_token"])
         snapshot = event_reader.read_snapshot(self.root)
         self.assertEqual(snapshot.query()["records"][0]["event"]["event_id"], "rev-correction")
@@ -236,11 +237,11 @@ class WorkspaceTests(WorkspaceCase):
         event = self.pending()
         event["counts"]["reviewed"] = 1
         with self.assertRaises(contract.ReviewError):
-            contract.validate(events.bundle([event]), schema=events.store_schema(), stored=True)
+            contract.validate(event_history.bundle([event]), schema=event_history.store_schema(), stored=True)
         event = self.pending()
         event["provenance"]["origin"] = "unattributed"
         with self.assertRaises(contract.ReviewError):
-            events.prepare_submission(events.bundle([event]), self.root)
+            events.prepare_submission(event_history.bundle([event]), self.root)
 
     def selected_text(self, raw=b"first\r\n\xce\xb2\nlast", name="sources/notes.txt", fmt="text"):
         self.registration(name, raw)
@@ -516,7 +517,7 @@ class WorkspaceTests(WorkspaceCase):
         event["uncertainties"] = []
         event["counts"].update(reviewed=1, pending=0)
         events.initialize(self.root)
-        events.append(self.root, events.bundle([event]), "test-reviewer", "req-review-docling", 0,
+        events.append(self.root, event_history.bundle([event]), "test-reviewer", "req-review-docling", 0,
                       events.status(self.root)["state_token"])
         self.docs()
         self.config["renditions"] = [{"path": path, "sha256": hashlib.sha256(raw).hexdigest(),

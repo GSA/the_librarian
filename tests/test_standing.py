@@ -10,6 +10,7 @@ from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index
 from tools.context_index import packets
 from tools.extraction import docling_bridge
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tools.intake import adapters, runner, standing, standing_events, standing_publication, store
 
@@ -133,7 +134,7 @@ class StandingCase(WorkspaceCase):
         _, db, _ = events.locations(self.root)
         with closing(events.connect(db)) as connection:
             connection.execute("BEGIN")
-            return events.inspect(connection, self.root)[1]
+            return event_history.inspect(connection, self.root)[1]
 
     def evaluate(self):
         return standing.evaluate(self.root, self.review_args())
@@ -248,7 +249,7 @@ class StandingEvaluationTests(StandingCase):
         event["evidence"] = [{"kind": "agent_statement", "pointer": None,
                               "quote": "Independent review outside the standing policy."}]
         state = events.status(self.root)
-        events.append(self.root, events.bundle([event]), "standing-reviewer", "req-other",
+        events.append(self.root, event_history.bundle([event]), "standing-reviewer", "req-other",
                       state["revision"], state["state_token"])
         self.assertIsNone(standing_events.bound_event(self.root, result, self.review_args()))
         self.assert_outcome("pending-review", "conflicting-review")
@@ -335,7 +336,7 @@ class StandingEvaluationTests(StandingCase):
     def test_existing_independent_review_is_not_bypassed(self):
         event = self.pending(RENDITION)
         event["event_id"] = "rev-independent"
-        events.append(self.root, events.bundle([event]), "test-runner", "req-independent", 0,
+        events.append(self.root, event_history.bundle([event]), "test-runner", "req-independent", 0,
                       events.status(self.root)["state_token"])
         self.assert_outcome("pending-review", "conflicting-review")
 
