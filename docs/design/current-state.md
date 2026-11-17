@@ -25,7 +25,7 @@ restated here.
   `the_librarian_mcp`, commands `librarian-mcp`, `librarian-preflight`,
   `librarian-audit`, MCP server name `the-librarian`. The earlier
   `qualified-context-*` names have no aliases. Evidence:
-  `tools/context-mcp/pyproject.toml`; `tests/test_kit.py::test_librarian_identity_and_role_documents_are_packaged`.
+  `tools/context-mcp/pyproject.toml`; `tests/test_documentation.py::test_librarian_identity_and_role_documents_are_packaged`.
 - **Three kinds of store**, all SQLite under a per-instance data root:
 
   | Kind | Stores | Rule of thumb |
@@ -34,14 +34,14 @@ restated here.
   | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
-  Evidence: `tests/test_kit.py::test_new_application_ids_and_superseded_refusal`
+  Evidence: `tests/test_workspace.py::test_new_application_ids_and_superseded_refusal`
   (superseded `FCAT`/`FREV`/`FCTX` identities refuse with a migration message),
   `::test_initialize_refuses_an_unmigrated_legacy_index`,
   `tests/test_catalog_inspect_equivalence.py` (about 100 tamperings of catalog
   rows, triggers, metadata and application id refuse),
-  `tests/test_kit.py::test_native_review_correction_retry_and_restore`
+  `tests/test_workspace.py::test_native_review_correction_retry_and_restore`
   (`DELETE FROM events` aborts), `tests/test_intake.py::test_wrong_identity_modes_and_missing_store_refuse`,
-  `tests/test_kit.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
+  `tests/test_workspace.py::test_stale_content_detected` and `::test_clean_copy_and_policy_freshness`.
   The review-event `contract_hash` refusal is pinned by
   `tests/test_review_event_contract.py`: an out-of-band edit of the stored hash
   and a change to the installed schema each make `status`, `audit`, `append`,
@@ -73,13 +73,23 @@ restated here.
   write, after starting it at `OFF`; weakening or dropping any of the seven pragma
   sites fails them. `Connection.backup` copy targets are not covered: they are
   fsynced and hash-verified before use rather than relying on the pragma.
+  The file-level primitives the stores share live in `tools/durable.py`: directory
+  and file fsync, exclusive 0600 creation (`reserve`, `write_new_private`) and
+  chunked SHA-256, each opened `O_NOFOLLOW` (`tests/test_durable.py`). Each store
+  still applies its own path rule and error type first (catalog `safe_path` also
+  refuses `..`; catalog modes must be exactly 0700/0600, review-event modes must
+  only deny group and other) and keeps its own `connect`, `private_directory`,
+  `private_file` and `writer_lock`, whose wait, timeout and journal semantics
+  differ. `tools/policy.py` keeps its own directory fsync because its bytes are
+  part of the policy and extraction fingerprints.
 - **Upgrade behavior.** Code never migrates an authority store implicitly: a
   store whose application id, `user_version`, `contract_version` or
   `contract_hash` differs from the installed contract refuses with an
   explicit-migration message. The derived index is assumed to need a rebuild
-  after any code change, because its fingerprint covers the reader and policy
-  module bytes (`context_index.engine_fingerprint`,
-  `tests/test_kit.py::test_qualification_code_is_bound_into_engine_fingerprint`).
+  after any code change, because its fingerprint covers the reader modules
+  (`context_index.py`, `packets.py`, `renditions.py`, `qualification.py`,
+  `compact_records.py`) and policy module bytes (`context_index.engine_fingerprint`,
+  `tests/test_workspace.py::test_qualification_code_is_bound_into_engine_fingerprint`).
   Schema snapshots in `tools/schemas/*.sql` are not backups.
 - **Store locations** are instance configuration (`storage_roots` in
   `config/policy*.json`), recorded with instance and store ids in
@@ -89,7 +99,7 @@ restated here.
   binds a *logical* root (instance id, store ids, storage roots), so moving the
   instance directory keeps it fresh while substituting another instance's
   database file is refused. Evidence:
-  `tests/test_kit.py::test_portable_roots_relocation_substitution_and_migration_recovery`
+  `tests/test_workspace.py::test_portable_roots_relocation_substitution_and_migration_recovery`
   and `::test_portable_roots_edge_cases_and_instance_policy_propagation`.
 - **Instance-root validation is memoized per process (Kata ck02).**
   `policy.validate_instance_roots` (policy read, symlink and ambiguity checks,
@@ -120,19 +130,38 @@ restated here.
 - **Packaging** is an explicit allowlist, `release-files.json`, built by
   `tools/package.py`. It excludes `.local`, `.venv`, databases, `data`, `sources`,
   `documents`, `*.local.*` files and symlinks. Evidence:
-  `tests/test_kit.py::test_clean_copy_and_policy_freshness` (the archive equals
-  the allowlist and omits `policy.local.json`), `::test_release_paths_rejects_missing_and_symlinked_files`,
-  `::test_package_rejects_symlinked_output_parent`, `::test_empty_initialization`
-  (the shipped toolkit seeds zero records).
-- **Runtime checks.** `librarian-preflight` probes Python >= 3.11, `mcp==2.2.0`
+  `tests/test_workspace.py::test_clean_copy_and_policy_freshness` (the archive equals
+  the allowlist and omits `policy.local.json`), `::test_empty_initialization`
+  (the shipped toolkit seeds zero records),
+  `tests/test_packaging.py::test_release_paths_rejects_missing_and_symlinked_files`
+  and `::test_package_rejects_symlinked_output_parent`.
+- **Allowlist coverage.** Every file tracked by Git is either listed in
+  `release-files.json` or named in a short exclusion list with a reason
+  (`PackageTests.UNPACKAGED_TRACKED`): `.kata.toml` (this repository's Kata
+  binding), `.github/` (hosting and CI configuration) and `ruff.toml` (repository
+  lint configuration no packaged code or test reads). Toolkit code, tests,
+  diagnostics and documentation are packaged. Every manifest entry must be a
+  tracked, existing file and none may match an exclusion. The check runs only in a
+  Git checkout whose top level is the toolkit root and skips in packaged kits,
+  which carry no `.git`. Evidence:
+  `tests/test_packaging.py::PackageTests::test_manifest_covers_every_tracked_file`.
+- **Runtime checks.** `librarian-preflight` probes Python >= 3.14, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
-  (`tests/test_mcp.py`). The runtime probe refuses, with a non-zero exit and an
-  explicit diagnostic, Python below 3.11, any `mcp` version other than the pin,
+  (`tests/test_mcp.py`). The adapter never imports the toolkit as a package: it
+  runs the reader CLIs with `cwd=--root` and loads `tools/policy.py` and the
+  diagnostics writer by file path. The files it relies on are one set,
+  `the_librarian_mcp.config.TOOLKIT_FILES`, which the root's `release-files.json`
+  must contain (`tests/test_mcp.py::test_paths_are_derived_from_the_toolkit_root`). The runtime probe refuses, with a non-zero exit and an
+  explicit diagnostic, Python below 3.14, any `mcp` version other than the pin,
   and missing FTS5, and reports the Python, SQLite and `mcp` versions and
   `fts5: true` when it passes (`tests/test_preflight.py`; the real probe runs in a
-  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` and `jsonschema`
-  are ranges and transitive dependencies are unpinned. There is no lock file,
+  child interpreter whose facts a temporary `sitecustomize` stubs). Only `mcp` is pinned exactly; `anyio` (`>=4.10,<5`)
+  and `jsonschema` (`>=4.20,<5`) are ranges whose floors are those `mcp` 2.2.0
+  requires on Python 3.14 (the suite passed at both floors and at the latest
+  releases, 2026-11-16), and transitive dependencies are unpinned.
+  `tools/context-mcp/pyproject.toml` is the only toolkit dependency declaration;
+  the review-event and context-index import errors point to it. There is no lock file,
   image or installer, by decision (Kata 7jkt, 2026-11-13). Measured drift: two
   `.venv`s of the same commit already differed in anyio, pydantic, starlette,
   sse-starlette and other transitive patch versions, and the repository history and
@@ -142,7 +171,18 @@ restated here.
   package; the first step then is to pin that package, not to add a lock file.
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
+  Its direct dependencies are exact pins in `tools/extraction/requirements-docling.in`;
+  `requirements-docling.txt` is the full Python 3.14 Linux CPU lock the worker
+  enforces at runtime, and every direct pin must appear in it unchanged
+  (`tests/test_docling.py::WorkerRequirements`).
   The reader needs none of it.
+- **Continuous integration** (`.github/workflows/ci.yml`) runs on pull requests
+  and pushes to `main` with Python 3.14: it installs `tools/context-mcp` into a
+  fresh `.venv`, then runs `ruff check`, the schema snapshot `--check` and the
+  unittest suite. `ruff.toml` pins the ruff version and enforces only pyflakes
+  (`F`), bugbear (`B`, minus `B007`/`B905`) and `SIM115`; formatting and line
+  length are not enforced. Ruff is a CI/development tool, not a runtime
+  dependency.
 - The first proof-of-concept installation is closed; this repository does not
   maintain or port from it. Its clean-copy tests only prove this repository's
   packaging and policy boundary.
@@ -150,7 +190,8 @@ restated here.
 ## 3. Intake and review
 
 - **Inbox first.** Content enters through the supported writers: manual upload
-  (`tools/intake/upload.py`), read-only cohort intake (`tools/intake/cohort.py`)
+  (`tools/intake/upload.py`), read-only cohort intake (`tools/intake/cohort.py`, which drives
+  `cohort_ingest.py`, `cohort_recovery.py` and `cohort_review.py`)
   and the durable ledger (`tools/intake/*`). A copied file is not a registered
   receipt until its catalog commit is confirmed; a receipt is not extracted
   text; extracted text is not a review; a review is not selection. Connectors,
@@ -431,7 +472,7 @@ restated here.
   backups (35 GB) for a 12.7 MB catalog.
 - On the first write of a UTC day the snapshot is the serialized image of the
   transaction that was just fully inspected, written, fsynced, re-read and refused
-  unless its hash equals the image (`catalog_store.py`, "Backup bytes mismatch").
+  unless its hash equals the image (`tools/catalog/backups.py`, "Backup bytes mismatch").
   Fresh verification checks fields, size, SHA-256 and receipt state instead of a
   third replay; every older snapshot is still fully verified before it counts.
 - Evidence: `tests/test_backups.py` (daily gate reads no snapshot body, truncated or
@@ -453,7 +494,8 @@ is what matters; the chain of how it got here is in git history and the Katas
 1. **Receipt.** A validation receipt in `<catalog home>/.local/read-validation.json`
    records the state a full validation produced and a *binding*: for a plain
    rollback-journal database, the file identity (device, inode, size, mtime_ns,
-   ctime_ns, SQLite change counter) plus the validator-file hash and runtime
+   ctime_ns, SQLite change counter) plus the validator-file hash (`VALIDATOR_FILES`:
+   `catalog_store.py`, `storage.py`, `backups.py` and `contracts.py`) and runtime
    versions; otherwise (journal or WAL present, or no `sqlite_dbpage`) the SHA-256
    of the exact database bytes. An identity-bound receipt is trusted only on the
    UTC date of the full validation it descends from (`validated_on`); the first
@@ -491,7 +533,9 @@ before the last speedup. Reproduce with the tools in `tools/diagnostics/`
 `catalog_daily_replay_benchmark.py`, `ingest_benchmark.py`,
 `ledger_scale_benchmark.py`, `upload_planning_benchmark.py`,
 `ledger_verify_benchmark.py`, `progress_benchmark.py`, `catalog_contention_budget.py`). Use synthetic
-fixtures only.
+fixtures only. Each runs as a script and, through `tools/diagnostics/_harness.py`, imports `tools`
+from the checkout given by `--tree` (default: its own), so two revisions can be compared on the same
+fixtures.
 
 Evidence: `tests/test_catalog_delta_commit.py` (randomized and named equivalence
 with `validate_graph`, tamper classes, forged receipts, crash after commit,
@@ -509,7 +553,7 @@ the batch moves (`claimants`). They used to be `instr(payload, ?)` scans over ev
 record, so each write cost O(catalog) and a first ingest grew quadratically (at 40,000
 synthetic documents the two scans were about half of the time per document).
 
-- **Structures** (`LOOKUP_OBJECTS` in `catalog_store.py`, mirrored in `tools/schemas/catalog.sql`):
+- **Structures** (`LOOKUP_OBJECTS` in `tools/catalog/storage.py`, mirrored in `tools/schemas/catalog.sql`):
   partial expression indexes on `versions` for `$.data.path`, `receipt_id`, `parent_id`,
   `artifact_id`, `from_id` and `to_id`, and `refs(ref, revision, ordinal)`, one row per
   `source_ids` entry of every *receipt version*, kept by an `AFTER INSERT` trigger on `versions`.
@@ -597,7 +641,9 @@ synthetic documents the two scans were about half of the time per document).
   validating reader's snapshot (observed as spurious "Current records differ" and
   "database disk image is malformed"). `tools/file_identity.py` therefore reads
   stat fields from the path and the change counter from page 1 through the open
-  connection. Evidence: `tests/test_file_identity_locks.py`.
+  connection. The catalog and review-event `connect` share its `KeyedConnection`,
+  which remembers the (device, inode) opened so a memo is never bound to a file
+  moved into the path later. Evidence: `tests/test_file_identity_locks.py`.
 
 ### Review-event validation
 
@@ -606,7 +652,8 @@ Every read of the review-event history (`event_reader.read_snapshot`, `event_sto
 index. `qualify` did that about nine times per entry, so its serial toolkit cost grew about
 1.1 ms per prior event (Kata r71k, from efz3).
 
-- **Memo.** `event_store.inspect(..., reuse=True)` keeps the last validated result per
+- **Memo.** `event_history.inspect(..., reuse=True)` (`tools/review_events/event_history.py`,
+  which also holds the store's SQL and validation) keeps the last validated result per
   database file **in process memory** (never written to disk, at most eight files). It is
   reused only when the file's identity (device, inode, size, mtime_ns, ctime_ns, SQLite
   change counter, from `tools/file_identity.py`), the installed contract hash and the UTC
@@ -625,7 +672,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   `progress-serve` therefore made concurrent review-event appends fail at once with
   `sqlite3.OperationalError`, which intake records as retryable `sqlite-operational`.
   Now `event_store.BUSY_TIMEOUT_SECONDS` (10 s, as the catalog's) is the busy wait of
-  every review-event connection, and `event_reader.read_snapshot` passes `release=True`,
+  every review-event connection, and `event_reader.read_snapshot` passes `release=True` to `event_history.view`,
   so a full pass reads every row inside one transaction and commits it before any
   validation; its longest hold at 13,000 events fell from 6.5 s to 0.04 s. The result is
   still one snapshot, memoized only if the file identity is unchanged afterwards (the
@@ -648,7 +695,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   removes those; below).
 - **Delta verification** (Kata m0tg). When the file's identity moved only the way SQLite's own
   commit moves it (same device and inode, not smaller, a new change counter) and the remembered
-  chain heads are still in the file, `event_store.view` verifies only the rows past them:
+  chain heads are still in the file, `event_history.view` verifies only the rows past them:
   their hash chain from the remembered head, batch chain and membership, payload hashes,
   the contract and the correction links (`validate_delta`, which checks the new events against
   the memoized `History` index through the `known`/`taken` hooks of `review_events.validate`),
@@ -657,7 +704,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   against that index. Any failure of the delta falls back to the full pass, which refuses with
   its exact message. **Rows before the remembered head are not read again until the next full
   check**: `audit`, a backup, publication (`read_snapshot(root, full=True)`, used by
-  `authorize_publication` and by index build and freshness, so publication still re-validates
+  `standing_publication.authorize_publication` and by index build and freshness, so publication still re-validates
   everything it serves), the first check of a new UTC day, a different contract, a swapped file,
   or any identity change SQLite did not make (an out-of-band write leaves the counter alone and
   is refused at once, as before). The residual below widens by one case: an edit to an old
@@ -764,7 +811,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values refuse)
   and the same value is the SQLite busy timeout. Exceeding it, or a transient SQLite
   BUSY/LOCKED during a stage, raises retryable `ledger_busy`; nothing was written.
-  `settle` and cohort ingest retry up to three times. `progress` reads the ledger in
+  `settle` and cohort ingest retry up to three times. `progress` (`progress.read_ledger`) reads the ledger in
   keyset pages of 5,000 requests, each in its own short read transaction, and
   verifies each page afterwards (`store.verify_page`, sharing `store.check_request`
   with `store.verify`), so it cannot hold a read lock across O(ledger) work and its
@@ -779,8 +826,9 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   counter is seen at the next UTC-day check). Digests of requests and artifacts
   already proven are kept by SHA-256 (no raw bytes, no failures) and a hit still
   hashes the bytes in hand and compares the stored digest. Its catalog read never
-  writes a receipt: it trusts a receipt covering this exact file or this process's
-  own full inspection today. `progress-serve` renders one page at a time, shares the
+  writes a receipt (`catalog_store.observed_state`): it trusts a receipt covering this exact file or
+  this process's own full inspection today, and an unreadable receipt is ignored, never reported,
+  so the full inspection decides. `progress-serve` (`progress_serve.Latest`) renders one page at a time, shares the
   result with requests that arrive meanwhile and reuses one younger than a second;
   the report adds finished-attempt rates (1/5/15 min) and attention grouped by
   cause. A 125,000-request synthetic ledger rendered in 11 s and 1.5 GB before and
@@ -835,7 +883,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   read-to-search ratio is reported, because the counts cannot tell an
   unconvincing excerpt from an agent that read enough in the excerpt. Nothing reads
   the log to change selection, ranking or qualification. Evidence:
-  `tests/test_kit.py` (`test_absence_never_echoes_query_terms_or_source_text`,
+  `tests/test_retrieval_diagnostics.py` (`test_absence_never_echoes_query_terms_or_source_text`,
   `test_refuses_query_text_and_unknown_fields`, `test_reads_are_counted_but_never_attributed`,
   `test_report_counts_reads_without_deriving_a_ratio`, `test_rejects_unsafe_log_paths`),
   `tests/test_mcp.py::test_diagnostics_*`.
@@ -850,7 +898,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   Evidence: `tests/test_mcp_audit.py` (about 20 tests, including
   `test_audit_failure_withholds_the_result`, `test_rotation_preserves_every_record_without_overwriting`,
   `test_paths_outside_local_symlinks_and_unsafe_modes_are_refused`); `.local`
-  exclusion: `tests/test_kit.py` (`index.eligible(".local/database.md")` is false).
+  exclusion: `tests/test_workspace.py` (`index.eligible(".local/database.md")` is false).
   The diagnostics log and the audit log are deliberately separate files and formats.
 - **The MCP adapter is read-only** and exposes six tools (`status`, `search`,
   `get`, `get_many`, `catalog`, `review_events`); `tests/test_mcp.py` asserts that

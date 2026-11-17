@@ -4,7 +4,7 @@
 Builds a temporary instance whose intake ledger already holds ``--ledger`` completed
 single-stage requests and whose catalog holds ``--catalog`` upload-shaped registrations (both written
 directly, without per-write validation, so large sizes build quickly), then ingests ``--files`` new
-synthetic markdown files through ``tools.intake.cohort.ingest``. Reports body-free JSON: wall and CPU
+synthetic markdown files through ``tools.intake.cohort_ingest.ingest``. Reports body-free JSON: wall and CPU
 seconds, seconds per file, how many times the whole ledger was validated and what share of the wall
 time that took. With a healthy hand-off ("Intake ledger" in docs/design/current-state.md) the ledger is validated about once per
 process, not once per lock acquisition. Synthetic fixtures only; never point it at a real instance.
@@ -15,10 +15,8 @@ import argparse
 import contextlib
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import sqlite3
-import sys
 import tempfile
 import time
 
@@ -109,8 +107,8 @@ def main(argv=None):
     parser.add_argument("--profile", action="store_true", help="also report per-function wall and CPU totals")
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     from tools.catalog import catalog_store as catalog
     from tools.diagnostics.catalog_lock_benchmark import seed
     from tools.diagnostics.ingest_benchmark import fixture, instrument

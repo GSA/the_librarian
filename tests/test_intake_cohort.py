@@ -12,8 +12,11 @@ import unittest.mock
 from zipfile import ZipFile
 
 from tools.catalog import catalog_store as catalog
-from tools.context_index import renditions
-from tools.intake import cohort, model_review, runner, selection_manifest, standing, store, upload
+from tools.context_index import packets, renditions
+from tools.extraction import extract
+from tools.intake import (adapters, cohort, cohort_ingest, cohort_review, model_review,
+                          runner, selection_manifest, standing, standing_events, standing_publication,
+                          store, upload)
 from tools.intake.contracts import IntakeError, LedgerBusy
 
 CONFLUENCE = (b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"----=_Part_1\"\r\n\r\n"
@@ -25,7 +28,6 @@ GEMINI = b"Summary\nDecided things.\nTranscript\nAlex: hello there\n"
 
 
 def odt():
-    from tools.extraction import extract
     buffer = io.BytesIO()
     with ZipFile(buffer, "w") as z:
         z.writestr("mimetype", "application/vnd.oasis.opendocument.text")
@@ -123,20 +125,20 @@ class ClassifyTests(CohortCase):
         self.assertEqual(caught.exception.code, "inbox_unavailable")
 
     def test_over_limit_is_counted_not_dropped(self):
-        original = cohort.upload.FORMATS["text"]
-        cohort.upload.FORMATS["text"] = (original[0], 4)
-        self.addCleanup(cohort.upload.FORMATS.__setitem__, "text", original)
+        original = upload.FORMATS["text"]
+        upload.FORMATS["text"] = (original[0], 4)
+        self.addCleanup(upload.FORMATS.__setitem__, "text", original)
         entries = {e["relative"]: e for e in cohort.classify(self.root, self.inbox)}
         self.assertEqual(entries["a/notes.md"]["disposition"], "over-limit")
 
     def test_submission_names_and_locators_are_ascii_safe_and_stable(self):
-        entry = cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox")
+        entry = cohort_ingest.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox")
         self.assertRegex(entry["name"], r"\A[A-Za-z0-9][A-Za-z0-9._-]*\.doc\Z")
         self.assertEqual(entry["locator"], "a/SAMPLE%2B%E2%80%94%2BReview%20Checklist.doc")
         self.assertRegex(entry["submission_id"], r"\Ainbox-[a-f0-9]{24}\Z")
-        self.assertEqual(entry, cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox"))
-        for other in (cohort.submission("a/SAMPLE+-+Review Checklist.doc", "inbox"),
-                      cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "other")):
+        self.assertEqual(entry, cohort_ingest.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox"))
+        for other in (cohort_ingest.submission("a/SAMPLE+-+Review Checklist.doc", "inbox"),
+                      cohort_ingest.submission("a/SAMPLE+\u2014+Review Checklist.doc", "other")):
             self.assertNotEqual(entry["submission_id"], other["submission_id"])
 
 
@@ -185,7 +187,7 @@ class IngestTests(CohortCase):
 
     def test_text_entry_from_before_mime_recognition_is_corrected_not_kept(self):
         from tools.intake import upload
-        old = cohort.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox")
+        old = cohort_ingest.submission("a/SAMPLE+\u2014+Review Checklist.doc", "inbox")
         upload.submit(self.root, self.inbox / "a/SAMPLE+\u2014+Review Checklist.doc", upload.descriptor(
             submission_id=old["submission_id"], format_name="text", name=old["name"],
             actor="cohort-runner", reason="earlier toolkit", origin_kind="local-path",
@@ -256,7 +258,7 @@ class BlockedCase(CohortCase):
             first = self.run_ingest()
         self.assertEqual(first["counts"]["failed_by_code"], {"register/native-input": 6})
         self.upgrade = unittest.mock.patch.object(
-            cohort.extract, "fingerprint", lambda root, fmt: "f" * 64)
+            extract, "fingerprint", lambda root, fmt: "f" * 64)
         self.upgrade.start()
         self.addCleanup(self.upgrade.stop)
         for request in store.list_requests(self.root):
@@ -274,7 +276,7 @@ class BlockedCase(CohortCase):
         (stage,) = request["stages"]
         if stage["operation"] == "extract-register":
             stage["arguments"]["expected_state"] = catalog.status(self.root)["state_token"]
-        cohort._stage_request(self.root, name, [stage], correction_of=parent)
+        store.stage_request(self.root, name, [stage], correction_of=parent)
         return name
 
     def repair(self, sid_register, suffix="-fix"):
@@ -330,7 +332,7 @@ class CorrectionChainTests(BlockedCase):
         # A look-alike request that is not linked by correction_of changes nothing.
         other = self.registers()[1]
         stage = store.request(self.root, other)["stages"][0]
-        cohort._stage_request(self.root, other + "-reid1", [stage])
+        store.stage_request(self.root, other + "-reid1", [stage])
         self.assertEqual(self.run_ingest()["counts"]["outcome"]["extracted"], 1)
 
     def test_a_blocked_head_is_reported_with_its_own_code_and_a_staged_head_is_settled(self):
@@ -338,7 +340,7 @@ class CorrectionChainTests(BlockedCase):
         first, second = self.registers()[:2]
         self.repair(first)
         # A correction that is itself blocked is the head: reported failed, with its own attempts.
-        with unittest.mock.patch.object(cohort.extract, "fingerprint", lambda r, f: "e" * 64):
+        with unittest.mock.patch.object(extract, "fingerprint", lambda r, f: "e" * 64):
             self.correct(first + "-fix", first + "-again")
             self.assertEqual(runner.settle(self.root, first + "-again", "register")
                              ["stages"][0]["status"], "blocked")
@@ -361,7 +363,7 @@ class CorrectionChainTests(BlockedCase):
         register = self.registers()[0]
         other = self.registers()[1]
         stage = store.request(self.root, other)["stages"][0]
-        cohort._stage_request(self.root, register + "-wrong", [stage], correction_of=register)
+        store.stage_request(self.root, register + "-wrong", [stage], correction_of=register)
         report = self.run_ingest()
         mismatched = [e for e in report["entries"] if e.get("code") == "correction_mismatch"]
         self.assertEqual(len(mismatched), 1)
@@ -475,7 +477,7 @@ class RecoverIdentityTests(BlockedCase):
         sid = register.removeprefix("register-")
         fault = catalog.CatalogError("Invalid record")
         renamed = {}
-        with unittest.mock.patch.object(cohort.extract, "fingerprint", lambda r, f: "d" * 64):
+        with unittest.mock.patch.object(extract, "fingerprint", lambda r, f: "d" * 64):
             for name, parent in (("extract-" + sid + "-fix", "extract-" + sid),
                                  (register + "-fix", register)):
                 (stage,) = store.request(self.root, parent)["stages"]
@@ -483,8 +485,8 @@ class RecoverIdentityTests(BlockedCase):
                 if stage["operation"] == "extract-register":
                     renamed[name]["arguments"] = {
                         **stage["arguments"], "expected_state": catalog.status(self.root)["state_token"]}
-                cohort._stage_request(self.root, name, [renamed[name]], correction_of=parent)
-                with unittest.mock.patch.object(cohort.adapters.extract.catalog, "submit", side_effect=fault):
+                store.stage_request(self.root, name, [renamed[name]], correction_of=parent)
+                with unittest.mock.patch.object(adapters.extract.catalog, "submit", side_effect=fault):
                     runner.settle(self.root, name, renamed[name]["id"])
         # The renamed registration is blocked on a fault under one extractor; under today's it is
         # refused as a changed identity (replay keeps the pin), and its stage is not called register.
@@ -501,7 +503,7 @@ class RecoverIdentityTests(BlockedCase):
         register = self.registers()[0]
         sid = register.removeprefix("register-")
         stage = store.request(self.root, "extract-" + sid)["stages"][0]
-        cohort._stage_request(self.root, "extract-" + sid + "-bad", [
+        store.stage_request(self.root, "extract-" + sid + "-bad", [
             {**stage, "arguments": {**stage["arguments"], "format_name": "odt"}}],
             correction_of="extract-" + sid)
         report = cohort.recover_identity(self.root)
@@ -578,7 +580,7 @@ class ReplayTests(CohortCase):
             entries = real(*args)
             (self.inbox / "a/notes.md").write_bytes(b"# Notes\nChanged after classification\n")
             return entries
-        with unittest.mock.patch.object(cohort, "classify", classify_then_change):
+        with unittest.mock.patch.object(cohort_ingest, "classify", classify_then_change):
             report = self.ingest()
         entry = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
         self.assertEqual((entry["outcome"], entry["code"]), ("changed-since-intake", "changed_input"))
@@ -678,14 +680,14 @@ class QualifyTests(QualifyCase):
         with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
             hits = index.search(db, "Fund codes", 10, None, root=self.root)["hits"]
             self.assertEqual(len(hits), 1)
-            got = index.packet(db, config, hits[0]["locator"], 60000, root=self.root)
+            got = packets.packet(db, config, hits[0]["locator"], 60000, root=self.root)
             rendition = got["renditions"][hits[0]["path"]]
             self.assertEqual(rendition["source"]["sha256"],
                              hashlib.sha256(CONFLUENCE).hexdigest())
             self.assertTrue(rendition["rendition_sha256"])
             self.assertTrue(got["pieces"][0]["source_hash"])
             self.assertEqual(got["pieces"][0]["locator"], hits[0]["locator"])
-            many = index.packet_many(db, config, [hits[0]["locator"]], 60000, root=self.root)
+            many = packets.packet_many(db, config, [hits[0]["locator"]], 60000, root=self.root)
             self.assertEqual(len(many["requests"]), 1)
             self.assertEqual(index.search(db, "Just text", 10, None, root=self.root)["hits"], [])
 
@@ -803,7 +805,7 @@ class QualifyTests(QualifyCase):
 
     def test_superseded_review_is_not_resurrected_by_a_later_qualify(self):
         from copy import deepcopy
-        from tools.review_events import event_reader, event_store as events
+        from tools.review_events import event_history, event_reader, event_store as events
         transport, calls = self._transport()
         report = self._qualify(transport)
         notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
@@ -814,7 +816,7 @@ class QualifyTests(QualifyCase):
                      correction_reason="Operator corrected this standing review.",
                      recorded_at="2099-01-01T00:00:00+00:00")
         state = events.status(self.root)
-        events.append(self.root, events.bundle([newer]), old["reviewer"], "req-operator-fix",
+        events.append(self.root, event_history.bundle([newer]), old["reviewer"], "req-operator-fix",
                       state["revision"], state["state_token"])
         calls.clear()
         again = self._qualify(transport)
@@ -841,7 +843,6 @@ class QualifyTests(QualifyCase):
     def test_changed_standing_policy_rereviews_and_supersedes_its_earlier_version(self):
         from datetime import datetime, timezone
         from unittest.mock import patch
-        from tools.intake import standing
         from tools.review_events import event_reader
         fixed = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -851,7 +852,7 @@ class QualifyTests(QualifyCase):
                 return fixed
         transport, calls = self._transport()
         # Both versions are reviewed within the same second.
-        clock = patch.object(standing, "datetime", Clock)
+        clock = patch.object(standing_events, "datetime", Clock)
         clock.start()
         self.addCleanup(clock.stop)
         self._qualify(transport)
@@ -873,12 +874,12 @@ class QualifyTests(QualifyCase):
 
     def test_replayed_review_with_a_stale_pinned_intent_is_restaged_as_a_correction(self):
         from unittest.mock import patch
-        from tools.intake import runner, standing
+        from tools.intake import runner
         transport, calls = self._transport()
         self._qualify(transport)
         self._bump_policy_version()
         # Reviews pinned before earlier-version reviews became supersedable.
-        with patch.object(standing, "_earlier_standing_review", return_value=False):
+        with patch.object(standing_events, "earlier_standing_review", return_value=False):
             pinned = self._qualify(transport)
         self.assertEqual(pinned["counts"]["qualification"], {"pending-review": 6})
         blocked = [r["correlation_id"] for r in store.list_requests(self.root)
@@ -887,10 +888,10 @@ class QualifyTests(QualifyCase):
         # An operator's own correction, under any valid name, is followed and corrected too.
         fix = blocked[0] + "-fix"
         stages = store.request(self.root, blocked[0])["stages"]
-        cohort._stage_request(self.root, fix, [
+        store.stage_request(self.root, fix, [
             {**s, "arguments": {**s["arguments"], "request_id": f"req-{fix}-{s['id']}"}}
             for s in stages], correction_of=blocked[0])
-        with patch.object(standing, "_earlier_standing_review", return_value=False):
+        with patch.object(standing_events, "earlier_standing_review", return_value=False):
             runner.run(self.root, fix, "review")
         for corr in blocked[1:] + [fix]:
             runner.replay(self.root, corr, "review")
@@ -1069,7 +1070,7 @@ class QualifyTests(QualifyCase):
         from tools.review_events import event_store
         self.root = Path(self.temp.name) / "instance-6"
         state = event_store.status(self.root)["state_token"]
-        with patch.object(cohort.store, "correlation_ids", return_value=set()):
+        with patch.object(store, "correlation_ids", return_value=set()):
             again = self._qualify(base, concurrency=6)
         self.assertEqual(again["counts"], serial[0]["counts"])
         self.assertEqual(again["usage"], {"prompt_tokens": 60, "completion_tokens": 30})
@@ -1102,20 +1103,20 @@ class QualifyTests(QualifyCase):
     def test_memoised_store_validation_still_refuses_changed_content(self):
         from copy import deepcopy
         import sqlite3
-        from tools.review_events import event_reader, event_store as events
+        from tools.review_events import event_history, event_reader, event_store as events
         from tools.review_events.review_events import ReviewError
         transport, _ = self._transport()
         self._qualify(transport)
         # Every event is now known valid; a changed event or envelope is still refused.
         known = event_reader.read_snapshot(self.root).events
-        events.validate_history(known, self.root)
+        event_history.validate_history(known, self.root)
         changed = deepcopy(known)
         changed[-1]["unexpected"] = True
         with self.assertRaises(ReviewError):
-            events.validate_history(changed, self.root)
+            event_history.validate_history(changed, self.root)
         with self.assertRaises(ReviewError):
-            events.contract.schema_validate({**events.bundle(known, self.root), "authority": "x"},
-                                            events.store_schema(self.root), root=self.root)
+            events.contract.schema_validate({**event_history.bundle(known, self.root), "authority": "x"},
+                                            event_history.store_schema(self.root), root=self.root)
         # A tampered ledger artifact or request is refused although its peers were memoised.
         db = self.root / ".local/intake/intake.sqlite3"
         store.list_requests(self.root)
@@ -1331,7 +1332,7 @@ class SharedManifestTests(QualifyCase):
         self.qualify("a")
         before = self.manifest.read_bytes()
         with unittest.mock.patch.object(
-                cohort.catalog, "read_records_by_receipt",
+                catalog, "read_records_by_receipt",
                 side_effect=catalog.CatalogError("unavailable")), self.assertRaises(IntakeError) as caught:
             self.qualify("b")
         self.assertEqual(caught.exception.code, "selection_attribution_unavailable")
@@ -1340,7 +1341,7 @@ class SharedManifestTests(QualifyCase):
     def test_an_interrupted_manifest_write_leaves_the_manifest_as_it_was(self):
         self.qualify("a")
         before = self.manifest.read_bytes()
-        real_replace, real_pwrite = os.replace, os.pwrite
+        real_replace = os.replace
 
         def fail_replace(source, target, *args, **kwargs):
             if Path(target) == self.manifest:
@@ -1384,15 +1385,14 @@ class SharedManifestTests(QualifyCase):
 
     def test_capacity_shared_with_other_cohorts_leaves_the_surplus_pending_and_resumable(self):
         self.qualify("a")
-        # A cap of four, as enforced by standing.write_manifest itself and by the reconciliation,
+        # A cap of four, as enforced by standing_publication.write_manifest itself and by the reconciliation,
         # shared with cohort A's three entries. Policy validation compares the policy's receipt
         # scope with the cap (``len(scope) <= cap``), which the real cap of 5,000 always satisfies.
         class Cap(int):
             def __ge__(self, other):
                 return True
         small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(4)})
-        with unittest.mock.patch.object(standing, "renditions", small), \
-                unittest.mock.patch.object(cohort, "renditions", small):
+        with self.patched_renditions(small):
             report = self.qualify("b")
             self.assertEqual(len(self.selections()), 4)
             self.assertEqual(report["counts"]["qualification"], {"qualified": 1, "pending-review": 1})
@@ -1421,9 +1421,13 @@ class SharedManifestTests(QualifyCase):
             def __ge__(self, other):
                 return True
         small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(cap)})
+        return self.patched_renditions(small)
+
+    @staticmethod
+    def patched_renditions(small):
         stack = contextlib.ExitStack()
-        stack.enter_context(unittest.mock.patch.object(standing, "renditions", small))
-        stack.enter_context(unittest.mock.patch.object(cohort, "renditions", small))
+        for module in (standing, standing_publication, cohort, cohort_review):
+            stack.enter_context(unittest.mock.patch.object(module, "renditions", small))
         return stack
 
     def fresh_instance(self):
@@ -1486,7 +1490,7 @@ class SharedManifestTests(QualifyCase):
         self.assertEqual(len(self.calls), 4)
         self.fresh_instance()
         self.qualify("a")
-        with self.capped(4), unittest.mock.patch.object(cohort, "_held_back", return_value=False):
+        with self.capped(4), unittest.mock.patch.object(cohort_review, "_held_back", return_value=False):
             paid = self.qualify("b")
         self.assertEqual(len(self.calls), 5)
         self.assertEqual(outcome(skipped), outcome(paid))
@@ -1495,7 +1499,7 @@ class SharedManifestTests(QualifyCase):
     def test_a_saved_review_is_never_repeated_and_is_selected_when_room_exists(self):
         self.qualify("a")
         # Room looked available, so both of B's reviews were paid and saved; the select was refused.
-        with self.capped(3), unittest.mock.patch.object(cohort, "_selection_room", return_value=True):
+        with self.capped(3), unittest.mock.patch.object(cohort_review, "_selection_room", return_value=True):
             self.qualify("b")
         self.assertEqual(len(self.calls), 5)
         self.calls.clear()
@@ -1531,7 +1535,8 @@ class SharedManifestTests(QualifyCase):
         small = types.SimpleNamespace(**{**vars(renditions), "MAX_SELECTIONS": Cap(3)})
         # Room looked available when the run checked, but another writer took it before the select ran.
         with unittest.mock.patch.object(standing, "renditions", small), \
-                unittest.mock.patch.object(cohort, "_selection_room", return_value=True):
+                unittest.mock.patch.object(standing_publication, "renditions", small), \
+                unittest.mock.patch.object(cohort_review, "_selection_room", return_value=True):
             report = self.qualify("b")
         self.assertEqual(report["counts"]["qualification"], {"pending-review": 2})
         self.assertEqual({e["review_code"] for e in report["entries"] if e.get("review_code")},
@@ -1970,7 +1975,7 @@ class ScopePrecheckTests(QualifyCase):
         entry = next(e for e in report["entries"] if e.get("review_code") ==
                      "standing-exception-prohibited-scope")
         sha = hashlib.sha256(self.policy_file.read_bytes()).hexdigest()
-        stage = store.inspect(self.root, "standing-" + cohort._standing_token(entry, sha))["stages"][0]
+        stage = store.inspect(self.root, "standing-" + cohort_review._standing_token(entry, sha))["stages"][0]
         self.assertEqual(stage["status"], "blocked")
         self.assertEqual(stage["attempts"][-1]["code"], "standing-exception-prohibited-scope")
         self.assertEqual(stage["attempts"][-1]["category"], "blocked")

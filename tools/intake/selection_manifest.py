@@ -35,6 +35,7 @@ import time
 
 from tools.context_index import context_index as index
 from tools.context_index import renditions
+from tools.durable import fsync_directory
 
 TAIL = b'\n  ],\n  "schema_version": 1\n}\n'
 _LOCK = threading.Lock()
@@ -191,15 +192,7 @@ def _remove(intent):
         os.unlink(intent)
     except FileNotFoundError:
         return
-    _sync_directory(intent.parent)
-
-
-def _sync_directory(directory):
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    fsync_directory(intent.parent)
 
 
 def _element(entry):
@@ -240,7 +233,7 @@ def append(root, name, entry, current):
             os.fsync(written)
         finally:
             os.close(written)
-        _sync_directory(path.parent)
+        fsync_directory(path.parent)
         _write_all(descriptor, text, current.end)
         os.fsync(descriptor)
     finally:

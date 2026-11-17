@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from tests.support import default_policy_hash
 from tools.catalog import catalog_store as catalog
+from tools.catalog import storage
 from tools.intake import adapters, cohort, runner, store, upload
 from tools.intake.contracts import IntakeError
 
@@ -114,7 +115,7 @@ class CatalogRebaseTests(Case):
         import fcntl
         home, db, _ = catalog.locations(self.root)
         journal = Path(str(db) + "-journal")
-        real = catalog._await_journal
+        real = storage._await_journal
 
         def late_writer(path):
             real(path)
@@ -127,7 +128,7 @@ class CatalogRebaseTests(Case):
                 journal.unlink()
                 os.close(descriptor)
             threading.Timer(hold_seconds, finish).start()
-        return patch.object(catalog, "_await_journal", late_writer), journal
+        return patch.object(storage, "_await_journal", late_writer), journal
 
     def test_reader_waits_for_a_writer_that_journals_after_the_wait(self):
         injected, journal = self.inject_writer_after_wait(0.3)
@@ -137,7 +138,7 @@ class CatalogRebaseTests(Case):
 
     def test_reader_gives_up_on_a_stuck_live_writer_as_busy_not_abandoned(self):
         injected, journal = self.inject_writer_after_wait(0.6)
-        with injected, patch.object(catalog, "BUSY_TIMEOUT_SECONDS", 0.2):
+        with injected, patch.object(storage, "BUSY_TIMEOUT_SECONDS", 0.2):
             with self.assertRaises(catalog.WriterBusy):
                 catalog.status(self.root)
         time.sleep(0.8)
@@ -214,7 +215,6 @@ class SettleTests(Case):
                 raise catalog.StaleState("Stale expected state; re-read before writing")
             return real(*args, **kwargs)
         import json
-        from tools import policy
         records = [{"id": "S1", "kind": "source", "data": {"category": "artifact", "provenance": []}}]
         store.stage(self.root, json.dumps({
             "version": 1, "correlation_id": "req-backoff", "correction_of": None,
@@ -339,7 +339,7 @@ class ContentionBudgetTests(Case):
         self.addCleanup(holder.stdout.close)
         self.addCleanup(holder.wait)
         self.assertEqual(holder.stdout.readline().strip(), "held")
-        with patch.object(catalog, "WRITER_WAIT_SECONDS", 0.2):
+        with patch.object(storage, "WRITER_WAIT_SECONDS", 0.2):
             result = runner.settle(self.root, "req-held", "receipt")
         self.assertEqual(result["stages"][0]["status"], "succeeded")
         self.assertGreater(self.codes(result).count("catalog-busy"), 3)

@@ -3,7 +3,6 @@
 from copy import deepcopy
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 import sys
 import tempfile
@@ -236,13 +235,13 @@ class DoclingLifecycle(unittest.TestCase):
         for target in ("source", "policy"):
             with self.subTest(target=target):
                 mutated = [False]
-                def mutate(*args):
+                def mutate(*args, mutated=mutated, target=target):
                     result = snapshot(*args)
                     mutated[0] = True
                     if target == "source":
                         self.path.write_bytes(self.raw + b"changed")
                     return result
-                def current_binding(*_args, **_kwargs):
+                def current_binding(*_args, mutated=mutated, target=target, **_kwargs):
                     return {**binding, "policy_sha256": "changed"} if mutated[0] and target == "policy" else binding
                 with patch.object(catalog, "_daily_snapshot", side_effect=mutate), \
                      patch.object(bridge, "binding", side_effect=current_binding):
@@ -647,6 +646,50 @@ class AdapterProcess(unittest.TestCase):
             with self.assertRaises(adapter.AdapterError) as raised:
                 adapter._operation("inspect", ROOT, Path(sys.executable))
         self.assertEqual(raised.exception.code, "invalid_result")
+
+
+class WorkerRequirements(unittest.TestCase):
+    def test_lock_pins_every_direct_constraint_in_worker_format(self):
+        def pins(name):
+            text = (ROOT / "tools/extraction" / name).read_text()
+            lines = [line for line in text.splitlines() if line and not line.startswith("#")]
+            for line in lines:
+                self.assertRegex(line, r"^[A-Za-z0-9._-]+(\[[a-z0-9,-]+\])?==[^=\s]+$")
+            return {line.split("==")[0].split("[")[0].lower(): line.split("==")[1]
+                    for line in lines}
+        lock = pins("requirements-docling.txt")
+        for name, version in pins("requirements-docling.in").items():
+            self.assertEqual(lock.get(name), version, name)
+
+
+class LimitContract(unittest.TestCase):
+    """The worker stays self-contained, so the parent's mirrored limits are pinned here."""
+
+    def test_parent_limits_match_worker_and_readme(self):
+        from tools.extraction import extract
+        spec = importlib.util.spec_from_file_location(
+            "docling_worker_limits", ROOT / "tools/extraction/docling_worker.py")
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        limits, mib = worker.LIMITS, 1024 * 1024
+        self.assertEqual(bridge.MAX_SOURCE, limits["source_bytes"])
+        self.assertEqual(adapter.MAX_RESULT, limits["result_bytes"])
+        self.assertEqual(adapter.MAX_DIAGNOSTIC, limits["diagnostic_bytes"])
+        self.assertEqual(adapter.WALL_SECONDS, limits["wall_seconds"])
+        self.assertLess(extract.MAX_SOURCE, bridge.MAX_SOURCE)
+        readme = " ".join((ROOT / "tools/extraction/README.md").read_text().split())
+        documented = (
+            f"Docling source limit is {limits['source_bytes'] // mib} MiB; "
+            f"PDFs allow at most {limits['pdf_pages']} pages and "
+            f"{limits['page_pixels']:,} pixels per page. Worker and final results are "
+            f"limited to {limits['result_bytes'] // mib} MiB, diagnostics to "
+            f"{limits['diagnostic_bytes'] // 1024} KiB, address space to "
+            f"{limits['address_space_bytes'] // 1024 ** 3} GiB, and wall time to "
+            f"{limits['wall_seconds']} seconds.",
+            f"their source limit is lower: {extract.MAX_SOURCE // mib} MiB, with "
+            f"renditions limited to {extract.MAX_EXPANDED // mib} MiB.")
+        for sentence in documented:
+            self.assertIn(sentence, readme)
 
 
 if __name__ == "__main__":

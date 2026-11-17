@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.file_identity import file_identity
+from tools.file_identity import KeyedConnection, file_identity
 from tests.test_catalog_delta_commit import Case
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -117,7 +117,7 @@ class CatalogBindingKeepsLocks(Case):
     def test_without_dbpage_the_binding_is_the_byte_hash_and_keeps_the_lock(self):
         from tools.catalog import catalog_store as catalog
         self.write(0)
-        with without_dbpage(catalog._Connection), closing(catalog.connect(self.db)) as reader:
+        with without_dbpage(KeyedConnection), closing(catalog.connect(self.db)) as reader:
             reader.execute("BEGIN")
             binding = catalog._binding(reader)
             self.assertEqual(binding["version"], 1)

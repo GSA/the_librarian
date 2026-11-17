@@ -1,6 +1,5 @@
 """Expose the existing CLI without duplicating its evidence or freshness rules."""
 
-import importlib.util
 import json
 import subprocess
 import sys
@@ -15,7 +14,7 @@ from mcp.types import CallToolResult, Implementation, TextContent, ToolAnnotatio
 from pydantic import Field
 
 from . import audit
-from .config import Config, parser
+from .config import Config, load_toolkit_module, parser
 
 Format = Literal["full", "compact"]
 Text = Annotated[str, Field(min_length=1, max_length=4096)]
@@ -43,12 +42,7 @@ def load_diagnostics(config: Config):
     """Load the body-free diagnostics writer only when an operator configured a log."""
     if config.diagnostics_log is None:
         return None
-    path = config.diagnostics_path
-    specification = importlib.util.spec_from_file_location("librarian_retrieval_log", path)
-    if specification is None or specification.loader is None:
-        raise ValueError(f"Diagnostics requested but the writer is unavailable: {path}")
-    module = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(module)
+    module = load_toolkit_module(config.diagnostics_path, "librarian_retrieval_log")
     return module.Log(config.root, config.diagnostics_log)
 
 

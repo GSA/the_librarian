@@ -1,8 +1,6 @@
 """One catalog revision per batch of documents (Kata herq): idempotency, rebase, refusal, crash."""
 from contextlib import closing
 import itertools
-import json
-import os
 from pathlib import Path
 import random
 import subprocess
@@ -12,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from tools.catalog import catalog_store as catalog
-from tools.catalog.contracts import CatalogError, validate_graph
+from tools.catalog.contracts import CatalogError
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
 
@@ -484,7 +482,6 @@ class CrashInjection(Case):
 
         def failing(writer, incoming, **kwargs):
             calls.append(len(incoming))
-            original = writer.connection.execute
 
             class Spy:
                 def __init__(self, inner):

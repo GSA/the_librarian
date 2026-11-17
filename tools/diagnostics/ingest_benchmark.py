@@ -2,7 +2,7 @@
 """Synthetic cohort ingest benchmark for the catalog write path.
 
 Generates non-identifying markdown files in a temporary inbox, ingests them into
-a fresh temporary instance through ``tools.intake.cohort.ingest`` and prints a
+a fresh temporary instance through ``tools.intake.cohort_ingest.ingest`` and prints a
 body-free JSON report: throughput, p50/p95 per-file latency, CPU time, stage
 timings (inclusive wall time of the catalog stages), backup count/bytes and
 stable disposition totals. It never reads a real instance or corpus; run it from
@@ -20,12 +20,9 @@ so an expensive first ingest is not paid per tree.
 """
 import argparse
 import contextlib
-from collections import Counter
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
 import sys
 import tempfile
 import time
@@ -38,7 +35,7 @@ STAGES = (
     ("tools.intake.upload", "catalog_view"), ("tools.intake.upload", "reserved_ids"),
     ("tools.intake.upload", "publish"), ("tools.intake.upload", "records_for"), ("tools.intake.upload", "next_id"),
     ("tools.intake.upload", "plan"), ("tools.intake.upload", "acknowledgment"), ("tools.intake.upload", "submit"),
-    ("tools.intake.cohort", "classify"), ("tools.intake.cohort", "_extract"),
+    ("tools.intake.cohort_ingest", "classify"), ("tools.intake.cohort_ingest", "_extract"),
     ("tools.extraction.extract", "run"),
     ("tools.intake.store", "stage"), ("tools.intake.runner", "run"),
 )
@@ -216,7 +213,7 @@ def replay(cohort, root, inbox, files, repeats, trust_stat=False):
 def run_replay(size, work, repeats, padding, kind, trust_stat=False):
     """Build (or reuse) a fully ingested instance, then time replays of its unchanged inbox."""
     from tools.catalog import catalog_store as catalog
-    from tools.intake import cohort, store
+    from tools.intake import cohort_ingest as cohort, store
     root, inbox = work / "instance", work / "inbox"
     marker = work / "built.json"
     wanted = {"files": size, "padding": padding, "fixture": kind}
@@ -249,7 +246,7 @@ def run_replay(size, work, repeats, padding, kind, trust_stat=False):
 
 def run_size(size, resume, work):
     from tools.catalog import catalog_store as catalog
-    from tools.intake import cohort, store
+    from tools.intake import cohort_ingest as cohort, store
     root, inbox = work / "instance", work / "inbox"
     root.mkdir()
     store.initialize(root)
@@ -294,8 +291,8 @@ def main(argv=None):
     parser.add_argument("--label", default="")
     parser.add_argument("--keep", type=Path, help="parent directory for fixtures (default: temporary)")
     args = parser.parse_args(argv)
-    sys.path.insert(0, str(args.tree.resolve()))
-    os.chdir(args.tree.resolve())
+    from _harness import use_tree
+    use_tree(args.tree)
     results = []
     for size in (int(s) for s in args.sizes.split(",")):
         if args.replay:

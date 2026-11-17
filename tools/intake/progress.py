@@ -3,24 +3,16 @@
 The view reads the intake ledger, catalog, review events and context index with
 their existing read-only paths. It never stages, runs, replays or repairs
 anything, and it reports each unavailable or corrupt source instead of failing.
-The HTTP view binds loopback only unless non-loopback exposure is explicitly
-approved by the operator.
+``progress_render`` turns the report into text or HTML and ``progress_serve``
+serves it over loopback HTTP.
 """
 from bisect import insort
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
-import base64
-import hashlib
-import html
-import http.server
-import ipaddress
-import json
 import os
-import socket
 import sqlite3
 import stat
-import threading
 import time
 
 from tools import policy
@@ -31,8 +23,6 @@ from .contracts import IntakeError, decode_request
 FUNNEL = ("staged", "received", "extracting", "extracted", "pending-review", "reviewed",
           "qualified", "selected", "rejected", "deferred", "exception", "skipped-by-format",
           "needs-reader", "blocked", "dead-letter", "published")
-EXCEPTIONAL = ("rejected", "deferred", "exception", "skipped-by-format", "needs-reader",
-               "blocked", "dead-letter")
 STATUSES = ("staged", "running", "retryable", "blocked", "dead-letter", "succeeded",
             "return-pending")
 KINDS = ("receipt", "extraction", "review", "publication", "return")
@@ -45,11 +35,6 @@ ACTIVE = {"receipt": "staged", "extraction": "extracting", "review": "pending-re
 STANDING_OUTCOMES = ("pending-review", "rejected", "deferred", "exception")
 FORMAT_CODES = {"unsupported-type", "type-mismatch", "unsupported-format", "skipped-by-format"}
 READER_PREFIX = "needs-reader"
-
-
-class BindRefused(IntakeError):
-    def __init__(self):
-        super().__init__("non_loopback_bind")
 
 
 def failure(error):
@@ -66,7 +51,6 @@ def failure(error):
 PAGE = 5000  # requests per short read transaction
 WINDOWS = (60, 300, 900)  # seconds for the "is it moving" attempt rates
 CODED = {"blocked", "dead-letter", "retryable"}  # statuses whose last attempt code is reported
-ATTENTION = CODED
 
 # Verification state reused across renders in this process. ``_memo`` holds SHA-256 digests of
 # request and artifact bytes already proven (store.PageMemo); ``_cached`` holds the one finished
@@ -139,6 +123,125 @@ def stage_signature(layout, statuses):
     return funnel, statuses[current][0], statuses[current][1]
 
 
+@contextmanager
+def ledger_errors():
+    """Map SQLite failures of a ledger read to the reported intake error codes."""
+    try:
+        yield
+    except sqlite3.OperationalError as error:
+        raise IntakeError("ledger_unavailable") from error
+    except sqlite3.DatabaseError as error:
+        raise IntakeError("corrupt_store") from error
+
+
+def first_identity(c, db):
+    """The ledger file identity inside the open read transaction (header fallback outside a lock)."""
+    before = file_identity(db, c)
+    if before is None:
+        c.execute("COMMIT")  # no SQLite lock is held while the header is read directly
+        before = header_identity(db)
+        c.execute("BEGIN")
+    return before
+
+
+def last_identity(c, db, before):
+    """The file identity and attempt rates after the last page."""
+    try:
+        c.execute("BEGIN")
+        after = file_identity(db, c)
+        moving = rates(c, time.time())
+        c.execute("COMMIT")
+        if after is None and before is not None:
+            after = header_identity(db)
+    except sqlite3.DatabaseError as error:
+        raise IntakeError("ledger_unavailable") from error
+    return after, moving
+
+
+def newer(current, value):
+    return value if current is None or (value is not None and value > current) else current
+
+
+def request_state(correlation_id, stages, layout, attempts_of):
+    """Each stage's (status, last attempt code when coded) and the newest attempt time of one request."""
+    statuses, updated = [], None
+    for saved, (stage_id, _, _) in zip(stages, layout):
+        history = attempts_of.get((correlation_id, stage_id), [])
+        for attempt in history:
+            updated = newer(newer(updated, attempt["started"]), attempt["ended"])
+        code = None
+        if saved["status"] in CODED:
+            current = [a for a in history if a["cycle"] == saved["cycle"]]
+            code = current[-1]["code"] if current else None
+        statuses.append((saved["status"], code))
+    return tuple(statuses), updated
+
+
+def scan(c, root, limit, runs, corrected):
+    """Verify every page and fold it into signature counts, newest times and the entries kept to show.
+
+    Requests in ``corrected`` are not chain heads: they are verified with their page but only
+    counted as superseded."""
+    counts, per_run = Counter(), {name: Counter() for name in runs}
+    superseded, superseded_runs = 0, Counter()
+    latest = dict.fromkeys(per_run)
+    newest, recent, groups, info, after = None, Best(limit), {}, {}, None
+    while True:
+        with ledger_errors():
+            c.execute("BEGIN")
+            rows = store.snapshot(c, after, PAGE)
+            c.execute("COMMIT")
+        requests, stages_of, attempts_of, _ = rows
+        if not requests:
+            break
+        layouts = store.verify_page(rows, root, _memo)
+        for row, layout in zip(requests, layouts):
+            correlation_id = row["correlation_id"]
+            if correlation_id in corrected:
+                superseded += 1
+                for name, prefix in runs.items():
+                    superseded_runs[name] += correlation_id.startswith(prefix)
+                continue
+            statuses, updated = request_state(correlation_id, stages_of[correlation_id], layout,
+                                              attempts_of)
+            signature = (layout, statuses)
+            if signature not in info:
+                info[signature] = stage_signature(layout, statuses)
+            funnel, state, code = info[signature]
+            counts[signature] += 1
+            newest = newer(newest, updated)
+            for name, prefix in runs.items():
+                if correlation_id.startswith(prefix):
+                    per_run[name][signature] += 1
+                    latest[name] = newer(latest[name], updated)
+            order = (-(updated or 0), correlation_id)
+
+            def build(row=row, stages=stages_of[correlation_id], attempts_of=attempts_of):
+                return candidate(row, stages, attempts_of)
+            recent.offer(order, build)
+            if state in CODED:
+                group = groups.setdefault((state, funnel, code), [0, Best(limit)])
+                group[0] += 1
+                group[1].offer(order, build)
+        after = requests[-1]["correlation_id"]
+    return counts, per_run, latest, newest, recent, groups, superseded, superseded_runs
+
+
+def summarize(counts, per_run, latest, newest, recent, groups, superseded, superseded_runs, limit):
+    return {
+        "overall": aggregate(counts, newest, superseded),
+        "runs": {name: aggregate(per_run[name], latest[name], superseded_runs[name])
+                 for name in per_run},
+        "recent": [public(make_item(entry)) for _, entry in recent.entries],
+        "attention_groups": [
+            {"state": state, "funnel": funnel, "code": code, "count": count}
+            for (state, funnel, code), (count, _) in sorted(
+                groups.items(), key=lambda g: (-g[1][0], tuple(str(x) for x in g[0])))],
+        "attention_total": sum(count for count, _ in groups.values()),
+        "attention": [public(make_item(entry)) for entry in spread(groups, limit)],
+    }
+
+
 def read_ledger(root, timeout=2.0, limit=50, runs=None):
     """Verify the whole ledger a page at a time and reduce it to counts and the few items shown.
 
@@ -147,113 +250,27 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
     the ``limit`` newest items per list is kept, so memory follows the page, not the ledger.
     """
     started = time.perf_counter()
+    runs = runs or {}
     root, db, c = open_ledger(root, timeout)
     with closing(c):
-        try:
+        with ledger_errors():
             c.execute("BEGIN")
-            before = file_identity(db, c)
-            if before is None:
-                c.execute("COMMIT")  # no SQLite lock is held while the header is read directly
-                before = header_identity(db)
-                c.execute("BEGIN")
-            key = (str(root), before, limit, tuple(sorted((runs or {}).items())),
+            before = first_identity(c, db)
+            key = (str(root), before, limit, tuple(sorted(runs.items())),
                    datetime.now(timezone.utc).date().isoformat())
             if before is not None and _cached.get("key") == key:
-                summary = _cached["summary"]
                 moving = rates(c, time.time())
                 c.execute("COMMIT")
-                return {**summary, "rates": moving, "cached": True,
+                return {**_cached["summary"], "rates": moving, "cached": True,
                         "seconds": round(time.perf_counter() - started, 3)}
             store.check_identity(c)
             # Requests some correction points at are not chain heads; read once, not per row.
             corrected = {parent for (parent,) in c.execute(
                 "SELECT DISTINCT correction_of FROM requests WHERE correction_of IS NOT NULL")}
             c.execute("COMMIT")
-        except sqlite3.OperationalError as error:
-            raise IntakeError("ledger_unavailable") from error
-        except sqlite3.DatabaseError as error:
-            raise IntakeError("corrupt_store") from error
-        counts, per_run = Counter(), {name: Counter() for name in runs or {}}
-        superseded, superseded_runs = 0, Counter()
-        latest = {name: None for name in per_run}
-        newest = None
-        recent, groups = Best(limit), {}
-        info, after = {}, None
-        while True:
-            try:
-                c.execute("BEGIN")
-                rows = store.snapshot(c, after, PAGE)
-                c.execute("COMMIT")
-            except sqlite3.OperationalError as error:
-                raise IntakeError("ledger_unavailable") from error
-            except sqlite3.DatabaseError as error:
-                raise IntakeError("corrupt_store") from error
-            requests, stages_of, attempts_of, _ = rows
-            if not requests:
-                break
-            layouts = store.verify_page(rows, root, _memo)
-            for row, layout in zip(requests, layouts):
-                correlation_id = row["correlation_id"]
-                if correlation_id in corrected:  # verified with its page, but reported only as superseded
-                    superseded += 1
-                    for name, prefix in (runs or {}).items():
-                        superseded_runs[name] += correlation_id.startswith(prefix)
-                    continue
-                statuses, updated = [], None
-                for saved, (stage_id, _, _) in zip(stages_of[correlation_id], layout):
-                    history = attempts_of.get((correlation_id, stage_id), [])
-                    for attempt in history:
-                        for field in ("started", "ended"):
-                            if attempt[field] is not None and (updated is None or attempt[field] > updated):
-                                updated = attempt[field]
-                    code = None
-                    if saved["status"] in CODED:
-                        current = [a for a in history if a["cycle"] == saved["cycle"]]
-                        code = current[-1]["code"] if current else None
-                    statuses.append((saved["status"], code))
-                signature = (layout, tuple(statuses))
-                if signature not in info:
-                    info[signature] = stage_signature(layout, signature[1])
-                _, state, code = info[signature]
-                funnel = info[signature][0]
-                counts[signature] += 1
-                if updated is not None and (newest is None or updated > newest):
-                    newest = updated
-                for name, prefix in (runs or {}).items():
-                    if correlation_id.startswith(prefix):
-                        per_run[name][signature] += 1
-                        if updated is not None and (latest[name] is None or updated > latest[name]):
-                            latest[name] = updated
-                order = (-(updated or 0), correlation_id)
-
-                def build(row=row, layout=layout, correlation_id=correlation_id):
-                    return candidate(row, stages_of[correlation_id], attempts_of)
-                recent.offer(order, build)
-                if state in ATTENTION:
-                    group = groups.setdefault((state, funnel, code), [0, Best(limit)])
-                    group[0] += 1
-                    group[1].offer(order, build)
-            after = requests[-1]["correlation_id"]
-        try:
-            c.execute("BEGIN")
-            after_identity = file_identity(db, c)
-            moving = rates(c, time.time())
-            c.execute("COMMIT")
-            if after_identity is None and before is not None:
-                after_identity = header_identity(db)
-        except sqlite3.DatabaseError as error:
-            raise IntakeError("ledger_unavailable") from error
-    summary = {
-        "overall": aggregate(counts, newest, superseded),
-        "runs": {name: aggregate(per_run[name], latest[name], superseded_runs[name]) for name in per_run},
-        "recent": [public(make_item(c_)) for _, c_ in recent.entries],
-        "attention_groups": [
-            {"state": state, "funnel": funnel, "code": code, "count": count}
-            for (state, funnel, code), (count, _) in sorted(
-                groups.items(), key=lambda g: (-g[1][0], tuple(str(x) for x in g[0])))],
-        "attention_total": sum(count for count, _ in groups.values()),
-    }
-    summary["attention"] = [public(make_item(c_)) for c_ in spread(groups, limit)]
+        tally = scan(c, root, limit, runs, corrected)
+        after_identity, moving = last_identity(c, db, before)
+    summary = summarize(*tally, limit)
     # Stored only when the file was exactly the same before the first and after the last page: no
     # commit landed between pages, so the summary describes one verified file state.
     if before is not None and after_identity == before:
@@ -374,32 +391,6 @@ def public(value):
 _catalog_seen = {}  # canonical binding -> state of a full inspection this process has done today
 
 
-def catalog_state(catalog, connection, home):
-    """The catalog's validated state without writing anything (no receipt is ever written here).
-
-    A read-validation receipt that covers exactly this file ("What a catalog write validates" in docs/design/current-state.md) vouches for a state
-    that a writer or reader already validated in full today, and this process's own earlier full
-    inspection of the identical binding does the same; otherwise the whole history is inspected.
-    A receipt that cannot be read is ignored, never trusted.
-    """
-    try:
-        binding = catalog._binding(connection)
-        marker = json.dumps([binding, catalog._today()], sort_keys=True)
-        trusted = catalog._trusted_state(connection, home, binding)
-    except (catalog.CatalogError, OSError, ValueError):
-        binding = marker = trusted = None
-    if trusted is not None:
-        return trusted[0]
-    if marker is not None and _catalog_seen.get("marker") == marker \
-            and _catalog_seen["head"] == catalog._head_state(connection):
-        return _catalog_seen["state"]
-    state = catalog.inspect(connection, detail=False)[0]
-    if marker is not None and binding["version"] == 2:
-        _catalog_seen.clear()
-        _catalog_seen.update(marker=marker, head=catalog._head_state(connection), state=state)
-    return state
-
-
 def read_catalog(root):
     from tools.catalog import catalog_store as catalog, contracts
     try:
@@ -409,7 +400,7 @@ def read_catalog(root):
                         "Catalog home missing or not private")
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
-            state = catalog_state(catalog, connection, home)
+            state = catalog.observed_state(connection, home, _catalog_seen)
             catalog.current_view(connection)
             # One scan of the current records for all three breakdowns.
             kinds, coverage, extraction = Counter(), Counter(), Counter()
@@ -492,296 +483,3 @@ def snapshot(root, *, limit=50, runs=None, timeout=2.0):
         "catalog": read_catalog(root), "review_events": read_review_events(root),
         "index": read_index(root),
     }
-
-
-# Rendering -------------------------------------------------------------------
-
-def when(value):
-    if value is None:
-        return "-"
-    return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds")
-
-
-LOCAL_TIME_SCRIPT = (
-    "for(const t of document.querySelectorAll('time[datetime]')){"
-    "const d=new Date(t.getAttribute('datetime'));"
-    "if(!isNaN(d)){t.title=t.textContent;t.textContent=d.toLocaleString(undefined,"
-    "{dateStyle:'medium',timeStyle:'medium'})}}")
-SCRIPT_SRC = "'sha256-" + base64.b64encode(
-    hashlib.sha256(LOCAL_TIME_SCRIPT.encode()).digest()).decode() + "'"
-
-
-def time_tag(value):
-    if value is None or value == "-":
-        return "-"
-    return f'<time datetime="{html.escape(str(value), quote=True)}">{html.escape(str(value))}</time>'
-
-
-def source_line(name, value):
-    if value.get("available"):
-        return name + ": available"
-    return f"{name} unavailable: {value.get('error')}" + (
-        f" ({value['detail']})" if value.get("detail") else "")
-
-
-def render_text(report):
-    lines = [f"Intake progress at {report['generated_at']} (read-only, body-free)"]
-    for name in ("ledger", "catalog", "review_events", "index"):
-        lines.append("  " + source_line(name.replace("_", " "), report[name]))
-    groups = [("overall", report["overall"])] + [("run " + k, v) for k, v in report["runs"].items()]
-    for label, data in groups:
-        counts = ", ".join(f"{k}={v}" for k, v in data["funnel"].items() if v) or "none"
-        lines.append(f"{label}: {data['requests']} requests, {data['exceptions']} exceptions, "
-                     f"{data['retrying']} retrying, {data['superseded']} superseded; {counts}")
-    moving = report.get("rates")
-    if moving:
-        lines.append("finished attempts (last " + "/".join(f"{w // 60}" for w in moving["windows_seconds"])
-                     + " min): " + (", ".join(
-                         f"{outcome} " + "/".join(str(counts[str(w)]) for w in moving["windows_seconds"])
-                         for outcome, counts in moving["finished"].items()) or "none"))
-    index = report["index"]
-    if index.get("available"):
-        lines.append(f"index: {'fresh' if index['fresh'] else 'STALE'}; documents="
-                     f"{index['indexed']['documents']} sections={index['indexed']['sections']}; "
-                     f"selected documents={index['selected']['documents']} "
-                     f"renditions={index['selected']['renditions']}")
-    for group in report["attention_groups"]:
-        lines.append(f"  group: {group['count']} x {group['state']} {group['funnel']} {group['code'] or '-'}")
-    for value in report["attention"]:
-        attempt = value["last_attempt"] or {}
-        lines.append(f"  ! {value['correlation_id']} {value['stage']} {value['state']} "
-                     f"{value['funnel']} {attempt.get('category') or '-'} {attempt.get('code') or '-'}")
-    return "\n".join(lines) + "\n"
-
-
-STYLE = """
-body{font:15px/1.4 system-ui,sans-serif;margin:1.5rem;color:#1b1b1b;background:#fafafa}
-h1{font-size:1.4rem;margin:0}h2{font-size:1.1rem;margin:1.4rem 0 .4rem}
-.muted{color:#555}.cards{display:flex;flex-wrap:wrap;gap:.5rem}
-.card{background:#fff;border:1px solid #ccc;border-radius:6px;padding:.5rem .8rem;min-width:7.5rem}
-.card b{display:block;font-size:1.5rem}.bad{border-color:#b50909;background:#fdecec}
-.ok{border-color:#2e8540;background:#eef8f0}.warn{border-color:#c05600;background:#fff4e5}
-table{border-collapse:collapse;background:#fff;font-size:.9rem}
-td,th{border:1px solid #ccc;padding:.25rem .5rem;text-align:left}th{background:#eee}
-"""
-
-
-class Raw:
-    def __init__(self, html_text):
-        self.html = html_text
-
-
-def esc(value):
-    return html.escape("-" if value is None else str(value), quote=True)
-
-
-def cards(funnel):
-    out = []
-    for name in FUNNEL:
-        tone = "bad" if name in EXCEPTIONAL and funnel[name] else "ok" if name == "published" else ""
-        out.append(f'<div class="card {tone}"><b>{funnel[name]}</b>{esc(name)}</div>')
-    return '<div class="cards">' + "".join(out) + "</div>"
-
-
-def table(headers, rows):
-    head = "".join(f"<th>{esc(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(
-        f"<td>{c.html}</td>" if isinstance(c, Raw) else f"<td>{esc(c)}</td>" for c in row) + "</tr>" for row in rows)
-    return f"<table><tr>{head}</tr>{body or '<tr><td colspan=99>none</td></tr>'}</table>"
-
-
-def item_rows(values):
-    return [(v["correlation_id"], v["stage"], v["operation"], v["state"], v["funnel"],
-             (v["last_attempt"] or {}).get("outcome"), (v["last_attempt"] or {}).get("category"),
-             (v["last_attempt"] or {}).get("code"), Raw(time_tag(when(v["updated"])))) for v in values]
-
-
-def render_html(report, *, refresh=5):
-    overall = report["overall"]
-    parts = [f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-             f'<meta http-equiv="refresh" content="{int(refresh)}">'
-             f"<title>Intake progress</title><style>{STYLE}</style></head><body>",
-             "<h1>Intake progress</h1>",
-             f'<p class="muted">Read-only and body-free. Updated {time_tag(report["generated_at"])}; '
-             f"refreshes every {int(refresh)} s. Ledger read {report['render']['ledger_seconds']} s"
-             f"{' (unchanged since last read)' if report['render']['ledger_cached'] else ''}. Last ledger activity {time_tag(when(overall['last_activity']))}.</p>"]
-    sources = []
-    for name in ("ledger", "catalog", "review_events", "index"):
-        value = report[name]
-        tone = "ok" if value.get("available") else "bad"
-        sources.append(f'<div class="card {tone}">{esc(source_line(name.replace("_", " "), value))}</div>')
-    parts.append('<h2>Sources</h2><div class="cards">' + "".join(sources) + "</div>")
-    index = report["index"]
-    if index.get("available"):
-        tone = "ok" if index["fresh"] else "warn"
-        parts.append(f'<h2>Index</h2><div class="cards"><div class="card {tone}"><b>'
-                     f'{"fresh" if index["fresh"] else "stale"}</b>freshness</div>'
-                     f'<div class="card"><b>{index["indexed"]["documents"]}</b>indexed documents</div>'
-                     f'<div class="card"><b>{index["indexed"]["sections"]}</b>indexed sections</div>'
-                     f'<div class="card"><b>{index["selected"]["documents"]}</b>selected documents</div>'
-                     f'<div class="card"><b>{index["selected"]["renditions"]}</b>selected renditions</div></div>')
-        if index["reasons"]:
-            parts.append("<p>Stale: " + esc("; ".join(index["reasons"])) + "</p>")
-    parts.append(f"<h2>Overall: {overall['requests']} requests, {overall['exceptions']} exceptions, "
-                 f"{overall['retrying']} retrying ({overall['superseded']} superseded originals not counted)</h2>" + cards(overall["funnel"]))
-    for name, data in report["runs"].items():
-        parts.append(f"<h2>Run {esc(name)} ({esc(data['prefix'])}*): {data['requests']} requests, "
-                     f"{data['exceptions']} exceptions ({data['superseded']} superseded not counted)</h2>"
-                     + cards(data["funnel"]))
-    parts.append("<h2>Stages by kind and state</h2>" + table(
-        ("kind", *STATUSES), [(k, *overall["stages"][k].values()) for k in KINDS]))
-    catalog = report["catalog"]
-    if catalog.get("available"):
-        parts.append("<h2>Catalog</h2>" + table(
-            ("receipts", "artifacts", *("coverage " + k for k in catalog["coverage"]),
-             *("extraction " + k for k in catalog["extraction"])),
-            [(catalog["receipts"], catalog["artifacts"], *catalog["coverage"].values(),
-              *catalog["extraction"].values())]))
-    reviews = report["review_events"]
-    if reviews.get("available"):
-        parts.append("<h2>Review events</h2>" + table(
-            ("current events", *reviews["outcomes"]), [(reviews["current"], *reviews["outcomes"].values())]))
-    headers = ("correlation", "stage", "operation", "state", "funnel", "last outcome",
-               "category", "code", "updated")
-    moving = report.get("rates")
-    if moving:
-        windows = moving["windows_seconds"]
-        parts.append("<h2>Attempts finished (is it moving?)</h2>" + table(
-            ("outcome", *(f"last {w // 60} min" for w in windows)),
-            [(outcome, *(counts[str(w)] for w in windows)) for outcome, counts in moving["finished"].items()]))
-    if report["attention_groups"]:
-        parts.append("<h2>Needs attention by cause</h2>" + table(
-            ("count", "state", "funnel", "code"),
-            [(g["count"], g["state"], g["funnel"], g["code"]) for g in report["attention_groups"]]))
-    parts.append(f"<h2>Needs attention (showing {len(report['attention'])} of {report['attention_total']})</h2>"
-                 + table(headers, item_rows(report["attention"])))
-    parts.append("<h2>Recent items</h2>" + table(headers, item_rows(report["recent"])))
-    parts.append(f"<script>{LOCAL_TIME_SCRIPT}</script></body></html>")
-    return "".join(parts)
-
-
-# Loopback server ---------------------------------------------------------------
-
-def check_bind(host, allow_non_loopback=False):
-    """Return the address to bind; refuse anything not loopback without approval."""
-    if host == "localhost":
-        return "127.0.0.1"
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = False
-    if loopback:
-        return str(ipaddress.ip_address(host))
-    if allow_non_loopback and host:
-        return host
-    raise BindRefused()
-
-
-class Latest:
-    """At most one render at a time, shared by every request that arrives meanwhile.
-
-    A request that finds a render running waits for it and uses its result, and a result younger
-    than ``reuse`` seconds is served again, so any number of open tabs cost one render per
-    ``reuse`` seconds plus one render's time at most, never one render per tab.
-    """
-
-    def __init__(self, render, reuse=1.0, clock=time.monotonic):
-        self.render, self.reuse, self.clock = render, reuse, clock
-        self.lock, self.result, self.finished, self.running = threading.Condition(), None, None, False
-
-    def get(self):
-        with self.lock:
-            while True:
-                if self.result is not None and not self.running \
-                        and self.clock() - self.finished <= self.reuse:
-                    return self.result
-                if not self.running:
-                    break
-                joined = self.finished
-                self.lock.wait()
-                if self.result is not None and self.finished != joined:
-                    return self.result
-            self.running = True
-        try:
-            result = self.render()
-        except BaseException:
-            with self.lock:
-                self.running = False
-                self.lock.notify_all()
-            raise
-        with self.lock:
-            self.result, self.finished, self.running = result, self.clock(), False
-            self.lock.notify_all()
-        return result
-
-
-def make_server(root, *, host="127.0.0.1", port=8765, refresh=5, limit=50, runs=None,
-                allow_non_loopback=False, reuse=1.0):
-    address = check_bind(host, allow_non_loopback)
-    latest = Latest(lambda: snapshot(root, limit=limit, runs=runs), reuse)
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        server_version = "librarian-progress"
-        sys_version = ""
-
-        def send(self, status, kind, body):
-            data = body.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", kind)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Security-Policy",
-                             f"default-src 'none'; style-src 'unsafe-inline'; script-src {SCRIPT_SRC}; "
-                             "frame-ancestors 'none'")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(data)
-
-        def trusted_host(self):
-            if allow_non_loopback:
-                return True
-            name = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
-            return name in {"127.0.0.1", "localhost", "::1"}
-
-        def do_GET(self):
-            if not self.trusted_host():
-                return self.send(421, "text/plain; charset=utf-8", "Misdirected request\n")
-            path = self.path.split("?", 1)[0]
-            if path not in {"/", "/progress.json"}:
-                return self.send(404, "text/plain; charset=utf-8", "Not found\n")
-            report = latest.get()
-            if path == "/":
-                return self.send(200, "text/html; charset=utf-8", render_html(report, refresh=refresh))
-            return self.send(200, "application/json", json.dumps(report, sort_keys=True))
-
-        do_HEAD = do_GET
-
-        def refuse(self):
-            self.send(405, "text/plain; charset=utf-8", "Read-only view\n")
-
-        do_POST = do_PUT = do_PATCH = do_DELETE = refuse
-
-        def log_message(self, *args):
-            return
-
-    class Server(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-        address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
-
-    return Server((address, port), Handler)
-
-
-def serve(root, **options):
-    server = make_server(root, **options)
-    host, port = server.server_address[:2]
-    shown = f"[{host}]" if ":" in host else host
-    print(json.dumps({"serving": f"http://{shown}:{port}/", "read_only": True}), flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-    return {"stopped": True}

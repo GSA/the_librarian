@@ -230,7 +230,6 @@ class LedgerTests(unittest.TestCase):
 class RunnerTests(unittest.TestCase):
     setUp = LedgerTests.setUp
     def stage_live(self):
-        from tools import policy
         raw = request(policy={"version": 1, "sha256": default_policy_hash()})
         store.stage(self.root, raw)
         return raw
@@ -335,7 +334,6 @@ class RunnerTests(unittest.TestCase):
 
     def test_return_pending_and_matching_ack(self):
         from tools.intake import runner
-        from tools import policy
         path = self.root / "disposition.json"
         path.write_bytes(b"private disposition")
         raw = json.loads(request(policy={"version": 1, "sha256": default_policy_hash()}))
@@ -354,7 +352,6 @@ class RunnerTests(unittest.TestCase):
 
     def test_return_artifact_changed_or_missing_blocks_ack(self):
         from tools.intake import runner
-        from tools import policy
         path = self.root / "disposition.json"
         path.write_bytes(b"private disposition")
         checksum = hashlib.sha256(path.read_bytes()).hexdigest()

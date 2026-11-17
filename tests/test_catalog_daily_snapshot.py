@@ -1,5 +1,5 @@
 """The first write of a UTC day replays the history once, not four times (Kata yxc2), at full strength."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
 import sqlite3
@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from tools import backups as snapshots
-from tools.catalog import catalog_store as catalog
+from tools.catalog import backups as catalog_backups, catalog_store as catalog
 from tools.catalog.contracts import CatalogError
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
@@ -45,7 +45,12 @@ class Case(unittest.TestCase):
         def count(*args, **kwargs):
             calls.append(1)
             return real(*args, **kwargs)
-        return calls, patch.object(catalog, "inspect", count)
+
+        @contextmanager
+        def patched():
+            with patch.object(catalog, "inspect", count), patch.object(catalog_backups, "inspect", count):
+                yield
+        return calls, patched()
 
 
 class OneReplay(Case):
@@ -114,7 +119,7 @@ class SnapshotStrength(Case):
     def test_bytes_that_differ_after_writing_are_refused_and_nothing_is_published(self):
         self.new_day()
         revision = catalog.status(self.root)["revision"]
-        with patch.object(catalog, "_partial_hash", return_value="0" * 64):
+        with patch.object(catalog_backups, "_partial_hash", return_value="0" * 64):
             with self.assertRaisesRegex(CatalogError, "Backup bytes mismatch"):
                 self.write(10)
         self.assertEqual(self.snapshots(), [])
@@ -142,13 +147,13 @@ class SnapshotStrength(Case):
             calls.append((Path(path).name, kwargs.get("replay", True)))
             return real(path, *args, **kwargs)
         self.new_day()
-        with patch.object(catalog, "verify_backup", spy):
+        with patch.object(catalog_backups, "verify_backup", spy):
             self.write(10)
         self.assertEqual([replay for _, replay in calls], [False])  # one cheap check, no full verification
         with patch.object(snapshots, "utcnow", lambda: snapshots.datetime.now(snapshots.timezone.utc)
                           + snapshots.timedelta(days=1)):
             calls.clear()
-            with patch.object(catalog, "verify_backup", spy):
+            with patch.object(catalog_backups, "verify_backup", spy):
                 self.write(11)
         # yesterday's snapshot is the candidate keeper only if the new one failed; it is not re-verified here
         self.assertEqual([replay for _, replay in calls], [False])

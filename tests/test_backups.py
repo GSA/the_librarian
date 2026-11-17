@@ -9,8 +9,10 @@ from unittest.mock import patch
 
 from tools import backups, policy
 from tools.catalog import catalog_store as catalog
+from tools.catalog import backups as catalog_backups
+from tools.review_events import event_history
 from tools.review_events import event_store as events
-from tests.test_kit import WorkspaceCase
+from tests.support import WorkspaceCase
 
 DAY = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -133,7 +135,7 @@ class DailySnapshots(unittest.TestCase):
         self.write("S1")
         self.clock.advance(days=30)
         before = set(self.backups.iterdir())
-        with patch.object(catalog, "verify_backup", side_effect=catalog.CatalogError("bad")):
+        with patch.object(catalog_backups, "verify_backup", side_effect=catalog.CatalogError("bad")):
             result = self.write("S2")
         self.assertIsNotNone(result["backup"])
         self.assertIn("refused", result["retention"])
@@ -143,7 +145,7 @@ class DailySnapshots(unittest.TestCase):
         self.write("S1")
         self.clock.advance(days=1)
         state = catalog.status(self.root)["state_token"]
-        with patch.object(catalog, "_snapshot_in_transaction", side_effect=OSError("disk full")):
+        with patch.object(catalog_backups, "_snapshot_in_transaction", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 catalog.submit(self.root, [source("S2")], actor="t", request_id="req-S2",
                                expected_state=state, reason="Daily snapshot test")
@@ -263,17 +265,17 @@ class ReviewEventSnapshots(WorkspaceCase):
             state = events.initialize(self.root)
             folder = events.locations(self.root)[2]
             one = self.pending()
-            first = events.append(self.root, events.bundle([one]), "test-runner", "req-one",
+            first = events.append(self.root, event_history.bundle([one]), "test-runner", "req-one",
                                   0, state["state_token"])
             self.assertIsNone(first["backup"])
             self.assertEqual(len(list(folder.glob("*.sqlite3"))), 1)
             clock.advance(days=1)
             two = {**one, "event_id": "rev-two", "source": {**one["source"], "locator": "sources/other.txt"}}
-            second = events.append(self.root, events.bundle([two]), "test-runner", "req-two",
+            second = events.append(self.root, event_history.bundle([two]), "test-runner", "req-two",
                                    1, first["state_token"])
             self.assertEqual(second["backup"]["revision"], 1)
             self.assertEqual(len(list(folder.glob("*.sqlite3"))), 2)
-            retry = events.append(self.root, events.bundle([two]), "test-runner", "req-two",
+            retry = events.append(self.root, event_history.bundle([two]), "test-runner", "req-two",
                                   1, first["state_token"])
             self.assertIsNone(retry["backup"])
             clock.advance(days=30)

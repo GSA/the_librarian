@@ -271,7 +271,7 @@ class WorkerTests(unittest.TestCase):
                     path.unlink()
                 path.write_bytes(b"synthetic")
 
-                def inference(*args):
+                def inference(*args, mode=mode, path=path):
                     if mode == "bytes":
                         path.write_bytes(b"changed")
                     elif mode == "rename":
@@ -320,7 +320,7 @@ class WorkerTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 path.write_bytes(b"synthetic")
 
-                def inference(*args):
+                def inference(*args, mode=mode):
                     if mode == "rewrite":
                         path.write_bytes(b"substituted")
                         path.write_bytes(b"synthetic")
@@ -854,7 +854,7 @@ class RealWorkerTests(unittest.TestCase):
                 renders = []
                 fake_page = SimpleNamespace(
                     get_size=lambda: SimpleNamespace(width=1000, height=1000),
-                    get_page_image=lambda **kw: renders.append(kw) or "pixels")
+                    get_page_image=lambda renders=renders, **kw: renders.append(kw) or "pixels")
                 if selected == "pdf":
                     self.assertEqual(captured.backend_options.parser_threads, 1)
                     self.assertEqual(captured.backend_options.render_scale, 1.0)

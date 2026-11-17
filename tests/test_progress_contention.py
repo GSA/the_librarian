@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from tests.test_review_event_memo import add
 from tools.catalog import catalog_store as catalog
-from tools.review_events import event_reader
+from tools.review_events import event_history, event_reader
 from tools.review_events import event_store as events
 
 WRITER_WAIT = 0.4  # seconds a writer waits for readers, far below the injected replay time
@@ -29,14 +29,14 @@ class WriterContention(unittest.TestCase):
         self.root.mkdir()
         catalog.initialize(self.root)
         events.initialize(self.root)
-        events.clear_memo()
-        self.addCleanup(events.clear_memo)
+        event_history.clear_memo()
+        self.addCleanup(event_history.clear_memo)
         for n in range(5):
             add(self.root, n)
 
     def writer_during(self, read):
         """Commit events from another thread, with a short busy wait, while ``read`` runs here."""
-        reader, real = threading.get_ident(), events.validate_history
+        reader, real = threading.get_ident(), event_history.validate_history
         committed, failures, running = [], [], threading.Event()
         stop = threading.Event()
 
@@ -58,7 +58,7 @@ class WriterContention(unittest.TestCase):
                 time.sleep(0.02)
 
         with patch.object(events, "BUSY_TIMEOUT_SECONDS", WRITER_WAIT), \
-                patch.object(events, "validate_history", slow):
+                patch.object(event_history, "validate_history", slow):
             thread = threading.Thread(target=write)
             thread.start()
             running.wait(5)
@@ -78,7 +78,7 @@ class WriterContention(unittest.TestCase):
         from tools.intake import progress
 
         def read():
-            events.clear_memo()
+            event_history.clear_memo()
             self.assertTrue(progress.read_review_events(self.root)["available"])
         committed, failures = self.writer_during(read)
         self.assertEqual(failures, [])

@@ -16,7 +16,8 @@ from unittest import mock
 
 from tests.support import default_policy_hash
 from tools.catalog import catalog_store as catalog
-from tools.intake import contracts, progress, store
+from tools.catalog import storage
+from tools.intake import contracts, progress, progress_render, progress_serve, store
 
 SECRET = "SECRET-BODY-TEXT"
 LAYOUTS = (
@@ -187,9 +188,9 @@ class EquivalenceTests(Case):
     def test_the_reported_fields_are_body_free(self):
         seed(self.root, 40)
         report = progress.snapshot(self.root)
-        text = json.dumps(report) + progress.render_html(report) + progress.render_text(report)
+        text = json.dumps(report) + progress_render.render_html(report) + progress_render.render_text(report)
         self.assertNotIn(SECRET, text)
-        self.assertIn("Needs attention by cause", progress.render_html(report))
+        self.assertIn("Needs attention by cause", progress_render.render_html(report))
 
 
 class SupersededTests(Case):
@@ -232,8 +233,8 @@ class SupersededTests(Case):
         shown = {v["correlation_id"] for v in got["attention"] + got["recent"]}
         self.assertNotIn(first, shown)
         self.assertNotIn(second, shown)
-        self.assertIn("2 superseded", progress.render_text(got))
-        self.assertIn("2 superseded", progress.render_html(got))
+        self.assertIn("2 superseded", progress_render.render_text(got))
+        self.assertIn("2 superseded", progress_render.render_html(got))
         self.assertEqual(progress.snapshot(self.root)["overall"], overall)  # the cached pass agrees
 
 
@@ -450,7 +451,7 @@ class CatalogTests(Case):
         store.initialize(self.root)
         from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
         seed_catalog(self.root, 30)
-        catalog._VALID_PAYLOADS.clear()
+        storage._VALID_PAYLOADS.clear()
         full = progress.read_catalog(self.root)
         self.assertEqual((full["receipts"], full["artifacts"], full["sources"]), (30, 60, 30))
         self.assertEqual(full["coverage"]["pending-extraction"], 30)
@@ -498,7 +499,7 @@ class SingleFlightTests(unittest.TestCase):
             started.set()
             gate.wait(5)
             return len(calls)
-        latest = progress.Latest(render, reuse=0)
+        latest = progress_serve.Latest(render, reuse=0)
         results = []
         threads = [threading.Thread(target=lambda: results.append(latest.get())) for _ in range(5)]
         threads[0].start()
@@ -513,7 +514,7 @@ class SingleFlightTests(unittest.TestCase):
 
     def test_a_fresh_result_is_reused_and_an_old_one_is_rendered_again(self):
         now = [0.0]
-        latest = progress.Latest(lambda: object(), reuse=1.0, clock=lambda: now[0])
+        latest = progress_serve.Latest(lambda: object(), reuse=1.0, clock=lambda: now[0])
         first = latest.get()
         now[0] = 0.5
         self.assertIs(latest.get(), first)
@@ -528,7 +529,7 @@ class SingleFlightTests(unittest.TestCase):
             if isinstance(value, Exception):
                 raise value
             return value
-        latest = progress.Latest(render, reuse=0)
+        latest = progress_serve.Latest(render, reuse=0)
         with self.assertRaises(RuntimeError):
             latest.get()
         self.assertEqual(latest.get(), "ok")
@@ -552,14 +553,14 @@ class RateTests(Case):
             moving = progress.rates(c, 1000.0)
         self.assertEqual(moving["finished"], {"failed": {"60": 0, "300": 0, "900": 1},
                                               "succeeded": {"60": 1, "300": 2, "900": 2}})
-        text = progress.render_text(progress.snapshot(self.root))
+        text = progress_render.render_text(progress.snapshot(self.root))
         self.assertIn("finished attempts (last 1/5/15 min)", text)
 
 
 class ServerTests(Case):
     def test_server_serves_concurrent_requests_from_one_render(self):
         seed(self.root, 20)
-        server = progress.make_server(self.root, port=0, reuse=30)
+        server = progress_serve.make_server(self.root, port=0, reuse=30)
         self.addCleanup(server.server_close)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)

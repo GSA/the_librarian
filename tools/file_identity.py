@@ -1,7 +1,19 @@
-"""File identity shared by the intake ledger hand-off (0014) and catalog receipts (0017)."""
+"""File identity shared by the intake ledger hand-off (0014), catalog receipts (0017) and the authority
+stores' validation memos."""
 import os
 import stat as stat_module
 import sqlite3
+
+
+def file_key(path):
+    info = os.stat(path)
+    return (info.st_dev, info.st_ino)
+
+
+class KeyedConnection(sqlite3.Connection):
+    """Remembers the (device, inode) the store's ``connect`` opened, so a validation is never bound to
+    a different file that a concurrent restore moved into the path afterwards."""
+    opened = None
 
 
 def file_identity(db, connection):

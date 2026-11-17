@@ -12,7 +12,7 @@ import unittest
 
 from tests.reference_inspect import reference_inspect
 from tools.catalog import catalog_store as catalog
-from tools.catalog import contracts
+from tools.catalog import contracts, storage
 from tools.catalog.contracts import CatalogError
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
@@ -90,7 +90,7 @@ class Case(unittest.TestCase):
         self.root = Path(self.temp.name) / "instance"
         shutil.copytree(self.template, self.root, symlinks=True)
         self.home, self.db, self.backups = catalog.locations(self.root)
-        catalog._VALID_PAYLOADS.clear()
+        storage._VALID_PAYLOADS.clear()
 
     def rebuild(self):
         """A fresh copy of the unmodified template, for several tamperings in one test."""
@@ -106,10 +106,10 @@ class Case(unittest.TestCase):
                 return ("refused", str(error))
 
     def both(self):
-        catalog._VALID_PAYLOADS.clear()
+        storage._VALID_PAYLOADS.clear()
         reference = self.outcome(reference_inspect)
         full = self.outcome(catalog.inspect)
-        catalog._VALID_PAYLOADS.clear()
+        storage._VALID_PAYLOADS.clear()
         light = self.outcome(catalog.inspect, detail=False)
         return reference, full, light
 
@@ -147,7 +147,7 @@ class Case(unittest.TestCase):
             if triggers:  # leave only the intended edit, so the refusal is not the dropped trigger's
                 for table in ("metadata", "revisions", "versions"):
                     for action in ("update", "delete"):
-                        connection.execute(catalog.trigger_sql(table, action))
+                        connection.execute(storage.trigger_sql(table, action))
         os.chmod(self.db, 0o600)
 
 
@@ -180,7 +180,6 @@ class ValidHistory(Case):
 
 class Tampering(Case):
     def test_named_tampering_classes_are_refused_with_the_original_messages(self):
-        payload = "SELECT payload FROM versions WHERE revision=2 AND ordinal=%d"
         cases = {
             "payload text edited": [("UPDATE versions SET payload=replace(payload,'Synthetic.','Edited.') "
                                      "WHERE revision=2")],

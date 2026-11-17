@@ -5,6 +5,17 @@ Install from the toolkit root with `python -m pip install ./tools/context-mcp`.
 This package is the adapter, not the complete reader distribution; retain the
 toolkit source files and provide their explicit paths.
 
+This install is also the toolkit's only Python dependency declaration: the
+review-event store, reader and context index use the `jsonschema` it provides
+(there is no separate requirements file). Pin policy: `mcp` is exact
+(`mcp==2.2.0`) because its API is the adapter contract and `librarian-preflight`
+refuses any other version. `anyio` and `jsonschema` take compatible ranges below
+the next major version; the lower bounds are the floors `mcp` 2.2.0 itself
+requires on Python 3.14 (`anyio>=4.10`, `jsonschema>=4.20`), and the test suite
+passes at both those floors and at the latest releases. Transitive dependencies
+are unpinned and there is no lock file. Raise a floor when code needs a newer
+API; move an upper bound only after the suite passes on the new major version.
+
 The distribution name is `the-librarian-mcp`, the module is
 `the_librarian_mcp`, the commands are `librarian-mcp` and
 `librarian-preflight`, and the MCP protocol identity is `the-librarian`.

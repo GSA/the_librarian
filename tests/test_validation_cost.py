@@ -2,7 +2,6 @@
 from copy import deepcopy
 import unittest
 
-from tools.catalog import contracts
 from tools.catalog.contracts import CatalogError, GraphValidator, validate_graph
 
 
@@ -117,7 +116,7 @@ class BenchmarkInstrumentationTests(unittest.TestCase):
             self.assertIsNot(catalog_store.inspect, original)
         self.assertIs(catalog_store.inspect, original)
         with bench.instrument(second):
-            with self.assertRaises(Exception):
+            with self.assertRaises(AttributeError):
                 catalog_store.inspect(None)
         self.assertIs(catalog_store.inspect, original)
         self.assertEqual(first, {})

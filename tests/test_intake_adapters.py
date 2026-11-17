@@ -8,9 +8,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests.support import default_policy_hash
+from tests.support import WorkspaceCase, default_policy_hash
 from tools import policy
 from tools.catalog import catalog_store as catalog
+from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tools.intake import store, runner, adapters
 
@@ -68,10 +69,9 @@ class NativeTests(unittest.TestCase):
         self.assert_lock_recovery(catalog.writer_lock(catalog.locations(self.root)[0]), "catalog-busy", charged=False)
 
     def test_review_lock_is_retryable(self):
-        import test_kit
-        event = test_kit.WorkspaceCase.pending(self)
+        event = WorkspaceCase.pending(self)
         state = events.initialize(self.root)
-        args = {"value": events.bundle([event]), "actor": "test-runner", "request_id": "req-review",
+        args = {"value": event_history.bundle([event]), "actor": "test-runner", "request_id": "req-review",
                 "expected_revision": 0, "expected_state": state["state_token"]}
         stage_request(self.root, [stage("review", "review-append", args)])
         self.assert_lock_recovery(events.writer_lock(events.locations(self.root)[0]))
@@ -106,14 +106,13 @@ class NativeTests(unittest.TestCase):
         import sqlite3 as database
         import subprocess
         import sys
-        import test_kit
-        event = test_kit.WorkspaceCase.pending(self)
+        event = WorkspaceCase.pending(self)
         state = events.initialize(self.root)
-        events.append(self.root, events.bundle([event]), "test-runner", "req-prior", 0, state["state_token"])
+        events.append(self.root, event_history.bundle([event]), "test-runner", "req-prior", 0, state["state_token"])
         other = deepcopy(event)
         other["event_id"], other["source"]["locator"] = "rev-next", "sources/next.txt"
         current = events.status(self.root)
-        args = {"value": events.bundle([other]), "actor": "test-runner", "request_id": "req-review",
+        args = {"value": event_history.bundle([other]), "actor": "test-runner", "request_id": "req-review",
                 "expected_revision": current["revision"], "expected_state": current["state_token"]}
         stage_request(self.root, [stage("review", "review-append", args)])
         # A decode failure inside a native writer is an input condition, not a crash.
@@ -252,10 +251,9 @@ class NativeTests(unittest.TestCase):
         self.assertIsNone(evidence["backup"])  # initialisation already covered today
 
     def test_review_commit_lost_ack_reconciles_original_revision(self):
-        import test_kit
-        event = test_kit.WorkspaceCase.pending(self)
+        event = WorkspaceCase.pending(self)
         state = events.initialize(self.root)
-        args = {"value": events.bundle([event]), "actor": "test-runner", "request_id": "req-review",
+        args = {"value": event_history.bundle([event]), "actor": "test-runner", "request_id": "req-review",
                 "expected_revision": 0, "expected_state": state["state_token"]}
         stage_request(self.root, [stage("review", "review-append", args)])
         real = adapters.execute
@@ -268,7 +266,7 @@ class NativeTests(unittest.TestCase):
         other["event_id"] = "rev-other"
         other["source"]["locator"] = "sources/other.txt"
         current = events.status(self.root)
-        events.append(self.root, events.bundle([other]), "test-runner", "req-other", 1, current["state_token"])
+        events.append(self.root, event_history.bundle([other]), "test-runner", "req-other", 1, current["state_token"])
         result = runner.run(self.root, "req-native", "native")
         self.assertTrue(result["complete"])
         self.assertEqual(result["stages"][0]["evidence"]["committed_revision"], 1)
@@ -344,7 +342,6 @@ class NativeTests(unittest.TestCase):
 
     def test_docling_stage_boundaries_and_restart(self):
         import test_docling
-        from tools.extraction import docling_adapter
         fixture = test_docling.DoclingLifecycle()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)

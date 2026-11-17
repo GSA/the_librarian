@@ -2,7 +2,6 @@
 from contextlib import closing
 import hashlib
 import io
-import json
 import os
 from pathlib import Path
 import sqlite3
@@ -10,7 +9,8 @@ import unittest
 import unittest.mock
 
 from tools.catalog import catalog_store as catalog
-from tools.intake import adapters, cohort, docs, docsync, runner, store, upload
+from tools.extraction import mhtml
+from tools.intake import adapters, cohort, cohort_ingest, cohort_recovery, docs, docsync, runner, store, upload
 from tools.intake.contracts import IntakeError
 from tests.test_intake_cohort import CohortCase
 
@@ -61,7 +61,7 @@ class RecordingTests(DocsCase):
                              ("extracted", e["sha256"], e["format"], e["receipt_id"], e["original"],
                               e["rendition"], e["rendition_sha256"], e["conflicts"]))
             self.assertEqual(e["submission_id"], row["submission_id"])
-            self.assertEqual("extract-" + e["submission_id"] + ("-m%d" % cohort.mhtml.METHOD_VERSION
+            self.assertEqual("extract-" + e["submission_id"] + ("-m%d" % mhtml.METHOD_VERSION
                                                                 if e["format"] == "mhtml" else ""),
                              row["extract_head"])
             self.assertEqual((row["dev"], row["ino"], row["size"], row["mtime_ns"], row["ctime_ns"]),
@@ -143,7 +143,7 @@ class TransactionTests(DocsCase):
     def test_a_correction_repoints_the_row_to_the_new_request(self):
         self.ingest()
         corr = rows(self.root)[("inbox", "a/notes.md")]["register_head"]
-        fixed = cohort._correct(self.root, store.inspect(self.root, corr))
+        fixed = cohort_recovery._correct(self.root, store.inspect(self.root, corr))
         row = rows(self.root)[("inbox", "a/notes.md")]
         self.assertEqual((row["register_head"], row["state"]), (fixed, "extracting"))
         self.assertEqual(docsync.audit(self.root)["differences"], [])
@@ -316,7 +316,6 @@ class ChangeDetectionTests(DocsCase):
     def tearDown_inbox(self):
         """Fresh instance and inbox for each sub-case."""
         import shutil
-        import tempfile
         for path in (self.root, self.inbox):
             if path.exists():
                 self.writable()
@@ -352,7 +351,7 @@ class CorrectionSafetyTests(DocsCase):
         first, other = sorted(r["correlation_id"] for r in store.list_requests(self.root)
                               if r["correlation_id"].startswith("register-"))[:2]
         stage = store.request(self.root, other)["stages"][0]
-        cohort._stage_request(self.root, first + "-wrong", [stage], correction_of=first)
+        store.stage_request(self.root, first + "-wrong", [stage], correction_of=first)
         runner.settle(self.root, first + "-wrong", "register")
         path = next(p for (_, p), r in rows(self.root).items() if r["register_head"] == first + "-wrong")
         self.assertEqual(rows(self.root)[("inbox", path)]["state"], "mismatch")
@@ -367,7 +366,7 @@ class CorrectionSafetyTests(DocsCase):
                        if r["correlation_id"].startswith("register-"))[0]
         stage = store.request(self.root, first)["stages"][0]
         for name in ("-one", "-two"):
-            cohort._stage_request(self.root, first + name, [stage], correction_of=first)
+            store.stage_request(self.root, first + name, [stage], correction_of=first)
         states = [r["state"] for r in rows(self.root).values()]
         self.assertEqual(sorted(states), ["ambiguous"] + ["extracted"] * 5)
         for trust in (False, True):
@@ -380,10 +379,10 @@ class CorrectionSafetyTests(DocsCase):
         old = self.entry(first, "a/notes.md")
         self.writable()
         (self.inbox / "a/notes.md").write_bytes(b"# Notes\nA different line\n")
-        new = cohort.submission("a/notes.md", "inbox", "text", hashlib.sha256(b"# Notes\nA different line\n").hexdigest())
+        new = cohort_ingest.submission("a/notes.md", "inbox", "text", hashlib.sha256(b"# Notes\nA different line\n").hexdigest())
         descriptor = upload.descriptor(
             submission_id=new["submission_id"], format_name="text", correction_of=old["submission_id"],
-            name=new["name"], actor="cohort-runner", reason=cohort.REASON, origin_kind="local-path",
+            name=new["name"], actor="cohort-runner", reason=cohort_ingest.REASON, origin_kind="local-path",
             origin_system="inbox", origin_locator=new["locator"])
         with unittest.mock.patch.object(runner, "settle"):  # staged, but never run
             upload.submit(self.root, self.inbox / "a/notes.md", descriptor)

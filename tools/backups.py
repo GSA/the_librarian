@@ -15,6 +15,8 @@ import sqlite3
 import stat
 import sys
 
+from tools.durable import fsync_directory
+
 DEFAULT_RETENTION_DAYS = 7
 RECEIPT_FIELDS = {"backup_version", "created_at", "reason", "database", "sha256", "bytes", "state"}
 MAX_RECEIPT_BYTES = 1_000_000
@@ -47,14 +49,6 @@ def _regular(path):
         return False
 
 
-def _fsync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 class Entry:
     """One backup stem: a snapshot, its receipt and any partial leftovers."""
 
@@ -63,7 +57,6 @@ class Entry:
         self.files = {}
         self.record = None
         self.created = None
-        self.age_basis = None
 
     @property
     def snapshot(self):
@@ -122,27 +115,16 @@ def scan(backups):
             if isinstance(record, dict) and set(record) == RECEIPT_FIELDS:
                 created = _parse(record["created_at"])
                 if created is not None:
-                    entry.record, entry.created, entry.age_basis = record, created, "receipt"
+                    entry.record, entry.created = record, created
         if entry.created is None:
             entry.created = datetime.fromtimestamp(
                 max(os.lstat(path).st_mtime for path in entry.files.values()), timezone.utc)
-            entry.age_basis = "mtime"
     return sorted(entries.values(), key=lambda e: (e.created, e.stem))
 
 
-def _verified(entry, store_id, verify, errors):
-    if entry.snapshot is None or entry.record is None:
-        return False
+def _verifies(path, store_id, verify, errors):
     try:
-        state = verify(entry.snapshot)
-    except (*errors, OSError, sqlite3.Error, ValueError, KeyError, TypeError):
-        return False
-    return isinstance(state, dict) and state.get("store_id") == store_id
-
-
-def _fresh_ok(snapshot, store_id, verify, errors):
-    try:
-        state = verify(Path(snapshot["snapshot"]))
+        state = verify(path)
     except (*errors, OSError, sqlite3.Error, ValueError, KeyError, TypeError):
         return False
     return isinstance(state, dict) and state.get("store_id") == store_id
@@ -163,7 +145,7 @@ def inventory(backups):
         "partial_files": sum(1 for e in entries if ".partial" in e.files),
         "newest": snapshots[-1].created.isoformat() if snapshots else None,
         "oldest": snapshots[0].created.isoformat() if snapshots else None,
-        "oldest_revision": min((e.revision for e in snapshots if e.revision is not None), default=None),
+        "oldest_revision": _oldest_revision(snapshots),
     }
 
 
@@ -180,57 +162,76 @@ def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, 
 
     With ``thin`` (operator prune) only the newest verified snapshot of each UTC day
     in the window is kept. ``protect`` names snapshots that must survive, such as a
-    restore source. Without ``apply`` nothing is deleted.
+    restore source. ``verified`` names snapshots already verified by the caller.
+    Without ``apply`` nothing is deleted.
     """
     days = retention_days(days)
-    now = now or utcnow()
-    cutoff = now - timedelta(days=days)
-    protected = {Path(p).absolute() for p in protect}
+    cutoff = (now or utcnow()) - timedelta(days=days)
     entries = scan(backups)
     report = {"applied": False, "window_days": days, "kept": len(entries), "deleted": 0,
               "bytes_freed": 0, "oldest_kept_revision": None, "unverified_kept": 0, "refused": None}
     inside = [e for e in entries if e.created >= cutoff]
-    known = {Path(p).absolute() for p in verified}
-    verified = {}
-
-    def good(entry):
-        if entry.stem not in verified:
-            verified[entry.stem] = (entry.snapshot is not None and entry.record is not None
-                                    and Path(entry.snapshot).absolute() in known
-                                    or _verified(entry, store_id, verify, errors))
-        return verified[entry.stem]
-
+    good = _verifier(store_id, verify, errors, verified)
     if not any(good(e) for e in reversed(inside)):
         report["refused"] = "no verified snapshot inside the retention window; nothing deleted"
         return report
     doomed = [e for e in entries if e.created < cutoff]
     if thin:
-        days_seen = {}
-        for entry in reversed(inside):
-            days_seen.setdefault(entry.created.date(), []).append(entry)
-        for same_day in days_seen.values():
-            keeper = next((e for e in same_day if good(e)), None)
-            if keeper is None:
-                report["unverified_kept"] += len(same_day)
-                continue
-            doomed.extend(e for e in same_day if e is not keeper)
-    doomed = [e for e in doomed if not (protected & {Path(p).absolute() for p in e.files.values()})]
-    freed = 0
-    for entry in doomed:
-        freed += entry.size
-        if apply:
-            for suffix in (".sqlite3", ".json", ".partial"):
-                path = entry.files.get(suffix)
-                if path is not None and _regular(path):
-                    os.unlink(path)
-    if apply and doomed:
-        _fsync_directory(backups)
+        extra, report["unverified_kept"] = _thinned(inside, good)
+        doomed += extra
+    protected = {Path(p).absolute() for p in protect}
+    doomed = [e for e in doomed if protected.isdisjoint(Path(p).absolute() for p in e.files.values())]
+    freed = sum(e.size for e in doomed)
+    if apply:
+        _delete(backups, doomed)
     gone = {e.stem for e in doomed}
     remaining = [e for e in entries if e.stem not in gone]
     report.update(applied=bool(apply), kept=len(remaining), deleted=len(doomed), bytes_freed=freed,
-                  oldest_kept_revision=min((e.revision for e in remaining
-                                            if e.snapshot is not None and e.revision is not None), default=None))
+                  oldest_kept_revision=_oldest_revision(remaining))
     return report
+
+
+def _oldest_revision(entries):
+    return min((e.revision for e in entries if e.snapshot is not None and e.revision is not None), default=None)
+
+
+def _verifier(store_id, verify, errors, verified):
+    """Memoized per-stem check; snapshots in ``verified`` with a receipt are trusted without a re-read."""
+    known = {Path(p).absolute() for p in verified}
+    results = {}
+
+    def good(entry):
+        if entry.stem not in results:
+            results[entry.stem] = entry.snapshot is not None and entry.record is not None and (
+                Path(entry.snapshot).absolute() in known or _verifies(entry.snapshot, store_id, verify, errors))
+        return results[entry.stem]
+    return good
+
+
+def _thinned(inside, good):
+    """``(extra, unverified)``: all but the newest verified snapshot of each day, and the size of
+    days with no verified snapshot (kept whole)."""
+    by_day = {}
+    for entry in reversed(inside):
+        by_day.setdefault(entry.created.date(), []).append(entry)
+    extra, unverified = [], 0
+    for same_day in by_day.values():
+        keeper = next((e for e in same_day if good(e)), None)
+        if keeper is None:
+            unverified += len(same_day)
+        else:
+            extra.extend(e for e in same_day if e is not keeper)
+    return extra, unverified
+
+
+def _delete(backups, doomed):
+    for entry in doomed:
+        for suffix in _SUFFIXES:
+            path = entry.files.get(suffix)
+            if path is not None and _regular(path):
+                os.unlink(path)
+    if doomed:
+        fsync_directory(backups)
 
 
 def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_RETENTION_DAYS, protect=(),
@@ -250,7 +251,7 @@ def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_R
     snapshot = take()
     try:
         # Retention starts only after the new snapshot verifies; otherwise delete nothing.
-        if not _fresh_ok(snapshot, store_id, verify_fresh or verify, errors):
+        if not _verifies(Path(snapshot["snapshot"]), store_id, verify_fresh or verify, errors):
             return snapshot, {"applied": False, "refused": "new snapshot did not verify; nothing deleted"}
         retention = prune(backups, store_id=store_id, verify=verify, errors=errors, days=days,
                           apply=True, protect=protect, verified=(Path(snapshot["snapshot"]),))
