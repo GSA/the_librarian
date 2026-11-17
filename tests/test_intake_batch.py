@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from tools.catalog import catalog_store as catalog
 from tools.diagnostics.ingest_benchmark import fixture
-from tools.intake import adapters, cohort, runner, store, upload
+from tools.intake import adapters, cohort, cohort_ingest, runner, store, upload
+from tools.intake.contracts import IntakeError, LedgerBusy
 from tools.extraction import extract
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +116,7 @@ class Equivalence(unittest.TestCase):
     def test_a_non_positive_batch_size_is_refused_before_anything_is_written(self):
         root, inbox = make_instance(self, 2)
         for bad in (0, -1, True, 2.5):
-            with self.assertRaises(cohort.IntakeError):
+            with self.assertRaises(IntakeError):
                 cohort.ingest(root, inbox, system="s", actor="a", batch_size=bad)
         self.assertEqual(revisions(root), [])
 
@@ -123,14 +124,14 @@ class Equivalence(unittest.TestCase):
 class FailedDocumentDoesNotBlockItsBatch(unittest.TestCase):
     def test_a_file_changed_after_classification_fails_alone(self):
         root, inbox = make_instance(self, 6)
-        real = cohort.classify
+        real = cohort_ingest.classify
         victim = next(p.relative_to(inbox).as_posix() for p in inbox.rglob("note-000002.*"))
 
         def classify_then_change(*args):
             entries = real(*args)
             (inbox / victim).write_text("changed after the classification\n")
             return entries
-        with patch.object(cohort, "classify", classify_then_change):
+        with patch.object(cohort_ingest, "classify", classify_then_change):
             report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=6)
         outcomes = {e["relative"]: e["outcome"] for e in report["entries"] if "outcome" in e}
         self.assertEqual(outcomes[victim], "changed-since-intake")
@@ -296,13 +297,13 @@ class RetriesAndBusyStores(unittest.TestCase):
         def busy_once(*args, **kwargs):
             calls.append(1)
             if len(calls) == 1:
-                raise cohort.LedgerBusy()
+                raise LedgerBusy()
             return real(*args, **kwargs)
         with patch.object(upload, "stage_submission", busy_once):
             report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
         self.assertEqual(report["counts"]["outcome"]["extracted"], 4)
         self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 1)
-        with patch.object(upload, "stage_submission", side_effect=cohort.LedgerBusy()):
+        with patch.object(upload, "stage_submission", side_effect=LedgerBusy()):
             again = cohort.ingest(root, inbox, system="s2", actor="a", batch_size=4)
         self.assertEqual(again["counts"]["failed_by_code"], {"ledger/ledger_busy": 4})
 

@@ -190,7 +190,8 @@ restated here.
 ## 3. Intake and review
 
 - **Inbox first.** Content enters through the supported writers: manual upload
-  (`tools/intake/upload.py`), read-only cohort intake (`tools/intake/cohort.py`)
+  (`tools/intake/upload.py`), read-only cohort intake (`tools/intake/cohort.py`, which drives
+  `cohort_ingest.py`, `cohort_recovery.py` and `cohort_review.py`)
   and the durable ledger (`tools/intake/*`). A copied file is not a registered
   receipt until its catalog commit is confirmed; a receipt is not extracted
   text; extracted text is not a review; a review is not selection. Connectors,
@@ -684,7 +685,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   against that index. Any failure of the delta falls back to the full pass, which refuses with
   its exact message. **Rows before the remembered head are not read again until the next full
   check**: `audit`, a backup, publication (`read_snapshot(root, full=True)`, used by
-  `authorize_publication` and by index build and freshness, so publication still re-validates
+  `standing_publication.authorize_publication` and by index build and freshness, so publication still re-validates
   everything it serves), the first check of a new UTC day, a different contract, a swapped file,
   or any identity change SQLite did not make (an out-of-band write leaves the counter alone and
   is refused at once, as before). The residual below widens by one case: an edit to an old

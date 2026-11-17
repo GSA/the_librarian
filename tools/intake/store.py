@@ -456,9 +456,46 @@ def stage(root, raw):
         return summary(c, correlation)
 
 
+def stage_request(root, correlation_id, stages, correction_of=None):
+    """Stage a version-1 request of ``stages`` under the instance policy; return its summary."""
+    return stage(root, json.dumps({
+        "version": 1, "correlation_id": correlation_id, "correction_of": correction_of,
+        "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+        "retry": {"max_attempts": 3, "backoff_seconds": 0},
+        "stages": stages,
+    }).encode())
+
+
 def inspect(root, correlation_id):
     with locked(root) as c:
         return summary(c, correlation_id)
+
+
+def _known(read, *args):
+    try:
+        return read(*args)
+    except IntakeError as error:
+        if error.code != "unknown_request":
+            raise
+        return None
+
+
+def find(root, correlation_id):
+    """``inspect``, or None when no such request was staged."""
+    return _known(inspect, root, correlation_id)
+
+
+def find_head(root, correlation_id, heads=None):
+    """``head`` (through a shared ``Heads`` index when given), or None when no such request was staged."""
+    return _known(heads.head if heads is not None else head, root, correlation_id)
+
+
+def next_correction(root, base):
+    """The first unused ``{base}-c{n}`` correlation ID."""
+    number = 1
+    while _known(request, root, f"{base}-c{number}") is not None:
+        number += 1
+    return f"{base}-c{number}"
 
 
 def head(root, correlation_id):
