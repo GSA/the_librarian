@@ -47,6 +47,8 @@
   "tools/intake/throttle.py",
   "tools/intake/usage_log.py",
   "tools/intake/progress.py",
+  "tools/intake/progress_render.py",
+  "tools/intake/progress_serve.py",
   "tools/schemas/intake.sql",
   "tests/support.py",
   "tests/test_mcp.py",

@@ -13,7 +13,7 @@ import urllib.request
 from tests.support import default_policy_hash
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from tools.intake import adapters, cli, progress, runner, store, upload
+from tools.intake import adapters, cli, progress, progress_render, progress_serve, runner, store, upload
 
 SECRET = "SECRET-BODY-TEXT"
 
@@ -104,7 +104,7 @@ class EmptyInstanceTests(ProgressCase):
         self.assertEqual(result["recent"], [])
         self.assertTrue(result["catalog"]["available"])
         self.assertEqual(result["catalog"]["artifacts"], 0)
-        page = progress.render_html(result, refresh=5)
+        page = progress_render.render_html(result, refresh=5)
         self.assertIn('http-equiv="refresh" content="5"', page)
         self.assertEqual(page.lower().count("<script"), 1)
         self.assertIn("<time datetime=", page)
@@ -168,7 +168,7 @@ class MixedStateTests(ProgressCase):
         self.assertEqual(items["run-staged"]["last_attempt"], None)
         self.assertEqual(items["run-published"]["state"], "succeeded")
         self.assertEqual(items["run-published"]["stages"], {"succeeded": 5})
-        text = json.dumps(result) + progress.render_html(result) + progress.render_text(result)
+        text = json.dumps(result) + progress_render.render_html(result) + progress_render.render_text(result)
         self.assertNotIn(SECRET, text)
 
     def test_limit_and_named_runs(self):
@@ -180,12 +180,12 @@ class MixedStateTests(ProgressCase):
         self.assertEqual({k: v for k, v in result["runs"]["ex"]["funnel"].items() if v},
                          {"extracting": 1, "extracted": 1, "exception": 1})
         self.assertEqual(result["runs"]["none"]["requests"], 0)
-        self.assertIn("ex", progress.render_html(result))
+        self.assertIn("ex", progress_render.render_html(result))
 
     def test_html_escapes_metadata(self):
         result = progress.snapshot(self.root)
         result["recent"][0]["correlation_id"] = "<b>x</b>"
-        page = progress.render_html(result)
+        page = progress_render.render_html(result)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
         self.assertNotIn("<b>x</b>", page)
 
@@ -239,7 +239,7 @@ class CorruptLedgerTests(ProgressCase):
         result = progress.snapshot(self.root)
         self.assertFalse(result["ledger"]["available"])
         self.assertEqual(result["ledger"]["error"], "corrupt_store")
-        self.assertIn("ledger unavailable", progress.render_html(result))
+        self.assertIn("ledger unavailable", progress_render.render_html(result))
 
     def test_tampered_request_is_reported(self):
         self.drive_ok()
@@ -275,15 +275,15 @@ class BindTests(unittest.TestCase):
     def test_non_loopback_binds_are_refused_unless_approved(self):
         for host in ("0.0.0.0", "::", "192.168.1.5", "example.com", ""):
             with self.subTest(host=host):
-                with self.assertRaises(progress.BindRefused):
-                    progress.check_bind(host)
-        self.assertEqual(progress.check_bind("0.0.0.0", allow_non_loopback=True), "0.0.0.0")
+                with self.assertRaises(progress_serve.BindRefused):
+                    progress_serve.check_bind(host)
+        self.assertEqual(progress_serve.check_bind("0.0.0.0", allow_non_loopback=True), "0.0.0.0")
         for host in ("127.0.0.1", "::1", "localhost"):
-            self.assertIn(progress.check_bind(host), {"127.0.0.1", "::1"})
+            self.assertIn(progress_serve.check_bind(host), {"127.0.0.1", "::1"})
 
     def test_cli_refuses_non_loopback_before_binding(self):
         with tempfile.TemporaryDirectory() as root, patch("sys.stdout") as out, \
-                patch.object(progress, "serve") as serve:
+                patch.object(progress_serve, "serve") as serve:
             self.assertEqual(cli.main(["--root", root, "progress-serve", "--host", "0.0.0.0"]), 1)
         serve.assert_not_called()
         self.assertIn("non_loopback_bind", "".join(c.args[0] for c in out.write.call_args_list))
@@ -292,7 +292,7 @@ class BindTests(unittest.TestCase):
 class ServerTests(ProgressCase):
     def test_serves_html_and_json_on_loopback_get_only(self):
         store.initialize(self.root)
-        server = progress.make_server(self.root, port=0, refresh=7)
+        server = progress_serve.make_server(self.root, port=0, refresh=7)
         self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -303,7 +303,7 @@ class ServerTests(ProgressCase):
         with urllib.request.urlopen(base + "/") as response:
             page = response.read().decode()
             self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
-            self.assertIn(progress.SCRIPT_SRC, response.headers["Content-Security-Policy"])
+            self.assertIn(progress_render.SCRIPT_SRC, response.headers["Content-Security-Policy"])
             self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertIn('content="7"', page)
         with urllib.request.urlopen(base + "/progress.json") as response:
