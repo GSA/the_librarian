@@ -204,7 +204,7 @@ def _served(state, history, materialize=True):
     return dict(state), history.events[:count], successors, history
 
 
-def view(connection, root=None, *, reuse=False, full=False, materialize=True):
+def view(connection, root=None, *, reuse=False, full=False, materialize=True, release=False):
     """``(state, events, successors, history)`` of the validated store.
 
     ``reuse`` serves an identical file from memory and verifies only a delta after SQLite's own
@@ -212,9 +212,10 @@ def view(connection, root=None, *, reuse=False, full=False, materialize=True):
     ``history`` is the shared read-only index when the result was memoized and None otherwise.
     ``materialize=False`` leaves ``events`` and ``successors`` None when ``history`` is returned, so
     state-only and indexed-lookup callers do no work proportional to the history.
+    ``release`` lets a full pass end the caller's read transaction before it validates (see ``_inspect``).
     """
     if not reuse:
-        state, events = _inspect(connection, root)
+        state, events = _inspect(connection, root, release)
         return state, events, _successors(events), None
     own = not connection.in_transaction
     if own:
@@ -224,7 +225,7 @@ def view(connection, root=None, *, reuse=False, full=False, materialize=True):
         connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
         binding = _binding(connection)
         if binding is None:
-            state, events = _inspect(connection, root)
+            state, events = _inspect(connection, root, release)
             return state, events, _successors(events), None
         path, identity = binding
         key = (identity, fingerprint(store_schema(root)), _today())
@@ -249,7 +250,7 @@ def view(connection, root=None, *, reuse=False, full=False, materialize=True):
                     _MEMO[path] = (key, state, history)
                     return _served(state, history, materialize)
                 _MEMO.pop(path, None)
-        state, events = _inspect(connection, root)
+        state, events = _inspect(connection, root, release)
         history = History(events)
         if _binding(connection) == binding:
             with _MEMO_LOCK:
@@ -344,16 +345,23 @@ def _batches(batches, by_revision, previous_batch, first):
     return previous_batch
 
 
-def _inspect(connection, root=None):
+def _inspect(connection, root=None, release=False):
+    """Validate the whole history. With ``release`` the read transaction ends once every row is in
+    memory, so the O(history) checks run holding no SQLite lock: a reader holding SHARED through the
+    replay made a writer's commit fail (Kata xeb8). The state is still one snapshot: all rows were
+    read inside it, and callers memoize it only if the file identity is unchanged afterwards."""
     metadata = _header(connection, root, deep=True)
     batches = [dict(r) for r in connection.execute("SELECT * FROM batches ORDER BY revision")]
     rows = [dict(r) for r in connection.execute("SELECT * FROM events ORDER BY sequence")]
+    stored_corrections = {tuple(r) for r in connection.execute("SELECT predecessor,successor FROM corrections")}
+    if release and connection.in_transaction:
+        connection.execute("COMMIT")
     events, by_revision, previous = _chain(rows, "", 1)
     previous_batch = _batches(batches, by_revision, "", 1)
     require(all(1 <= r["revision"] <= len(batches) for r in rows), "Event references invalid batch")
     validate_history(events, root)
     expected_corrections = {(target, event["event_id"]) for event in events for target in event["supersedes"]}
-    actual_corrections = {tuple(r) for r in connection.execute("SELECT predecessor,successor FROM corrections")}
+    actual_corrections = stored_corrections
     require(actual_corrections == expected_corrections, "Correction index differs from preserved history")
     state = {"store_id": metadata["store_id"], "revision": len(batches), "events": len(events),
              "active_events": len(events) - len(actual_corrections), "head_hash": previous,

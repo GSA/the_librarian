@@ -79,11 +79,19 @@ def writer_lock(home):
         os.close(descriptor)
 
 
+# Seconds a connection waits for another process's commit or reader before SQLite reports BUSY.
+# It was 0, so any momentary overlap (a progress reader's short SHARED hold, or a writer's commit
+# under a reader) failed as ``sqlite3.OperationalError`` and, in intake, a retryable
+# ``sqlite-operational`` stage failure (Kata xeb8). Same bound as the catalog's.
+BUSY_TIMEOUT_SECONDS = 10.0
+
+
 def connect(path, write=False):
     private_file(path)
     before = file_key(path)
     connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if write else "?mode=ro"),
-                                 uri=True, timeout=0, isolation_level=None, factory=KeyedConnection)
+                                 uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+                                 factory=KeyedConnection)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
