@@ -340,17 +340,92 @@ class StandingEvaluationTests(StandingCase):
                       events.status(self.root)["state_token"])
         self.assert_outcome("pending-review", "conflicting-review")
 
-    def test_rejected_deferred_and_unresolved(self):
+    def test_rejected_and_deferred_stay_so_even_with_reported_issues(self):
+        issues = {"contradictions": ["Table total differs."], "missing_evidence": ["Figure 2 is absent."]}
         for update, expected in (({"decision": "reject"}, ("rejected", "reviewer-rejected")),
                                  ({"decision": "defer"}, ("deferred", "reviewer-deferred")),
-                                 ({"contradictions": ["Table total differs."]},
-                                  ("pending-review", "unresolved-evidence")),
-                                 ({"missing_evidence": ["Referenced figure 2 is absent."],
-                                   "unverifiable_references": ["Cites an external spec."]},
-                                  ("pending-review", "unresolved-evidence"))):
+                                 ({"decision": "reject", **issues}, ("rejected", "reviewer-rejected")),
+                                 ({"decision": "defer", **issues}, ("deferred", "reviewer-deferred"))):
             with self.subTest(update=update):
                 self.write_private("config/standing-findings.json", {**self.findings, **update})
                 self.assert_outcome(*expected)
+
+    def test_accepted_review_with_reported_issues_qualifies_and_attaches_them(self):
+        for update in ({"contradictions": ["Table total differs."]},
+                       {"missing_evidence": ["Referenced figure 2 is absent."],
+                        "unverifiable_references": ["Cites an external spec."]},
+                       {"contradictions": ["Title says 7 MB, body says 8 MB.", "Lambda named two ways."],
+                        "missing_evidence": ["README is not in the rendition."]}):
+            with self.subTest(update=update):
+                self.write_private("config/standing-findings.json", {**self.findings, **update})
+                result = self.assert_outcome("qualified", "complete-inspected-scope")
+                event = standing_events.review_event(result, self.review_args())
+                quotes = [e["quote"] for e in event["evidence"]]
+                contradictions, missing = update.get("contradictions", []), update.get("missing_evidence", [])
+                self.assertEqual([q for q in quotes if q.startswith("Reviewer-noted contradiction: ")],
+                                 ["Reviewer-noted contradiction: " + c for c in contradictions])
+                self.assertEqual([q for q in quotes if q.startswith("Reviewer-noted missing evidence: ")],
+                                 ["Reviewer-noted missing evidence: " + m for m in missing])
+                self.assertIn(f"Reviewer-noted issues: {len(contradictions)} contradictions and "
+                              f"{len(missing)} missing-evidence items; accepted with these attached.", quotes)
+
+    def test_a_review_without_issues_records_no_noted_statements(self):
+        quotes = [e["quote"] for e in standing_events.review_event(
+            self.assert_outcome("qualified", "complete-inspected-scope"), self.review_args())["evidence"]]
+        self.assertEqual([q for q in quotes if q.startswith("Reviewer-noted")], [])
+
+    def test_issues_never_rescue_incomplete_inspection(self):
+        partial = deepcopy(self.findings)
+        partial["inspected"]["texts"] = []
+        partial["contradictions"] = ["Table total differs."]
+        partial["missing_evidence"] = ["Figure 2 is absent."]
+        self.write_private("config/standing-findings.json", partial)
+        self.assert_outcome("pending-review", "insufficient-inspected-scope")
+
+    def test_issues_never_override_a_conflicting_review(self):
+        self.write_private("config/standing-findings.json",
+                           {**self.findings, "contradictions": ["Table total differs."]})
+        event = self.pending(RENDITION)
+        event["event_id"] = "rev-independent"
+        events.append(self.root, event_history.bundle([event]), "test-runner", "req-independent", 0,
+                      events.status(self.root)["state_token"])
+        self.assert_outcome("pending-review", "conflicting-review")
+
+    def test_issues_never_rescue_the_other_gates(self):
+        issues = {"contradictions": ["Table total differs."], "missing_evidence": ["Figure 2 is absent."]}
+        for update, expected in (({"correction_of": "rev-prior"}, ("pending-review", "independent-review-required")),
+                                 ({"new_mapping": True}, ("pending-review", "independent-review-required")),
+                                 ({"reviewer": "someone-else"}, ("exception", "findings-mismatch")),
+                                 ({"rendition_sha256": "f" * 64}, ("exception", "findings-mismatch"))):
+            with self.subTest(update=update):
+                self.write_private("config/standing-findings.json", {**self.findings, **issues, **update})
+                self.assert_outcome(*expected)
+        self.write_private("config/standing-findings.json", {**self.findings, **issues})
+        self.policy["scope"]["receipts"] = ["D2"]
+        self.write_private("config/standing-policy.json", self.policy)
+        self.assert_outcome("exception", "prohibited-scope")
+
+    def test_every_issue_is_recorded_or_the_truncation_is_stated(self):
+        contradictions = [f"Contradiction {n}." for n in range(50)]
+        missing = [f"Missing {n}." for n in range(50)]
+        self.write_private("config/standing-findings.json", {
+            **self.findings, "contradictions": contradictions, "missing_evidence": missing,
+            "unverifiable_references": ["Cites a repo."], "exception_resolution": "Operator note."})
+        result = self.assert_outcome("qualified", "complete-inspected-scope")
+        event = standing_events.review_event(result, self.review_args())
+        quotes = [e["quote"] for e in event["evidence"]]
+        self.assertEqual(len(quotes), 30)
+        recorded = [q for q in quotes if q.startswith(("Reviewer-noted contradiction: ",
+                                                       "Reviewer-noted missing evidence: "))]
+        # Items are kept in reported order, contradictions first, verbatim.
+        self.assertEqual(recorded, [("Reviewer-noted contradiction: " + c) for c in contradictions]
+                         [:len(recorded)])
+        truncation = [q for q in quotes if q.startswith("Reviewer-noted issues truncated: ")]
+        self.assertEqual(len(truncation), 1)
+        self.assertIn(f"first {len(recorded)} of 100", truncation[0])
+        # The event stays valid under the review-event contract and is stored.
+        self.stage_all()
+        self.assertEqual(self.run_stage("review")["status"], "succeeded")
 
     def test_advisory_references_do_not_block_and_are_counted_in_the_event(self):
         cited = "Relies on a linked analysis document that is not included."
@@ -366,7 +441,7 @@ class StandingEvaluationTests(StandingCase):
         v1 = {k: v for k, v in self.findings.items() if k != "unverifiable_references"}
         for update, expected in (({}, ("qualified", "complete-inspected-scope")),
                                  ({"missing_evidence": ["Section 3 is truncated."]},
-                                  ("pending-review", "unresolved-evidence")),
+                                  ("qualified", "complete-inspected-scope")),
                                  ({"unverifiable_references": []},
                                   ("exception", "invalid-findings"))):
             with self.subTest(update=update):
@@ -631,6 +706,32 @@ class StandingIntakeTests(StandingCase):
         self.assertEqual(packet["renditions"][RENDITION]["confidence"], {"layout": 0.99})
         self.assertEqual(packet["renditions"][RENDITION]["qualification"]["review_event_ids"],
                          ["rev-standing"])
+
+
+    def test_retrieval_surfaces_the_issues_a_qualified_document_carries(self):
+        issues = {"contradictions": ["Title says 7 MB, body says 8 MB."],
+                  "missing_evidence": ["README is cited but absent."]}
+        self.write_private("config/standing-findings.json", {**self.findings, **issues})
+        self.stage_all()
+        for name in ("review", "select", "publish"):
+            self.assertEqual(self.run_stage(name)["status"], "succeeded")
+        with closing(index.readonly(self.root / DB)) as db:
+            packet = packets.packet(db, self.config | json.loads(
+                (self.root / "config/selection.json").read_text()), RENDITION + "#text-1", 60000, root=self.root)
+        scope = packet["renditions"][RENDITION]["qualification"]["reviewed_scope"]
+        self.assertEqual(scope[0]["noted_issues"], [
+            "Reviewer-noted issues: 1 contradictions and 1 missing-evidence items; accepted with these attached.",
+            "Reviewer-noted contradiction: Title says 7 MB, body says 8 MB.",
+            "Reviewer-noted missing evidence: README is cited but absent."])
+
+    def test_a_document_without_issues_carries_no_noted_issues(self):
+        self.stage_all()
+        for name in ("review", "select", "publish"):
+            self.run_stage(name)
+        with closing(index.readonly(self.root / DB)) as db:
+            packet = packets.packet(db, self.config | json.loads(
+                (self.root / "config/selection.json").read_text()), RENDITION + "#text-1", 60000, root=self.root)
+        self.assertNotIn("noted_issues", packet["renditions"][RENDITION]["qualification"]["reviewed_scope"][0])
 
 
 class StandingExtractTests(WorkspaceCase):

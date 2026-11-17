@@ -17,6 +17,30 @@ STANDING_STATEMENT = re.compile(
     r"authorized this exact rendition review\.")
 
 
+NOTED = (("contradictions", "Reviewer-noted contradiction: "),
+         ("missing_evidence", "Reviewer-noted missing evidence: "))
+MAX_EVIDENCE = 30  # the review-event contract's limit on evidence statements
+
+
+def _noted(result, room):
+    """Statements attaching the reviewer's reported issues, verbatim, in ``room`` evidence slots.
+
+    One count statement, then each contradiction and each missing-evidence item. When they do
+    not all fit, the event says how many were recorded rather than dropping any silently."""
+    items = [prefix + text for key, prefix in NOTED for text in result.get(key, [])]
+    if not items:
+        return []
+    counts = (f"Reviewer-noted issues: {len(result.get('contradictions', []))} contradictions and "
+              f"{len(result.get('missing_evidence', []))} missing-evidence items; "
+              "accepted with these attached.")
+    if len(items) + 1 <= room:
+        return [counts, *items]
+    kept = items[:room - 2]
+    return [counts, *kept, f"Reviewer-noted issues truncated: recorded the first {len(kept)} of "
+            f"{len(items)} (contradictions first); findings sha256 {result['findings_sha256']} "
+            "holds all of them."]
+
+
 def _statements(result, scope_counts):
     policy_ref = result["policy"]
     statements = [
@@ -30,7 +54,7 @@ def _statements(result, scope_counts):
     if result.get("unverifiable_references"):
         statements.append(f"Reviewer noted {result['unverifiable_references']} advisory "
                           "references to material outside the rendition.")
-    return statements
+    return statements + _noted(result, MAX_EVIDENCE - len(statements))
 
 
 def review_event(result, args, recorded_at=None):

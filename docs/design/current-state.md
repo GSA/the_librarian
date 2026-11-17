@@ -220,12 +220,35 @@ restated here.
   `::RecoverIdentityTests`, `::QualifyRepairedTests`.
 - **Standing review.** A model reply is recorded as findings exactly as
   reported; the standing policy, not the model, decides qualification. Missing
-  inspection, internal contradictions and out-of-scope receipts block; references
-  to material outside the rendition are advisory. Model traffic stays within the
+  inspection and out-of-scope receipts block; references to material outside the
+  rendition are advisory. Contradictions and missing evidence the reviewer reports
+  on an `accept` are attached issues, not blocks (owner decision, Kata my2k): the
+  rendition qualifies and its review event carries every item verbatim as
+  `Reviewer-noted contradiction: ...` / `Reviewer-noted missing evidence: ...`
+  evidence statements after a count statement. Event `uncertainties` stay empty
+  because native qualification refuses a review that has any, so retrieval reads
+  the notes from `qualification.reviewed_scope[].noted_issues` on the selected
+  rendition. The review-event contract holds at most 30 evidence statements: if
+  the items do not fit, the event says how many it recorded (contradictions
+  first) and points at the findings hash, never dropping silently. `reject`,
+  `defer`, incomplete inspection, independent-review, conflicting-review, scope,
+  registration, fidelity and budget gates are unchanged and keep their order; the
+  policy file format and sha are unchanged. `cohort recover-unresolved-evidence`
+  re-evaluates only reviews blocked `standing-pending-review-unresolved-evidence`
+  from their saved findings, makes no model call, stages a correction for each
+  that now qualifies (the ledger stays append-only) and selects it under the
+  shared manifest's capacity. Model traffic stays within the
   configured provider and redirects are refused. Evidence:
   `tests/test_standing.py` (`test_fabricated_success_without_inspection_is_not_qualified`,
   `test_confidence_never_yields_verification`, `test_prohibited_scope`,
-  `test_advisory_references_do_not_block_...`), `tests/test_model_review.py`
+  `test_accepted_review_with_reported_issues_qualifies_and_attaches_them`,
+  `test_rejected_and_deferred_stay_so_even_with_reported_issues`,
+  `test_issues_never_rescue_incomplete_inspection`,
+  `test_issues_never_override_a_conflicting_review`,
+  `test_every_issue_is_recorded_or_the_truncation_is_stated`,
+  `test_retrieval_surfaces_the_issues_a_qualified_document_carries`,
+  `test_advisory_references_do_not_block_...`),
+  `tests/test_intake_cohort.py::RecoverUnresolvedEvidenceTests`, `tests/test_model_review.py`
   (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
 - **Only an absent registration is `unregistered-rendition`.** The standing check reads a
