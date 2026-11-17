@@ -1171,6 +1171,135 @@ def _qualify_in_process(root, inbox, system):
         concurrency=2)["counts"]["qualification"]
 
 
+class RecoverUnresolvedEvidenceTests(QualifyCase):
+    """Reviews blocked as ``unresolved-evidence`` before reported issues were attached, not blocking."""
+
+    ISSUES = {"contradictions": ["Title says 7 MB, body says 8 MB."],
+              "missing_evidence": ["README is cited but absent."]}
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = self.root / "config/selection.local.json"
+        self.calls = []
+
+    def transport(self, issues_for=("Just text", "Fund codes", "Decided things"), decision="accept"):
+        inner, _ = self._transport()
+
+        def fake(model, messages):
+            self.calls.append(model)
+            reply = inner(model, messages)
+            body = json.loads(messages[-1]["content"])
+            if any(name in json.dumps(body) for name in issues_for):
+                findings = json.loads(reply["content"])
+                findings.update(self.ISSUES, decision=decision)
+                reply["content"] = json.dumps(findings)
+            return reply
+        return fake
+
+    def blocked_as_before(self):
+        """The decision this change replaced: an accept with reported issues ends unresolved-evidence."""
+        original = standing._decision
+
+        def before(findings, expected):
+            if findings["decision"] == "accept" and (findings["contradictions"] or findings["missing_evidence"]):
+                return "pending-review", "unresolved-evidence"
+            return original(findings, expected)
+        return unittest.mock.patch.object(standing, "_decision", before)
+
+    def blocked_codes(self):
+        codes = {}
+        for request in store.list_requests(self.root):
+            if request["correlation_id"].startswith("standing-") and request["stages"][0]["status"] == "blocked":
+                codes[request["correlation_id"]] = request["stages"][0]["attempts"][-1]["code"]
+        return codes
+
+    def test_qualify_attaches_reported_issues_and_publishes_the_document(self):
+        report = self._qualify(self.transport())
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(self.blocked_codes(), {})
+
+    def test_recovery_qualifies_only_unresolved_evidence_reviews_without_a_model_call(self):
+        with self.blocked_as_before():
+            transport = self.transport()
+            report = self._qualify(transport)
+        blocked = self.blocked_codes()
+        self.assertEqual(set(blocked.values()), {"standing-pending-review-unresolved-evidence"})
+        self.assertEqual(len(blocked), 3)
+        spent = len(self.calls)
+        ledger_before = {c: store.request(self.root, c) for c in store.correlation_ids(self.root)}
+        dry = cohort.recover_unresolved_evidence(self.root)
+        self.assertEqual((dry["apply"], dry["candidates"], dry["skipped"]), (False, 3, {}))
+        self.assertEqual(store.correlation_ids(self.root), set(ledger_before))
+        applied = cohort.recover_unresolved_evidence(self.root, apply=True)
+        self.assertEqual((applied["candidates"], applied["results"]), (3, {"qualified": 3}))
+        self.assertEqual(len(self.calls), spent)
+        self.assertEqual(len(json.loads(self.manifest.read_text())["renditions"]), 6)
+        # Append-only: every earlier request is unchanged and each blocked review gained one correction.
+        for corr, raw in ledger_before.items():
+            self.assertEqual(store.request(self.root, corr), raw)
+        for corr in blocked:
+            self.assertEqual(store.head(self.root, corr)["correlation_id"], corr + "-c1")
+        # Rerunnable: nothing is left to recover.
+        again = cohort.recover_unresolved_evidence(self.root, apply=True)
+        self.assertEqual((again["candidates"], again.get("results")), (0, {}))
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(self.calls), spent)
+
+    def test_other_blocked_reviews_are_untouched(self):
+        inner = self.transport(("Decided things",))
+
+        def mixed(model, messages):
+            reply = inner(model, messages)
+            content = messages[-1]["content"]
+            findings = json.loads(reply["content"])
+            if "Fund codes" in content:
+                findings.update(self.ISSUES, decision="reject")
+            elif "Just text" in content:
+                findings.update(self.ISSUES, decision="defer")
+            elif "Line" in content:
+                findings.update(self.ISSUES, inspected_records=[])
+            return {**reply, "content": json.dumps(findings)}
+        with self.blocked_as_before():
+            self._qualify(mixed)
+        codes = set(self.blocked_codes().values())
+        # Before this change, reported issues were checked first, so the incomplete review with
+        # issues also ended unresolved-evidence; it must stay blocked after recovery re-evaluates it.
+        self.assertEqual(codes, {"standing-rejected-reviewer-rejected", "standing-deferred-reviewer-deferred",
+                                 "standing-pending-review-unresolved-evidence"})
+        before = {c: store.head(self.root, c) for c in store.correlation_ids(self.root)}
+        report = cohort.recover_unresolved_evidence(self.root, apply=True)
+        self.assertEqual((report["candidates"], report["skipped"], report["results"]),
+                         (1, {"not-qualified": 1}, {"qualified": 1}))
+        after = {c: store.head(self.root, c) for c in store.correlation_ids(self.root)}
+        changed = [c for c in before if before[c] != after[c]]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(before[changed[0]]["stages"][0]["attempts"][-1]["code"],
+                         "standing-pending-review-unresolved-evidence")
+
+    def test_a_still_incomplete_unresolved_review_is_not_qualified_by_recovery(self):
+        with self.blocked_as_before():
+            self._qualify(self.transport())
+        for corr in self.blocked_codes():
+            request = store.request(self.root, corr)
+            findings = self.root / request["stages"][0]["arguments"]["findings_path"]
+            value = json.loads(findings.read_text())
+            value["inspected"]["records"] = value["inspected"]["records"][:-1] or [999]
+            findings.write_text(json.dumps(value))
+        report = cohort.recover_unresolved_evidence(self.root, apply=True)
+        self.assertEqual(report["candidates"], 0)
+        self.assertEqual(set(self.blocked_codes().values()), {"standing-pending-review-unresolved-evidence"})
+
+    def test_a_full_manifest_leaves_the_recovered_select_for_later(self):
+        with self.blocked_as_before():
+            self._qualify(self.transport(("Fund codes",)))
+        self.assertEqual(len(self.blocked_codes()), 1)
+        with self.capped(5):
+            report = cohort.recover_unresolved_evidence(self.root, apply=True)
+        self.assertEqual((report["candidates"], report["results"]), (1, {"selection-capacity": 1}))
+        self.assertEqual(len(json.loads(self.manifest.read_text())["renditions"]), 5)
+        self.assertEqual(self._qualify(self.transport())["counts"]["qualification"], {"qualified": 6})
+
+
 class SharedManifestTests(QualifyCase):
     """Several inboxes, one catalog, one selection manifest and one published index."""
 
@@ -1580,6 +1709,10 @@ class SharedManifestTests(QualifyCase):
         raw = json.loads(policy_file.read_text())
         raw["version"] += 1
         policy_file.write_text(json.dumps(raw))
+
+
+RecoverUnresolvedEvidenceTests.patched_renditions = staticmethod(SharedManifestTests.patched_renditions)
+RecoverUnresolvedEvidenceTests.capped = SharedManifestTests.capped
 
 
 class ThroughputTests(QualifyCase):

@@ -3,7 +3,7 @@ from collections import Counter
 from pathlib import Path
 
 from tools.catalog import catalog_store as catalog
-from . import adapters, contracts, runner, store
+from . import adapters, cohort_review, contracts, runner, standing, store
 from .contracts import IntakeError
 
 
@@ -120,5 +120,70 @@ def recover_identity(root, *, apply=False):
             results[_repair(root, corr, prepare, reuse)] += 1
         except IntakeError as error:
             results[error.code] += 1
+    report["results"] = dict(results)
+    return report
+
+
+UNRESOLVED = "standing-pending-review-unresolved-evidence"
+
+
+def _unresolved_blocked(root):
+    """Chain heads whose standing review is blocked ``unresolved-evidence``: ``(head summary, rendition, manifest)``."""
+    found = []
+    with store.locked(root) as c:
+        rows = c.execute("SELECT s.correlation_id, r.raw FROM stages s JOIN requests r USING(correlation_id) "
+                         "WHERE s.status='blocked' AND s.ordinal=0 ORDER BY s.correlation_id").fetchall()
+        for row in rows:
+            request = contracts.decode_request(row["raw"])
+            review = request["stages"][0]
+            if review["operation"] != "standing-review" or len(request["stages"]) != 2:
+                continue
+            if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
+                continue  # not the head: a correction follows it
+            last = c.execute("SELECT code FROM attempts WHERE correlation_id=? AND stage_id=? "
+                             "ORDER BY cycle DESC, ordinal DESC LIMIT 1",
+                             (row["correlation_id"], review["id"])).fetchone()
+            if last is not None and last[0] == UNRESOLVED:
+                found.append((row["correlation_id"], review["arguments"]["rendition"],
+                              request["stages"][1]["arguments"].get("manifest")))
+    return found
+
+
+def recover_unresolved_evidence(root, *, apply=False):
+    """Report, and with ``apply`` re-evaluate, reviews blocked as ``unresolved-evidence``.
+
+    An accepted review's reported contradictions and missing evidence now qualify it with the
+    issues attached instead of blocking it. Each chain head blocked that way is re-evaluated from
+    its saved, hash-verified findings under its pinned policy: no model call is made. One that
+    now qualifies is restaged as a correction with the same arguments (the ledger stays
+    append-only), reviewed, and selected under the shared manifest's capacity (a full manifest
+    leaves its select staged for a later ``qualify``). One that still does not qualify (incomplete
+    inspection, a conflicting review, a changed policy, ...) is counted in ``skipped`` and
+    untouched, as is every qualified, rejected, deferred or exception review. Run ``publish`` after.
+    """
+    root = Path(root).resolve()
+    heads = store.Heads()
+    work, skipped = [], Counter()
+    for corr, rendition, manifest in _unresolved_blocked(root):
+        current = store.find_head(root, corr, heads)
+        if not cohort_review._issues_now_qualify(root, current):
+            skipped["not-qualified"] += 1
+        else:
+            work.append((corr, current, rendition, manifest))
+    report = {"apply": apply, "candidates": len(work), "skipped": dict(skipped)}
+    if not apply:
+        return report
+    results = Counter()
+    for corr, current, rendition, manifest in work:
+        try:
+            active, current = cohort_review._run_review(root, corr, current, {"rendition": rendition})
+            current = cohort_review._run_select(root, active, current, {"rendition": rendition}, manifest)
+        except (IntakeError, standing.Refusal) as error:
+            results[getattr(error, "code", "refused")] += 1
+            continue
+        if current is None:
+            results["selection-capacity"] += 1
+        else:
+            results["qualified" if current["complete"] else "not-complete"] += 1
     report["results"] = dict(results)
     return report

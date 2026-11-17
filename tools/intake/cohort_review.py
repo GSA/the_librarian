@@ -16,7 +16,7 @@ import hashlib
 from tools import policy
 from tools.context_index import renditions
 from tools.review_events import event_reader
-from . import model_review, runner, selection_manifest, standing, store
+from . import adapters, model_review, runner, selection_manifest, standing, store
 
 RUNNABLE = {"staged", "running", "retryable"}
 
@@ -66,6 +66,22 @@ def _registration_recovered(root, current, entry):
     """
     return (_blocked_with(current["stages"][0], "standing-exception-unregistered-rendition")
             and standing.registered(root, entry["rendition"], entry["rendition_sha256"]))
+
+
+def _issues_now_qualify(root, current):
+    """A review saved as ``unresolved-evidence`` that its saved, hash-verified findings now qualify.
+
+    Reported contradictions and missing evidence used to block an accepted review; they are now
+    attached to its event. Evaluating (which never writes or calls a model) leaves every other
+    blocked review as it is."""
+    if not _blocked_with(current["stages"][0], "standing-pending-review-unresolved-evidence"):
+        return False
+    arguments = store.request(root, current["correlation_id"])["stages"][0]["arguments"]
+    try:
+        result = standing.evaluate(root, {key: arguments[key] for key in adapters.STANDING_REVIEW})
+    except standing.Refusal:
+        return False
+    return result["outcome"] == "qualified"
 
 
 def _stage_correction(root, corr, active):
@@ -157,10 +173,12 @@ def _run_review(root, corr, current, entry):
     if current["stages"][0]["status"] in RUNNABLE:
         current = runner.run(root, active, "review")
     if (_blocked_with(current["stages"][0], "changed-standing-inputs")
-            or _registration_recovered(root, current, entry)):
+            or _registration_recovered(root, current, entry)
+            or _issues_now_qualify(root, current)):
         # The saved review's pinned intent is stale (e.g. an earlier-version review it
-        # conflicted with is now supersedable, or a registration a failed catalog read
-        # missed is confirmed now); re-pin it under a correction request.
+        # conflicted with is now supersedable, a registration a failed catalog read
+        # missed is confirmed now, or reported issues no longer block); re-pin it under a
+        # correction request.
         active = _stage_correction(root, corr, active)
         current = runner.run(root, active, "review")
     return active, current

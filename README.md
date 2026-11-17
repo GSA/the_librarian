@@ -141,7 +141,10 @@ them. If a registration reports `register/changed-extraction-identity` (the
 extractor changed after it was first prepared), `python -m tools.intake.cohort
 recover-identity --root .` lists the recoverable ones and `--apply` repairs
 them through validated correction requests
-([context/intake.md](context/intake.md#read-only-cohort-intake)).
+([context/intake.md](context/intake.md#read-only-cohort-intake)). An accepted review
+that reports contradictions or missing evidence now qualifies with those issues attached;
+`recover-unresolved-evidence --root .` (`--apply`) qualifies earlier reviews blocked as
+`unresolved-evidence` from their saved findings without a model call.
 
 To review, select and publish the extracted cohort in one rerunnable step
 (model traffic stays within the configured USAi provider). `qualify` runs `ingest` itself,
@@ -263,7 +266,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `progress`, `progress-serve` |
-| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `backfill-docs`, `audit-docs`, `docs-status` |
+| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `backfill-docs`, `audit-docs`, `docs-status` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |

@@ -70,9 +70,14 @@ named stage. The ledger is operational recovery state, never corpus authority.
   registered Docling or extraction rendition. Only findings that inspected every
   page, text record, table and individual warning (`#/warnings/N`) of a Docling
   rendition, or every payload record (`records: [index]`) and warning
-  (`#/payload/warnings/N`) of a text, transcript or ODT rendition, with no
-  contradictions or missing evidence, are
-  `qualified`; parser success and confidence never qualify. The v2 advisory
+  (`#/payload/warnings/N`) of a text, transcript or ODT rendition, are
+  `qualified`; parser success and confidence never qualify. An `accept` that
+  reports `contradictions` or `missing_evidence` still qualifies: the event
+  records each item verbatim as a `Reviewer-noted contradiction:` or
+  `Reviewer-noted missing evidence:` statement (with a count; if more than the
+  event's 30 statements would be needed, it states how many it recorded), and
+  `get` shows them under the rendition's `qualification.reviewed_scope[].noted_issues`.
+  `reject` and `defer` stay so. The v2 advisory
   `unverifiable_references` list (claims depending on material the document
   cites but does not contain) never blocks; a qualified event states only its
   count. Other outcomes
@@ -586,6 +591,23 @@ moves again blocks it again. The next `ingest` or `qualify` follows the chain to
 registration and reports the entry `extracted` with no new extraction work; it is then reviewed and
 selected like any other rendition. Repaired chains are not candidates again. Run it while no ingest is
 writing, as with `recover-conflicts`.
+
+**Recovering reviews blocked as `unresolved-evidence`.** Before accepted reviews with reported
+contradictions or missing evidence qualified, they ended `standing-pending-review-unresolved-evidence`.
+Run
+
+    python -m tools.intake.cohort recover-unresolved-evidence --root ROOT           # dry run
+    python -m tools.intake.cohort recover-unresolved-evidence --root ROOT --apply
+    python -m tools.intake.cohort publish --root ROOT --policy POLICY --manifest MANIFEST
+
+The dry run counts `candidates` (chain heads blocked that way whose saved, hash-verified findings
+now evaluate as `qualified`) and `skipped.not-qualified` (blocked that way but still failing another
+gate, for example a conflicting review). `--apply` makes no model call: it stages a correction
+`<id>-c<n>` of each candidate with the same arguments, records the review and selects the rendition
+under the shared manifest's capacity (`results.selection-capacity` leaves the select staged for a
+later `qualify`). Qualified, rejected, deferred, exception and other pending reviews are not touched,
+and a rerun finds nothing further. `publish` then makes the selections retrievable. Run it while no
+`qualify` is writing.
 
 Model calls made by `qualify` and `model_review evaluate` are recorded body-free (model and token
 counts only, never prompts, documents or replies) as one session file per run in

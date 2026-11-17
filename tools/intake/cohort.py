@@ -25,7 +25,7 @@ from . import (cli, cohort_review, docsync, model_review, runner, selection_mani
                throttle, upload, usage_log)
 from . import contracts
 from .cohort_ingest import BATCH_SIZE, classify, ingest
-from .cohort_recovery import recover_identity
+from .cohort_recovery import recover_identity, recover_unresolved_evidence
 from .contracts import IntakeError
 
 DEFAULT_INDEX = "tools/context_index/.local/index.sqlite3"
@@ -471,6 +471,12 @@ def _parser():
         help="Report (or with --apply correct) registrations blocked as changed-extraction-identity")
     recover.add_argument("--root", required=True, type=Path)
     recover.add_argument("--apply", action="store_true")
+    unresolved = commands.add_parser(
+        "recover-unresolved-evidence", allow_abbrev=False,
+        help="Report (or with --apply qualify) accepted reviews blocked as unresolved-evidence, "
+             "from their saved findings and without a model call")
+    unresolved.add_argument("--root", required=True, type=Path)
+    unresolved.add_argument("--apply", action="store_true")
     backfill = commands.add_parser(
         "backfill-docs", allow_abbrev=False,
         help="Report (or with --apply create) the derived docs table and its missing rows from the requests")
@@ -526,6 +532,8 @@ def _maintenance(args):
     """The report of a ledger maintenance command (identity recovery or the docs table)."""
     if args.command == "recover-identity":
         return recover_identity(args.root, apply=args.apply)
+    if args.command == "recover-unresolved-evidence":
+        return recover_unresolved_evidence(args.root, apply=args.apply)
     root = args.root.resolve()
     if args.command == "backfill-docs":
         return docsync.backfill(root, apply=args.apply)
@@ -557,7 +565,7 @@ def _inbox_report(args):
 def main(argv=None):
     args = _parser().parse_args(argv)
     try:
-        if args.command in {"recover-identity", "backfill-docs", "audit-docs", "docs-status"}:
+        if args.command in {"recover-identity", "recover-unresolved-evidence", "backfill-docs", "audit-docs", "docs-status"}:
             print(json.dumps(_maintenance(args), sort_keys=True))
             return 0
         if args.command == "publish":

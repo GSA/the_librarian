@@ -430,8 +430,6 @@ def _decision(findings, expected):
         return "rejected", "reviewer-rejected"
     if findings["decision"] == "defer":
         return "deferred", "reviewer-deferred"
-    if findings["contradictions"] or findings["missing_evidence"]:
-        return "pending-review", "unresolved-evidence"
     inspected = {key: sorted(findings["inspected"][key]) for key in expected}
     if inspected != expected:
         return "pending-review", "insufficient-inspected-scope"
@@ -460,6 +458,11 @@ def evaluate(root, args, snapshot=None):
     result["explanation"] = findings["explanation"]
     result["exception_resolution"] = findings["exception_resolution"]
     result["unverifiable_references"] = len(findings.get("unverifiable_references", []))
+    # Reported issues never block an accepted review; they travel to its event. Keys appear only
+    # when there is something to attach, so a review without issues pins and records what it did.
+    for key in ("contradictions", "missing_evidence"):
+        if findings[key]:
+            result[key] = list(findings[key])
     if not _findings_match(findings, standing, args):
         return outcome("exception", "findings-mismatch")
     engine = index.rendition_api(root)

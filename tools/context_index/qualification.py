@@ -58,8 +58,12 @@ def _bound(selection, source, snapshot, engine, complete_scope, label):
                 or event.get("uncertainties") != []):
             engine.fail(f"{label} review does not bind the exact complete rendition")
         reviewed_content.update(content)
+        noted = [e["quote"] for e in event["evidence"]
+                 if isinstance(e, dict) and isinstance(e.get("quote"), str)
+                 and e["quote"].startswith("Reviewer-noted ")]
         reviewed_scope.append({"event_id": event_id, "content": sorted(content),
-                               "unit": "file", "extent": "defined_scope"})
+                               "unit": "file", "extent": "defined_scope",
+                               **({"noted_issues": noted} if noted else {})})
     return reviewed_content, reviewed_scope
 
 
