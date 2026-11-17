@@ -38,9 +38,9 @@ CODES = ("prohibited-scope", "native-busy", "unsupported-type", "needs-reader-do
          "standing-rejected-reviewer-rejected", "standing-pending-review-x", None)
 
 
-def raw_request(number, layout, prefix="bulk-"):
+def raw_request(number, layout, prefix="bulk-", correction_of=None):
     return json.dumps({
-        "version": 1, "correlation_id": f"{prefix}{number:06d}", "correction_of": None,
+        "version": 1, "correlation_id": f"{prefix}{number:06d}", "correction_of": correction_of,
         "policy": {"version": 1, "sha256": default_policy_hash()},
         "retry": {"max_attempts": 3, "backoff_seconds": 0},
         "stages": [{"id": stage, "kind": kind, "operation": operation,
@@ -106,6 +106,7 @@ def reference(root, runs=None, limit=50):
         return {"requests": len(values), "funnel": funnel, "stages": matrix,
                 "exceptions": sum(any(s in {"blocked", "dead-letter"} for _, s in v["kinds"]) for v in values),
                 "retrying": sum(any(s == "retryable" for _, s in v["kinds"]) for v in values),
+                "superseded": 0,  # these seeded ledgers hold no corrections
                 "last_activity": max(updated) if updated else None}
     return {"overall": aggregate(items),
             "runs": {name: aggregate([v for v in items if v["correlation_id"].startswith(prefix)])
@@ -190,6 +191,51 @@ class EquivalenceTests(Case):
         text = json.dumps(report) + progress_render.render_html(report) + progress_render.render_text(report)
         self.assertNotIn(SECRET, text)
         self.assertIn("Needs attention by cause", progress_render.render_html(report))
+
+
+class SupersededTests(Case):
+    """Kata jv24: only correction-chain heads are counted; corrected originals are reported apart."""
+
+    def add(self, number, parent, status, code=None):
+        layout, prefix = LAYOUTS[0], "chain-"
+        raw = raw_request(number, layout, prefix, parent)
+        name = f"{prefix}{number:06d}"
+        intent, evidence = json.dumps({"n": number}), json.dumps({"ok": True})
+        done = status == "succeeded"
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO requests VALUES (?,?,?,?,?)",
+                      (name, parent, raw, contracts.digest(raw), str(self.root)))
+            c.execute("INSERT INTO stages VALUES (?,?,?,?,?,?,?,?,?)", (
+                name, "receipt", 0, status, 0, intent, contracts.digest(intent.encode()),
+                evidence if done else None, contracts.digest(evidence.encode()) if done else None))
+            c.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                name, "receipt", 0, 1, 1000.0 + number, 1001.0 + number,
+                "succeeded" if done else "failed", None if done else "permanent", code, None))
+        return name
+
+    def test_only_chain_heads_are_counted_and_the_rest_reported_as_superseded(self):
+        store.initialize(self.root)
+        first = self.add(1, None, "blocked", "standing-exception-unregistered-rendition")
+        second = self.add(2, first, "blocked", "conflicting-review")
+        self.add(3, second, "succeeded")  # head of a chain of three
+        self.add(4, None, "blocked", "prohibited-scope")  # an uncorrected block still counts
+        got = progress.snapshot(self.root, runs={"chain": "chain-", "none": "zzz"})
+        overall = got["overall"]
+        self.assertEqual((overall["requests"], overall["superseded"]), (2, 2))
+        self.assertEqual(overall["funnel"]["received"], 1)
+        self.assertEqual(overall["funnel"]["blocked"], 1)
+        self.assertEqual(overall["exceptions"], 1)
+        self.assertEqual((got["runs"]["chain"]["requests"], got["runs"]["chain"]["superseded"]), (2, 2))
+        self.assertEqual(got["runs"]["none"]["superseded"], 0)
+        self.assertEqual(overall["stages"]["receipt"]["blocked"], 1)
+        self.assertEqual([g["code"] for g in got["attention_groups"]], ["prohibited-scope"])
+        self.assertEqual(got["attention_total"], 1)
+        shown = {v["correlation_id"] for v in got["attention"] + got["recent"]}
+        self.assertNotIn(first, shown)
+        self.assertNotIn(second, shown)
+        self.assertIn("2 superseded", progress_render.render_text(got))
+        self.assertIn("2 superseded", progress_render.render_html(got))
+        self.assertEqual(progress.snapshot(self.root)["overall"], overall)  # the cached pass agrees
 
 
 class CachedResultTests(Case):

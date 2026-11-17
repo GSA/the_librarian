@@ -177,9 +177,13 @@ def request_state(correlation_id, stages, layout, attempts_of):
     return tuple(statuses), updated
 
 
-def scan(c, root, limit, runs):
-    """Verify every page and fold it into signature counts, newest times and the entries kept to show."""
+def scan(c, root, limit, runs, corrected):
+    """Verify every page and fold it into signature counts, newest times and the entries kept to show.
+
+    Requests in ``corrected`` are not chain heads: they are verified with their page but only
+    counted as superseded."""
     counts, per_run = Counter(), {name: Counter() for name in runs}
+    superseded, superseded_runs = 0, Counter()
     latest = dict.fromkeys(per_run)
     newest, recent, groups, info, after = None, Best(limit), {}, {}, None
     while True:
@@ -193,6 +197,11 @@ def scan(c, root, limit, runs):
         layouts = store.verify_page(rows, root, _memo)
         for row, layout in zip(requests, layouts):
             correlation_id = row["correlation_id"]
+            if correlation_id in corrected:
+                superseded += 1
+                for name, prefix in runs.items():
+                    superseded_runs[name] += correlation_id.startswith(prefix)
+                continue
             statuses, updated = request_state(correlation_id, stages_of[correlation_id], layout,
                                               attempts_of)
             signature = (layout, statuses)
@@ -215,13 +224,14 @@ def scan(c, root, limit, runs):
                 group[0] += 1
                 group[1].offer(order, build)
         after = requests[-1]["correlation_id"]
-    return counts, per_run, latest, newest, recent, groups
+    return counts, per_run, latest, newest, recent, groups, superseded, superseded_runs
 
 
-def summarize(counts, per_run, latest, newest, recent, groups, limit):
+def summarize(counts, per_run, latest, newest, recent, groups, superseded, superseded_runs, limit):
     return {
-        "overall": aggregate(counts, newest),
-        "runs": {name: aggregate(per_run[name], latest[name]) for name in per_run},
+        "overall": aggregate(counts, newest, superseded),
+        "runs": {name: aggregate(per_run[name], latest[name], superseded_runs[name])
+                 for name in per_run},
         "recent": [public(make_item(entry)) for _, entry in recent.entries],
         "attention_groups": [
             {"state": state, "funnel": funnel, "code": code, "count": count}
@@ -254,8 +264,11 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
                 return {**_cached["summary"], "rates": moving, "cached": True,
                         "seconds": round(time.perf_counter() - started, 3)}
             store.check_identity(c)
+            # Requests some correction points at are not chain heads; read once, not per row.
+            corrected = {parent for (parent,) in c.execute(
+                "SELECT DISTINCT correction_of FROM requests WHERE correction_of IS NOT NULL")}
             c.execute("COMMIT")
-        tally = scan(c, root, limit, runs)
+        tally = scan(c, root, limit, runs, corrected)
         after_identity, moving = last_identity(c, db, before)
     summary = summarize(*tally, limit)
     # Stored only when the file was exactly the same before the first and after the last page: no
@@ -352,8 +365,9 @@ def item(correlation, correction_of, request, saved, attempts):
     }
 
 
-def aggregate(counts, last_activity):
-    """Counts for a ``Counter`` of (layout, ((status, code), ...)) request signatures."""
+def aggregate(counts, last_activity, superseded=0):
+    """Counts for a ``Counter`` of (layout, ((status, code), ...)) request signatures of chain heads;
+    ``superseded`` is the number of corrected originals left out of them."""
     funnel = dict.fromkeys(FUNNEL, 0)
     matrix = {kind: dict.fromkeys(STATUSES, 0) for kind in KINDS}
     exceptions = retrying = 0
@@ -364,7 +378,8 @@ def aggregate(counts, last_activity):
         exceptions += number * any(status in {"blocked", "dead-letter"} for status, _ in statuses)
         retrying += number * any(status == "retryable" for status, _ in statuses)
     return {"requests": sum(counts.values()), "funnel": funnel, "stages": matrix,
-            "exceptions": exceptions, "retrying": retrying, "last_activity": last_activity}
+            "exceptions": exceptions, "retrying": retrying, "superseded": superseded,
+            "last_activity": last_activity}
 
 
 def public(value):

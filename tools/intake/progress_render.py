@@ -46,7 +46,7 @@ def render_text(report):
     for label, data in groups:
         counts = ", ".join(f"{k}={v}" for k, v in data["funnel"].items() if v) or "none"
         lines.append(f"{label}: {data['requests']} requests, {data['exceptions']} exceptions, "
-                     f"{data['retrying']} retrying; {counts}")
+                     f"{data['retrying']} retrying, {data['superseded']} superseded; {counts}")
     moving = report.get("rates")
     if moving:
         lines.append("finished attempts (last " + "/".join(f"{w // 60}" for w in moving["windows_seconds"])
@@ -137,10 +137,11 @@ def render_html(report, *, refresh=5):
         if index["reasons"]:
             parts.append("<p>Stale: " + esc("; ".join(index["reasons"])) + "</p>")
     parts.append(f"<h2>Overall: {overall['requests']} requests, {overall['exceptions']} exceptions, "
-                 f"{overall['retrying']} retrying</h2>" + cards(overall["funnel"]))
+                 f"{overall['retrying']} retrying ({overall['superseded']} superseded originals not counted)</h2>" + cards(overall["funnel"]))
     for name, data in report["runs"].items():
         parts.append(f"<h2>Run {esc(name)} ({esc(data['prefix'])}*): {data['requests']} requests, "
-                     f"{data['exceptions']} exceptions</h2>" + cards(data["funnel"]))
+                     f"{data['exceptions']} exceptions ({data['superseded']} superseded not counted)</h2>"
+                     + cards(data["funnel"]))
     parts.append("<h2>Stages by kind and state</h2>" + table(
         ("kind", *STATUSES), [(k, *overall["stages"][k].values()) for k in KINDS]))
     catalog = report["catalog"]

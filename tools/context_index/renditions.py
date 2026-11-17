@@ -15,7 +15,7 @@ from tools.context_index import qualification
 # One instance publishes a reviewed cohort (tens of thousands of files), not a hand-picked handful.
 # Sized for a 36,000-document cohort at the observed acceptance rate (about 13,000 selections) with
 # headroom; publish cost and manifest rewrite cost at this size are in docs/design/current-state.md.
-MAX_SELECTIONS = 20000
+MAX_SELECTIONS = 50000
 DOCLING_MAX_PAGES = 100
 DOCLING_MAX_RECORDS = 10000
 DOCLING_RENDER_SCALE = 3.0
