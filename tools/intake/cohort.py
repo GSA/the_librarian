@@ -25,7 +25,7 @@ from . import (cli, cohort_review, docsync, model_review, runner, selection_mani
                throttle, upload, usage_log)
 from . import contracts
 from .cohort_ingest import BATCH_SIZE, classify, ingest
-from .cohort_recovery import recover_identity, recover_unresolved_evidence
+from .cohort_recovery import recover_deferred, recover_identity, recover_unresolved_evidence
 from .contracts import IntakeError
 
 DEFAULT_INDEX = "tools/context_index/.local/index.sqlite3"
@@ -318,7 +318,7 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
     raise IntakeError("publication_revisions_exhausted")
 
 
-def _check_options(concurrency, initial_concurrency, inspected_form, context):
+def _check_options(concurrency, initial_concurrency, inspected_form, context, deferred="hold"):
     if type(concurrency) is not int or concurrency < 1:
         raise IntakeError("invalid_concurrency")
     if initial_concurrency is not None and (
@@ -326,6 +326,8 @@ def _check_options(concurrency, initial_concurrency, inspected_form, context):
         raise IntakeError("invalid_concurrency")
     if inspected_form not in model_review.FORMS:
         raise IntakeError("invalid_inspected_form")
+    if deferred not in standing.DEFERRED_MODES:
+        raise IntakeError("invalid_deferred_mode")
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
         raise IntakeError("context_required")
@@ -375,7 +377,7 @@ def _qualification_counts(report, extracted, others, published):
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
             context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
-            initial_concurrency=None, inspected_form="list", trust_stat=False):
+            initial_concurrency=None, inspected_form="list", trust_stat=False, deferred="hold"):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
 
     ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
@@ -385,8 +387,11 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     effective rate. ``inspected_form`` (``list`` or ``ranges``) only changes how the reviewer is
     asked to write the inspected record indices; findings and outcomes are identical.
     ``trust_stat`` is passed to ``ingest`` (opt-in; see there).
+    ``deferred="qualify-low-confidence"`` (opt-in; default ``hold``) qualifies a reviewer deferral
+    after a complete inspection under the current policy as low confidence instead of holding it,
+    and restages this cohort's held deferrals that way from their saved findings (no model call).
     """
-    _check_options(concurrency, initial_concurrency, inspected_form, context)
+    _check_options(concurrency, initial_concurrency, inspected_form, context, deferred)
     root = Path(root).resolve()
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
     report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat)
@@ -410,7 +415,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         cohort_review.review_all(root, extracted, {
             "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
             "manifest": manifest, "model": model, "transport": gated, "usage": usage,
-            "snapshot": snapshot, "inspected_form": inspected_form}, concurrency)
+            "snapshot": snapshot, "inspected_form": inspected_form, "deferred": deferred}, concurrency)
     others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     others["orphaned"] = pruned["orphaned"]
@@ -477,6 +482,13 @@ def _parser():
              "from their saved findings and without a model call")
     unresolved.add_argument("--root", required=True, type=Path)
     unresolved.add_argument("--apply", action="store_true")
+    held = commands.add_parser(
+        "recover-deferred", allow_abbrev=False,
+        help="Report (or with --apply qualify as low confidence) reviews held as reviewer-deferred "
+             "after a complete inspection under the current policy, from their saved findings "
+             "and without a model call")
+    held.add_argument("--root", required=True, type=Path)
+    held.add_argument("--apply", action="store_true")
     backfill = commands.add_parser(
         "backfill-docs", allow_abbrev=False,
         help="Report (or with --apply create) the derived docs table and its missing rows from the requests")
@@ -525,6 +537,10 @@ def _parser():
             command.add_argument("--inspected-form", choices=model_review.FORMS, default="list",
                                  help="ask the reviewer for inspected records as every index "
                                       "(list, default) or as ranges (ranges)")
+            command.add_argument("--deferred", choices=standing.DEFERRED_MODES, default="hold",
+                                 help="hold reviewer deferrals unpublished (hold, default) or "
+                                      "qualify completely inspected ones as low confidence "
+                                      "(qualify-low-confidence)")
     return parser
 
 
@@ -534,6 +550,8 @@ def _maintenance(args):
         return recover_identity(args.root, apply=args.apply)
     if args.command == "recover-unresolved-evidence":
         return recover_unresolved_evidence(args.root, apply=args.apply)
+    if args.command == "recover-deferred":
+        return recover_deferred(args.root, apply=args.apply)
     root = args.root.resolve()
     if args.command == "backfill-docs":
         return docsync.backfill(root, apply=args.apply)
@@ -552,7 +570,8 @@ def _inbox_report(args):
             context=args.context, index_path=args.index_path,
             concurrency=args.concurrency, adaptive=not args.no_adaptive,
             initial_concurrency=args.initial_concurrency,
-            inspected_form=args.inspected_form, trust_stat=args.trust_stat)
+            inspected_form=args.inspected_form, trust_stat=args.trust_stat,
+            deferred=args.deferred)
     if args.command == "ingest":
         return ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                       limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
@@ -565,7 +584,7 @@ def _inbox_report(args):
 def main(argv=None):
     args = _parser().parse_args(argv)
     try:
-        if args.command in {"recover-identity", "recover-unresolved-evidence", "backfill-docs", "audit-docs", "docs-status"}:
+        if args.command in {"recover-identity", "recover-unresolved-evidence", "recover-deferred", "backfill-docs", "audit-docs", "docs-status"}:
             print(json.dumps(_maintenance(args), sort_keys=True))
             return 0
         if args.command == "publish":

@@ -8,11 +8,11 @@ from unittest.mock import patch
 
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index
-from tools.context_index import packets
+from tools.context_index import confidence, packets
 from tools.extraction import docling_bridge
 from tools.review_events import event_history
 from tools.review_events import event_store as events
-from tools.intake import adapters, runner, standing, standing_events, standing_publication, store
+from tools.intake import adapters, contracts, runner, standing, standing_events, standing_publication, store
 
 from tests.support import WorkspaceCase
 from test_intake_adapters import stage, stage_request
@@ -111,8 +111,8 @@ class StandingCase(WorkspaceCase):
                 "findings_sha256": sha((self.root / "config/standing-findings.json").read_bytes()),
                 "event_id": "rev-standing"}
 
-    def stage_all(self, correlation="req-standing"):
-        review = self.review_args()
+    def stage_all(self, correlation="req-standing", **extra):
+        review = {**self.review_args(), **extra}
         stages = [
             stage("review", "standing-review", {**review, "request_id": "req-standing-review"},
                   "review"),
@@ -373,6 +373,52 @@ class StandingEvaluationTests(StandingCase):
         quotes = [e["quote"] for e in standing_events.review_event(
             self.assert_outcome("qualified", "complete-inspected-scope"), self.review_args())["evidence"]]
         self.assertEqual([q for q in quotes if q.startswith("Reviewer-noted")], [])
+
+    def test_opted_in_deferral_qualifies_as_low_confidence(self):
+        self.write_private("config/standing-findings.json", {**self.findings, "decision": "defer"})
+        args = {**self.review_args(), "deferred": "qualify-low-confidence"}
+        result = standing.evaluate(self.root, args)
+        self.assertEqual((result["outcome"], result["reasons"]),
+                         ("qualified", ["complete-inspected-scope", "reviewer-deferred-low-confidence"]))
+        event = standing_events.review_event(result, args)
+        self.assertTrue(event["reason"].startswith("Qualified as low confidence"))
+        self.assertEqual(event["uncertainties"], [])
+        self.assertEqual(confidence.review_notes(event["evidence"]),
+                         ([], "Compared every page, text, table and warning to the original."))
+        # Without the opt-in (or with ``hold``) a deferral stays held, unpublished.
+        for mode in (None, "hold"):
+            with self.subTest(mode=mode):
+                held = self.review_args() if mode is None else {**self.review_args(), "deferred": mode}
+                outcome = standing.evaluate(self.root, held)
+                self.assertEqual((outcome["outcome"], outcome["reasons"]), ("deferred", ["reviewer-deferred"]))
+                self.assertNotIn("deferred", outcome)
+
+    def test_deferral_opt_in_never_rescues_rejection_or_the_other_gates(self):
+        args = {**self.review_args(), "deferred": "qualify-low-confidence"}
+        partial = deepcopy(self.findings)
+        partial["inspected"]["texts"] = []
+        for findings, expected in (
+                ({**self.findings, "decision": "reject"}, ("rejected", ["reviewer-rejected"])),
+                ({**partial, "decision": "defer"}, ("pending-review", ["insufficient-inspected-scope"])),
+                ({**self.findings, "decision": "defer", "correction_of": "rev-prior"},
+                 ("pending-review", ["independent-review-required"])),
+                ({**self.findings, "decision": "defer", "reviewer": "someone-else"},
+                 ("exception", ["findings-mismatch"]))):
+            with self.subTest(findings=findings):
+                self.write_private("config/standing-findings.json", findings)
+                args["findings_sha256"] = self.review_args()["findings_sha256"]
+                result = standing.evaluate(self.root, args)
+                self.assertEqual((result["outcome"], result["reasons"]), expected)
+        self.write_private("config/standing-findings.json", {**self.findings, "decision": "defer"})
+        args["findings_sha256"] = self.review_args()["findings_sha256"]
+        event = self.pending(RENDITION)
+        event["event_id"] = "rev-independent"
+        events.append(self.root, event_history.bundle([event]), "test-runner", "req-independent", 0,
+                      events.status(self.root)["state_token"])
+        result = standing.evaluate(self.root, args)
+        self.assertEqual((result["outcome"], result["reasons"]), ("pending-review", ["conflicting-review"]))
+        with self.assertRaises(standing.Refusal):
+            standing.evaluate(self.root, {**args, "deferred": "qualify"})
 
     def test_issues_never_rescue_incomplete_inspection(self):
         partial = deepcopy(self.findings)
@@ -724,6 +770,66 @@ class StandingIntakeTests(StandingCase):
             "Reviewer-noted contradiction: Title says 7 MB, body says 8 MB.",
             "Reviewer-noted missing evidence: README is cited but absent."])
 
+    def published_packet(self):
+        with closing(index.readonly(self.root / DB)) as db:
+            return packets.packet(db, self.config | json.loads(
+                (self.root / "config/selection.json").read_text()), RENDITION + "#text-1", 60000, root=self.root)
+
+    def test_noted_issues_and_machine_reading_mark_text_low_confidence(self):
+        self.write_private("config/standing-findings.json",
+                           {**self.findings, "contradictions": ["Title says 7 MB, body says 8 MB."]})
+        self.stage_all()
+        for name in ("review", "select", "publish"):
+            self.assertEqual(self.run_stage(name)["status"], "succeeded")
+        piece = next(p for p in self.published_packet()["pieces"] if p["path"] == RENDITION)
+        self.assertEqual(piece["confidence"], {"level": "low", "reasons": [
+            {"code": "noted-issues", "details": ["rev-standing: 1 contradictions, 0 missing-evidence items attached"]},
+            {"code": "machine-ocr", "details": ["docling-pdf"]}]})
+
+    def test_opted_in_deferral_publishes_visibly_marked_low_confidence(self):
+        self.write_private("config/standing-findings.json", {**self.findings, "decision": "defer"})
+        self.stage_all(deferred="qualify-low-confidence")
+        for name in ("review", "select", "publish"):
+            self.assertEqual(self.run_stage(name)["status"], "succeeded", name)
+        packet = self.published_packet()
+        by_path = {p["path"]: p["confidence"] for p in packet["pieces"]}
+        self.assertEqual(by_path[RENDITION]["level"], "low")
+        self.assertEqual([r["code"] for r in by_path[RENDITION]["reasons"]], ["reviewer-deferred", "machine-ocr"])
+        self.assertEqual(by_path[RENDITION]["reasons"][0]["details"],
+                         ["rev-standing: Compared every page, text, table and warning to the original."])
+        self.assertEqual(by_path["documents/AGENTS.md"], {"level": "normal", "reasons": []})
+        self.assertEqual(packet["confidence"]["level"], "low")
+        self.assertEqual(list(packet["confidence"]["reasons"]), ["reviewer-deferred", "machine-ocr"])
+        self.assertIn("meeting transcript", packet["confidence"]["reasons"]["reviewer-deferred"]["correction"])
+        compact = packets.compact_packet(packet)
+        self.assertEqual(compact["format"], "qualified-compact-v2")
+        self.assertEqual({d["path"]: d["confidence"]["level"] for d in compact["documents"].values()},
+                         {RENDITION: "low", "documents/AGENTS.md": "normal"})
+        self.assertTrue(all("confidence" not in p for p in compact["pieces"]))
+        with closing(index.readonly(self.root / DB)) as db:
+            self.assertEqual(index.count_index(db)["confidence"], {
+                "contract": "confidence-v1", "normal": 2, "low": 1,
+                "low_reasons": {"machine-ocr": 1, "reviewer-deferred": 1}})
+            found = index.search(db, "Standing phrase", 10, None, root=self.root)
+            self.assertEqual(found["hits"][0]["confidence"],
+                             {"level": "low", "reasons": ["reviewer-deferred", "machine-ocr"]})
+            self.assertEqual(found["confidence"]["level"], "low")
+            excluded = index.search(db, "Standing phrase", 10, None, root=self.root, low_confidence="exclude")
+            self.assertEqual((excluded["hits"], excluded["low_confidence_excluded"]), ([], 1))
+            self.assertIn("absence", excluded)
+            last = index.search(db, "standing", 50, None, root=self.root, low_confidence="last")
+            levels = [hit["confidence"]["level"] for hit in last["hits"]]
+            self.assertEqual(levels[-1], "low")
+            self.assertEqual(levels, sorted(levels, key=lambda level: level == "low"))
+            self.assertIn("normal", levels)
+            with self.assertRaises(index.IndexError_):
+                index.search(db, "standing", 5, None, root=self.root, low_confidence="hide")
+
+    def test_deferral_opt_in_is_a_contract_checked_stage_argument(self):
+        self.stage_all(deferred="qualify-low-confidence")
+        with self.assertRaises(contracts.IntakeError):
+            self.stage_all("req-other", deferred="hold")
+
     def test_a_document_without_issues_carries_no_noted_issues(self):
         self.stage_all()
         for name in ("review", "select", "publish"):
@@ -829,6 +935,52 @@ class StandingExtractTests(WorkspaceCase):
         qualified = packet["renditions"][self.rendition]["qualification"]
         self.assertEqual(qualified["review_event_ids"], ["rev-standing-text"])
         self.assertEqual(qualified["reviewed_content"], ["text"])
+
+    def test_text_renditions_are_normal_and_rendition_kinds_map_to_reasons(self):
+        review = self.args()
+        stage_request(self.root, [
+            stage("review", "standing-review", {**review, "request_id": "req-text-review"}, "review"),
+            stage("publication", "standing-select", {**review, "request_id": "req-text-select",
+                                                     "manifest": "config/selection.json"}, "select")],
+                      "req-text")
+        for name in ("review", "select"):
+            runner.run(self.root, "req-text", name)
+        self.config = json.loads((self.root / "config/selection.json").read_text())
+        self.build()
+
+        def label():
+            with closing(index.readonly(self.root / DB)) as db:
+                return index.search(db, "Extract phrase", 10, None, root=self.root)["hits"][0]["confidence"]
+        self.assertEqual(label(), {"level": "normal", "reasons": []})
+        # The seam a converter or OCR kind uses: one RENDITION_REASONS entry, then a rebuild.
+        with patch.dict(confidence.RENDITION_REASONS, {"text": "converted-format"}):
+            with closing(index.readonly(self.root / DB)) as db:
+                self.assertEqual(index.freshness(db, self.root, self.manifest, self.db,
+                                                 *index.load_manifest(self.manifest, self.root)),
+                                 ["metadata changed: rendition_identity"])
+            self.build()
+            self.assertEqual(label(), {"level": "low", "reasons": ["converted-format"]})
+
+    def test_open_correction_hook_adds_a_reason_to_an_existing_label(self):
+        low = confidence.with_reason(confidence.label(), "open-correction", ["correction C-1 is open"])
+        self.assertEqual(low, {"level": "low", "reasons": [
+            {"code": "open-correction", "details": ["correction C-1 is open"]}]})
+        merged = confidence.with_reason(confidence.label([confidence.reason("machine-ocr", ["docling-pdf"])]),
+                                        "noted-issues", ["rev-1: 1 contradictions"])
+        self.assertEqual([r["code"] for r in merged["reasons"]], ["noted-issues", "machine-ocr"])
+        with self.assertRaises(ValueError):
+            confidence.reason("unsure")
+
+    def test_an_index_without_the_confidence_table_is_stale(self):
+        self.build()
+        import sqlite3
+        with closing(sqlite3.connect(self.db)) as db:
+            db.execute("DROP TABLE document_confidence")
+            db.commit()
+        with closing(index.readonly(self.db)) as db:
+            self.assertIn("confidence schema missing; run build", index.freshness(
+                db, self.root, self.manifest, self.db, *index.load_manifest(self.manifest, self.root)))
+            self.assertNotIn("confidence", index.count_index(db))
 
     def test_text_selection_with_unknown_review_event_is_refused(self):
         self.config["renditions"] = [{"path": self.rendition, "sha256": self.rendition_sha,

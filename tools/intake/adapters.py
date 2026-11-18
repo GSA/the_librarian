@@ -55,6 +55,15 @@ STANDING_REVIEW = ("policy_path", "policy_sha256", "rendition", "rendition_sha25
                    "findings_path", "findings_sha256", "event_id")
 
 
+def standing_arguments(arguments):
+    """The pinned standing-review arguments of a stage, plus ``deferred`` when the operator opted
+    in (requests staged without it keep the ``hold`` default)."""
+    args = {key: arguments[key] for key in STANDING_REVIEW}
+    if "deferred" in arguments:
+        args["deferred"] = arguments["deferred"]
+    return args
+
+
 class OneRead:
     """A review-event snapshot read at most once, on first use, shared by the steps of one stage.
 
@@ -75,7 +84,7 @@ class OneRead:
 
 def standing_intent(root, stage, snapshot=None):
     """Evaluate a standing-policy stage; the outcome is pinned before any write."""
-    args = {key: stage["arguments"][key] for key in STANDING_REVIEW}
+    args = standing_arguments(stage["arguments"])
     result = standing.evaluate(root, args, snapshot)
     result.pop("child", None)
     return {"operation": stage["operation"], **result}
@@ -181,7 +190,7 @@ def _standing_result(root, stage, intent, snapshot=None):
     """Re-evaluate against current inputs; stale policy, source or findings refuse.
 
     ``snapshot`` is the one review-event read the caller shares across this stage's steps."""
-    args = {key: stage["arguments"][key] for key in STANDING_REVIEW}
+    args = standing_arguments(stage["arguments"])
     result = standing.evaluate(root, args, snapshot)
     current = {"operation": stage["operation"], **{k: v for k, v in result.items() if k != "child"}}
     expected = {k: v for k, v in intent.items() if k != "recorded_at"}

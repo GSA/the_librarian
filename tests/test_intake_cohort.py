@@ -1200,10 +1200,10 @@ class RecoverUnresolvedEvidenceTests(QualifyCase):
         """The decision this change replaced: an accept with reported issues ends unresolved-evidence."""
         original = standing._decision
 
-        def before(findings, expected):
+        def before(findings, expected, deferred):
             if findings["decision"] == "accept" and (findings["contradictions"] or findings["missing_evidence"]):
-                return "pending-review", "unresolved-evidence"
-            return original(findings, expected)
+                return "pending-review", ("unresolved-evidence",)
+            return original(findings, expected, deferred)
         return unittest.mock.patch.object(standing, "_decision", before)
 
     def blocked_codes(self):
@@ -2271,3 +2271,71 @@ class QualifyRepairedTests(BlockedCase, QualifyCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeferredLowConfidenceTests(QualifyCase):
+    """Reviewer deferrals held by default, qualified as low confidence by the operator opt-in."""
+
+    ISSUES = {}
+    transport = RecoverUnresolvedEvidenceTests.transport
+    blocked_codes = RecoverUnresolvedEvidenceTests.blocked_codes
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+    DEFERRED = ("Just text", "Fund codes", "Decided things")
+    OPT_IN = "qualify-low-confidence"
+
+    def low_hits(self, text):
+        from tools.context_index import context_index as index
+        with contextlib.closing(index.readonly(self.root / "tools/context_index/.local/index.sqlite3")) as db:
+            return [hit["confidence"] for hit in index.search(db, text, 10, None, root=self.root)["hits"]]
+
+    def test_deferrals_are_held_by_default_and_recovered_without_a_model_call(self):
+        transport = self.transport(self.DEFERRED, decision="defer")
+        self.assertEqual(self._qualify(transport)["counts"]["qualification"], {"qualified": 3, "deferred": 3})
+        self.assertEqual(set(self.blocked_codes().values()), {"standing-deferred-reviewer-deferred"})
+        spent = len(self.calls)
+        dry = cohort.recover_deferred(self.root)
+        self.assertEqual((dry["apply"], dry["candidates"], dry["skipped"]), (False, 3, {}))
+        applied = cohort.recover_deferred(self.root, apply=True)
+        self.assertEqual(applied["results"], {"qualified": 3})
+        self.assertEqual(len(self.calls), spent)
+        self.assertEqual(cohort.recover_deferred(self.root, apply=True)["candidates"], 0)
+        report = self._qualify(transport)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(self.calls), spent)
+        self.assertEqual(self.low_hits("Fund codes"), [{"level": "low", "reasons": ["reviewer-deferred"]}])
+
+    def test_qualify_opt_in_qualifies_new_and_held_deferrals_as_low_confidence(self):
+        transport = self.transport(self.DEFERRED, decision="defer")
+        self._qualify(transport)
+        spent = len(self.calls)
+        report = self._qualify(transport, deferred=self.OPT_IN)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
+        self.assertEqual(len(self.calls), spent)
+        # Append-only: each held review gained one correction that qualified it.
+        for corr in self.blocked_codes():
+            self.assertEqual(store.head(self.root, corr)["correlation_id"], corr + "-c1")
+        self.assertEqual(self.low_hits("Fund codes"), [{"level": "low", "reasons": ["reviewer-deferred"]}])
+
+    def test_rejections_and_incomplete_deferrals_stay_out_under_the_opt_in(self):
+        inner = self.transport(("Just text", "Fund codes"), decision="defer")
+
+        def mixed(model, messages):
+            reply = inner(model, messages)
+            findings = json.loads(reply["content"])
+            if "Fund codes" in messages[-1]["content"]:
+                findings["inspected_records"] = []
+            elif "Decided things" in messages[-1]["content"]:
+                findings["decision"] = "reject"
+            return {**reply, "content": json.dumps(findings)}
+        report = self._qualify(mixed, deferred=self.OPT_IN)
+        self.assertEqual(report["counts"]["qualification"],
+                         {"qualified": 4, "pending-review": 1, "rejected": 1})
+        self.assertEqual(cohort.recover_deferred(self.root)["candidates"], 0)
+
+    def test_an_unknown_deferral_mode_is_refused_before_touching_anything(self):
+        with self.assertRaises(cohort.IntakeError) as raised:
+            self._qualify(self.transport(), deferred="qualify")
+        self.assertEqual(raised.exception.code, "invalid_deferred_mode")

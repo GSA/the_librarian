@@ -31,6 +31,10 @@ FINDINGS_SCHEMAS = {"standing-findings-v1": frozenset(),
                     FINDINGS_SCHEMA: frozenset({"unverifiable_references"})}
 OUTCOMES = ("qualified", "pending-review", "rejected", "deferred", "exception")
 LIMIT = 1024 * 1024
+# How a reviewer ``defer`` ends: ``hold`` (the default) keeps it a visible, unpublished ``deferred``
+# outcome; ``qualify-low-confidence`` (an explicit operator opt-in recorded as the ``deferred``
+# argument of the standing request) qualifies a completely inspected deferral as low confidence.
+DEFERRED_MODES = ("hold", "qualify-low-confidence")
 DOCLING_INSPECTED = frozenset({"pages", "texts", "tables", "warnings"})
 EXTRACT_INSPECTED = frozenset({"records", "warnings"})
 
@@ -425,15 +429,17 @@ def _conflicting(snapshot, standing, qualified, result, args):
                and not standing_events.matches(e, candidate, args) for e in same)
 
 
-def _decision(findings, expected):
+def _decision(findings, expected, deferred):
     if findings["decision"] == "reject":
-        return "rejected", "reviewer-rejected"
-    if findings["decision"] == "defer":
-        return "deferred", "reviewer-deferred"
+        return "rejected", ("reviewer-rejected",)
+    if findings["decision"] == "defer" and deferred == "hold":
+        return "deferred", ("reviewer-deferred",)
     inspected = {key: sorted(findings["inspected"][key]) for key in expected}
     if inspected != expected:
-        return "pending-review", "insufficient-inspected-scope"
-    return "qualified", "complete-inspected-scope"
+        return "pending-review", ("insufficient-inspected-scope",)
+    if findings["decision"] == "defer":
+        return "qualified", ("complete-inspected-scope", "reviewer-deferred-low-confidence")
+    return "qualified", ("complete-inspected-scope",)
 
 
 def evaluate(root, args, snapshot=None):
@@ -452,9 +458,15 @@ def evaluate(root, args, snapshot=None):
 
     if standing["status"] != "active":
         return outcome("exception", "policy-revoked")
+    deferred = args.get("deferred", "hold")
+    if deferred not in DEFERRED_MODES:
+        raise Refusal("blocked", "standing-deferred-mode-invalid")
     findings, failure = _read_findings(root, args, standing)
     if failure:
         return outcome("exception", failure)
+    if findings["decision"] == "defer" and deferred != "hold":
+        # Set before the conflict check so a retry recognises its own low-confidence event.
+        result["deferred"] = True
     result["explanation"] = findings["explanation"]
     result["exception_resolution"] = findings["exception_resolution"]
     result["unverifiable_references"] = len(findings.get("unverifiable_references", []))
@@ -493,10 +505,10 @@ def evaluate(root, args, snapshot=None):
                  "reviewer": standing["reviewer"], "context": standing["selection"]["context"]}
     if _conflicting(snapshot, standing, qualified, result, args):
         return outcome("pending-review", "conflicting-review")
-    name, reason = _decision(findings, expected)
+    name, reasons = _decision(findings, expected, deferred)
     if name == "qualified":
         result.update(qualified, child=child)
-    return outcome(name, reason)
+    return outcome(name, *reasons)
 
 
 def refusal(result):

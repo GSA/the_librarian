@@ -79,6 +79,9 @@ def relative(value):
 
 STANDING = {"policy_path", "policy_sha256", "rendition", "rendition_sha256",
             "findings_path", "findings_sha256", "event_id"}
+# Optional on standing-review/standing-select: present only when the operator opted a request in to
+# qualifying reviewer deferrals as low confidence, so requests staged without it are unchanged.
+DEFERRED_OPT_IN = "qualify-low-confidence"
 KINDS = ("receipt", "extraction", "review", "publication", "return")
 OPERATIONS = {
     "catalog-submit": ("receipt", {"records", "actor", "request_id", "expected_state", "reason"}),
@@ -124,8 +127,11 @@ def decode_request(raw):
         kind, names = OPERATIONS[stage["operation"]]
         require(stage["kind"] == kind and KINDS.index(kind) >= previous)
         previous = KINDS.index(kind)
-        fields(stage["arguments"], names)
         args = stage["arguments"]
+        if stage["operation"] in {"standing-review", "standing-select"} and isinstance(args, dict) and "deferred" in args:
+            require(args["deferred"] == DEFERRED_OPT_IN)
+            names = names | {"deferred"}
+        fields(args, names)
         for key in names - {"records", "value", "expected_revision"}:
             text(args[key], 4096 if key in {"artifacts_path", "python", "manifest", "db", "disposition_path", "policy_path", "rendition", "findings_path"} else 500)
         if "expected_revision" in args:
