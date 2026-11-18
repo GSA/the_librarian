@@ -81,6 +81,13 @@ named stage. The ledger is operational recovery state, never corpus authority.
   qualify-low-confidence` (or `cohort recover-deferred --apply` for already held deferrals)
   qualifies a `defer` with complete inspected scope under the current policy as low confidence:
   its event adds a `Reviewer-deferred:` statement and the index labels it `reviewer-deferred`.
+  `cohort rereview` (dry run; `--apply` with `--models-config`) re-reviews, as append-only
+  corrections under the current policy, standing reviews still pending or deferred under an
+  older policy and those blocked `insufficient-inspected-scope` (`--include-current-deferred`
+  adds current-policy deferrals); it never selects rejected or out-of-scope renditions, reports
+  counts by reason and estimated model calls/prompt tokens (`--cost-estimate FILE`), takes
+  `--limit N` for staged rollout, qualifies remaining deferrals as low confidence by default,
+  and resumes staged reviews without a new model call. Run `cohort publish` afterwards.
   Every indexed document carries a `confidence` label (`normal`, or `low` with reasons
   `noted-issues`, `reviewer-deferred`, `converted-format`, `machine-ocr`, `agent-generated`,
   `open-correction`); retrieval shows it, never hides the text. When a newer document,

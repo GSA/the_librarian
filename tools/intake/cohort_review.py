@@ -142,8 +142,9 @@ def _deferred_argument(deferred):
     return {} if deferred == "hold" else {"deferred": deferred}
 
 
-def _stage_review(root, entry, run, corr, event_id, reviewed):
-    """Stage the review and selection of a reviewed rendition; return the request summary."""
+def _stage_review(root, entry, run, corr, event_id, reviewed, correction_of=None):
+    """Stage the review and selection of a reviewed rendition (as a correction of
+    ``correction_of`` when given); return the request summary."""
     review_args = {
         "policy_path": run["policy_path"], "policy_sha256": run["policy_sha"],
         "rendition": entry["rendition"], "rendition_sha256": entry["rendition_sha256"],
@@ -156,7 +157,7 @@ def _stage_review(root, entry, run, corr, event_id, reviewed):
          "arguments": {**review_args, "request_id": "req-" + corr + "-review"}},
         {"id": "select", "kind": "publication", "operation": "standing-select",
          "arguments": {**review_args, "request_id": "req-" + corr + "-select",
-                       "manifest": run["manifest"]}}])
+                       "manifest": run["manifest"]}}], correction_of=correction_of)
 
 
 def _new_review(root, entry, run, corr, event_id, reviewed):
@@ -300,8 +301,24 @@ def review_all(root, extracted, run, concurrency):
     # A request another writer stages later is still found by the fresh per-entry
     # read in _review_and_select, which then discards the unused review.
     existing = store.correlation_ids(root)
+
+    def ahead(entry, waiting):
+        # A review is started ahead only while the manifest has room for every entry
+        # still in the window; any other entry is checked exactly, in turn, in
+        # _review_and_select, so no call is paid for an entry that cannot be selected.
+        corr = "standing-" + _standing_token(entry, run["policy_sha"])
+        return corr not in existing and _free_room(root, run["manifest"]) > waiting
+    pipeline(extracted, concurrency, ahead, lambda entry: _review(root, entry, run),
+             lambda entry, prefetched: _review_and_select(root, entry, run, prefetched))
+
+
+def pipeline(entries, concurrency, ahead, review, settle):
+    """``settle(entry, prefetched)`` each entry in input order on this thread, while up to
+    ``concurrency`` ``review(entry)`` calls run ahead on workers for entries ``ahead(entry, waiting)``
+    accepts (``waiting``: entries already in the window); ``prefetched`` is the started review's
+    ``result`` callable, or None."""
     window = deque()
-    upcoming = iter(extracted)
+    upcoming = iter(entries)
     with ThreadPoolExecutor(max_workers=concurrency,
                             thread_name_prefix="cohort-review") as pool:
         try:
@@ -309,16 +326,12 @@ def review_all(root, extracted, run, concurrency):
                 # At most `concurrency` calls run; a bounded lookahead keeps workers busy
                 # while this thread finishes the ledger work for the oldest entry.
                 while len(window) < 2 * concurrency and (entry := next(upcoming, None)) is not None:
-                    corr = "standing-" + _standing_token(entry, run["policy_sha"])
-                    # A review is started ahead only while the manifest has room for every entry
-                    # still in the window; any other entry is checked exactly, in turn, in
-                    # _review_and_select, so no call is paid for an entry that cannot be selected.
-                    ahead = corr not in existing and _free_room(root, run["manifest"]) > len(window)
-                    window.append((entry, pool.submit(_review, root, entry, run) if ahead else None))
+                    started = ahead(entry, len(window))
+                    window.append((entry, pool.submit(review, entry) if started else None))
                 if not window:
                     return
                 entry, future = window.popleft()
-                _review_and_select(root, entry, run, future.result if future is not None else None)
+                settle(entry, future.result if future is not None else None)
         except BaseException:
             for _, future in window:
                 if future is not None:

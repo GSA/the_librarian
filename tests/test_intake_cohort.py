@@ -2339,3 +2339,163 @@ class DeferredLowConfidenceTests(QualifyCase):
         with self.assertRaises(cohort.IntakeError) as raised:
             self._qualify(self.transport(), deferred="qualify")
         self.assertEqual(raised.exception.code, "invalid_deferred_mode")
+
+
+class RereviewTests(QualifyCase):
+    """``cohort rereview``: held standing reviews re-reviewed under the current policy."""
+
+    POLICY = "config/standing-policy.local.json"
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+    def transport(self, defer=(), reject=(), incomplete=()):
+        def fake(model, messages):
+            self.calls.append(model)
+            text = messages[-1]["content"]
+            body = json.loads(text)
+            decision = ("reject" if any(t in text for t in reject)
+                        else "defer" if any(t in text for t in defer) else "accept")
+            return {"content": json.dumps({
+                "decision": decision,
+                "inspected_records": [] if any(t in text for t in incomplete) else [r["i"] for r in body["records"]],
+                "inspected_warnings": [w["ref"] for w in body["warnings"]],
+                "contradictions": [], "missing_evidence": [], "explanation": "Reviewed."}),
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        return fake
+
+    def write_policy(self, version, excluded=()):
+        receipts = sorted({e["receipt_id"] for e in self.entries} - set(excluded))
+        path = self.root / self.POLICY
+        path.write_text(json.dumps({
+            "schema": standing.POLICY_SCHEMA, "policy_id": "cohort-standing", "version": version,
+            "status": "active", "reviewer": "usai:gpt-5.6-terra",
+            "scope": {"receipts": receipts, "audiences": ["source"]},
+            "budget": {"max_pages": renditions.DOCLING_MAX_PAGES, "max_records": renditions.DOCLING_MAX_RECORDS,
+                       "max_findings_bytes": standing.LIMIT},
+            "selection": {"context": ["documents/context.md"]}}))
+        path.chmod(0o600)
+
+    def receipt(self, relative):
+        return next(e["receipt_id"] for e in self.entries if e["relative"] == relative)
+
+    def rereview(self, **extra):
+        return cohort.rereview(self.root, policy_path=self.POLICY, manifest="config/selection.local.json",
+                               model="gpt-5.6-terra", **extra)
+
+    def ingest(self):
+        self.entries = [e for e in cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")["entries"]
+                        if e.get("outcome") == "extracted"]
+
+    def test_older_policy_reviews_are_re_reviewed_as_corrections_never_rejected_or_out_of_scope(self):
+        self.ingest()
+        self.write_policy(1, excluded=[self.receipt("a/notes.md")])
+        report = self._qualify(self.transport(defer=["Just text"], reject=["Fund codes"],
+                                              incomplete=["Decided", "Plan"]))
+        self.assertEqual(report["counts"]["qualification"],
+                         {"qualified": 1, "rejected": 1, "deferred": 1, "pending-review": 2, "exception": 1})
+        # The policy moves on; ``plan.odt`` leaves its scope.
+        self.write_policy(2, excluded=[self.receipt("a/notes.md"), self.receipt("plan.odt")])
+        ledger = {c: store.request(self.root, c) for c in store.correlation_ids(self.root)}
+        spent = len(self.calls)
+        dry = self.rereview()
+        self.assertEqual(dry["selected"], {"older-policy-pending": 1, "older-policy-deferred": 1})
+        self.assertEqual(dry["skipped"], {"out-of-scope": 2, "rejected": 1, "reviewed": 1})
+        self.assertEqual(dry["estimate"]["model_calls"], 2)
+        self.assertEqual((len(self.calls), store.correlation_ids(self.root)), (spent, set(ledger)))
+
+        applied = self.rereview(apply=True, transport=self.transport(defer=["Just text"]), concurrency=2)
+        self.assertEqual(applied["results"], {"qualified": 1, "qualified-low-confidence": 1})
+        self.assertEqual(len(self.calls), spent + 2)
+        self.assertEqual(applied["usage"], {"prompt_tokens": 20, "completion_tokens": 10})
+        self.assertEqual(applied["throughput"]["calls"], 2)
+        # Append-only: each earlier request is unchanged; each re-reviewed head gained one correction,
+        # named as ``qualify`` names the current policy's review.
+        policy_sha = hashlib.sha256((self.root / self.POLICY).read_bytes()).hexdigest()
+        for corr, raw in ledger.items():
+            self.assertEqual(store.request(self.root, corr), raw)
+        corrected = [r for r in store.list_requests(self.root) if r["correction_of"] in ledger]
+        self.assertEqual(len(corrected), 2)
+        for request in corrected:
+            self.assertTrue(request["correlation_id"].endswith("-" + policy_sha[:8]))
+            self.assertTrue(request["complete"])
+        again = self.rereview()
+        self.assertEqual((again["selected"], again["estimate"]["model_calls"]), ({}, 0))
+        # A later qualify finds the re-reviewed renditions and pays only for the others.
+        spent = len(self.calls)
+        report = self._qualify(self.transport(reject=["Fund codes"]))
+        self.assertEqual(len(self.calls), spent + 2)  # ``inside`` and ``Fund codes`` under policy 2
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 3, "rejected": 1, "exception": 2})
+        from tools.context_index import context_index as index
+        with contextlib.closing(index.readonly(self.root / "tools/context_index/.local/index.sqlite3")) as db:
+            hits = index.search(db, "Just text", 10, None, root=self.root)["hits"]
+        self.assertEqual([h["confidence"] for h in hits], [{"level": "low", "reasons": ["reviewer-deferred"]}])
+
+    def test_current_policy_incomplete_reviews_resume_after_interruption_with_cost_reported(self):
+        self._qualify(self.transport(defer=["Decided", "Fund codes"], incomplete=["Just text", "Plan", "Fund codes"]))
+        self.assertEqual(self.rereview()["selected"], {"insufficient-inspected-scope": 2})
+        widened = self.rereview(include_current_deferred=True)
+        self.assertEqual(widened["selected"], {"insufficient-inspected-scope": 2, "current-policy-deferred": 1})
+        # A complete deferral needs no model call: ``recover-deferred`` qualifies it.
+        self.assertEqual(widened["skipped"]["recoverable-without-model"], 1)
+        estimate = Path(self.temp.name) / "cost-estimate.json"
+        estimate.write_text(json.dumps({"gpt-5.6-terra": {"per_document": {"prompt_tokens": 100,
+                                                                           "completion_tokens": 7}}}))
+        limited = self.rereview(limit=1, cost_estimate=estimate)
+        self.assertEqual(limited["over_limit"], {"insufficient-inspected-scope": 1})
+        self.assertEqual(limited["estimate"]["model_calls"], 1)
+        self.assertEqual(limited["estimate"]["by_count"], {"prompt_tokens": 100, "completion_tokens": 7})
+        self.assertGreater(limited["estimate"]["prompt_tokens_approx"], 0)
+
+        spent = len(self.calls)
+        with unittest.mock.patch.object(cohort_review, "_run_review", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.rereview(apply=True, limit=1, transport=self.transport())
+        self.assertEqual(len(self.calls), spent + 1)
+        resumed = self.rereview()
+        self.assertEqual(resumed["selected"], {"resume": 1, "insufficient-inspected-scope": 1})
+        self.assertEqual(resumed["estimate"]["model_calls"], 1)
+        applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(applied["results"], {"qualified": 2})
+        self.assertEqual(len(self.calls), spent + 2)
+        self.assertEqual(self.rereview()["selected"], {})
+        for request in store.list_requests(self.root):
+            if request["correction_of"]:
+                self.assertEqual(request["correlation_id"], request["correction_of"] + "-c1")
+
+    def test_a_rendition_rejected_under_an_older_policy_stays_out_when_its_current_review_is_incomplete(self):
+        self.ingest()
+        self.write_policy(1)
+        self._qualify(self.transport(reject=["Fund codes"]))
+        self.write_policy(2)
+        self._qualify(self.transport(incomplete=["Fund codes"]))
+        dry = self.rereview(include_current_deferred=True)
+        self.assertEqual(dry["selected"], {})
+        self.assertEqual(dry["skipped"]["rejected"], 1)
+
+    def test_a_review_interrupted_before_selection_is_selected_on_rerun_without_a_model_call(self):
+        self._qualify(self.transport(incomplete=["Just text"]))
+        spent = len(self.calls)
+        with unittest.mock.patch.object(cohort_review, "_run_select", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(len(self.calls), spent + 1)
+        self.assertEqual(self.rereview()["selected"], {"resume": 1})
+        applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(applied["results"], {"qualified": 1})
+        self.assertEqual(len(self.calls), spent + 1)
+        self.assertEqual(self.rereview()["selected"], {})
+
+    def test_cli_dry_run_prints_the_report_and_apply_needs_a_models_config(self):
+        self._qualify(self.transport(incomplete=["Just text"]))
+        args = ["rereview", "--root", str(self.root), "--policy", self.POLICY,
+                "--manifest", "config/selection.local.json", "--model", "gpt-5.6-terra"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cohort.main(args), 0)
+        self.assertEqual(json.loads(out.getvalue())["selected"], {"insufficient-inspected-scope": 1})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(cohort.main(args + ["--apply"]), 2)
+        self.assertEqual(json.loads(err.getvalue()), {"error": "models_config_required"})

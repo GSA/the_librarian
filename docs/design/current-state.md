@@ -614,6 +614,33 @@ restated here.
   the index build, so an incremental build is not pursued. Evidence:
   `tests/test_intake_cohort.py::PublishTests`.
 
+- **Re-review of blocked standing reviews.** `cohort rereview` (dry run by default, `--apply`)
+  selects standing-review chain heads that can still qualify only with a new model review:
+  heads reviewed under an older policy that are pending (`standing-policy-changed`,
+  `unresolved-evidence`, `insufficient-inspected-scope`) or deferred, current-policy heads blocked
+  `insufficient-inspected-scope` (including `unresolved-evidence` ones that re-evaluate as
+  insufficient), and with `--include-current-deferred` current-policy deferrals whose saved
+  findings cannot qualify without a model. A rendition already reviewed and selected under any
+  chain, rejected or refused as out of scope under any chain (older policies included), out of the
+  current policy's scope, superseded in the docs table
+  (`stale-rendition`) or recoverable from saved findings (`recoverable-without-model`, left to
+  `recover-*`) is skipped with that reason; a rejected or out-of-scope rendition is never
+  selected. The dry run counts selected/skipped heads by reason and estimates model calls and
+  prompt size (about four characters per token, plus `by_count` from a `--cost-estimate` file's
+  per-document averages); `--limit N` bounds model calls for a staged rollout (`over_limit`).
+  `--apply` reviews each selected head with qualify's plumbing (models config, the policy's context,
+  adaptive concurrency, throttle/backoff, `--inspected-form`, usage and throughput reporting) and
+  stages the review as an append-only correction of the old head (an older-policy head under the
+  current-policy chain name, so a later `qualify` finds it), then selects. `--deferred` defaults
+  to `qualify-low-confidence` here, so a head still deferred qualifies as `reviewer-deferred` low
+  confidence; a rejection stays out. A staged but unfinished re-review, or a current-policy review whose
+  selection is unfinished (interrupted, or the manifest was full), is resumed without a new model
+  call, so an interrupted run is rerunnable. Nothing is published until `cohort publish`.
+  Insufficient-scope reviews on a live cohort were accepts over long renditions (median about
+  2,200 records) whose inspected-record list was abbreviated; `--inspected-form ranges` lets the
+  reviewer state full coverage compactly while the completeness gate is unchanged. Evidence:
+  `tests/test_intake_cohort.py::RereviewTests`.
+
 ## 4. Backups
 
 - Catalog, review-event and claim-correction writes take a verified `daily` snapshot before the
