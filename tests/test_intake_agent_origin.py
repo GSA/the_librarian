@@ -139,7 +139,7 @@ class AgentOriginTests(QualifyCase):
         git(self.docs, "add", "-A")
         git(self.docs, "commit", "-q", "-m", "later")
         relabelled = cohort.ingest(self.root, self.docs, system="agent-docs", actor="cohort-runner",
-                                   origin=self.origin())
+                                   origin=self.origin(), trust_stat=True)
         self.assertEqual(relabelled["counts"]["failed_by_code"], {"receipt/submission_conflict": 2})
         self.assertEqual(relabelled["counts"]["outcome"]["extracted"], 1)
 
@@ -155,6 +155,19 @@ class AgentOriginTests(QualifyCase):
         bundle = git(self.docs, "log", "-1", "--format=%H", "--", "ACTIVE/bundle.zip")
         self.assertEqual((member["provenance"], member["agent_generated"]["source_commit"]),
                          ("committed", bundle))
+        excluded = cohort.classify(self.root, self.docs, origin=self.origin(exclude=["ACTIVE/bundle.zip!/inner.md"]))
+        self.assertEqual(next(e for e in excluded if e["relative"] == "ACTIVE/bundle.zip!/inner.md"),
+                         {"relative": "ACTIVE/bundle.zip!/inner.md", "disposition": "excluded", "format": None})
+
+    def test_a_deleted_then_recreated_file_is_uncommitted(self):
+        self.repository()
+        git(self.docs, "rm", "-q", "README.md")
+        git(self.docs, "commit", "-q", "-m", "drop readme")
+        (self.docs / "README.md").write_bytes(FILES["README.md"])
+        entries = cohort.classify(self.root, self.docs, origin=self.origin())
+        agent_origin.declare(self.docs, self.origin(), entries)
+        readme = next(e for e in entries if e["relative"] == "README.md")
+        self.assertEqual((readme["provenance"], readme["agent_generated"]["source_commit"]), ("uncommitted", None))
 
     def test_git_provenance_needs_the_repository_root(self):
         self.repository()

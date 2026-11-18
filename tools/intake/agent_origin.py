@@ -147,7 +147,11 @@ def git_provenance(inbox, origin):
         return {"head": None, "commits": {}, "modified": set()}
     log = _git(inbox, "log", "--no-renames", "--format=%x01%H %as", "--name-only", "-z", *pathspec)
     status = _git(inbox, "status", "--porcelain=v1", "-z", "--untracked-files=no", *pathspec)
-    return {"head": head, "commits": _last_commits(log), "modified": _modified(status)}
+    # History also names deleted paths; only files in HEAD's tree can have committed bytes.
+    tracked = {_decode(name) for name in
+               _git(inbox, "ls-tree", "-r", "-z", "--name-only", "HEAD", *pathspec).split(b"\0") if name}
+    commits = {path: found for path, found in _last_commits(log).items() if path in tracked}
+    return {"head": head, "commits": commits, "modified": _modified(status)}
 
 
 def declare(inbox, origin, entries):

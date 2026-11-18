@@ -160,7 +160,7 @@ def _archive_disposition(root, path, inbox_file):
             "_manifest": manifest}
 
 
-def _member_entries(root, relative, manifest, trusted, provisioned=False):
+def _member_entries(root, relative, manifest, trusted, provisioned=False, excluded=lambda name: False):
     """One entry per file member of an instance-expanded archive, named ``<archive>!/<member>``.
 
     Stored members are classified like inbox files from their stored bytes (``_source``); members
@@ -172,6 +172,9 @@ def _member_entries(root, relative, manifest, trusted, provisioned=False):
     entries = []
     for index, member in enumerate(manifest["members"]):
         name = relative + archives.SEPARATOR + (member["path"] or "#%d" % index)
+        if excluded(name):
+            entries.append({"relative": name, "disposition": "excluded", "format": None})
+            continue
         if member["disposition"] != "extracted":
             entries.append({"relative": name, "disposition": MEMBER_DISPOSITIONS.get(member["code"], "unsafe-path"),
                             "format": None, "bytes": member["bytes"], "code": "archive-" + member["code"]})
@@ -247,7 +250,8 @@ def classify(root, inbox, trusted=None, keep_stat=False, origin=None):
             entry = pending.pop()
             manifest = entry.pop("_manifest", None)
             if manifest is not None:
-                pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned))
+                pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned,
+                                               lambda name: agent_origin.excluded(origin, name)))
             if not keep_stat:
                 for key in ("_stat", "_fast", "_source"):
                     entry.pop(key, None)
@@ -711,7 +715,8 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
     contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
     contracts.require(type(extract_concurrency) is int and extract_concurrency >= 1, "invalid_concurrency")
     trusted = {}
-    if trust_stat:
+    # A stat-trusted file skips submission, so a changed agent declaration would go unchecked.
+    if trust_stat and origin is None:
         with store.locked(root) as c:
             trusted = docs.load(c, system)
     entries = classify(root, inbox, trusted, True, origin)

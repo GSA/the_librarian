@@ -624,7 +624,7 @@ be the top level of a git work tree (`agent_origin_not_repository_root`, and
 `agent_origin_git_unavailable` when git fails); git runs read-only (no optional locks, fsmonitor,
 signatures or pager). A tracked, unmodified file is declared with the last commit that touched it
 and its author date (`committed`); a modified, untracked or ignored file has neither
-(`uncommitted`), since its bytes are in no commit. A member of an expanded archive is declared like the archive file it came from. Reports count them in
+(`uncommitted`), since its bytes are in no commit. A member of an expanded archive is declared like the archive file it came from, and an `exclude` may name a member (`ARCHIVE!/MEMBER`) or a nested archive. A run with `--agent-origin` does not take the `--trust-stat` fast path, so every file's declaration is checked against its submission. Reports count them in
 `counts.agent_origin.declared` (`committed`, `uncommitted`, `none`) with the work tree's `head`;
 `classify` also counts admitted `format`s and `admitted_bytes`, so it is the dry run.
 
