@@ -553,7 +553,8 @@ Members are checked before any byte is written:
 - **Unreadable members:** encrypted members (`encrypted`), unknown compression and bad CRCs are
   refused (`unsupported-compression`, `corrupt-member`).
 - **Archive-level limits:** an archive over 100,000 members, 16 GiB expanded, or a 200:1
-  expansion ratio (counted once 64 MiB is expanded) is refused as a whole (`too-many-members`,
+  expansion ratio (counted once 64 MiB is expanded; for compressed tars every decompressed byte
+counts, including skipped or refused payloads) is refused as a whole (`too-many-members`,
   `expanded-size-cap`, `ratio-cap`). An unreadable archive is refused as `archive-unreadable`.
   The refused manifest is kept and no members are stored. `classify` reports the archive as
   `needs-reader` with code `archive-<code>`. To retry, remove that `<sha256>/` directory.

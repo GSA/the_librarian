@@ -174,7 +174,11 @@ def _member_entries(root, relative, manifest, trusted):
             continue
         source = stored / member["path"]
         entry = _disposition(root, source, name, trusted, nested=name.count(archives.SEPARATOR))
-        if entry.get("sha256") not in (None, member["sha256"]):
+        current = entry.get("sha256")
+        if current is None and source.is_file() and not source.is_symlink():
+            # Dispositions decided without reading (empty, assets, over-limit, ...) still verify the bytes.
+            current = sha256_file(source)
+        if current != member["sha256"]:
             entry = {"relative": name, "disposition": "unsafe-path", "format": None,
                      "code": "archive-member-changed"}
         entries.append({**entry, "_source": source})

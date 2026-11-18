@@ -16,8 +16,10 @@ no content: ``link``, ``special``) and ``refused`` (``unsafe-name``, ``duplicate
 ``archive-unreadable``, ``too-many-members``, ``expanded-size-cap``, ``ratio-cap``.
 """
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import bz2
 import fcntl
+import gzip
 import hashlib
 import json
 import lzma
@@ -130,8 +132,63 @@ def _zip_entries(handle):
                 yield info.filename, "file", info.file_size, lambda info=info: archive.open(info)
 
 
-def _tar_entries(handle):
-    with tarfile.open(fileobj=handle, mode="r:*") as archive:
+# A tar stream's headers and padding add at most this much to its members' bytes before
+# ``_TarBudget`` refuses it (a pax header can be large, so this is generous).
+TAR_OVERHEAD_PER_MEMBER = 64 * 1024
+COMPRESSED_TAR = {b"\x1f\x8b": "gzip", b"BZh": "bz2", b"\xfd7zXZ\x00": "xz"}
+
+
+class _TarBudget:
+    """A decompressed tar stream that counts every byte ``tarfile`` decompresses, including the
+    payloads of refused or skipped members it seeks past, against the expanded-size and ratio caps."""
+
+    def __init__(self, stream, archive_bytes):
+        self.stream, self.archive_bytes = stream, archive_bytes
+
+    def _check(self):
+        position = self.stream.tell()
+        if position > MAX_EXPANDED_BYTES + TAR_OVERHEAD_PER_MEMBER * MAX_MEMBERS:
+            raise Refused("expanded-size-cap")
+        if position > RATIO_FLOOR and position > MAX_RATIO * max(self.archive_bytes, 1):
+            raise Refused("ratio-cap")
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            return b"".join(iter(lambda: self.read(CHUNK), b""))
+        data = self.stream.read(size)
+        self._check()
+        return data
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_CUR:
+            offset, whence = self.stream.tell() + offset, os.SEEK_SET
+        if whence != os.SEEK_SET or offset < self.stream.tell():
+            return self.stream.seek(offset, whence)
+        # A forward seek decompresses everything it skips: do it in checked reads.
+        while self.stream.tell() < offset and self.read(min(CHUNK, offset - self.stream.tell())):
+            pass
+        return self.stream.tell()
+
+    def tell(self):
+        return self.stream.tell()
+
+
+def _decompressed(handle):
+    """The tar stream inside ``handle``: gzip, bzip2 or xz by magic bytes, else ``handle`` itself."""
+    magic = handle.read(6)
+    handle.seek(0)
+    compression = next((name for prefix, name in COMPRESSED_TAR.items() if magic.startswith(prefix)), None)
+    if compression == "gzip":
+        return gzip.GzipFile(fileobj=handle, mode="rb")
+    if compression == "bz2":
+        return bz2.BZ2File(handle, "rb")
+    if compression == "xz":
+        return lzma.LZMAFile(handle, "rb")
+    return nullcontext(handle)
+
+
+def _tar_entries(handle, archive_bytes):
+    with _decompressed(handle) as stream, tarfile.open(fileobj=_TarBudget(stream, archive_bytes), mode="r:") as archive:
         while (info := archive.next()) is not None:
             if info.isdir():
                 yield info.name, "directory", 0, None
@@ -299,7 +356,8 @@ def read(path, relative, *, sink=None, sibling=None, inbox=None):
     status, code = ("pre-expanded" if sibling is not None else "expanded"), None
     with handle:
         try:
-            for name, what, size, opener in (_zip_entries if archive_kind == "zip" else _tar_entries)(handle):
+            entries = _zip_entries(handle) if archive_kind == "zip" else _tar_entries(handle, before.st_size)
+            for name, what, size, opener in entries:
                 run.add(name, what, size, opener)
         except Refused as refusal:
             status, code = "refused", refusal.code

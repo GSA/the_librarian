@@ -226,6 +226,20 @@ class ExpandTests(ArchiveCase):
             manifest = archives.read(self.inbox / "bomb.zip", "bomb.zip")
         self.assertEqual((manifest["status"], manifest["code"]), ("refused", "expanded-size-cap"))
 
+    def test_compressed_tar_payloads_count_against_the_caps_even_when_refused(self):
+        for name in ("../zeros.md", "a/zeros.md"):
+            raw = make_tar([tar_file(name, b"\0" * 400_000), tar_file("ok.md", b"# ok\n")])
+            for patch, code in (("RATIO_FLOOR", "ratio-cap"), ("MAX_EXPANDED_BYTES", "expanded-size-cap")):
+                with self.subTest(name=name, code=code), unittest.mock.patch.object(archives, patch, 1000), \
+                        unittest.mock.patch.object(archives, "TAR_OVERHEAD_PER_MEMBER", 0):
+                    self.put("t.tar.gz", raw)
+                    manifest = archives.read(self.inbox / "t.tar.gz", "t.tar.gz")
+                    self.assertEqual((manifest["status"], manifest["code"]), ("refused", code))
+        for mode in ("w:bz2", "w:xz", "w:"):
+            raw = make_tar([tar_file("a.md", b"# a\n")], mode=mode)
+            self.put("t.tar", raw)
+            self.assertEqual(archives.read(self.inbox / "t.tar", "t.tar")["members"][0]["disposition"], "extracted")
+
     def test_sibling_folder_is_verified_by_hash_and_classify_is_unchanged(self):
         self.put("site.zip", make_zip([("a.md", b"# A\n"), ("b.md", b"# B\n"), ("c.md", b"# C\n")]))
         self.put("_extracted/site/a.md", b"# A\n")
@@ -267,6 +281,17 @@ class IngestMemberTests(ArchiveCase):
         self.assertEqual(sidecar["origin"]["locator"], "drop/bundle.zip%21/docs/a.md")
         self.assertEqual(sidecar["original"]["sha256"], hashlib.sha256(b"# A\nalpha\n").hexdigest())
         self.assertNotIn("_source", json.dumps(report, default=str))
+        stored = (self.root / ".local/intake/archives" / hashlib.sha256((self.inbox / "drop/bundle.zip").read_bytes())
+                  .hexdigest() / "members")
+        (stored / "web/app.js").write_bytes(b"y()")
+        (stored / "docs/a.md").write_bytes(b"")
+        entries = self.entries()
+        self.assertEqual({k: (entries[k]["disposition"], entries[k]["code"]) for k in
+                          ("drop/bundle.zip!/web/app.js", "drop/bundle.zip!/docs/a.md")},
+                         {"drop/bundle.zip!/web/app.js": ("unsafe-path", "archive-member-changed"),
+                          "drop/bundle.zip!/docs/a.md": ("unsafe-path", "archive-member-changed")})
+        (stored / "web/app.js").write_bytes(b"x()")
+        (stored / "docs/a.md").write_bytes(b"# A\nalpha\n")
         again = cohort.ingest(self.root, self.inbox, system="inbox", actor="runner")
         self.assertEqual(again["counts"]["outcome"], report["counts"]["outcome"])
         trusted = cohort.ingest(self.root, self.inbox, system="inbox", actor="runner", trust_stat=True)
@@ -305,6 +330,8 @@ class DeleteOriginalTests(ArchiveCase):
 
     def test_verified_dry_run_then_apply_records_before_deleting_and_is_idempotent(self):
         self.expand()
+        log = self.root / ".local/intake/archives/deletions.jsonl"
+        log.write_bytes(b'{"inbox": "/elsewhere", "relative": "earlier.zip", "sha256": "0"}\n{"relative": "torn')
         cohort.ingest(self.root, self.inbox, system="inbox", actor="runner")
         report = self.delete()
         self.assertEqual((report["status"], report["registered"], report["blockers"]), ("verified", 2, []))
@@ -320,13 +347,14 @@ class DeleteOriginalTests(ArchiveCase):
         with unittest.mock.patch.object(cohort_archives.os, "unlink", crash):
             with self.assertRaises(OSError):
                 self.delete(apply=True)
-        self.assertEqual(len(self.deletions()), 1)
+        self.assertEqual(len(self.deletions()), 2)
         self.assertTrue((self.inbox / "drop/bundle.zip").exists())
         self.assertIs(os.unlink, real_unlink)
         report = self.delete(apply=True)
         self.assertEqual((report["status"], report["deleted"]), ("deleted", True))
         self.assertFalse((self.inbox / "drop/bundle.zip").exists())
-        (record,) = self.deletions()
+        earlier, record = self.deletions()
+        self.assertEqual(earlier["relative"], "earlier.zip")
         sha = hashlib.sha256(self.raw).hexdigest()
         manifest = self.root / ".local/intake/archives" / sha / "manifest.json"
         self.assertEqual({k: record[k] for k in ("relative", "bytes", "sha256", "manifest_sha256", "actor")},
@@ -334,7 +362,7 @@ class DeleteOriginalTests(ArchiveCase):
                           "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
                           "actor": "operator"})
         self.assertEqual(self.delete(apply=True)["status"], "already-deleted")
-        self.assertEqual(len(self.deletions()), 1)
+        self.assertEqual(len(self.deletions()), 2)
 
     def test_changed_stored_member_unsupported_member_and_nested_archive_block(self):
         self.expand()

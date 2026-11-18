@@ -171,10 +171,9 @@ def _append(directory, record):
     """Append one deletion record and make it durable before anything is unlinked."""
     path = store.safe(Path(directory) / DELETIONS)
     created = not path.exists()
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "ab") as stream:
-        if stream.tell() and _torn(path):
-            stream.write(b"\n")
+        _repair_tail(stream.fileno())
         stream.write((json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
         stream.flush()
         os.fsync(stream.fileno())
@@ -183,10 +182,22 @@ def _append(directory, record):
     fsync_file(path)
 
 
-def _torn(path):
-    with open(path, "rb") as stream:
-        stream.seek(-1, os.SEEK_END)
-        return stream.read(1) != b"\n"
+def _repair_tail(descriptor):
+    """Before appending (under the store lock): end a complete last record that lacks only its
+    newline, and cut a torn one (a crash while appending) back to the last complete record."""
+    size = os.fstat(descriptor).st_size
+    if not size or os.pread(descriptor, 1, size - 1) == b"\n":
+        return
+    start = max(0, size - archives.MAX_MANIFEST_BYTES)
+    data = os.pread(descriptor, size - start, start)
+    cut = data.rfind(b"\n") + 1
+    try:
+        json.loads(data[cut:].decode("utf-8"))
+    except (UnicodeError, ValueError):
+        os.ftruncate(descriptor, start + cut)
+    else:
+        os.write(descriptor, b"\n")
+    os.fsync(descriptor)
 
 
 def _registered(root, wanted):
