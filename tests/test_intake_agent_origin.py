@@ -143,6 +143,19 @@ class AgentOriginTests(QualifyCase):
         self.assertEqual(relabelled["counts"]["failed_by_code"], {"receipt/submission_conflict": 2})
         self.assertEqual(relabelled["counts"]["outcome"]["extracted"], 1)
 
+    def test_expanded_archive_members_are_declared_with_their_archive_files_commit(self):
+        from tests.test_intake_archives import make_zip
+        from tools.intake import cohort_archives
+        (self.docs / "ACTIVE/bundle.zip").write_bytes(make_zip([("inner.md", b"# Inner\nZebra.\n")]))
+        self.repository()  # commits ACTIVE, the archive with it
+        cohort_archives.expand(self.root, self.docs, apply=True)
+        entries = cohort.classify(self.root, self.docs, origin=self.origin())
+        agent_origin.declare(self.docs, self.origin(), entries)
+        member = next(e for e in entries if e["relative"] == "ACTIVE/bundle.zip!/inner.md")
+        bundle = git(self.docs, "log", "-1", "--format=%H", "--", "ACTIVE/bundle.zip")
+        self.assertEqual((member["provenance"], member["agent_generated"]["source_commit"]),
+                         ("committed", bundle))
+
     def test_git_provenance_needs_the_repository_root(self):
         self.repository()
         with self.assertRaises(IntakeError) as raised:
