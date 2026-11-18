@@ -14,7 +14,7 @@ from tools.review_events import event_reader
 from tools.review_events import event_history, event_store as events
 from tools.extraction import convert, docling_adapter as docling
 from tools.extraction import extract
-from tools.extraction import pdf_image
+from tools.extraction import pdf_image, pdf_pages
 from tools.context_index import context_index as index
 from . import standing, standing_events, standing_publication
 from .contracts import IntakeError, identifier, require
@@ -117,8 +117,10 @@ def pinned_metadata(intent, checksum):
 
 
 def extractor_for(format_name):
-    """The extraction lifecycle module for ``format_name``: PDF/image renditions, the office/RTF
+    """The extraction lifecycle module for ``format_name``: PDF pages, images, the office/RTF
     document converter or ``extract``."""
+    if format_name in pdf_pages.FORMATS:
+        return pdf_pages
     if format_name in pdf_image.FORMATS:
         return pdf_image
     return convert if format_name in convert.FORMATS else extract
@@ -475,8 +477,8 @@ def execute_batch(root, entries):
                       "expected_state": args.get("expected_state"), "prepared": prepared})
         owners.append(index)
     registered = {}
-    # Text-family, PDF/image and converted renditions register through their own lifecycle, one batch each.
-    for module in (extract, pdf_image, convert):
+    # Text-family, PDF, image and converted renditions register through their own lifecycle, one batch each.
+    for module in (extract, pdf_image, pdf_pages, convert):
         chosen = [(owner, item) for owner, item in zip(owners, items)
                   if extractor_for(item["format_name"]) is module]
         if not chosen:

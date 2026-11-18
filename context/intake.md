@@ -89,7 +89,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
   `--limit N` for staged rollout, qualifies remaining deferrals as low confidence by default,
   and resumes staged reviews without a new model call. Run `cohort publish` afterwards.
   Every indexed document carries a `confidence` label (`normal`, or `low` with reasons
-  `noted-issues`, `reviewer-deferred`, `converted-format`, `machine-ocr`, `agent-generated`,
+  `noted-issues`, `reviewer-deferred`, `converted-format`, `machine-ocr`, `agent-generated`, `incomplete-rendition`,
   `open-correction`); retrieval shows it, never hides the text. When a newer document,
   meeting transcript or answered question contradicts or settles a claim, record it with
   `python -m tools.review_events.corrections record|resolve` or `intake FILE` (a
@@ -425,9 +425,11 @@ format, else the entry fails as `correction_mismatch` (`ambiguous_correction` fo
 two children); neither aborts the run. The
 optional `--report` (0600) lists per-file paths, hashes and outcomes and is
 private instance data. Extraction never reviews, selects or qualifies. PDFs and images are converted
-before each chunk's ledger stages, `--extract-concurrency` (default 2) files at a time, each in
-its own bounded child process; a refused file is a blocked `extract-prepare` with an `extract-<code>`
-code and is not converted again on rerun (limits, codes and the `pdf-text`/`ocr` rendition marker:
+before each chunk's ledger stages, `--extract-concurrency` (default 2) child processes at a time. A
+PDF is read page by page (text layer or OCR of that page), each OCR page retried once and otherwise
+kept as a placeholder with its code; an image is one bounded child. A refused file is a blocked
+`extract-prepare` with an `extract-<code>` code and is not converted again on rerun (limits, codes
+and the `pdf-pages`/`ocr` rendition marker:
 [tools/extraction/README.md](../tools/extraction/README.md#pdf-and-image-text-in-cohort-intake)).
 
 `qualify ... --system LABEL --actor A --policy PATH --manifest PATH

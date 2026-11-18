@@ -185,20 +185,25 @@ same request.
 
 ## PDF and image text in cohort intake
 
-`tools/extraction/pdf_image.py` lets cohort intake (`python -m tools.intake.cohort
-ingest|qualify`) read `.pdf`, `.png`, `.jpg` and `.jpeg` files through the pinned
-environment above. Simplest reader first:
+Cohort intake (`python -m tools.intake.cohort ingest|qualify`) reads `.pdf` files
+page by page (`tools/extraction/pdf_pages.py`) and `.png`, `.jpg` and `.jpeg`
+files whole (`tools/extraction/pdf_image.py`) through the pinned environment
+above. Simplest reader first:
 
-- **PDF text layer.** `pdf_text_worker.py` reads the embedded text with the locked
+- **PDFs are unstapled into pages.** `pdf_page_worker.py inventory` reads each
+  page's embedded text layer, image-object count and size with the locked
   `pypdfium2`, run `-I` in the Docling interpreter inside `unshare -Urn` (no
-  network). It is used when the document has at least 200 letters or digits and
-  every page that draws an image has at least 200 letters or digits that are at
-  least half of its non-space characters (`TEXT_LAYER` in `pdf_image.py`). A
-  short page without images has nothing to OCR and is kept. Tables and layout
-  are not reconstructed; that loss is accepted.
-- **Docling OCR/layout** for every other PDF (scanned or low-text pages) and for
-  every image, through the unchanged `docling_adapter` and worker. The reason a
-  PDF fell back is recorded in `method.fallback` and as a warning. Docling sizes
+  network). A page keeps its **text layer** when it has at least 200 letters or
+  digits that are at least half of its non-space characters, or when it draws no
+  image and the document has at least 200 letters or digits overall (a short
+  page without images has nothing to OCR). Tables and layout are not
+  reconstructed; that loss is accepted.
+- **Every other page is OCRed alone.** `pdf_page_worker.py render` draws just
+  that page as a grayscale PNG at 216 DPI (Docling's own 3x OCR scale), reduced
+  to fit 98% of the 32,000,000-pixel cap, so an oversized drawing sheet is read
+  smaller rather than refused (`render_scale` records it). The PNG goes through
+  the unchanged `docling_adapter` and worker.
+- **Images** always use Docling OCR/layout through `pdf_image.py`. Docling sizes
   an image page from its DPI metadata; the bytes handed to Docling get a DPI
   (`method.ocr_dpi`, at least 72) at which the 3x OCR raster fits the 32,000,000
   pixel cap, so ordinary screenshots are not refused. Pixel data is unchanged
@@ -206,16 +211,48 @@ environment above. Simplest reader first:
 
 Each rendition is an ordinary `A-extract-<run>` extraction with a page-located
 `lines` payload (`{"line", "page", "text"}`). The machine-readable marker is
-`payload.format`: `pdf-text` (`method.kind: "pdf-text-layer"`) or `ocr`
-(`method.kind: "docling-ocr"`), with `payload.source_format` `pdf` or `image`.
-Retrieval labels `ocr` low confidence `machine-ocr` and `pdf-text`
-`converted-format` (`confidence.RENDITION_REASONS`): the text layer is the PDF's own
-text, not recognised from pixels, but its layout and tables are lost.
-The extractor identity hashes `pdf_image.py`, `pdf_text_worker.py`, the lock,
-the Docling code and profile, the routing thresholds and limits, and the
-instance policy; changing any of them is a new run.
+`payload.format`: a PDF is `pdf-pages` (`method.kind: "pdf-pages"`) and an image
+`ocr` (`method.kind: "docling-ocr"`). A `pdf-pages` payload records every page's
+outcome in `pages`: `{"page", "outcome": "text-layer", "text_chars",
+"image_objects"}`, `{"page", "outcome": "ocr", "textless", "attempts",
+"render_scale", "confidence"}` or `{"page", "outcome": "failed", "code",
+"attempts"}`, plus `page_count` and `unread_pages`. A failed page leaves one
+placeholder line in its place, for example `[Page 7 not extracted:
+extract-timeout after 2 attempts]`, and a warning. Retrieval labels the union of
+the pages' kinds (`confidence.page_kinds`): text-layer pages add
+`converted-format`, OCR pages `machine-ocr`, and failed or unread pages
+`incomplete-rendition` naming them; an image `ocr` is `machine-ocr`.
+PDF renditions written by `pdf_image` (`pdf-text`, `ocr` from a PDF) stay valid
+and keep their labels. The `pdf-pages` identity hashes `pdf_pages.py`,
+`pdf_page_worker.py`, `pdf_image.py` (shared helpers), the lock, the Docling code
+and profile, the thresholds, render settings and limits, and the instance policy;
+the image identity is unchanged. Changing any of them is a new run.
 
-**Hardening.** Every file converts in its own child process
+**PDF hardening and retry.** The inventory and every OCR page are separate
+units, each in its own child process (`python -m tools.extraction.pdf_pages unit`)
+in a private directory below `data/extractions/.local/work/` that is removed
+afterwards, with a 16 GiB address-space limit and 600 CPU seconds. The inventory
+has 330 wall seconds; an OCR page 300 (the slowest measured page took 160 under
+4-way load), ending its Docling conversion 15 seconds earlier. Each unit runs as PID 1 of its own PID namespace (`unshare -Ur --pid
+--fork --kill-child`), so when it ends or is killed every process it started dies
+with it, including workers in sessions of their own; its process group is killed
+too, and every unit alarm fires before its parent's. The page worker itself is limited to 2 GiB, 300 CPU and wall seconds.
+**A unit that times out or crashes is retried once**; a page that still fails, or
+is refused (`extract-pixel-limit`, `extract-malformed-page`, ...), becomes a
+failed page with its code and attempts, and the rest of the document is kept.
+Budgets per document replace the old 100-page refusal: at most 5,000 pages are
+read (the rest are recorded in `unread_pages` with code `extract-page-budget`
+and one placeholder line; pages after 24 MiB of text-layer text likewise, with
+`extract-output-limit`), 200,000 line records including placeholders (the page
+that would not fit and all later ones fail as `extract-record-limit` behind one
+range placeholder), and 7,200 seconds of OCR units (later OCR pages fail as
+`extract-time-budget` without running). The document is refused only when it
+cannot be opened (`extract-encrypted`, `extract-malformed-source`, an inventory
+`extract-timeout` after two attempts), when every page failed (their shared
+code, else `extract-all-pages-failed`) or when no page has any text
+(`extract-empty-conversion`). Sources are limited to 64 MiB.
+
+**Image hardening.** Every image converts in its own child process
 (`python -m tools.extraction.pdf_image child`) in a private directory below
 `data/extractions/.local/work/` that is removed afterwards, with an address-space
 limit of 16 GiB, 1,800 CPU seconds and a 900-second wall clock (its process
@@ -233,8 +270,9 @@ then a blocked extraction stage with an `extract-<code>` code, for example
 cohort or changes another file's ledger entries, and a rerun does not convert it
 again.
 
-**Concurrency.** Each chunk's conversions run before its ledger stages,
-`--extract-concurrency N` at once (default 2). The ledger's prepare stage then
+**Concurrency.** Each chunk's conversions run before its ledger stages, PDFs
+then images, `--extract-concurrency N` child processes at once (default 2): for
+PDFs, inventory and page units of all the chunk's documents share that bound. The ledger's prepare stage then
 finds the published rendition (or the file's refusal) and does not convert
 under the ledger. Budget about 1.5 GiB resident per OCR conversion. With
 `--batch-size 1` conversions run one at a time inside the prepare stage.
@@ -252,8 +290,17 @@ The MCP preflight reports the same as `pdf_image_runtime` (informational). Until
 the runtime is provisioned, cohort `classify` and `ingest` keep these files
 `needs-runtime` with code `docling-not-provisioned`; after provisioning, the next
 `ingest` or `qualify` reads them. Use
-`pdf_image probe --root ROOT --work DIR FILE...` to time conversions without
-storing anything. `DIR` must be a private scratch directory.
+`pdf_pages probe --root ROOT --work DIR [--concurrency N] FILE...` (PDFs; one
+JSON line per document with every unit's seconds and peak resident memory) or
+`pdf_image probe --root ROOT --work DIR FILE...` (images) to time conversions
+without storing anything. `DIR` must be a private scratch directory.
+
+**Upgrading from whole-file PDFs.** A PDF whose extraction already succeeded or
+was refused under `pdf_image` keeps that outcome and is not converted again (its
+`pdf-text`/`ocr` rendition stays valid). Re-reading a refused one page by page
+needs a new linked request (`correction_of`); there is no cohort shortcut yet.
+Let in-flight cohorts finish registering before upgrading: a PDF prepared by
+`pdf_image` but not yet registered is refused as `changed_extraction_identity`.
 
 ## MIME HTML (Confluence export)
 

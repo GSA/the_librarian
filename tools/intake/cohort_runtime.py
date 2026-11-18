@@ -1,7 +1,8 @@
 """PDF and image files in cohort intake: classification and ahead-of-ledger conversion.
 
-PDFs (``.pdf``) and images (``.png``, ``.jpg``, ``.jpeg``) are read through the pinned offline Docling
-runtime (``tools/extraction/pdf_image.py``) when this instance has it provisioned, and otherwise stay
+PDFs (``.pdf``, page by page: ``tools/extraction/pdf_pages.py``) and images (``.png``, ``.jpg``,
+``.jpeg``: ``tools/extraction/pdf_image.py``) are read through the pinned offline Docling runtime when
+this instance has it provisioned, and otherwise stay
 ``needs-runtime`` with code ``docling-not-provisioned``. Conversion is slow, so a chunk's conversions run
 before its ledger stages, up to ``concurrency`` at once, each in its own limited child process; the
 ledger's prepare stage then finds the rendition already published (or the file's recorded refusal)
@@ -9,8 +10,8 @@ and never converts under the ledger.
 """
 import hashlib
 
-from tools.extraction import pdf_image
-from . import store, upload
+from tools.extraction import pdf_image, pdf_pages
+from . import adapters, store, upload
 from .contracts import IntakeError
 
 SUFFIXES = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
@@ -57,6 +58,8 @@ def read_disposition(path, entry):
 def convert_ahead(root, entries, heads, concurrency, prepare_name):
     """Convert the chunk's PDF/image entries whose prepare stage is still to run; returns how many.
 
+    PDFs are converted before images (``pdf_pages`` before ``pdf_image``).
+
     ``prepare_name(entry)`` is the prepare request's correlation ID. Outcomes are not reported here:
     the ledger's prepare stage that follows records each one (a published rendition or the file's
     refusal code), so a crash between the two is completed by the next run.
@@ -71,6 +74,9 @@ def convert_ahead(root, entries, heads, concurrency, prepare_name):
             continue  # a chain the store cannot follow is reported by the prepare stage
         if current is None or current["stages"][0]["status"] in OPEN:
             requests.append((entry["receipt_id"], entry["format"]))
-    if requests:
-        pdf_image.prepare_many(root, requests, concurrency)
+    # Each module bounds its own conversion children to ``concurrency``; the two run one after the other.
+    for module in (pdf_pages, pdf_image):
+        chosen = [(receipt, fmt) for receipt, fmt in requests if adapters.extractor_for(fmt) is module]
+        if chosen:
+            module.prepare_many(root, chosen, concurrency)
     return len(requests)

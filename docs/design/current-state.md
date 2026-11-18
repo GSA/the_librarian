@@ -228,17 +228,27 @@ restated here.
 - **Cohort PDFs and images read through a hardened, provisioned runtime.** Without the
   pinned Docling interpreter and models (`pdf_image.status`, preflight
   `pdf_image_runtime`) `.pdf`/`.png`/`.jpg`/`.jpeg` stay `needs-runtime` with code
-  `docling-not-provisioned`. With them, a PDF uses its embedded text layer
-  (`pypdfium2` in the pinned interpreter) when every image-bearing page has at least
-  200 alphanumeric characters at a ratio of 0.5 or more and the document has 200, and
-  falls back to Docling OCR otherwise; images always use OCR. The rendition payload
-  `format` is `pdf-text` or `ocr` (`method.kind` `pdf-text-layer` / `docling-ocr`).
-  Each file converts in its own child process with address-space, CPU, wall-clock,
-  file-size, page, record, output and header-pixel limits, `--extract-concurrency`
-  at a time before the ledger stages; a timeout or crash is retried once, then the
-  file is a blocked stage `extract-<code>` and the cohort continues. Evidence:
-  `tests/test_pdf_image.py::CohortTests`, `::HardeningTests`, `::RoutingTests`,
-  `::ImageLimitTests`; `::RuntimeTests` runs the real runtime when provisioned.
+  `docling-not-provisioned`. With them, images use Docling OCR (`pdf_image`, payload
+  `format` `ocr`), each in its own limited child process, retried once on a timeout
+  or crash, then a blocked stage `extract-<code>`.
+- **Cohort PDFs are read page by page with per-page retry.** `pdf_pages` lists the
+  pages in an isolated child (`pdf_page_worker.py`, the locked `pypdfium2`); a page
+  keeps its text layer when it has at least 200 alphanumeric characters at a ratio of
+  0.5 or more (or draws no image in a document with 200), else just that page is
+  rendered (216 DPI, reduced to fit the pixel cap) and OCRed through the unchanged
+  Docling adapter. Inventory and OCR pages are units in their own limited child
+  processes, at most `--extract-concurrency` at once; a unit that times out or
+  crashes is retried once, then its page is `failed` with a code and a placeholder
+  line, and the rest of the document is kept. The payload (`format` `pdf-pages`)
+  records each page's outcome; confidence is the union of page kinds
+  (`converted-format`, `machine-ocr`, `incomplete-rendition` for failed or unread
+  pages). Per-document budgets (5,000 pages, 200,000 lines, 7,200 OCR seconds)
+  record what they leave unread with explicit codes; a document is refused only when
+  it cannot be opened, every page failed or nothing has text. PDF renditions made by
+  `pdf_image` keep their identity and are not converted again. Evidence:
+  `tests/test_pdf_pages.py::RoutingTests`, `::AssemblyTests`, `::HardeningTests`,
+  `tests/test_pdf_image.py::CohortTests`, `::HardeningTests`, `::ImageLimitTests`;
+  `::RuntimeTests` in both run the real runtime when provisioned.
 - **Office and RTF documents convert to derived Markdown; disguised text is read as text (Kata
   khky).** `cohort_ingest` decides by content, not suffix. Zip packages holding `word/`, `xl/`,
   `ppt/` or `visio/` parts become `docx`/`xlsx`/`pptx`/`vsdx`, `{\rtf` becomes `rtf`, and legacy
@@ -325,7 +335,9 @@ restated here.
   `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `converted-format` and
   `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
   extraction payload format; `docling-pdf`, `docling-image` and cohort `ocr` are `machine-ocr`, a cohort PDF text layer
-  (`pdf-text`) and `converted` (office/RTF conversion, below) are `converted-format`, text, MHTML,
+  (`pdf-text`) and `converted` (office/RTF conversion, below) are `converted-format`, a cohort
+  `pdf-pages` PDF is the union of its pages' kinds plus `incomplete-rendition` for pages not read
+  (`confidence.page_kinds`), text, MHTML,
   Gemini transcript and ODT renditions add no reason), `agent-generated` (an upload whose
   version-2 descriptor declares `origin.agent_generated: {generator, generated_on,
   source_commit}`; the hash-pinned `submission.json` sidecar is read at build and a missing,

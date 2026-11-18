@@ -3,6 +3,7 @@
 Pure routing and limit logic always runs. Tests that convert through the pinned Docling runtime skip
 unless it is provisioned (``tools/extraction/.local/`` or LIBRARIAN_DOCLING_PYTHON/ARTIFACTS).
 """
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ from unittest import mock
 from pdf_fixtures import encrypted_pdf, image_pdf, jpeg_header, png, png_header, text_pdf
 from tools.catalog import catalog_store as catalog
 from tools.context_index import confidence, context_index as index, renditions
-from tools.extraction import docling_worker, pdf_image
+from tools.extraction import docling_worker, pdf_image, pdf_pages
 from tools.intake import adapters, cohort, cohort_runtime, standing, store
 
 RUNTIME = pdf_image.runtime(pdf_image.TOOLKIT)
@@ -306,6 +307,7 @@ class CohortTests(unittest.TestCase):
         self.assertEqual(found["bomb.png"], ("over-limit", "image", "pixel-limit"))
 
     def fake_convert(self, calls, refusals, active=None):
+        """Fakes of ``(pdf_image.convert, pdf_pages.convert)``: images and PDFs."""
         lock = threading.Lock()
 
         def convert(raw, name, format_name, paths, work, limits=None):
@@ -320,7 +322,8 @@ class CohortTests(unittest.TestCase):
                     raise pdf_image.ConversionFailed(refusals[name])
                 text = (SENTENCE % len(raw)) if format_name == "pdf" else "OCR words"
                 if format_name == "pdf":
-                    return pdf_image.text_payload(report([page(1, text)])), {}
+                    text = "\n".join([text] + [SENTENCE % i for i in range(5)])
+                    return pdf_pages.assemble({**report([page(1, text)]), "page_count": 1}, {}), {}
                 document = {"body": {"children": [{"$ref": "#/texts/0"}]}, "texts": [
                     {"text": text, "prov": [{"page_no": 1}]}]}
                 return pdf_image.ocr_payload({
@@ -331,15 +334,25 @@ class CohortTests(unittest.TestCase):
                 if active is not None:
                     with lock:
                         active["now"] -= 1
-        return convert
+
+        def convert_pdf(raw, name, paths, work, limits=None, units=None, log=None):
+            return convert(raw, name, "pdf", paths, work, limits)
+        return convert, convert_pdf
+
+    def faked(self, *args, **kwargs):
+        images, pdfs = self.fake_convert(*args, **kwargs)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(pdf_image, "convert", images))
+        stack.enter_context(mock.patch.object(pdf_pages, "convert", pdfs))
+        return stack
 
     def test_ingest_extracts_them_concurrently_and_a_refusal_never_stops_the_cohort(self):
         provision(self.root)
         calls, active = [], {"now": 0, "peak": 0}
-        pdf_image.forget_failures()
-        self.addCleanup(pdf_image.forget_failures)
-        with mock.patch.object(pdf_image, "convert",
-                               self.fake_convert(calls, {"locked.pdf": "encrypted"}, active)):
+        for module in (pdf_image, pdf_pages):
+            module.forget_failures()
+            self.addCleanup(module.forget_failures)
+        with self.faked(calls, {"locked.pdf": "encrypted"}, active):
             report_ = cohort.ingest(self.root, self.inbox, system="inbox", actor="runner",
                                     extract_concurrency=3)
             outcomes = {e["relative"]: (e.get("outcome"), e.get("code")) for e in report_["entries"]}
@@ -351,8 +364,7 @@ class CohortTests(unittest.TestCase):
             self.assertGreater(active["peak"], 1)
             self.assertLessEqual(active["peak"], 3)
             self.assertEqual(report_["counts"]["failed_by_code"], {"prepare/extract-encrypted": 1})
-            self.assertEqual(pdf_image._FAILED, {})  # recorded refusals are not retained
-            pdf_image.forget_failures()
+            self.assertEqual((pdf_image._FAILED, pdf_pages._FAILED), ({}, {}))  # refusals are not retained
             again = cohort.ingest(self.root, self.inbox, system="inbox", actor="runner")
         self.assertEqual(len(calls), 4)  # a decided file is not converted again
         self.assertEqual(again["counts"]["outcome"], report_["counts"]["outcome"])
@@ -368,16 +380,16 @@ class CohortTests(unittest.TestCase):
             located = list(renditions.records(raw, value, index.rendition_api()))
             self.assertEqual(located[0]["source_location"]["page"], 1)
             self.assertEqual(standing.EXTRACT_FORMATS[value["payload"]["format"]], "lines")
-        self.assertEqual(formats, {("pdf-text", "pdf-text-layer"), ("ocr", "docling-ocr")})
+        self.assertEqual(formats, {("pdf-pages", "pdf-pages"), ("ocr", "docling-ocr")})
 
     def test_a_crash_between_conversion_and_ledger_is_completed_by_the_next_run(self):
         provision(self.root)
         calls = []
-        with mock.patch.object(pdf_image, "convert", self.fake_convert(calls, {})), \
+        with self.faked(calls, {}), \
                 mock.patch.object(cohort_runtime, "convert_ahead", side_effect=RuntimeError("crash")), \
                 self.assertRaises(RuntimeError):
             cohort.ingest(self.root, self.inbox, system="inbox", actor="runner")
-        with mock.patch.object(pdf_image, "convert", self.fake_convert(calls, {"locked.pdf": "encrypted"})):
+        with self.faked(calls, {"locked.pdf": "encrypted"}):
             report_ = cohort.ingest(self.root, self.inbox, system="inbox", actor="runner")
         self.assertEqual(report_["counts"]["outcome"]["extracted"], 4)
         self.assertEqual(report_["counts"]["outcome"]["failed"], 1)
@@ -451,7 +463,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["counts"]["outcome"]["extracted"], 2)
         kinds = {e["relative"]: json.loads((root / e["rendition"]).read_bytes())["payload"]["method"]["kind"]
                  for e in result["entries"]}
-        self.assertEqual(kinds, {"a.pdf": "pdf-text-layer", "shot.png": "docling-ocr"})
+        self.assertEqual(kinds, {"a.pdf": "pdf-pages", "shot.png": "docling-ocr"})
         self.assertEqual(list(pdf_image.work_directory(root).iterdir()), [])
 
 
