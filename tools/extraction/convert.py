@@ -156,6 +156,26 @@ def code_sha256():
     return extract.digest(Path(__file__).read_bytes() + WORKER.read_bytes())
 
 
+def request_version(format_name):
+    """The extraction request-name suffix of a converted format (like MHTML's ``-mN``).
+
+    It covers the converter code and, for legacy input, the LibreOffice version, so changing
+    either makes cohort intake extract the document again instead of reusing the old stages.
+    """
+    try:
+        external = runtime(format_name)
+    except ConversionError:
+        external = {"python": "stdlib", "soffice": None}
+    key = (code_sha256(), extract.encoded(external))
+    if key not in _VERSIONS:
+        _VERSIONS.clear()
+        _VERSIONS[key] = "-c" + extract.digest((key[0] + key[1].decode()).encode())[:12]
+    return _VERSIONS[key]
+
+
+_VERSIONS = {}
+
+
 def fingerprint(root, format_name):
     """Converter identity: both converter files, the toolkit policy and the external runtime."""
     return extract.digest((code_sha256() + policy.fingerprint(root)

@@ -284,10 +284,11 @@ lines, 10,000 rows, 64 columns and 1,000 characters per sheet cell.
 - PPTX: `## Slide N` in presentation order, the title as `###`, other text as bullets, tables,
   then `#### Notes` (slide numbers and dates skipped).
 - XLSX: `## Sheet: name`, each 50 rows as a Markdown table under the first row as header with
-  the spreadsheet row number. Shared strings, booleans and date formats are resolved; formulas
+  the spreadsheet row number. Shared strings, booleans, dates, times of day and elapsed durations (`[h]:mm`) are resolved; formulas
   show their cached value.
 - VSDX: `## Page: name` with one bullet per shape text; geometry and connectors are omitted.
-- RTF: text with `\par` lines, `\'hh` (by `\ansicpg`) and `\u` characters, and table cells joined
+- RTF: text with `\par` lines, literal and `\'hh` bytes decoded by `\ansicpg`, `\u` characters (surrogate
+  pairs combined), and table cells joined
   with `|`. Hidden destinations (font tables, `\*` groups, pictures, metadata) are skipped.
 - Legacy `.doc`/`.xls`/`.ppt`/`.vsd` (`office-legacy`): converted first with
   `soffice --headless --convert-to` (private profile, extraction home, same timeout) to
@@ -298,7 +299,8 @@ lines, 10,000 rows, 64 columns and 1,000 characters per sheet cell.
 `payload.conversion` records `source_format`, `via`, `converter` (`librarian-convert`), `version`,
 `code_sha256` (both converter files), `lock_sha256` (`null`), `runtime` and `fidelity`
 (`truncated`, `dropped`, `notes`). The engine identity covers the converter code and policy (and
-the `soffice` version), so changing either re-extracts. The catalogued source remains the original
+the `soffice` version), and cohort extraction requests carry a `-c<12 hex>` suffix of the same
+  identity (like MHTML's `-mN`), so changing either extracts again, even under `--trust-stat`. The catalogued source remains the original
 bytes. Failures are blocked stages with a code: `container-invalid`, `container-limit`,
 `unsafe-member`, `encrypted-document`, `zip-bomb`, `xml-dtd`, `xml-invalid`, `xml-limit`,
 `ooxml-invalid`, `rtf-invalid`, `conversion-empty`, `conversion-limit`, `conversion-timeout`,

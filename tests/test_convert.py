@@ -109,7 +109,9 @@ def xlsx(rows=None, extra_sheet=""):
     rows = rows or ('<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="inlineStr">'
                     '<is><t>When</t></is></c></row>'
                     '<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>4.0</v></c><c r="C2" s="1"><v>45292</v></c></row>'
-                    '<row r="4"><c r="A4" t="str"><v>x|y</v></c><c r="B4" t="b"><v>1</v></c></row>')
+                    '<row r="4"><c r="A4" t="str"><v>x|y</v></c><c r="B4" t="b"><v>1</v></c></row>'
+                    '<row r="5"><c r="A5" t="str"><v>times</v></c><c r="B5" s="2"><v>0.5</v></c>'
+                    '<c r="C5" s="3"><v>1.5</v></c></row>')
     return package({
         "xl/workbook.xml": ('<workbook %s><sheets><sheet name="Codes" sheetId="1" r:id="rId1"/>%s</sheets>'
                             "</workbook>") % (SNS, extra_sheet),
@@ -118,8 +120,9 @@ def xlsx(rows=None, extra_sheet=""):
                                            ("rId3", "styles", "styles.xml")),
         "xl/sharedStrings.xml": ('<sst %s><si><t>Code</t></si><si><r><t>Amo</t></r><r><t>unt</t></r>'
                                  "<rPh><t>ignored</t></rPh></si><si><t>Rent</t></si></sst>") % SNS,
-        "xl/styles.xml": ('<styleSheet %s><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs>'
-                          "</styleSheet>") % SNS,
+        "xl/styles.xml": ('<styleSheet %s><numFmts><numFmt numFmtId="164" formatCode="[h]:mm"/></numFmts>'
+                          '<cellXfs><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="20"/><xf numFmtId="164"/>'
+                          "</cellXfs></styleSheet>") % SNS,
         "xl/worksheets/sheet1.xml": "<worksheet %s><sheetData>%s</sheetData></worksheet>" % (SNS, rows),
     })
 
@@ -176,6 +179,7 @@ class WorkerFormatTests(unittest.TestCase):
         self.assertIn("| Row | Code | Amount | When |\n|---|---|---|---|\n", markdown)
         self.assertIn("| 2 | Rent | 4 | 2024-01-01 |\n", markdown)
         self.assertIn("| 4 | x\\|y | TRUE |  |\n", markdown)
+        self.assertIn("| 5 | times | 12:00:00 | 36:00:00 |\n", markdown)
         self.assertNotIn("ignored", markdown)
         self.assertFalse(fidelity["truncated"])
 
@@ -200,6 +204,15 @@ class WorkerFormatTests(unittest.TestCase):
         markdown, fidelity = convert_bytes("rtf", RTF)
         self.assertEqual(markdown, "Budget café plan\nEuro €\tdone\nCell A | B\n")
         self.assertEqual(fidelity["dropped"], {"images": 1})
+
+    def test_rtf_literal_bytes_follow_the_code_page_and_surrogate_pairs_combine(self):
+        self.assertEqual(convert_bytes("rtf", b"{\\rtf1\\ansi\\ansicpg1252 Price \x80 5}")[0], "Price \u20ac 5\n")
+        self.assertEqual(convert_bytes("rtf", b"{\\rtf1\\ansi\\ansicpg1251 \xcf\xf0\xe8\xe2\xe5\xf2}")[0],
+                         "\u041f\u0440\u0438\u0432\u0435\u0442\n")
+        self.assertEqual(convert_bytes("rtf", rb"{\rtf1\uc1 A\u-10179?{\b}\u-8704?B}")[0], "A\U0001f600B\n")
+        markdown, fidelity = convert_bytes("rtf", rb"{\rtf1\uc1 Lone \u-10179? end}")
+        self.assertEqual(markdown, "Lone \ufffd end\n")
+        self.assertEqual(fidelity["notes"], ["unpaired RTF surrogate replaced"])
 
     def test_empty_document_is_refused_with_a_code(self):
         with self.assertRaises(worker.Refused) as caught:
@@ -420,6 +433,22 @@ class CohortConversionTests(QualifyCase):
             self.assertEqual(metadata["format"], "converted")
             self.assertEqual(metadata["conversion"]["source_format"], "pptx")
             self.assertTrue(index.search(db, "Approve", 10, None, root=self.root)["hits"])
+
+    def test_converter_change_extracts_again_even_under_trust_stat(self):
+        with unittest.mock.patch.object(convert, "soffice", return_value=None):
+            first = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+            old = {e["relative"]: e for e in first["entries"]}
+            again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", trust_stat=True)
+            self.assertEqual(next(e for e in again["entries"] if e["relative"] == "conv/plan.docx")["rendition"],
+                             old["conv/plan.docx"]["rendition"])
+            real = convert.code_sha256
+            with unittest.mock.patch.object(convert, "code_sha256", lambda: real()[::-1]):
+                second = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner",
+                                       trust_stat=True)
+        new = {e["relative"]: e for e in second["entries"]}
+        self.assertEqual(new["conv/plan.docx"]["outcome"], "extracted")
+        self.assertNotEqual(new["conv/plan.docx"]["rendition"], old["conv/plan.docx"]["rendition"])
+        self.assertEqual(new["conv/query.sql"]["rendition"], old["conv/query.sql"]["rendition"])
 
     def test_conversion_failure_stays_visible_with_its_code(self):
         def refuse(*_):

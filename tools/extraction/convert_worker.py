@@ -472,12 +472,24 @@ def pptx(package, fidelity):
 
 # --- XLSX -------------------------------------------------------------------------------------
 
-DATE_FORMATS = {14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47}
+# Built-in number formats that are calendar dates, date-times, times of day or elapsed durations.
+DATE_FORMATS = {14: "date", 15: "date", 16: "date", 17: "date", 22: "datetime", 18: "time", 19: "time",
+                20: "time", 21: "time", 45: "time", 47: "time", 46: "elapsed"}
 
 
-def _is_date_format(code):
-    stripped = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", code or "")
-    return bool(re.search(r"[dmyhs]", stripped, re.I)) and "general" not in stripped.lower()
+def _date_kind(code):
+    """``date``, ``datetime``, ``time``, ``elapsed`` or None for a custom number format code."""
+    code = code or ""
+    if re.search(r"\[(h+|m+|s+)\]", code, re.I):
+        return "elapsed"
+    stripped = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", code).lower()
+    if "general" in stripped or not re.search(r"[dmyhs]", stripped):
+        return None
+    day = re.search(r"[dy]", stripped)
+    clock = re.search(r"[hs]", stripped)
+    if day:
+        return "datetime" if clock else "date"
+    return "time" if clock else "date"
 
 
 def _column(reference):
@@ -498,15 +510,25 @@ def _column_name(number):
     return name
 
 
-def _number(text, date, date1904):
+def _clock(seconds):
+    hours, rest = divmod(round(seconds), 3600)
+    return "%d:%02d:%02d" % (hours, rest // 60, rest % 60)
+
+
+def _number(text, kind, date1904):
+    """A cell number as text; ``kind`` (``_date_kind``) renders dates, times and durations."""
     try:
         value = float(text)
     except ValueError:
         return text
-    if date and 0 <= value < 2958466:
+    if kind == "elapsed" and abs(value) < 2958466:
+        return ("-" if value < 0 else "") + _clock(abs(value) * 86400)
+    if kind == "time" and 0 <= value < 2958466:
+        return _clock(round((value % 1) * 86400) % 86400)
+    if kind in ("date", "datetime") and 0 <= value < 2958466:
         base = datetime(1904, 1, 1) if date1904 else datetime(1899, 12, 30)
         moment = base + timedelta(days=value)
-        if value == int(value):
+        if kind == "date" and value == int(value):
             return moment.date().isoformat()
         return moment.replace(microsecond=0).isoformat(sep=" ")
     if value == int(value) and abs(value) < 1e15 and "e" not in text.lower():
@@ -527,7 +549,7 @@ def xlsx(package, fidelity):
             # Direct and rich-run text only; phonetic (rPh) runs are reading aids, not cell text.
             texts = item.findall(q(S, "t")) + item.findall(q(S, "r") + "/" + q(S, "t"))
             shared.append("".join(t.text or "" for t in texts))
-    date_styles = set()
+    date_styles = {}
     style_part = next((path for rtype, path in rels.values() if rtype == "styles"), None)
     if style_part and package.has(style_part):
         styles = tree(package.read(style_part))
@@ -535,8 +557,10 @@ def xlsx(package, fidelity):
         cell_formats = styles.find(q(S, "cellXfs"))
         for index, xf in enumerate(cell_formats.findall(q(S, "xf")) if cell_formats is not None else ()):
             identifier = xf.get("numFmtId", "0")
-            if (identifier.isdigit() and int(identifier) in DATE_FORMATS) or _is_date_format(custom.get(identifier)):
-                date_styles.add(str(index))
+            kind = (DATE_FORMATS.get(int(identifier)) if identifier.isdigit() else None) \
+                or _date_kind(custom.get(identifier))
+            if kind:
+                date_styles[str(index)] = kind
     lines = []
     sheets = root.find(q(S, "sheets"))
     for sheet in sheets if sheets is not None else ():
@@ -594,7 +618,7 @@ def _sheet_rows(raw, shared, date_styles, date1904, fidelity):
             elif kind in ("str", "inlineStr", "e", "d"):
                 value = raw_text
             else:
-                value = _number(raw_text, state["style"] in date_styles, date1904) if raw_text else ""
+                value = _number(raw_text, date_styles.get(state["style"]), date1904) if raw_text else ""
             if value.strip():
                 if state["cell"] <= MAX_COLUMNS:
                     state["cells"][state["cell"]] = value
@@ -709,11 +733,23 @@ def rtf(raw, fidelity):
     stack, skip, uc, skip_chars = [], False, 1, 0
     group_start = False
     position = 0
+    high = None  # a \u high surrogate waiting for its low half
 
-    def flush():
+    def settle():
+        nonlocal high
+        if high is not None:
+            out.append("\ufffd")
+            fidelity.notes.add("unpaired RTF surrogate replaced")
+            high = None
+
+    def flush(paired=False):
+        # Literal and \' bytes decode together in the document code page (multibyte pages too).
         if pending:
+            settle()
             out.append(pending.decode(codepage, errors="replace"))
             pending.clear()
+        if not paired:
+            settle()
     while position < len(raw):
         token = RTF_TOKEN.match(raw, position)
         if token is None:
@@ -722,14 +758,14 @@ def rtf(raw, fidelity):
         position = token.end()
         word, argument, hexbyte, symbol, brace, text = token.groups()
         if brace == b"{":
-            flush()
+            flush(paired=True)
             if len(stack) >= MAX_DEPTH:
                 raise Refused("rtf-invalid", "RTF group depth exceeds limits")
             stack.append((skip, uc))
             group_start = True
             continue
         if brace == b"}":
-            flush()
+            flush(paired=True)
             if stack:
                 skip, uc = stack.pop()
             group_start = False
@@ -753,11 +789,21 @@ def rtf(raw, fidelity):
             if name == "uc" and argument:
                 uc = max(int(argument), 0)
             elif name == "u" and argument:
-                flush()
+                flush(paired=True)
                 code = int(argument)
                 code = code + 65536 if code < 0 else code
-                if 0 < code < 0x110000 and not 0xD800 <= code < 0xE000:
-                    out.append(chr(code))
+                if 0xDC00 <= code < 0xE000 and high is not None:
+                    out.append(chr(0x10000 + ((high - 0xD800) << 10) + (code - 0xDC00)))
+                    high = None
+                else:
+                    settle()
+                    if 0xD800 <= code < 0xDC00:
+                        high = code
+                    elif 0xDC00 <= code < 0xE000:
+                        out.append("\ufffd")
+                        fidelity.notes.add("unpaired RTF surrogate replaced")
+                    elif 0 < code < 0x110000:
+                        out.append(chr(code))
                 skip_chars = uc
             elif name in ("par", "line", "row", "sect", "page"):
                 flush()
@@ -787,6 +833,8 @@ def rtf(raw, fidelity):
             if skip_chars:
                 skip_chars -= 1
                 continue
+            if not pending:
+                settle()
             pending.append(int(hexbyte, 16))
             continue
         if symbol is not None:
@@ -806,12 +854,13 @@ def rtf(raw, fidelity):
                 out.append("-")
             continue
         if text is not None:
-            flush()
-            chunk = text.decode("latin-1")
             if skip_chars:
-                dropped = min(skip_chars, len(chunk))
-                chunk, skip_chars = chunk[dropped:], skip_chars - dropped
-            out.append(chunk)
+                dropped = min(skip_chars, len(text))
+                text, skip_chars = text[dropped:], skip_chars - dropped
+            if text:
+                if not pending:
+                    settle()
+                pending.extend(text)
     flush()
     return [line.rstrip() for line in clean("".join(out)).split("\n")]
 

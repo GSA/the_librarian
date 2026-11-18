@@ -259,14 +259,16 @@ restated here.
   worker opens no sockets. The rendition is a derived line rendition of the registered original
   with `payload.format: "converted"` and `payload.conversion: {source_format, via, converter,
   version, code_sha256, lock_sha256, runtime, fidelity}`; its engine identity hashes both
-  converter files (and the `soffice` version for legacy input), so converter changes
-  re-extract. Each conversion failure is a blocked stage with its code. Evidence:
+  converter files (and the `soffice` version for legacy input), and cohort request names carry a
+  `-c<12 hex>` suffix of it (as MHTML carries `-mN`), so a converter change extracts again; a
+  `--trust-stat` row with an older suffix is not trusted. Each conversion failure is a blocked stage with its code. Evidence:
   `tests/test_convert.py::CohortConversionTests::test_classify_routes_documents_to_converters_and_disguised_text_to_the_text_reader`,
   `::CohortConversionTests::test_converted_documents_are_derived_renditions_reviewed_selected_and_retrievable`,
   `::CohortConversionTests::test_conversion_failure_stays_visible_with_its_code`,
   `::CohortConversionTests::test_legacy_binary_converts_through_soffice_when_present`,
   `::HostileInputTests`, `::IsolatedWorkerTests::test_wall_clock_timeout_and_output_cap_kill_the_child`,
-  `::IsolatedWorkerTests::test_converter_identity_changes_with_converter_code`.
+  `::IsolatedWorkerTests::test_converter_identity_changes_with_converter_code`,
+  `::CohortConversionTests::test_converter_change_extracts_again_even_under_trust_stat`.
 - **Ingest follows correction-chain heads.** `ingest` and `qualify` report an
   extraction or registration through the head of its validated `correction_of`
   chain, never by request name: a repaired entry is `extracted` with the head's

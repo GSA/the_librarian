@@ -109,9 +109,11 @@ def _stat(info):
 
 
 def _unchanged(row, identity):
-    """True when an extracted document's row recorded exactly this (non-empty) file's stat identity."""
+    """True when an extracted document's row recorded exactly this (non-empty) file's stat identity
+    under the current reader version (a new MIME reader or converter is never trusted from an old row)."""
     return (row is not None and row["state"] == "extracted" and row["ino"] is not None
-            and identity == tuple(row[k] for k in docs.STAT) and identity[2] > 0)
+            and identity == tuple(row[k] for k in docs.STAT) and identity[2] > 0
+            and row["suffix"] == suffix_of(row["format"]))
 
 
 def _unread_disposition(path, size, provisioned=False):
