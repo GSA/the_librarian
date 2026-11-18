@@ -816,7 +816,8 @@ class StandingIntakeTests(StandingCase):
             self.assertEqual(found["confidence"]["level"], "low")
             excluded = index.search(db, "Standing phrase", 10, None, root=self.root, low_confidence="exclude")
             self.assertEqual((excluded["hits"], excluded["low_confidence_excluded"]), ([], 1))
-            self.assertIn("absence", excluded)
+            self.assertNotIn("absence", excluded)
+            self.assertEqual(excluded["filtered"]["classification"], "low-confidence-excluded")
             last = index.search(db, "standing", 50, None, root=self.root, low_confidence="last")
             levels = [hit["confidence"]["level"] for hit in last["hits"]]
             self.assertEqual(levels[-1], "low")

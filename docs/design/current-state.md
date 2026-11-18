@@ -269,7 +269,8 @@ restated here.
   it at read time). Markdown documents are `normal`. `search` hits carry `{level, reasons:
   [codes]}` and `--low-confidence include|last|exclude` (default `include`, rank order) ranks
   low hits after normal ones or leaves them out while counting them in
-  `low_confidence_excluded`; `get` pieces, compact `documents` (`qualified-compact-v2`) and
+  `low_confidence_excluded` (an empty result caused only by that filter reports
+  `filtered: low-confidence-excluded` instead of an absence classification); `get` pieces, compact `documents` (`qualified-compact-v2`) and
   `get_many` documents (`qualified-many-*-v2`) carry the full label, and each read has a
   top-level `confidence` block with the worst level and each present reason's explanation and
   correction. `status` (and intake progress) report `confidence: {normal, low, low_reasons}`;

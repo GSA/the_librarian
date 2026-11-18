@@ -739,7 +739,13 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
     if low_confidence == "exclude":
         result["low_confidence_excluded"] = connection.execute(
             "SELECT count(*) " + matching + " AND c.level='low'", parameters).fetchone()[0]
-    if not hits:
+    if not hits and result.get("low_confidence_excluded"):
+        result["filtered"] = {
+            "classification": "low-confidence-excluded",
+            "caveat": "Matching sections exist but are all low confidence and were excluded; "
+                      "search with low_confidence include or last to read them with their reasons.",
+        }
+    elif not hits:
         result["absence"] = classify_absence(connection, query, path)
     return result
 

@@ -228,7 +228,7 @@ def create_server(config: Config) -> MCPServer:
         Each hit carries confidence {level, reasons}; low-confidence text is published and marked,
         and the response's confidence.reasons explains each reason and how to correct it.
         low_confidence: include (default, rank order), last (after normal hits) or exclude (counted
-        in low_confidence_excluded).
+        in low_confidence_excluded; if that empties the result, filtered replaces absence).
         """
         count = min(5, config.max_results) if limit is None else limit
         reader.budget(count, config.max_results, "limit")
