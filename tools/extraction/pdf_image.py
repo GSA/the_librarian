@@ -102,8 +102,9 @@ def digest(raw):
 def runtime(root):
     """The Docling interpreter and model directory this instance uses (environment overrides)."""
     local = Path(root) / RUNTIME
-    return {"python": Path(os.environ.get(PYTHON_ENV) or local / "venv-docling/bin/python"),
-            "artifacts": Path(os.environ.get(ARTIFACTS_ENV) or local / "models")}
+    # Absolute (the child runs in the toolkit directory) but not resolved: a venv interpreter is a symlink.
+    return {"python": Path(os.path.abspath(os.environ.get(PYTHON_ENV) or local / "venv-docling/bin/python")),
+            "artifacts": Path(os.path.abspath(os.environ.get(ARTIFACTS_ENV) or local / "models"))}
 
 
 def status(root):
@@ -304,10 +305,28 @@ def text_payload(report, format_name="pdf"):
     }
 
 
-def _flatten(document):
+def _page_spans(text, prov):
+    """``[(page, text)]`` of a text item whose provenance spans pages, split at each page's charspan
+    start; None when the spans are not ordered, in-range character offsets."""
+    starts = []
+    for item in prov:
+        span = item.get("charspan") if isinstance(item, dict) else None
+        if (type(item.get("page_no") if isinstance(item, dict) else None) is not int
+                or not isinstance(span, list) or len(span) != 2
+                or not all(type(n) is int for n in span) or not 0 <= span[0] <= span[1] <= len(text)
+                or (starts and span[0] < starts[-1][1])):
+            return None
+        starts.append((item["page_no"], span[0]))
+    bounds = [0] + [start for _, start in starts[1:]] + [len(text)]
+    return [(page, text[bounds[i]:bounds[i + 1]]) for i, (page, _) in enumerate(starts)]
+
+
+def _flatten(document, spanning=None):
     """``(page, text)`` of a Docling document in body then furniture order, then any item not reached.
 
-    Text items give their text; tables give one ' | '-joined line per row (a spanning cell in its first row).
+    Text items give their text; one whose provenance spans pages is split at its charspans, or, when
+    they cannot place it, cited at its first page and counted in ``spanning``. Tables give one
+    ' | '-joined line per row (a spanning cell in its first row).
     """
     seen, items, page = set(), [], 1
 
@@ -335,7 +354,15 @@ def _flatten(document):
         if prov and isinstance(prov[0], dict) and type(prov[0].get("page_no")) is int:
             page = prov[0]["page_no"]
         if ref.startswith("#/texts/") and isinstance(value.get("text"), str):
-            items.append((page, value["text"]))
+            pages = {p.get("page_no") for p in prov if isinstance(p, dict)}
+            split = _page_spans(value["text"], prov) if len(pages) > 1 else None
+            if split:
+                items.extend(split)
+                page = split[-1][0]
+            else:
+                items.append((page, value["text"]))
+                if len(pages) > 1 and spanning is not None:
+                    spanning.append(ref)
         elif ref.startswith("#/tables/"):
             rows = {}
             for cell in (value.get("data") or {}).get("table_cells") or []:
@@ -369,10 +396,15 @@ def _confidence_warnings(warnings):
 def ocr_payload(report, format_name, fallback=None):
     conversion = report["conversion"]
     notes = _confidence_warnings(conversion.get("warnings", []))
+    spanning = []
+    lines = _lines(_flatten(conversion["document"], spanning))
+    if spanning:
+        notes.append("%d text item(s) span pages without usable character spans; each is cited at "
+                     "its first page" % len(spanning))
     return {
         "format": "ocr", "source_format": format_name, "scope": OCR_SCOPE,
         "warnings": [OCR_WARNING] + ([fallback] if fallback else []) + notes,
-        "lines": _lines(_flatten(conversion["document"])),
+        "lines": lines,
         "pages": [{"page": page["page_no"], "textless": page["textless"]} for page in conversion["pages"]],
         "method": {"kind": "docling-ocr", "fallback": fallback, "runtime": report["runtime"],
                    "profile_version": report["profile"]["version"],

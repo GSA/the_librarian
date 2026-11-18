@@ -99,6 +99,20 @@ class RoutingTests(unittest.TestCase):
                          [(1, "first"), (1, "second"), (2, "a | b"), (2, "orphan")])
 
 
+    def test_text_spanning_pages_is_split_at_its_charspans_or_counted(self):
+        def document(prov):
+            return {"body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+                    "texts": [{"text": "end of one start of two", "prov": prov},
+                              {"text": "after", "prov": [{"page_no": 2}]}]}
+        split = document([{"page_no": 1, "charspan": [0, 10]}, {"page_no": 2, "charspan": [11, 23]}])
+        self.assertEqual(pdf_image._flatten(split),
+                         [(1, "end of one "), (2, "start of two"), (2, "after")])
+        spanning = []
+        unplaced = document([{"page_no": 1}, {"page_no": 2}])
+        self.assertEqual(pdf_image._flatten(unplaced, spanning)[0], (1, "end of one start of two"))
+        self.assertEqual(spanning, ["#/texts/0"])
+
+
 class ImageLimitTests(unittest.TestCase):
     def test_headers_give_dimensions_before_any_decoder(self):
         self.assertEqual(pdf_image.image_size(png_header(640, 480)), (640, 480))
@@ -208,6 +222,17 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result["code"], "docling-not-provisioned")
         self.assertIn("python", result["missing"])
         self.assertIn("tools/extraction/README.md", result["action"])
+
+    def test_runtime_paths_are_absolute_for_the_child_without_resolving_the_venv_link(self):
+        with mock.patch.dict(os.environ, {pdf_image.PYTHON_ENV: "venv/bin/python",
+                                          pdf_image.ARTIFACTS_ENV: "models"}):
+            paths = pdf_image.runtime("instance")
+        self.assertEqual(paths["python"], Path.cwd() / "venv/bin/python")
+        self.assertEqual(paths["artifacts"], Path.cwd() / "models")
+        with mock.patch.dict(os.environ, clear=False) as env:
+            env.pop(pdf_image.PYTHON_ENV, None)
+            self.assertEqual(pdf_image.runtime("instance")["python"],
+                             Path.cwd() / "instance" / pdf_image.RUNTIME / "venv-docling/bin/python")
 
     def test_the_preflight_check_is_informational(self):
         from types import SimpleNamespace
