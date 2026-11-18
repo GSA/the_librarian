@@ -254,7 +254,8 @@ def _rendition(root, args, engine):
     return raw, value, None
 
 
-EXTRACT_FORMATS = {"text": "lines", "gemini-txt": "lines", "mhtml": "lines", "odt": "nodes"}
+EXTRACT_FORMATS = {"text": "lines", "gemini-txt": "lines", "mhtml": "lines", "odt": "nodes",
+                   "pdf-text": "lines", "ocr": "lines"}
 
 
 def _kind(value):

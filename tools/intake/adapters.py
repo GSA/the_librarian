@@ -14,6 +14,7 @@ from tools.review_events import event_reader
 from tools.review_events import event_history, event_store as events
 from tools.extraction import docling_adapter as docling
 from tools.extraction import extract
+from tools.extraction import pdf_image
 from tools.context_index import context_index as index
 from . import standing, standing_events, standing_publication
 from .contracts import IntakeError, identifier, require
@@ -31,6 +32,9 @@ def native_failure(error):
     """Classify wrapped native failures without persisting private diagnostics."""
     current = error
     while current is not None:
+        # A refused PDF/image conversion names its own durable code (``extract-encrypted``, ...).
+        if isinstance(current, pdf_image.ConversionFailed):
+            return StageFailure("blocked", current.code)
         # Concurrent catalog writers: a lost race retries; an overlapping write cannot.
         if isinstance(current, catalog.ConflictingWrite):
             return StageFailure("blocked", "catalog-conflict")
@@ -109,6 +113,11 @@ def pinned_metadata(intent, checksum):
     return intent["metadata"] if intent.get("manifest_sha256") == checksum else None
 
 
+def extractor_for(format_name):
+    """The extraction lifecycle module for ``format_name``: PDF/image renditions or ``extract``."""
+    return pdf_image if format_name in pdf_image.FORMATS else extract
+
+
 def extract_intent(operation, root, prepared):
     """The pinned identity of one ``extract.bundle`` result."""
     _, _, path, value = prepared
@@ -165,7 +174,8 @@ def _prepare(root, stage):
                 events.prepare_submission(args["value"], root)
             return {"operation": operation}
         if operation.startswith("extract-"):
-            return extract_intent(operation, root, extract.bundle(root, args["receipt"], args["format_name"]))
+            module = extractor_for(args["format_name"])
+            return extract_intent(operation, root, module.bundle(root, args["receipt"], args["format_name"]))
         if operation.startswith("docling-"):
             _, _, path, value, _ = docling._bundle(root, args["receipt"], args["format_name"], Path(args["artifacts_path"]), Path(args["python"]))
             return {"operation": operation, "run_id": value["run_id"], "source": value["source"],
@@ -297,10 +307,11 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
             # Refuse a changed source/extractor before any publication or registration. The bundle
             # read for this check is the one ``run`` uses; ``run`` still re-reads and re-hashes the
             # source and recomputes the extractor identity under the catalog writer lock.
-            prepared = extract.bundle(root, args["receipt"], args["format_name"])
+            module = extractor_for(args["format_name"])
+            prepared = module.bundle(root, args["receipt"], args["format_name"])
             require(extract_intent(operation, root, prepared) == intent, "changed_extraction_identity")
             command = operation.removeprefix("extract-")
-            result = extract.run(root, command, args["receipt"], args["format_name"],
+            result = module.run(root, command, args["receipt"], args["format_name"],
                                  args.get("actor"), args.get("expected_state"), rebase=True,
                                  prepared=prepared)
             require(result["run_id"] == intent["run_id"] and result["rendition"] == intent["rendition"],
@@ -438,7 +449,7 @@ def execute_batch(root, entries):
         try:
             # The same guard ``_execute`` makes before it registers: the source, extractor and catalog
             # are read afresh and must still be the pinned identity.
-            prepared = extract.bundle(root, args["receipt"], args["format_name"])
+            prepared = extractor_for(args["format_name"]).bundle(root, args["receipt"], args["format_name"])
             require(extract_intent(operation, root, prepared) == intent, "changed_extraction_identity")
         except NATIVE_ERRORS as error:
             outcomes[index] = _failure_of(error)
@@ -452,13 +463,21 @@ def execute_batch(root, entries):
         items.append({"receipt": args["receipt"], "format_name": args["format_name"], "actor": args.get("actor"),
                       "expected_state": args.get("expected_state"), "prepared": prepared})
         owners.append(index)
-    try:
-        registered = extract.register_batch(root, items) if items else []
-    except (OSError, sqlite3.Error, *NATIVE_ERRORS) as error:
-        # A failure of the whole batch (the extraction lock held too long, say) is each stage's failure,
-        # classified like the single path's, so its attempt is recorded and contention is retried.
-        registered = [error] * len(items)
-    for index, result in zip(owners, registered):
+    registered = {}
+    # Text-family and PDF/image renditions register through their own lifecycle, one batch each.
+    for module in (extract, pdf_image):
+        chosen = [(owner, item) for owner, item in zip(owners, items)
+                  if extractor_for(item["format_name"]) is module]
+        if not chosen:
+            continue
+        try:
+            results = module.register_batch(root, [item for _, item in chosen])
+        except (OSError, sqlite3.Error, *NATIVE_ERRORS) as error:
+            # A failure of the whole batch (the extraction lock held too long, say) is each stage's failure,
+            # classified like the single path's, so its attempt is recorded and contention is retried.
+            results = [error] * len(chosen)
+        registered.update(zip((owner for owner, _ in chosen), results))
+    for index, result in registered.items():
         _, intent, _ = entries[index]
         if isinstance(result, (OSError, sqlite3.Error)):
             outcomes[index] = result
