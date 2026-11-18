@@ -6,6 +6,7 @@ import posixpath
 import re
 from urllib.parse import unquote, urlsplit
 
+from tools.context_index import confidence
 from tools.context_index.context_index import (
     REFERENCE, canonical_locator, envelope, fail, get_section, visible_lines,
 )
@@ -48,7 +49,8 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None
         fail("--max-chars must be a positive integer")
     requested = canonical_locator(locator, root)
     selected = get_section(connection, requested, root)
-    docs = {row["path"]: row for row in connection.execute("SELECT * FROM documents")}
+    docs = {row["path"]: row for row in connection.execute(
+        "SELECT d.*,c.label AS confidence FROM documents d JOIN document_confidence c USING(path)")}
     rendition_metadata = dict(connection.execute("SELECT path,payload FROM rendition_documents"))
     pieces = {}
     assembled_chars = 0
@@ -90,7 +92,8 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None
     result = envelope(
         root=root, command="get", requested_locator=requested, locator=selected["locator"],
         caveat="Exact source text with inherited/configured context, not a synthesized or verified answer.",
-        characters=required, pieces=pieces, outbound_links=links,
+        characters=required, confidence=confidence.summary(piece["confidence"] for piece in pieces),
+        pieces=pieces, outbound_links=links,
     )
     selected_renditions = {piece["path"] for piece in pieces} & rendition_metadata.keys()
     if selected_renditions:
@@ -105,6 +108,7 @@ def _piece(connection, docs, rendition_metadata, row, start, end, text, reason, 
         "title": row["title"], "role": docs[row["path"]]["role"],
         "source_hash": docs[row["path"]]["hash"], "line_start": start,
         "line_end": end, "text": text, "reasons": [reason],
+        "confidence": json.loads(docs[row["path"]]["confidence"]),
     }
     if row["path"] in rendition_metadata:
         location = connection.execute("SELECT payload FROM rendition_locations WHERE locator=?",
@@ -180,6 +184,10 @@ def _outbound_links(connection, pieces, docs, rendition_metadata):
     return links
 
 
+# Per-document fields compact and get-many formats share once per document instead of per piece.
+DOCUMENT_KEYS = ("path", "role", "source_hash", "confidence")
+
+
 def compact_packet(result):
     documents = {}
     references = {}
@@ -190,17 +198,16 @@ def compact_packet(result):
             reference = f"d{len(documents) + 1}"
             references[path] = reference
             documents[reference] = {
-                key: piece[key] for key in ("path", "role", "source_hash")
+                key: piece[key] for key in DOCUMENT_KEYS
             }
         pieces.append({
-            **{key: value for key, value in piece.items()
-               if key not in ("path", "role", "source_hash")},
+            **{key: value for key, value in piece.items() if key not in DOCUMENT_KEYS},
             "document_ref": references[path],
         })
     return {
         **{key: value for key, value in result.items()
            if key not in ("pieces", "outbound_links")},
-        "format": "qualified-compact-v1",
+        "format": "qualified-compact-v2",
         "documents": documents,
         "pieces": pieces,
         "navigation": {
@@ -244,9 +251,7 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
             if document_key not in document_refs:
                 reference = f"d{len(documents) + 1}"
                 document_refs[document_key] = reference
-                documents[reference] = {
-                    key: piece[key] for key in ("path", "role", "source_hash")
-                }
+                documents[reference] = {key: piece[key] for key in DOCUMENT_KEYS}
             span_key = tuple(piece[key] for key in
                              ("source_hash", "path", "line_start", "line_end", "text"))
             if span_key not in span_refs:
@@ -263,7 +268,7 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
                 }
             pieces.append({
                 **{key: value for key, value in piece.items()
-                   if key not in ("path", "role", "source_hash", "line_start", "line_end", "text")},
+                   if key not in (*DOCUMENT_KEYS, "line_start", "line_end", "text")},
                 "span_ref": span_refs[span_key],
             })
         requests.append({
@@ -271,18 +276,20 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
             "input_locator": locator,
             "packet": {
                 **{key: value for key, value in projected.items()
-                   if key not in ("audience", "notice", "documents", "pieces")},
+                   if key not in ("audience", "notice", "documents", "pieces", "confidence")},
                 "pieces": pieces,
             },
         })
     return envelope(
-        root=root, command="get-many", format=f"qualified-many-{format_}-v1",
+        root=root, command="get-many", format=f"qualified-many-{format_}-v2",
         characters=characters, document_count=len(documents), span_count=len(spans),
+        confidence=confidence.summary(document["confidence"] for document in documents.values()),
         documents=documents, spans=spans, requests=requests,
         reference_notice="All references are local to this response. Each request's ordered pieces "
                          "retain its qualification relationships; resolve span_ref through spans and "
                          "document_ref through documents. Shared audience and notice apply to every "
-                         "request. Identical text in different sources is not corroboration. "
+                         "request, as does the confidence legend; each document carries its own "
+                         "confidence label. Identical text in different sources is not corroboration. "
                          "Later reads may reflect changed sources; compare source hashes.",
     )
 

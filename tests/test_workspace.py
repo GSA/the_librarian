@@ -698,7 +698,8 @@ class WorkspaceTests(WorkspaceCase):
         before = index.engine_fingerprint()
         paths = [Path(index.__file__), ROOT / "tools/context_index/compact_records.py",
                  ROOT / "tools/context_index/renditions.py", qualification_path,
-                 ROOT / "tools/context_index/packets.py", Path(policy.__file__)]
+                 ROOT / "tools/context_index/packets.py", ROOT / "tools/context_index/confidence.py",
+                 Path(policy.__file__)]
         contents = {path: path.read_bytes() for path in paths}
         with patch.object(Path, "read_bytes", autospec=True,
                           side_effect=lambda path: contents[path]

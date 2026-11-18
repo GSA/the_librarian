@@ -18,4 +18,8 @@ CREATE TABLE sections (
 CREATE TABLE aliases (locator TEXT PRIMARY KEY, section_id INTEGER REFERENCES sections(id));
 CREATE TABLE rendition_documents (path TEXT PRIMARY KEY REFERENCES documents(path), payload TEXT NOT NULL);
 CREATE TABLE rendition_locations (locator TEXT PRIMARY KEY REFERENCES sections(locator), payload TEXT NOT NULL);
+CREATE TABLE document_confidence (
+    path TEXT PRIMARY KEY REFERENCES documents(path),
+    level TEXT NOT NULL CHECK (level IN ('normal', 'low')), label TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE search_fts USING fts5(title, text, tokenize='unicode61');

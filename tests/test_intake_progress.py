@@ -221,7 +221,8 @@ class CatalogAndIndexTests(ProgressCase):
         self.assertEqual(self.files(), before)
         self.assertTrue(result["available"])
         self.assertTrue(result["fresh"])
-        self.assertEqual(result["indexed"], {"documents": 0, "sections": 0})
+        self.assertEqual(result["indexed"], {"documents": 0, "sections": 0, "confidence": {
+            "contract": "confidence-v1", "normal": 0, "low": 0, "low_reasons": {}}})
         self.assertEqual(result["selected"], {"documents": 0, "renditions": 0})
         db = self.root / "tools/context_index/.local/index.sqlite3"
         db.chmod(0o644)

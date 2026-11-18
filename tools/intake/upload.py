@@ -29,6 +29,11 @@ from . import runner, store
 from .contracts import IntakeError, canonical, decode, digest, fields, identifier, relative, require, sha, text
 
 VERSION = 1
+# Version 2 adds ``origin.agent_generated`` and is written only when it is declared, so a version 1
+# descriptor (and its sidecar) stays byte-identical and idempotent resubmission is unaffected.
+AGENT_VERSION = 2
+DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+COMMIT = re.compile(r"[a-f0-9]{7,64}")
 DROP_MARKER = ".librarian-drop"
 DESCRIPTOR_SUFFIX = ".submission.json"
 UPLOAD_DIRECTORY = "intake"
@@ -55,7 +60,7 @@ NOTICE = ("A committed receipt registers retained bytes only; it is not extracti
 def validate_descriptor(value):
     fields(value, {"version", "submission_id", "correction_of", "format", "name",
                    "actor", "reason", "origin", "expected_sha256"})
-    require(type(value["version"]) is int and value["version"] == VERSION, "invalid_descriptor")
+    require(type(value["version"]) is int and value["version"] in (VERSION, AGENT_VERSION), "invalid_descriptor")
     identifier(value["submission_id"])
     require(len(value["submission_id"]) <= 100, "invalid_descriptor")
     if value["correction_of"] is not None:
@@ -69,7 +74,10 @@ def validate_descriptor(value):
     text(value["actor"], 200)
     text(value["reason"], 500)
     origin = value["origin"]
-    fields(origin, {"kind", "system", "locator", "version"})
+    names = {"kind", "system", "locator", "version"}
+    fields(origin, names | ({"agent_generated"} if value["version"] == AGENT_VERSION else set()))
+    if value["version"] == AGENT_VERSION:
+        _agent_generated(origin["agent_generated"])
     if origin["kind"] == "operator-supplied":
         # Without a declaration there is no remote identity to record.
         require(origin["system"] is None and origin["locator"] is None
@@ -94,17 +102,35 @@ def validate_descriptor(value):
     return value
 
 
+def _agent_generated(value):
+    """``{generator, generated_on, source_commit}``: the declaration that an AI agent wrote the
+    submitted content, which the context index labels low confidence (``agent-generated``)."""
+    try:
+        fields(value, {"generator", "generated_on", "source_commit"})
+        text(value["generator"], 200)
+        require(value["generated_on"] is None or (
+            isinstance(value["generated_on"], str) and DATE.fullmatch(value["generated_on"]) is not None))
+        require(value["source_commit"] is None or (
+            isinstance(value["source_commit"], str) and COMMIT.fullmatch(value["source_commit"]) is not None))
+    except IntakeError as error:
+        raise IntakeError("invalid_origin") from error
+
+
 def descriptor(*, submission_id, format_name, name, actor, reason, correction_of=None,
                origin_system=None, origin_locator=None, origin_version=None, expected_sha256=None,
-               origin_kind=None):
+               origin_kind=None, agent_generated=None):
+    """A validated descriptor; ``agent_generated`` (``{generator, generated_on, source_commit}``)
+    declares agent-written content and makes it a version 2 descriptor."""
     declared = any(v is not None for v in (origin_system, origin_locator, origin_version))
     kind = origin_kind or ("declared-remote" if declared else "operator-supplied")
+    origin = {"kind": kind, "system": origin_system, "locator": origin_locator, "version": origin_version}
+    if agent_generated is not None:
+        origin["agent_generated"] = agent_generated
     return validate_descriptor({
-        "version": VERSION, "submission_id": submission_id, "correction_of": correction_of,
+        "version": VERSION if agent_generated is None else AGENT_VERSION,
+        "submission_id": submission_id, "correction_of": correction_of,
         "format": format_name, "name": name, "actor": actor, "reason": reason,
-        "origin": {"kind": kind,
-                   "system": origin_system, "locator": origin_locator, "version": origin_version},
-        "expected_sha256": expected_sha256})
+        "origin": origin, "expected_sha256": expected_sha256})
 
 
 def snapshot(stat_result):
@@ -461,7 +487,7 @@ def plan(root, value, raw):
     require(policy.allowed(original_path, "original_roots", root)
             and policy.allowed(sidecar_path, "original_roots", root), "excluded_path")
     sidecar = (canonical({
-        "version": VERSION, "submission_id": sid, "correction_of": value["correction_of"],
+        "version": value["version"], "submission_id": sid, "correction_of": value["correction_of"],
         "format": value["format"], "name": value["name"], "actor": value["actor"],
         "reason": value["reason"], "origin": value["origin"],
         "original": {"path": original_path, "sha256": digest(raw), "bytes": len(raw)},
