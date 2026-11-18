@@ -43,9 +43,10 @@ def validate(config, engine, root=None):
         validate_item(item, engine, pattern, seen, valid_contexts)
 
 
-FORMATS = frozenset({"gemini-txt", "text", "mhtml", "odt", "docling", "pdf-text", "ocr", "converted"})
-# Page-located line renditions of PDFs and images (tools/extraction/pdf_image.py).
-PAGE_LINE_FORMATS = frozenset({"pdf-text", "ocr"})
+FORMATS = frozenset({"gemini-txt", "text", "mhtml", "odt", "docling", "pdf-text", "ocr", "converted",
+                     "pdf-pages"})
+# Page-located line renditions of PDFs and images (tools/extraction/pdf_image.py, pdf_pages.py).
+PAGE_LINE_FORMATS = frozenset({"pdf-text", "ocr", "pdf-pages"})
 
 
 def validate_item(item, engine, pattern, seen, valid_contexts):
@@ -133,6 +134,8 @@ PAYLOAD_FIELDS = {
     "pdf-text": ("format", "scope", "warnings", "lines", "source_format", "method", "pages"),
     "ocr": ("format", "scope", "warnings", "lines", "source_format", "method", "pages"),
     "converted": ("format", "scope", "warnings", "lines", "conversion"),
+    "pdf-pages": ("format", "scope", "warnings", "lines", "source_format", "method", "pages", "page_count",
+                  "unread_pages"),
 }
 ODT_PAYLOAD_FIELDS = ("format", "scope", "warnings", "nodes", "xml_sha256", "members", "unrendered_features")
 SELECTION_NOTES = {
@@ -145,6 +148,8 @@ SELECTION_NOTES = {
     "ocr": "All machine OCR/layout lines, by page; characters and reading order may be misread.",
     "converted": "All Markdown lines machine-converted from an office/RTF original explicitly selected; "
                  "conversion is not review.",
+    "pdf-pages": "All non-blank lines of every page (text layer, else machine OCR of that page), by page; "
+                 "a page that could not be read is a placeholder line.",
 }
 ODT_SELECTION_NOTE = "Located XML records only; text rendition, not a rendered or approved view."
 DOCLING_CITATION = ("Docling packet line ranges are null; source_location gives the exact retained-extraction "
@@ -153,7 +158,7 @@ EXTRACTION_CITATION = ("Packet line ranges cite extraction JSON, not original li
                        "Resolve source_location for the original line, byte range or XML member/element. "
                        "Extraction and retrieval are not new review, corroboration or acceptance.")
 PAYLOAD_METADATA = ("precedence", "xml_sha256", "unrendered_features", "bom_bytes", "ends_with_terminator",
-                    "method", "parts", "source_format", "conversion")
+                    "method", "parts", "source_format", "conversion", "page_count", "unread_pages")
 
 
 def inputs(root, config, engine, review_snapshot=None):

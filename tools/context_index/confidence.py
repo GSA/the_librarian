@@ -4,7 +4,8 @@ Low confidence never withholds content. It marks published text as shaky, says w
 to correct it. Every reason has a stable code; the seams that add one are:
 
 - ``RENDITION_REASONS``: rendition kind (``rendition_kind``) -> reason, for converted and
-  machine-read renditions (one line per new converter or OCR kind);
+  machine-read renditions (one line per new converter or OCR kind); a ``pdf-pages`` rendition
+  contributes the union of its pages' kinds (``page_kinds``);
 - ``review_reasons``: reviewer-noted issues and reviewer deferrals recorded on review events;
 - ``origin_reasons``: an origin a submission declares (``agent_generated`` in its sidecar);
 - ``with_reason``: adds a reason to an existing label at read time (``open-correction``).
@@ -38,6 +39,11 @@ REASONS = {
         "Written by an AI agent (declared origin), not a primary source.",
         "Confirm against primary sources via a newer document, meeting transcript or answered "
         "question."),
+    "incomplete-rendition": (
+        "Some pages could not be read; the text shows a placeholder line naming each missing page "
+        "and its failure code.",
+        "Check the missing pages in the original file, or confirm via a newer document, meeting "
+        "transcript or answered question."),
     "open-correction": (
         "An open claim correction disputes or amends this text; the piece's corrections list the "
         "quoted claim, any corrected statement and the cited source.",
@@ -53,7 +59,11 @@ RENDITION_REASONS = {
     # A PDF's own embedded text, not recognised from pixels; only layout and tables are lost.
     "pdf-text": "converted-format",
     "converted": "converted-format",
+    # Pages of a ``pdf-pages`` rendition (``page_kinds``) that were not read.
+    "failed-pages": "incomplete-rendition",
 }
+# A ``pdf-pages`` page outcome -> the rendition kind it contributes.
+PAGE_KINDS = {"text-layer": "pdf-text", "ocr": "ocr", "failed": "failed-pages"}
 NOTED_PREFIX = "Reviewer-noted "
 DEFERRED_PREFIX = "Reviewer-deferred: "
 EXPLANATION_PREFIX = "Reviewer explanation: "
@@ -97,6 +107,25 @@ def rendition_kind(value):
     if "conversion" in value:
         return "docling-" + value["conversion"]["format"]
     return value["payload"]["format"]
+
+
+def page_kinds(payload):
+    """``{kind: details}`` of a ``pdf-pages`` payload: the union of its pages' kinds, with the pages
+    that were not read (and any left unread by the page budget) as the ``failed-pages`` details."""
+    kinds = {}
+    for page in payload["pages"]:
+        kind = PAGE_KINDS[page["outcome"]]
+        details = kinds.setdefault(kind, [])
+        if kind == "failed-pages":
+            details.append("page %d: %s" % (page["page"], page["code"]))
+    unread = payload.get("unread_pages")
+    if unread:
+        kinds.setdefault("failed-pages", []).append(
+            "pages %d-%d: %s" % (unread["first"], unread["last"], unread["code"]))
+    if "failed-pages" in kinds and len(kinds["failed-pages"]) > 20:
+        shown = kinds["failed-pages"]
+        kinds["failed-pages"] = shown[:20] + ["and %d more" % (len(shown) - 20)]
+    return {kind: details or [kind] for kind, details in kinds.items()}
 
 
 def review_reasons(reviewed_scope):
@@ -193,8 +222,10 @@ def for_rendition(value, review, origin):
     """The label of one selected rendition at build time."""
     found = []
     kind = rendition_kind(value)
-    if kind in RENDITION_REASONS:
-        found.append(reason(RENDITION_REASONS[kind], [kind]))
+    kinds = page_kinds(value["payload"]) if kind == "pdf-pages" else {kind: [kind]}
+    for kind, details in kinds.items():
+        if kind in RENDITION_REASONS:
+            found.append(reason(RENDITION_REASONS[kind], details))
     if review is not None:
         found.extend(review_reasons(review["reviewed_scope"]))
     found.extend(origin_reasons(origin))
