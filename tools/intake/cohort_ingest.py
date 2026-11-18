@@ -17,7 +17,7 @@ from urllib.parse import quote
 from tools.catalog import catalog_store as catalog
 from tools.extraction import extract, mhtml
 from tools.durable import sha256_file
-from . import archives, cohort_runtime, contracts, docs, runner, store, upload
+from . import agent_origin, archives, cohort_runtime, contracts, docs, runner, store, upload
 from .contracts import IntakeError, LedgerBusy
 from .docsync import suffix_of
 
@@ -160,7 +160,7 @@ def _archive_disposition(root, path, inbox_file):
             "_manifest": manifest}
 
 
-def _member_entries(root, relative, manifest, trusted, provisioned=False):
+def _member_entries(root, relative, manifest, trusted, provisioned=False, excluded=lambda name: False):
     """One entry per file member of an instance-expanded archive, named ``<archive>!/<member>``.
 
     Stored members are classified like inbox files from their stored bytes (``_source``); members
@@ -172,6 +172,9 @@ def _member_entries(root, relative, manifest, trusted, provisioned=False):
     entries = []
     for index, member in enumerate(manifest["members"]):
         name = relative + archives.SEPARATOR + (member["path"] or "#%d" % index)
+        if excluded(name):
+            entries.append({"relative": name, "disposition": "excluded", "format": None})
+            continue
         if member["disposition"] != "extracted":
             entries.append({"relative": name, "disposition": MEMBER_DISPOSITIONS.get(member["code"], "unsafe-path"),
                             "format": None, "bytes": member["bytes"], "code": "archive-" + member["code"]})
@@ -219,10 +222,12 @@ def _disposition(root, path, relative, trusted=None, nested=0, provisioned=False
     return _read_disposition(root, path, entry)
 
 
-def classify(root, inbox, trusted=None, keep_stat=False):
+def classify(root, inbox, trusted=None, keep_stat=False, origin=None):
     """Return one explicit disposition per inbox file; never writes the inbox.
 
     ``ingest`` passes ``keep_stat`` to keep each entry's private ``_stat`` (and ``_fast``) fields.
+    An agent ``origin`` (``agent_origin.load``) limits the walk to its includes and marks files
+    under its excludes ``excluded`` without reading them.
     """
     root, inbox = Path(root).resolve(), Path(inbox).resolve()
     if root == inbox or inbox in root.parents:
@@ -234,21 +239,34 @@ def classify(root, inbox, trusted=None, keep_stat=False):
         raise IntakeError("inbox_unavailable") from error
     provisioned = cohort_runtime.ready(root)
     entries = []
-    for directory, names, files in os.walk(inbox, onerror=unavailable, followlinks=False):
-        here = Path(directory)
-        for name in [*files, *(n for n in names if (here / n).is_symlink())]:
-            path = here / name
-            pending = [_disposition(root, path, path.relative_to(inbox).as_posix(), trusted,
-                                    provisioned=provisioned)]
-            while pending:
-                entry = pending.pop()
-                manifest = entry.pop("_manifest", None)
-                if manifest is not None:
-                    pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned))
-                if not keep_stat:
-                    for key in ("_stat", "_fast", "_source"):
-                        entry.pop(key, None)
-                entries.append(entry)
+
+    def add(path):
+        relative = path.relative_to(inbox).as_posix()
+        if agent_origin.excluded(origin, relative):
+            entries.append({"relative": relative, "disposition": "excluded", "format": None})
+            return
+        pending = [_disposition(root, path, relative, trusted, provisioned=provisioned)]
+        while pending:
+            entry = pending.pop()
+            manifest = entry.pop("_manifest", None)
+            if manifest is not None:
+                pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned,
+                                               lambda name: agent_origin.excluded(origin, name)))
+            if not keep_stat:
+                for key in ("_stat", "_fast", "_source"):
+                    entry.pop(key, None)
+            entries.append(entry)
+    for include, start in agent_origin.starts(origin, inbox):
+        if include and any(p.is_symlink() for p in (start, *start.parents) if inbox in p.parents):
+            entries.append({"relative": include, "disposition": "unsafe-path", "format": None})
+            continue
+        if include and not start.is_dir():
+            add(start)
+            continue
+        for directory, names, files in os.walk(start, onerror=unavailable, followlinks=False):
+            here = Path(directory)
+            for name in [*files, *(n for n in names if (here / n).is_symlink())]:
+                add(here / name)
     return sorted(entries, key=lambda e: e["relative"])
 
 
@@ -390,7 +408,8 @@ def _descriptor(entry, system, actor, superseded):
     return upload.descriptor(
         submission_id=entry["submission_id"], format_name=entry["format"], correction_of=superseded,
         name=entry["name"], actor=actor, reason=REASON, origin_kind="local-path",
-        origin_system=system, origin_locator=entry["locator"], expected_sha256=entry["sha256"])
+        origin_system=system, origin_locator=entry["locator"], expected_sha256=entry["sha256"],
+        agent_generated=entry.get("agent_generated"))
 
 
 def _correlation(entry, system):
@@ -671,7 +690,8 @@ def _counts(entries, admitted):
 
 
 def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False,
-           extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY):
+           extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY,
+           origin=None):
     """Classify the inbox, then submit and extract admitted files; return the report.
 
     Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
@@ -688,14 +708,19 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
     PDFs and images are read only when the instance's Docling runtime is provisioned. Each chunk's
     conversions run before its ledger stages, ``extract_concurrency`` at once (each in its own limited
     child process); with ``batch_size=1`` they run one at a time inside the prepare stage.
+
+    An agent ``origin`` (``agent_origin.load``) selects the files of an agent-written tree and
+    submits each admitted one with its ``agent_generated`` declaration (counted in ``agent_origin``).
     """
     contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
     contracts.require(type(extract_concurrency) is int and extract_concurrency >= 1, "invalid_concurrency")
     trusted = {}
-    if trust_stat:
+    # A stat-trusted file skips submission, so a changed agent declaration would go unchecked.
+    if trust_stat and origin is None:
         with store.locked(root) as c:
             trusted = docs.load(c, system)
-    entries = classify(root, inbox, trusted, True)
+    entries = classify(root, inbox, trusted, True, origin)
+    declared = agent_origin.declare(inbox, origin, entries) if origin is not None else None
     admitted = [e for e in entries if e["disposition"] == "admit"]
     # Private stat fields never reach the report: take them off every entry now.
     stats = {e["relative"]: e.pop("_stat", None) for e in entries}
@@ -710,7 +735,10 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
                  batch_size, stats, extract_concurrency)
     for entry in entries:
         entry.pop("_source", None)
-    return {"counts": _counts(entries, admitted), "entries": entries}
+    counts = _counts(entries, admitted)
+    if declared is not None:
+        counts["agent_origin"] = declared
+    return {"counts": counts, "entries": entries}
 
 
 def _process_all(root, inbox, todo, system, actor, batch_size, stats, concurrency=1):
