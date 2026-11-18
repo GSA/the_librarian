@@ -53,6 +53,8 @@ def arguments(argv):
                         help="Declare the file was written by this AI agent; indexed as low confidence")
     submit.add_argument("--agent-generated-on", help="YYYY-MM-DD the agent wrote it (with --agent-generator)")
     submit.add_argument("--agent-source-commit", help="Commit the agent wrote it from (with --agent-generator)")
+    submit.add_argument("--agent-source-repository",
+                        help="Label of the repository the agent wrote it in (with --agent-generator)")
     submit.add_argument("--expected-sha256")
     for name in ("drop-scan", "drop-submit"):
         commands.add_parser(name).add_argument("--drop", type=Path, required=True)
@@ -95,11 +97,15 @@ def runs(values):
 
 def _agent_generated(args):
     if args.agent_generator is None:
-        if args.agent_generated_on is not None or args.agent_source_commit is not None:
+        if any(value is not None for value in (
+                args.agent_generated_on, args.agent_source_commit, args.agent_source_repository)):
             raise IntakeError("invalid_origin")
         return None
-    return {"generator": args.agent_generator, "generated_on": args.agent_generated_on,
-            "source_commit": args.agent_source_commit}
+    declared = {"generator": args.agent_generator, "generated_on": args.agent_generated_on,
+                "source_commit": args.agent_source_commit}
+    if args.agent_source_repository is not None:
+        declared["source_repository"] = args.agent_source_repository
+    return declared
 
 
 def main(argv=None):

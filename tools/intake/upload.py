@@ -77,7 +77,7 @@ def validate_descriptor(value):
     names = {"kind", "system", "locator", "version"}
     fields(origin, names | ({"agent_generated"} if value["version"] == AGENT_VERSION else set()))
     if value["version"] == AGENT_VERSION:
-        _agent_generated(origin["agent_generated"])
+        agent_declaration(origin["agent_generated"])
     if origin["kind"] == "operator-supplied":
         # Without a declaration there is no remote identity to record.
         require(origin["system"] is None and origin["locator"] is None
@@ -102,12 +102,16 @@ def validate_descriptor(value):
     return value
 
 
-def _agent_generated(value):
-    """``{generator, generated_on, source_commit}``: the declaration that an AI agent wrote the
-    submitted content, which the context index labels low confidence (``agent-generated``)."""
+def agent_declaration(value):
+    """``{generator, generated_on, source_commit[, source_repository]}``: the declaration that an AI
+    agent wrote the submitted content, which the context index labels low confidence
+    (``agent-generated``). ``source_repository`` is an optional label for the tree it came from."""
     try:
-        fields(value, {"generator", "generated_on", "source_commit"})
+        optional = {"source_repository"} & set(value) if isinstance(value, dict) else set()
+        fields(value, {"generator", "generated_on", "source_commit"} | optional)
         text(value["generator"], 200)
+        if "source_repository" in value:
+            text(value["source_repository"], 200)
         require(value["generated_on"] is None or (
             isinstance(value["generated_on"], str) and DATE.fullmatch(value["generated_on"]) is not None))
         require(value["source_commit"] is None or (

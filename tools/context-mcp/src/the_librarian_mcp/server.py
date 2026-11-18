@@ -229,7 +229,9 @@ def create_server(config: Config) -> MCPServer:
         Each hit carries confidence {level, reasons}; low-confidence text is published and marked,
         and the response's confidence.reasons explains each reason and how to correct it. A hit
         whose text carries a recorded claim correction lists it under corrections (open ones make
-        the hit low confidence: open-correction); read it with get for the statement and source.
+        the hit low confidence: open-correction); read it with get for the statement and source. A hit
+        written by an AI agent also carries origin "agent-generated (...)" naming the generator,
+        date and source commit: it is not a primary source.
         low_confidence: include (default, rank order), last (after normal hits) or exclude (counted
         in low_confidence_excluded; if that empties the result, filtered replaces absence).
         """

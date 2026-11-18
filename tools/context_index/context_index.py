@@ -727,7 +727,11 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
             "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
             "excerpt": row["excerpt"][:600], "caveat": DISCOVERY,
         }
-        labels.append(corrections.flag_hit(hit, json.loads(row["confidence"]), placed.get(row["id"])))
+        label = json.loads(row["confidence"])
+        labels.append(corrections.flag_hit(hit, label, placed.get(row["id"])))
+        origin = confidence.origin_label(label)
+        if origin is not None:
+            hit["origin"] = origin
         hits.append(hit)
     for hit in hits:
         location = connection.execute("SELECT payload FROM rendition_locations WHERE locator=?",
