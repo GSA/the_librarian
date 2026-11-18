@@ -1100,6 +1100,37 @@ class QualifyTests(QualifyCase):
         self.assertEqual([e for e in report["entries"]
                           if e.get("review_code") == "review-superseded"], [])
 
+    def test_review_staged_by_another_writer_after_the_ledger_lookup_is_reused(self):
+        base = self._transport()[0]
+        find_head, raced = store.find_head, []
+
+        def lookup(root, correlation_id, heads=None):
+            found = find_head(root, correlation_id, heads)
+            if found is None and correlation_id.startswith("standing-") and not raced:
+                # Another writer stages every review, with its own reply, right after this
+                # lookup and before the review this run already paid for is staged.
+                raced.append(correlation_id)
+                with unittest.mock.patch.object(store, "find_head", find_head):
+                    self._qualify(base, concurrency=1)
+            return found
+
+        def transport(model, messages):
+            reply = base(model, messages)
+            value = json.loads(reply["content"])
+            value["explanation"] = "losing writer reply"
+            return {**reply, "content": json.dumps(value)}
+
+        with unittest.mock.patch.object(store, "find_head", lookup):
+            report = self._qualify(transport, concurrency=2)
+        self.assertEqual(len(raced), 1)
+        self.assertEqual(report["counts"], self._qualify(base, concurrency=1)["counts"])
+        # A genuinely different request under a staged correlation ID is still refused.
+        with self.assertRaises(IntakeError) as caught:
+            store.stage_request(self.root, raced[0], [
+                {**s, "arguments": {**s["arguments"], "findings_sha256": "0" * 64}}
+                for s in store.request(self.root, raced[0])["stages"]])
+        self.assertEqual(caught.exception.code, "correlation_conflict")
+
     def test_memoised_store_validation_still_refuses_changed_content(self):
         from copy import deepcopy
         import sqlite3

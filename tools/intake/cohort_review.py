@@ -17,6 +17,7 @@ from tools import policy
 from tools.context_index import renditions
 from tools.review_events import event_reader
 from . import adapters, model_review, runner, selection_manifest, standing, store
+from .contracts import IntakeError
 
 RUNNABLE = {"staged", "running", "retryable"}
 
@@ -176,7 +177,14 @@ def _new_review(root, entry, run, corr, event_id, reviewed):
     if reviewed["status"] != "reviewed":
         entry.update(qualification="pending-review", review_status=reviewed["status"])
         return None
-    return _stage_review(root, entry, run, corr, event_id, reviewed)
+    try:
+        return _stage_review(root, entry, run, corr, event_id, reviewed)
+    except IntakeError as error:
+        if error.code != "correlation_conflict":
+            raise
+    # Another writer staged this review after the ledger lookup, with its own model reply;
+    # reuse its request exactly as if the lookup had found it.
+    return store.find_head(root, corr, run["heads"])
 
 
 def _superseded(root, current, event_id, live):
