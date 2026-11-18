@@ -294,7 +294,8 @@ restated here.
   my2k qualifications become low confidence at the next rebuild without re-review),
   `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `converted-format` and
   `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
-  extraction payload format; `docling-pdf` and `docling-image` are `machine-ocr`, text, MHTML,
+  extraction payload format; `docling-pdf`, `docling-image` and cohort `ocr` are `machine-ocr`, a cohort PDF text layer
+  (`pdf-text`) is `converted-format`, text, MHTML,
   Gemini transcript and ODT renditions add no reason), `agent-generated` (an upload whose
   version-2 descriptor declares `origin.agent_generated: {generator, generated_on,
   source_commit}`; the hash-pinned `submission.json` sidecar is read at build and a missing,

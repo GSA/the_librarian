@@ -208,7 +208,9 @@ Each rendition is an ordinary `A-extract-<run>` extraction with a page-located
 `lines` payload (`{"line", "page", "text"}`). The machine-readable marker is
 `payload.format`: `pdf-text` (`method.kind: "pdf-text-layer"`) or `ocr`
 (`method.kind: "docling-ocr"`), with `payload.source_format` `pdf` or `image`.
-Treat `ocr` as machine OCR whose characters and reading order may be misread.
+Retrieval labels `ocr` low confidence `machine-ocr` and `pdf-text`
+`converted-format` (`confidence.RENDITION_REASONS`): the text layer is the PDF's own
+text, not recognised from pixels, but its layout and tables are lost.
 The extractor identity hashes `pdf_image.py`, `pdf_text_worker.py`, the lock,
 the Docling code and profile, the routing thresholds and limits, and the
 instance policy; changing any of them is a new run.

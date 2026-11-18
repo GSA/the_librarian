@@ -17,7 +17,7 @@ from unittest import mock
 
 from pdf_fixtures import encrypted_pdf, image_pdf, jpeg_header, png, png_header, text_pdf
 from tools.catalog import catalog_store as catalog
-from tools.context_index import context_index as index, renditions
+from tools.context_index import confidence, context_index as index, renditions
 from tools.extraction import docling_worker, pdf_image
 from tools.intake import adapters, cohort, cohort_runtime, standing, store
 
@@ -68,6 +68,13 @@ class RoutingTests(unittest.TestCase):
         payload = pdf_image.text_payload(report([page(1, "first"), page(2, "second")]))
         _, pages, _, _ = standing._expected_inspection({"payload": payload}, [])
         self.assertEqual(pages, 2)  # a max_pages 1 policy refuses this two-page PDF
+
+    def test_ocr_is_low_confidence_machine_ocr_and_a_text_layer_converted_format(self):
+        text = pdf_image.text_payload(report([page(1, "first")]))
+        ocr = {**text, "format": "ocr"}
+        for payload, code in ((ocr, "machine-ocr"), (text, "converted-format")):
+            label = confidence.for_rendition({"payload": payload}, None, None)
+            self.assertEqual(label["reasons"], [{"code": code, "details": [payload["format"]]}])
 
     def test_line_records_are_capped(self):
         with mock.patch.dict(pdf_image.LIMITS, lines=2), self.assertRaises(pdf_image.ConversionFailed) as caught:
