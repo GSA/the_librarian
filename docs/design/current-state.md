@@ -924,13 +924,15 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   `read_records_by_receipt` now copies the validated snapshot's current records into a
   temporary table and commits before its joins and lookups, which read only that copy. The
   `progress` panel never inspects or hashes a catalog larger than `progress.INSPECT_LIMIT`
-  (32 MiB): without a receipt (or this process's memo) it reports `unvalidated`, and its render
+  (32 MiB; `_binding(hash_bytes=False)` gives no byte binding): without an identity-bound
+  receipt (or this process's memo) it reports `unvalidated`, and its render
   runs the index check, which leaves a receipt, first. The cohort side waits a busy store out: `tools/intake/store_busy.py`
   retries a call that failed only on a SQLite busy/locked error (in its cause chain) with
   backoff for up to 300 s, then raises the retryable `store_busy`, never an identity error.
   The model-review findings probe and each entry's review-and-select settle use it; a settle
-  retry restores the entry and token usage first and reuses a prefetched review that
-  succeeded. WAL was not adopted: the stores require `journal_mode=delete`, refuse `-wal`
+  retry restores the entry and token usage first and passes a review that already succeeded
+  (prefetched or made by the failed attempt) as its prefetched review, so it is charged once and
+  never paid for again. WAL was not adopted: the stores require `journal_mode=delete`, refuse `-wal`
   sidecars, and bind receipts to the header change counter and file bytes that WAL does not
   maintain. Tests: `tests/test_store_busy.py` (a writer can take EXCLUSIVE while batch reads
   page their results; bounded retry; settle retry), `tests/test_progress_scale.py`

@@ -119,7 +119,7 @@ class SettleRetry(unittest.TestCase):
     def test_a_busy_store_mid_settle_resumes_without_counting_usage_or_entry_changes_twice(self):
         attempts = Counter()
 
-        def review_and_select(root, entry, run, prefetched=None):
+        def review_and_select(root, entry, run, prefetched=None, spent=None):
             attempts[entry["rendition"]] += 1
             run["usage"].update(prompt_tokens=10)
             entry["model_call_skipped"] = False
@@ -138,7 +138,7 @@ class SettleRetry(unittest.TestCase):
         prefetched = mock.Mock(return_value={"status": "reviewed"})
         calls = Counter()
 
-        def review_and_select(root, entry, run, fetched=None):
+        def review_and_select(root, entry, run, fetched=None, spent=None):
             calls[id(entry)] += 1
             seen.append(fetched)
             if calls[id(entry)] == 1:
@@ -150,10 +150,31 @@ class SettleRetry(unittest.TestCase):
             cohort_review._settle("root", {}, {"usage": Counter()}, failed)
         self.assertEqual(seen, [prefetched, prefetched, failed, None])
 
+    def test_a_review_staged_before_a_busy_store_is_charged_once_and_not_paid_again(self):
+        entry = {"rendition": "r1", "submission_id": "s", "rendition_sha256": "a" * 64}
+        run = {"usage": Counter(), "policy_sha": "p" * 64, "manifest": "m", "heads": None,
+               "policy": {}, "live": set()}
+        current = {"stages": []}
+        heads = mock.Mock(side_effect=[None, current])  # staged by the first attempt
+        review = mock.Mock(return_value={"status": "reviewed", "usage": {"prompt_tokens": 7}})
+        superseded = mock.Mock(side_effect=[locked(), False])
+        with mock.patch.object(cohort_review.store, "find_head", heads), \
+                mock.patch.object(cohort_review, "_held_back", return_value=False), \
+                mock.patch.object(cohort_review, "_review", review), \
+                mock.patch.object(cohort_review, "_stage_review", return_value=current), \
+                mock.patch.object(cohort_review, "_superseded", superseded), \
+                mock.patch.object(cohort_review, "_run_review", return_value=(None, current)), \
+                mock.patch.object(cohort_review, "_run_select", return_value=current), \
+                mock.patch.object(cohort_review, "_conclude"), \
+                mock.patch.object(store_busy.time, "sleep"):
+            cohort_review._settle("root", entry, run)
+        self.assertEqual((review.call_count, superseded.call_count), (1, 2))
+        self.assertEqual(run["usage"], Counter(prompt_tokens=7))
+
     def test_a_concurrent_run_settles_through_the_same_retry(self):
         attempts = Counter()
 
-        def review_and_select(root, entry, run, prefetched=None):
+        def review_and_select(root, entry, run, prefetched=None, spent=None):
             attempts[entry["rendition"]] += 1
             if attempts[entry["rendition"]] == 1:
                 raise locked()

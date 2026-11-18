@@ -162,8 +162,10 @@ def _migrate_locked(home, db, backups, rebuild):
                 "backup": taken}
 
 
-def _binding(connection):
+def _binding(connection, *, hash_bytes=True):
     """What a validation covers: the database file, the validator bytes and the runtime.
+
+    With ``hash_bytes`` false a file that only its bytes could bind gives None, never a hash.
 
     The file is bound by its identity (device, inode, size, mtime, ctime, SQLite change counter;
     docs/design/current-state.md, "What a catalog write validates") when it is a plain rollback-journal file; otherwise by the SHA-256 of its exact
@@ -186,6 +188,8 @@ def _binding(connection):
         identity = None
     if identity is not None:
         return {"version": 2, "identity": identity, "validator_sha256": VALIDATOR_SHA256, "runtime": runtime}
+    if not hash_bytes:
+        return None
     return {"version": 1, "snapshot_sha256": hashlib.sha256(connection.serialize()).hexdigest(),
             "validator_sha256": VALIDATOR_SHA256, "runtime": runtime}
 
@@ -273,19 +277,19 @@ def observed_state(connection, home, seen, *, inspect_limit=None):
     any real defect surfaces as that inspection's refusal. ``status`` and ``audit`` remain the
     commands that report an unusable receipt.
 
-    With ``inspect_limit``, a database file larger than that many bytes is neither inspected nor,
-    while a writer's journal is beside it, hashed for a byte binding: without a receipt or memo
-    the result is None. An O(history) pass holds the read lock throughout, and in rollback-journal
+    With ``inspect_limit``, a database file larger than that many bytes is neither inspected nor
+    hashed for a byte binding (as while a writer's journal is beside it): without an
+    identity-bound receipt or memo the result is None. An O(history) pass holds the read lock throughout, and in rollback-journal
     mode a writer's commit then waits in PENDING while every new reader, such as the
     instance-identity probe, fails (Kata 8as8).
     """
     connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
     path = connection.execute("PRAGMA database_list").fetchone()["file"]
     large = inspect_limit is not None and os.path.getsize(path) > inspect_limit
-    if large and os.path.lexists(f"{path}-journal"):
-        return None
     try:
-        binding = _binding(connection)
+        binding = _binding(connection, hash_bytes=not large)
+        if binding is None:
+            return None
         marker = json.dumps([binding, _today()], sort_keys=True)
         trusted = _trusted_state(connection, home, binding)
     except (CatalogError, OSError, ValueError):

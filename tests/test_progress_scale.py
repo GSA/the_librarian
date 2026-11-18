@@ -513,7 +513,8 @@ class CatalogTests(Case):
             connection.execute("BEGIN")
             journal.write_bytes(b"")  # a writer began after this reader opened the file
             try:
-                with mock.patch.object(catalog, "_binding", side_effect=AssertionError("hashed")):
+                with mock.patch.object(type(connection), "serialize", side_effect=AssertionError("hashed")), \
+                        mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
                     self.assertIsNone(catalog.observed_state(connection, home, {}, inspect_limit=0))
             finally:
                 journal.unlink()
