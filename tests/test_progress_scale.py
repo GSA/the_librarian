@@ -490,6 +490,35 @@ class CatalogTests(Case):
         self.assertEqual(inspected.call_count, 1)
 
 
+    def test_a_large_catalog_is_never_inspected_and_without_a_receipt_reports_unvalidated(self):
+        catalog.initialize(self.root)
+        from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
+        seed_catalog(self.root, 5)
+        progress._catalog_seen.clear()
+        with mock.patch.object(progress, "INSPECT_LIMIT", 0), \
+                mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
+            result = progress.read_catalog(self.root)
+        self.assertEqual((result["available"], result["error"]), (False, "unvalidated"))
+        catalog.status(self.root)  # a validating read leaves the receipt the view trusts
+        with mock.patch.object(progress, "INSPECT_LIMIT", 0), \
+                mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
+            self.assertTrue(progress.read_catalog(self.root)["available"])
+
+    def test_a_large_catalog_with_a_writer_journal_is_not_hashed(self):
+        catalog.initialize(self.root)
+        catalog.status(self.root)
+        home, db, _ = catalog.locations(self.root)
+        journal = db.with_name(db.name + "-journal")
+        with closing(catalog.connect(db)) as connection:
+            connection.execute("BEGIN")
+            journal.write_bytes(b"")  # a writer began after this reader opened the file
+            try:
+                with mock.patch.object(type(connection), "serialize", side_effect=AssertionError("hashed")), \
+                        mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
+                    self.assertIsNone(catalog.observed_state(connection, home, {}, inspect_limit=0))
+            finally:
+                journal.unlink()
+
 class SingleFlightTests(unittest.TestCase):
     def test_concurrent_requests_share_one_render(self):
         gate, started, calls = threading.Event(), threading.Event(), []

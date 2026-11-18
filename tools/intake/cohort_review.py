@@ -13,10 +13,9 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 
-from tools import policy
 from tools.context_index import renditions
 from tools.review_events import event_reader
-from . import adapters, model_review, runner, selection_manifest, standing, store
+from . import adapters, model_review, runner, selection_manifest, standing, store, store_busy
 from .contracts import IntakeError
 
 RUNNABLE = {"staged", "running", "retryable"}
@@ -130,7 +129,7 @@ def _review(root, entry, run):
     ``standing-review`` adapter then ends it as ``prohibited-scope`` by its own scope check.
     """
     if standing.refused_scope(root, run["policy"], entry["rendition"], entry["rendition_sha256"]):
-        home = policy.validate_instance_roots(root)["intake_home"]
+        home = store_busy.instance_roots(root)["intake_home"]
         return {"status": "reviewed", "skipped": "scope",
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0},
                 "findings_path": f"{home}/findings/out-of-scope/{entry['rendition_sha256'][:24]}.json",
@@ -161,10 +160,11 @@ def _stage_review(root, entry, run, corr, event_id, reviewed, correction_of=None
                        "manifest": run["manifest"]}}], correction_of=correction_of)
 
 
-def _new_review(root, entry, run, corr, event_id, reviewed):
+def _new_review(root, entry, run, corr, event_id, reviewed, spent=None):
     """Review (unless prefetched) and stage an entry without a standing request.
 
     Returns the staged request summary, or None when the entry's outcome is already decided.
+    A review made here is also appended to ``spent``, so a retry can reuse it.
     """
     if reviewed is None:
         if _held_back(root, entry, run["policy"], run["manifest"]):
@@ -173,6 +173,8 @@ def _new_review(root, entry, run, corr, event_id, reviewed):
                          capacity_call_skipped=True)
             return None
         reviewed = _review(root, entry, run)
+        if spent is not None:
+            spent.append(reviewed)
     entry["model_call_skipped"] = reviewed.get("skipped") == "scope"
     run["usage"].update(reviewed["usage"])
     if reviewed["status"] != "reviewed":
@@ -250,7 +252,7 @@ def _conclude(entry, current, event_id):
     entry.update(qualification="qualified", review_event_id=event_id, selection=selection)
 
 
-def _review_and_select(root, entry, run, prefetched=None):
+def _review_and_select(root, entry, run, prefetched=None, spent=None):
     """Review and select one extracted rendition; identity is bound to the exact rendition.
 
     ``prefetched`` optionally returns the model review already started for this entry
@@ -273,7 +275,7 @@ def _review_and_select(root, entry, run, prefetched=None):
     if current is None:
         if failure is not None:
             raise failure
-        current = _new_review(root, entry, run, corr, event_id, reviewed)
+        current = _new_review(root, entry, run, corr, event_id, reviewed, spent)
         if current is None:
             return
     elif reviewed is not None:
@@ -292,6 +294,37 @@ def _review_and_select(root, entry, run, prefetched=None):
     _conclude(entry, current, event_id)
 
 
+def _settle(root, entry, run, prefetched=None):
+    """``_review_and_select``, resumed while it fails only because a store is briefly locked.
+
+    Each step it takes is a durable, idempotent ledger step, so a retry finds what was staged and
+    goes on from there. The entry and token usage are restored before each attempt, and a model
+    review that succeeded (prefetched, or made by an earlier attempt) is handed to the retry as its
+    prefetched review: it is charged once and never paid for again (Kata 8as8).
+    """
+    entry_before, usage_before = dict(entry), run["usage"].copy()
+    fetched, spent = [prefetched], []
+
+    def attempt():
+        entry.clear()
+        entry.update(entry_before)
+        run["usage"].clear()
+        run["usage"].update(usage_before)
+        try:
+            _review_and_select(root, entry, run, fetched[0], spent)
+        except Exception:
+            if spent:
+                reviewed = spent[-1]
+                fetched[0] = lambda: reviewed
+            elif fetched[0] is not None:
+                try:
+                    fetched[0]()
+                except Exception:
+                    fetched[0] = None  # a failed prefetch is not replayed; review in turn instead
+            raise
+    store_busy.retry(attempt)
+
+
 def review_all(root, extracted, run, concurrency):
     """Review and select each entry in input order, with up to ``concurrency`` model calls in flight.
 
@@ -303,7 +336,7 @@ def review_all(root, extracted, run, concurrency):
     run = {**run, "heads": store.Heads(), "live": _live_events(run["snapshot"])}
     if concurrency == 1:
         for entry in extracted:
-            _review_and_select(root, entry, run)
+            _settle(root, entry, run)
         return
     # Requests saved before this run need no model call; one read covers the run.
     # A request another writer stages later is still found by the fresh per-entry
@@ -317,7 +350,7 @@ def review_all(root, extracted, run, concurrency):
         corr = "standing-" + _standing_token(entry, run["policy_sha"])
         return corr not in existing and _free_room(root, run["manifest"]) > waiting
     pipeline(extracted, concurrency, ahead, lambda entry: _review(root, entry, run),
-             lambda entry, prefetched: _review_and_select(root, entry, run, prefetched))
+             lambda entry, prefetched: _settle(root, entry, run, prefetched))
 
 
 def pipeline(entries, concurrency, ahead, review, settle):

@@ -25,9 +25,8 @@ import time
 import urllib.error
 import urllib.request
 
-from tools import policy
 from tools.catalog import catalog_store as catalog
-from . import standing, usage_log
+from . import standing, store_busy, usage_log
 
 PROVIDER = "usai"
 MAX_PROMPT_CHARS = 400_000
@@ -240,7 +239,7 @@ def review(root, rendition, standing_policy, model, transport,
     if len(encoded) > standing_policy["budget"]["max_findings_bytes"]:
         return {**result, "status": "over-budget"}
     digest = hashlib.sha256(encoded).hexdigest()
-    home = policy.validate_instance_roots(root)["intake_home"]
+    home = store_busy.instance_roots(root)["intake_home"]
     name = (f"{home}/findings/{value['source']['receipt_id']}/{value['run_id']}/"
             f"{digest[:24]}.json")
     _write_private(root, name, encoded)
