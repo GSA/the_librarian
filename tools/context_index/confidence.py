@@ -49,6 +49,9 @@ REASONS = {
 RENDITION_REASONS = {
     "docling-pdf": "machine-ocr",
     "docling-image": "machine-ocr",
+    "ocr": "machine-ocr",
+    # A PDF's own embedded text, not recognised from pixels; only layout and tables are lost.
+    "pdf-text": "converted-format",
 }
 NOTED_PREFIX = "Reviewer-noted "
 DEFERRED_PREFIX = "Reviewer-deferred: "

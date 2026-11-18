@@ -368,7 +368,10 @@ body-free counts: `admit` (with format `text`, `gemini-txt`, `mhtml` or `odt`; a
 that parses as a Gemini transcript is `gemini-txt`; a text-suffix file whose
 content starts with MIME headers, such as a Confluence "Exported From Confluence"
 `.doc`, is `mhtml`), `needs-runtime` (PDF and
-images awaiting a verified Docling runtime), `needs-reader` (no existing
+images while the instance has no provisioned Docling runtime, code
+`docling-not-provisioned`; once provisioned they are `admit` with format `pdf` or
+`image`, and an image whose header declares more than 32,000,000 pixels is
+`over-limit` with code `pixel-limit`), `needs-reader` (no existing
 reader, for example Office formats, or MIME that cannot be read strictly; the
 report carries a `code` such as `mime-malformed`, `mime-no-html`, `mime-encoding`,
 `mime-charset` or `mime-empty`, and raw encoded text is never admitted instead), `archive-expanded` (a zip or tar
@@ -389,7 +392,7 @@ new `mhtml` submission that is recorded as a correction of the old one
 (`correction_of`), so it is extracted again rather than kept. Bump
 `mhtml.METHOD_VERSION` when conversion output changes.
 
-`ingest ... --system LABEL --actor A [--limit N] [--batch-size N]` submits each admitted file as
+`ingest ... --system LABEL --actor A [--limit N] [--batch-size N] [--extract-concurrency N]` submits each admitted file as
 a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,
 percent-encoded inbox-relative locator, pinned SHA-256) and runs
 `extract-prepare` then `extract-register` through the ledger. When an inbox
@@ -408,7 +411,11 @@ effects it always did. A head must be a single stage with the entry's operation,
 format, else the entry fails as `correction_mismatch` (`ambiguous_correction` for a chain with
 two children); neither aborts the run. The
 optional `--report` (0600) lists per-file paths, hashes and outcomes and is
-private instance data. Extraction never reviews, selects or qualifies.
+private instance data. Extraction never reviews, selects or qualifies. PDFs and images are converted
+before each chunk's ledger stages, `--extract-concurrency` (default 2) files at a time, each in
+its own bounded child process; a refused file is a blocked `extract-prepare` with an `extract-<code>`
+code and is not converted again on rerun (limits, codes and the `pdf-text`/`ocr` rendition marker:
+[tools/extraction/README.md](../tools/extraction/README.md#pdf-and-image-text-in-cohort-intake)).
 
 `qualify ... --system LABEL --actor A --policy PATH --manifest PATH
 --models-config FILE --model M --context LOCATOR [--context LOCATOR ...]

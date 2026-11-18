@@ -23,7 +23,7 @@ from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
 from . import (cli, cohort_archives, cohort_review, docsync, model_review, runner, selection_manifest, standing, store,
                throttle, upload, usage_log)
-from . import contracts
+from . import cohort_runtime, contracts
 from .cohort_ingest import BATCH_SIZE, classify, ingest
 from .cohort_recovery import recover_deferred, recover_identity, recover_unresolved_evidence
 from .contracts import IntakeError
@@ -377,7 +377,8 @@ def _qualification_counts(report, extracted, others, published):
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
             context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
-            initial_concurrency=None, inspected_form="list", trust_stat=False, deferred="hold"):
+            initial_concurrency=None, inspected_form="list", trust_stat=False, deferred="hold",
+            extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
 
     ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
@@ -386,7 +387,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     exceeds ``concurrency``; ``adaptive=False`` holds it fixed. ``report["throughput"]`` is the
     effective rate. ``inspected_form`` (``list`` or ``ranges``) only changes how the reviewer is
     asked to write the inspected record indices; findings and outcomes are identical.
-    ``trust_stat`` is passed to ``ingest`` (opt-in; see there).
+    ``trust_stat`` and ``extract_concurrency`` are passed to ``ingest`` (see there).
     ``deferred="qualify-low-confidence"`` (opt-in; default ``hold``) qualifies a reviewer deferral
     after a complete inspection under the current policy as low confidence instead of holding it,
     and restages this cohort's held deferrals that way from their saved findings (no model call).
@@ -394,7 +395,8 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     _check_options(concurrency, initial_concurrency, inspected_form, context, deferred)
     root = Path(root).resolve()
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
-    report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat)
+    report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat,
+                    extract_concurrency=extract_concurrency)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
     extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
@@ -533,6 +535,9 @@ def _parser():
             command.add_argument("--trust-stat", action="store_true",
                                  help="skip reading and hashing an extracted file whose stat identity "
                                       "equals its docs row (default: every file is hashed)")
+            command.add_argument("--extract-concurrency", type=int, default=cohort_runtime.DEFAULT_CONCURRENCY,
+                                 help="PDF/image conversions in flight, each its own limited process "
+                                      "(default %d; ~1.5 GiB resident each)" % cohort_runtime.DEFAULT_CONCURRENCY)
         if name == "ingest":
             command.add_argument("--limit", type=int)
             command.add_argument("--batch-size", type=int, default=BATCH_SIZE,
@@ -589,10 +594,11 @@ def _inbox_report(args):
             concurrency=args.concurrency, adaptive=not args.no_adaptive,
             initial_concurrency=args.initial_concurrency,
             inspected_form=args.inspected_form, trust_stat=args.trust_stat,
-            deferred=args.deferred)
+            deferred=args.deferred, extract_concurrency=args.extract_concurrency)
     if args.command == "ingest":
         return ingest(args.root, args.inbox, system=args.system, actor=args.actor,
-                      limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat)
+                      limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat,
+                      extract_concurrency=args.extract_concurrency)
     entries = classify(args.root, args.inbox)
     return {"counts": {"files": len(entries),
                        "disposition": dict(Counter(e["disposition"] for e in entries))},

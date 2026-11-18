@@ -125,7 +125,7 @@ to exist in this distribution.
 | Capability | Status | State in this repository | Required action |
 |---|---|---|---|
 | Three-agent collaboration and returned findings | Open | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
-| Broader extraction | Partial | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT, MHTML (including Confluence `.doc` exports) and ODT; optional offline Docling PDF/image conversion. Office formats are classified `needs-reader` | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
+| Broader extraction | Partial | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT, MHTML (including Confluence `.doc` exports) and ODT; optional offline Docling PDF/image conversion; cohort intake reads PDFs (embedded text layer first, Docling OCR fallback) and images (Docling OCR) when the runtime is provisioned. Office formats are classified `needs-reader` | Port DOCX/XLSX/PPTX; preserve format limitations, dependency pins and source/engine-bound versions |
 | Archive-member and large-workbook handling | Partial | Explicit `cohort expand-archives` expands zip/tar members by hash into instance storage with name, link and size checks, and `delete-archive-original` deletes a verified, fully registered original (Kata 12sc); no row-chunk engine or member-selection policy | Add versioned XLSX chunking and member-policy selection without automatic recursive expansion or legacy-run rewriting |
 | Bounded ingestion cohorts | Partial | Cohort driver delivered (`tools.intake.cohort`: classify, batched ingest, qualify, publish) with saved ledger requests, serialized writes, explicit per-file outcomes and daily backups; no `ReceiptMetadataSnapshot`-style operation-local catalog snapshot API | Port an operation-local catalog snapshot API only if cohort cost measurements need it |
 | Read-only remote discovery | Open | No remote connector; local explicit-root inventory, marked local drop and read-only local inbox classification exist | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
@@ -225,7 +225,7 @@ than assuming an old local copy remains authorized for retrieval.
 
 **Partial.** Registration through the catalog writer and format-routed
 extraction run as intake stages for text, Gemini TXT, MHTML and ODT (cohort
-ingest) and Docling PDF/images (staged requests). Further formats are **Open**
+ingest) and PDF/images (cohort ingest through the provisioned Docling runtime, or staged Docling requests). Further formats are **Open**
 (see the reuse-gap table).
 
 Register real receipt/source/artifact metadata through the supported catalog

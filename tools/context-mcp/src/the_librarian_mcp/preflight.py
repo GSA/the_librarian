@@ -49,6 +49,24 @@ def module_command(config: Config, module: str, *arguments: str) -> list[str]:
     return [sys.executable, "-B", "-m", module, *arguments]
 
 
+def pdf_image_runtime(config: Config) -> dict:
+    """Informational: whether cohort intake can read PDFs and images (the pinned Docling runtime).
+
+    An unprovisioned runtime is not a failure; those files stay ``needs-runtime`` until it is.
+    """
+    check = run_check(
+        "pdf_image_runtime",
+        module_command(config, "tools.extraction.pdf_image", "status", "--root", str(config.root)),
+        config, "Run python -m tools.extraction.pdf_image status --root ROOT and resolve its diagnostic.",
+    )
+    if check["ok"]:
+        result = check["result"]
+        check["provisioned"] = result.get("provisioned") is True
+        check["action"] = result.get("action") or (
+            "PDF and image files in cohort intake are read through the pinned runtime.")
+    return check
+
+
 def preflight(config: Config, *, refresh_index: bool = False) -> dict:
     checks = [run_check(
         "runtime", [sys.executable, "-B", "-c", RUNTIME], config,
@@ -90,6 +108,7 @@ def preflight(config: Config, *, refresh_index: bool = False) -> dict:
         "index", [*index_argv, "status"], config,
         "After maintained-context edits, run this command with --refresh-index; this refreshes only derived data.",
     ))
+    checks.append(pdf_image_runtime(config))
     return {
         "command": "preflight", "ok": all(check["ok"] for check in checks),
         "refresh_requested": refresh_index, "checks": checks,

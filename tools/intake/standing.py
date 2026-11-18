@@ -254,7 +254,8 @@ def _rendition(root, args, engine):
     return raw, value, None
 
 
-EXTRACT_FORMATS = {"text": "lines", "gemini-txt": "lines", "mhtml": "lines", "odt": "nodes"}
+EXTRACT_FORMATS = {"text": "lines", "gemini-txt": "lines", "mhtml": "lines", "odt": "nodes",
+                   "pdf-text": "lines", "ocr": "lines"}
 
 
 def _kind(value):
@@ -391,7 +392,9 @@ def _expected_inspection(value, records):
     records = payload[EXTRACT_FORMATS[payload["format"]]]
     expected = {"records": list(range(len(records))),
                 "warnings": sorted(f"#/payload/warnings/{i}" for i in range(len(payload["warnings"])))}
-    return expected, 0, records, ["text"]
+    # PDF/image renditions count their pages against the policy's page budget.
+    pages = len(payload["pages"]) if payload["format"] in renditions.PAGE_LINE_FORMATS else 0
+    return expected, pages, records, ["text"]
 
 
 def _snapshot(root, snapshot):

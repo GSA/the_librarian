@@ -421,8 +421,11 @@ class ExtractStageTests(unittest.TestCase):
 
     def test_extract_and_docling_formats_are_not_interchangeable(self):
         from tools.intake.contracts import IntakeError
-        for operation, fmt in (("extract-prepare", "pdf"), ("docling-prepare", "text")):
+        for operation, fmt in (("extract-prepare", "docx"), ("docling-prepare", "text")):
             args = ({"receipt": "D1", "format_name": fmt} if operation.startswith("extract")
                     else {"receipt": "D1", "format_name": fmt, "artifacts_path": "/a", "python": "/p"})
             with self.subTest(operation=operation), self.assertRaises(IntakeError):
                 stage_request(self.root, [stage("extraction", operation, args)], "req-" + fmt)
+        # PDF and image renditions (text layer or OCR) run through the extract-* lifecycle.
+        stage_request(self.root, [stage("extraction", "extract-prepare",
+                                        {"receipt": "D1", "format_name": "pdf"})], "req-pdf")

@@ -102,8 +102,8 @@ watches folders or runs on a schedule.
 | --- | --- | --- |
 | One file | `tools.intake.cli submit-file` | Steps 4–7 of [registering by hand](#registering-a-file-by-hand) (extract, write, select, rebuild) |
 | A marked drop folder | `tools.intake.cli drop-scan` / `drop-submit` | As for one file |
-| A read-only inbox folder (text, Gemini TXT, MHTML, ODT) | `tools.intake.cohort qualify` | Nothing: it ingests, extracts, reviews, selects and publishes what qualifies; the rest stay visibly pending |
-| PDF or images | `submit-file`, then Docling stages | See [tools/extraction/README.md](tools/extraction/README.md) |
+| A read-only inbox folder (text, Gemini TXT, MHTML, ODT; PDF and images once the Docling runtime is provisioned) | `tools.intake.cohort qualify` | Nothing: it ingests, extracts, reviews, selects and publishes what qualifies; the rest stay visibly pending |
+| One PDF or image | `submit-file`, then Docling stages | See [tools/extraction/README.md](tools/extraction/README.md) |
 
 ### One file or a drop folder
 
