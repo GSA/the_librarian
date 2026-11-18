@@ -232,8 +232,8 @@ the image identity is unchanged. Changing any of them is a new run.
 units, each in its own child process (`python -m tools.extraction.pdf_pages unit`)
 in a private directory below `data/extractions/.local/work/` that is removed
 afterwards, with a 16 GiB address-space limit and 600 CPU seconds. The inventory
-has 330 wall seconds; an OCR page 180, ending its Docling conversion 15 seconds
-earlier. Each unit runs as PID 1 of its own PID namespace (`unshare -Ur --pid
+has 330 wall seconds; an OCR page 300 (the slowest measured page took 160 under
+4-way load), ending its Docling conversion 15 seconds earlier. Each unit runs as PID 1 of its own PID namespace (`unshare -Ur --pid
 --fork --kill-child`), so when it ends or is killed every process it started dies
 with it, including workers in sessions of their own; its process group is killed
 too, and every unit alarm fires before its parent's. The page worker itself is limited to 2 GiB, 300 CPU and wall seconds.

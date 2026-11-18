@@ -58,7 +58,7 @@ TEXT_LAYER = dict(pdf_image.TEXT_LAYER)
 RENDER = {"scale": 3.0, "dpi": 216, "max_pixels": renditions.DOCLING_MAX_PAGE_PIXELS * 98 // 100}
 LIMITS = {
     "source_bytes": pdf_image.MAX_SOURCE, "pages": 5000, "lines": 200_000, "document_seconds": 7200,
-    "page_wall_seconds": 180, "inventory_wall_seconds": 330, "cpu_seconds": 600,
+    "page_wall_seconds": 300, "inventory_wall_seconds": 330, "cpu_seconds": 600,
     "address_space_bytes": docling_worker.LIMITS["address_space_bytes"], "attempts": 2,
 }
 GRACE_SECONDS = 2
