@@ -629,7 +629,7 @@ restated here.
   prompt size (about four characters per token, plus `by_count` from a `--cost-estimate` file's
   per-document averages); `--limit N` bounds model calls for a staged rollout (`over_limit`).
   `--apply` reviews each selected head with qualify's plumbing (models config, the policy's context,
-  adaptive concurrency, throttle/backoff, `--inspected-form`, the policy's maintained context, usage and throughput reporting) and
+  adaptive concurrency, throttle/backoff, `--inspected-form`, usage and throughput reporting) and
   stages the review as an append-only correction of the old head (an older-policy head under the
   current-policy chain name, so a later `qualify` finds it), then selects. `--deferred` defaults
   to `qualify-low-confidence` here, so a head still deferred qualifies as `reviewer-deferred` low
