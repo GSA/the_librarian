@@ -605,6 +605,46 @@ size, sha256, manifest sha256, actor, time) to `archives/deletions.jsonl`. It fs
 then unlinks the archive and fsyncs the directory. A rerun reports `already-deleted`. Exit status
 is 0 for `verified`, `deleted` and `already-deleted`, and 1 when blocked.
 
+## Agent-written context
+
+`classify`, `ingest` and `qualify` accept `--agent-origin FILE`: a private origin file
+(version 1, at most 64 KiB; template `config/agent-origin.example.json`, keep the instance copy in
+an ignored `config/*.local.json`) declaring that the inbox, or the part of it the file selects,
+was written by an AI agent. Fields: `version` (1), `generator` (printable ASCII, at most 200
+characters, e.g. `the_librarian (previous version)`), optional `source_repository` (a label such as
+`falcon-docs`), `provenance` (`git` or `none`, default `none`), optional `include` (inbox-relative
+paths walked instead of the whole inbox; a missing one refuses the run as
+`agent_origin_include_missing`, a symlinked one or one below a symlink is `unsafe-path`) and
+`exclude` (paths below which files are reported `excluded`, unread). A malformed file is
+`invalid_agent_origin`. Files outside `include` are not part of the cohort and are not listed.
+
+Each admitted file is submitted with a version-2 descriptor whose `origin.agent_generated` is
+`{generator, generated_on, source_commit, source_repository?}`. With `git` provenance the inbox must
+be the top level of a git work tree (`agent_origin_not_repository_root`, and
+`agent_origin_git_unavailable` when git fails); git runs read-only (no optional locks, fsmonitor,
+signatures or pager). A tracked, unmodified file is declared with the last commit that touched it
+and its author date (`committed`); a modified, untracked or ignored file has neither
+(`uncommitted`), since its bytes are in no commit. A member of an expanded archive is declared like the archive file it came from. Reports count them in
+`counts.agent_origin.declared` (`committed`, `uncommitted`, `none`) with the work tree's `head`;
+`classify` also counts admitted `format`s and `admitted_bytes`, so it is the dry run.
+
+The declaration never admits or withholds anything: the cohort is reviewed, selected and published
+by the same standing review as any other (the review checks that the rendition is complete and
+faithful to the file, not that the file is true), and whatever qualifies is indexed low confidence
+with reason `agent-generated` whose detail names the generator, date and
+`REPO@COMMIT:PATH`. Search hits carry it as `origin: "agent-generated (...)"`; `get` pieces carry it
+in their confidence label; `--low-confidence last|exclude` ranks them last or leaves them out.
+Reviewer deferrals of agent-written context can qualify as low confidence with `--deferred
+qualify-low-confidence` like any other.
+
+The declaration is part of the submission record, so give the cohort its own `--system` label and
+keep the origin file and the tree's commits as they were: re-running with a different declaration
+for unchanged bytes (another generator, or a file committed after it was ingested uncommitted) is
+refused visibly as `receipt/submission_conflict`, never silently relabelled; as for any failed
+entry, the next `qualify` of that cohort then drops those files' earlier selections. Decide
+whether to commit the source tree before the first ingest. Changed bytes are a
+correction as for any inbox file.
+
 ## Model-assisted standing review
 
 `tools/intake/model_review.py` turns one model's review of one exact extraction
