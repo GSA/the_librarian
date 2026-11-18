@@ -56,6 +56,7 @@
   "tools/intake/cohort_runtime.py",
   "tools/intake/agent_origin.py",
   "tools/intake/cohort_recovery.py",
+  "tools/intake/cohort_rereview.py",
   "tools/intake/cohort_review.py",
   "tools/intake/model_review.py",
   "tools/intake/throttle.py",

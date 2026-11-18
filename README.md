@@ -150,6 +150,9 @@ them through validated correction requests
 that reports contradictions or missing evidence now qualifies with those issues attached;
 `recover-unresolved-evidence --root .` (`--apply`) qualifies earlier reviews blocked as
 `unresolved-evidence` from their saved findings without a model call.
+`rereview --root . --policy ... --manifest ... --model MODEL` lists standing reviews that need a
+new model review (older policy, insufficient inspected scope) with an estimated cost; add
+`--apply --models-config FILE` (and `--limit N`) to re-review them as corrections, then `publish`.
 
 To review, select and publish the extracted cohort in one rerunnable step
 (model traffic stays within the configured USAi provider). `qualify` runs `ingest` itself,
@@ -299,7 +302,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore` |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `progress`, `progress-serve` |
-| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
+| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `recover-deferred`, `rereview`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
