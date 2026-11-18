@@ -913,6 +913,28 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   1.5 s replay, in `read_snapshot(full=True)` and in the cold `progress` read; a writer
   waits out a reader's brief hold). Measured holds for the other stores, which did not
   cause the failures, are under "Intake ledger" and `progress` below.
+- **Catalog read locks and the identity probe (Kata 8as8).** Two multi-hour `cohort qualify`
+  runs died with "Invalid store identity at .../catalog.sqlite3: database is locked". In
+  rollback-journal mode a catalog writer's commit (the run's own `standing-select`) holds
+  PENDING while readers finish, and every new reader, the 5 s instance-identity probe
+  (`policy._probe_store_id`) among them, fails meanwhile. The long readers were the index
+  freshness check (`renditions.inputs` → `read_records_by_receipt`, about 6 s at 458,000
+  current records, on every `progress-serve` refresh and twice per MCP call) and the
+  `progress` catalog panel's full inspection (about 21 s) when no receipt vouched.
+  `read_records_by_receipt` now copies the validated snapshot's current records into a
+  temporary table and commits before its joins and lookups, which read only that copy. The
+  `progress` panel never inspects or hashes a catalog larger than `progress.INSPECT_LIMIT`
+  (32 MiB): without a receipt (or this process's memo) it reports `unvalidated`, and its render
+  runs the index check, which leaves a receipt, first. The cohort side waits a busy store out: `tools/intake/store_busy.py`
+  retries a call that failed only on a SQLite busy/locked error (in its cause chain) with
+  backoff for up to 300 s, then raises the retryable `store_busy`, never an identity error.
+  The model-review findings probe and each entry's review-and-select settle use it; a settle
+  retry restores the entry and token usage first and reuses a prefetched review that
+  succeeded. WAL was not adopted: the stores require `journal_mode=delete`, refuse `-wal`
+  sidecars, and bind receipts to the header change counter and file bytes that WAL does not
+  maintain. Tests: `tests/test_store_busy.py` (a writer can take EXCLUSIVE while batch reads
+  page their results; bounded retry; settle retry), `tests/test_progress_scale.py`
+  (`CatalogTests`: a large catalog is never inspected or hashed).
 - **Invalidation.** Any commit (by this or another process), restore, swapped file,
   same-size edit (even with a restored mtime, because `utime` moves ctime), changed
   contract or new UTC day misses and revalidates everything with the unchanged
@@ -1060,7 +1082,8 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   hashes the bytes in hand and compares the stored digest. Its catalog read never
   writes a receipt (`catalog_store.observed_state`): it trusts a receipt covering this exact file or
   this process's own full inspection today, and an unreadable receipt is ignored, never reported,
-  so the full inspection decides. `progress-serve` (`progress_serve.Latest`) renders one page at a time, shares the
+  so the full inspection decides; a catalog above `progress.INSPECT_LIMIT` is never inspected and
+  is reported `unvalidated` instead (Kata 8as8). `progress-serve` (`progress_serve.Latest`) renders one page at a time, shares the
   result with requests that arrive meanwhile and reuses one younger than a second;
   the report adds finished-attempt rates (1/5/15 min) and attention grouped by
   cause. A 125,000-request synthetic ledger rendered in 11 s and 1.5 GB before and

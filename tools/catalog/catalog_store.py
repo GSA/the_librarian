@@ -258,7 +258,7 @@ def validated_state(connection, home, *, audit=False):
     return state
 
 
-def observed_state(connection, home, seen):
+def observed_state(connection, home, seen, *, inspect_limit=None):
     """The validated state for a read-only observer; writes nothing, not even a receipt.
 
     For callers such as ``tools/intake/progress.py`` that report on the catalog and must not change
@@ -272,7 +272,18 @@ def observed_state(connection, home, seen):
     OSError, ValueError) is not reported: it is never trusted, so the full inspection decides and
     any real defect surfaces as that inspection's refusal. ``status`` and ``audit`` remain the
     commands that report an unusable receipt.
+
+    With ``inspect_limit``, a database file larger than that many bytes is neither inspected nor,
+    while a writer's journal is beside it, hashed for a byte binding: without a receipt or memo
+    the result is None. An O(history) pass holds the read lock throughout, and in rollback-journal
+    mode a writer's commit then waits in PENDING while every new reader, such as the
+    instance-identity probe, fails (Kata 8as8).
     """
+    connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    path = connection.execute("PRAGMA database_list").fetchone()["file"]
+    large = inspect_limit is not None and os.path.getsize(path) > inspect_limit
+    if large and os.path.lexists(f"{path}-journal"):
+        return None
     try:
         binding = _binding(connection)
         marker = json.dumps([binding, _today()], sort_keys=True)
@@ -283,6 +294,8 @@ def observed_state(connection, home, seen):
         return trusted[0]
     if marker is not None and seen.get("marker") == marker and seen["head"] == _head_state(connection):
         return seen["state"]
+    if large:
+        return None
     state = inspect(connection, detail=False)[0]
     if marker is not None and binding["version"] == 2:
         seen.clear()
@@ -1018,6 +1031,10 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
             raise StaleState("Stale query state")
         current_view(connection)
         connection.execute("CREATE TEMP TABLE current_rows AS SELECT * FROM catalog_current")
+        # The copy is this snapshot's current records, so the read transaction ends here and the
+        # joins and lookups below hold no lock on the catalog: a long hold made a writer's commit
+        # wait in PENDING and new readers, such as the instance-identity probe, fail (Kata 8as8).
+        connection.execute("COMMIT")
         connection.execute("CREATE UNIQUE INDEX temp.current_rows_id ON current_rows(id)")
         for name, field in (("receipt", "receipt_id"), ("from", "from_id"), ("to", "to_id")):
             connection.execute(f"CREATE INDEX temp.current_rows_{name} ON current_rows"
@@ -1050,14 +1067,14 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
             page = members[:limit]
             result[receipt_id] = {
                 "authority": AUTHORITY, "state": state,
-                "records": [current_record(connection, record_id) for record_id in page],
+                "records": [current_record(connection, record_id, "current_rows") for record_id in page],
                 "count": len(page), "total_matching": len(members),
                 "next_after": page[-1] if len(members) > limit else None}
         return result
 
 
-def current_record(connection, record_id):
-    row = connection.execute("SELECT payload FROM catalog_current WHERE id=?", (record_id,)).fetchone()
+def current_record(connection, record_id, table="catalog_current"):
+    row = connection.execute(f"SELECT payload FROM {table} WHERE id=?", (record_id,)).fetchone()
     if row is None:
         raise MissingRecord("Record missing from authoritative catalog: " + record_id)
     return decode(row["payload"])

@@ -389,6 +389,9 @@ def public(value):
 # Other sources ------------------------------------------------------------
 
 _catalog_seen = {}  # canonical binding -> state of a full inspection this process has done today
+# Larger catalogs are never inspected by a render: a full pass would hold the read lock for its
+# whole O(history) replay (about 21 s at 800 MB) and block writers and the identity probe (Kata 8as8).
+INSPECT_LIMIT = 32 * 1024 * 1024
 
 
 def read_catalog(root):
@@ -400,7 +403,11 @@ def read_catalog(root):
                         "Catalog home missing or not private")
         with closing(catalog.connect(db)) as connection:
             connection.execute("BEGIN")
-            state = catalog.observed_state(connection, home, _catalog_seen)
+            state = catalog.observed_state(connection, home, _catalog_seen, inspect_limit=INSPECT_LIMIT)
+            if state is None:
+                return {"available": False, "error": "unvalidated",
+                        "detail": "No read-validation receipt covers this catalog file; "
+                                  "run python -m tools.catalog.cli --root . status"}
             catalog.current_view(connection)
             # One scan of the current records for all three breakdowns.
             kinds, coverage, extraction = Counter(), Counter(), Counter()
@@ -470,6 +477,7 @@ def snapshot(root, *, limit=50, runs=None, timeout=2.0):
         view = {"overall": empty, "runs": {name: aggregate(Counter(), None) for name in runs or {}},
                 "recent": [], "attention": [], "attention_groups": [], "attention_total": 0,
                 "rates": None, "cached": False, "seconds": None}
+    index = read_index(root)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "body_free": True, "read_only": True,
@@ -480,6 +488,6 @@ def snapshot(root, *, limit=50, runs=None, timeout=2.0):
         "attention_groups": view["attention_groups"], "attention_total": view["attention_total"],
         "rates": view["rates"],
         "render": {"ledger_seconds": view["seconds"], "ledger_cached": view["cached"]},
-        "catalog": read_catalog(root), "review_events": read_review_events(root),
-        "index": read_index(root),
+        # The index freshness check validates the catalog and leaves a receipt, so it runs first.
+        "index": index, "catalog": read_catalog(root), "review_events": read_review_events(root),
     }
