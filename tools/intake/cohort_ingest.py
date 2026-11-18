@@ -17,12 +17,12 @@ from urllib.parse import quote
 from tools.catalog import catalog_store as catalog
 from tools.extraction import extract, mhtml
 from tools.durable import sha256_file
-from . import archives, contracts, docs, runner, store, upload
+from . import archives, cohort_runtime, contracts, docs, runner, store, upload
 from .contracts import IntakeError, LedgerBusy
 from .docsync import suffix_of
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
-RUNTIME_FORMATS = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
+RUNTIME_FORMATS = cohort_runtime.SUFFIXES
 EXPANDED_DIRECTORY = "_extracted"
 MAX_NESTING = 8  # archive levels classify looks into (``a.zip!/b.zip!/...``)
 REASON = "Read-only local cohort intake; copy only, not extraction review or qualification."
@@ -91,8 +91,11 @@ def _unchanged(row, identity):
             and identity == tuple(row[k] for k in docs.STAT) and identity[2] > 0)
 
 
-def _unread_disposition(path, size):
-    """The disposition a file gets from its name and size alone, or None when it must be read."""
+def _unread_disposition(path, size, provisioned=False):
+    """The disposition a file gets from its name and size alone, or None when it must be read.
+
+    PDFs and images are read only when the instance's Docling runtime is ``provisioned``.
+    """
     suffix = path.suffix.lower()
     if ":" in path.name:
         # Windows alternate-data-stream sidecars (Zone.Identifier, DLP tags).
@@ -102,8 +105,7 @@ def _unread_disposition(path, size):
     if size == 0:
         return {"disposition": "empty"}
     if suffix in RUNTIME_FORMATS:
-        fmt = RUNTIME_FORMATS[suffix]
-        return {"format": fmt, "disposition": "over-limit" if size > upload.FORMATS[fmt][1] else "needs-runtime"}
+        return cohort_runtime.unread_disposition(path, size, provisioned)
     if suffix not in extract.TEXT_SUFFIXES | {".odt"}:
         return {"disposition": "needs-reader"}
     if size > max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "mhtml", "odt")):
@@ -112,7 +114,9 @@ def _unread_disposition(path, size):
 
 
 def _read_disposition(root, path, entry):
-    """The disposition of a text or ODT file from its bytes; ``entry`` gains its format and hash."""
+    """The disposition of a text, ODT, PDF or image file from its bytes; ``entry`` gains its format and hash."""
+    if path.suffix.lower() in RUNTIME_FORMATS:
+        return cohort_runtime.read_disposition(path, entry)
     try:
         raw = upload.read_file(path, max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "mhtml", "odt")))
     except IntakeError as error:
@@ -156,7 +160,7 @@ def _archive_disposition(root, path, inbox_file):
             "_manifest": manifest}
 
 
-def _member_entries(root, relative, manifest, trusted):
+def _member_entries(root, relative, manifest, trusted, provisioned=False):
     """One entry per file member of an instance-expanded archive, named ``<archive>!/<member>``.
 
     Stored members are classified like inbox files from their stored bytes (``_source``); members
@@ -173,7 +177,8 @@ def _member_entries(root, relative, manifest, trusted):
                             "format": None, "bytes": member["bytes"], "code": "archive-" + member["code"]})
             continue
         source = stored / member["path"]
-        entry = _disposition(root, source, name, trusted, nested=name.count(archives.SEPARATOR))
+        entry = _disposition(root, source, name, trusted, nested=name.count(archives.SEPARATOR),
+                             provisioned=provisioned)
         current = entry.get("sha256")
         if current is None and source.is_file() and not source.is_symlink():
             # Dispositions decided without reading (empty, assets, over-limit, ...) still verify the bytes.
@@ -185,7 +190,7 @@ def _member_entries(root, relative, manifest, trusted):
     return entries
 
 
-def _disposition(root, path, relative, trusted=None, nested=0):
+def _disposition(root, path, relative, trusted=None, nested=0, provisioned=False):
     """One file's disposition.
 
     ``trusted`` (``{relative: ledger row}``, only under ``--trust-stat``) lets a file whose stat
@@ -208,7 +213,7 @@ def _disposition(root, path, relative, trusted=None, nested=0):
         if nested >= MAX_NESTING:
             return {**entry, "disposition": "needs-reader", "code": "archive-nesting"}
         return {**entry, **_archive_disposition(root, path, not nested)}
-    unread = _unread_disposition(path, info.st_size)
+    unread = _unread_disposition(path, info.st_size, provisioned)
     if unread is not None:
         return {**entry, **unread}
     return _read_disposition(root, path, entry)
@@ -227,17 +232,19 @@ def classify(root, inbox, trusted=None, keep_stat=False):
 
     def unavailable(error):
         raise IntakeError("inbox_unavailable") from error
+    provisioned = cohort_runtime.ready(root)
     entries = []
     for directory, names, files in os.walk(inbox, onerror=unavailable, followlinks=False):
         here = Path(directory)
         for name in [*files, *(n for n in names if (here / n).is_symlink())]:
             path = here / name
-            pending = [_disposition(root, path, path.relative_to(inbox).as_posix(), trusted)]
+            pending = [_disposition(root, path, path.relative_to(inbox).as_posix(), trusted,
+                                    provisioned=provisioned)]
             while pending:
                 entry = pending.pop()
                 manifest = entry.pop("_manifest", None)
                 if manifest is not None:
-                    pending.extend(_member_entries(root, entry["relative"], manifest, trusted))
+                    pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned))
                 if not keep_stat:
                     for key in ("_stat", "_fast", "_source"):
                         entry.pop(key, None)
@@ -316,9 +323,13 @@ def _identity(entry):
     return {"receipt": entry["receipt_id"], "format_name": entry["format"]}, suffix_of(entry["format"])
 
 
+def _prepare_name(entry):
+    return "extract-" + entry["submission_id"] + _identity(entry)[1]
+
+
 def _prepare(root, entry, heads):
-    base, version = _identity(entry)
-    stage = _request(root, "extract-" + entry["submission_id"] + version, "prepare",
+    base, _ = _identity(entry)
+    stage = _request(root, _prepare_name(entry), "prepare",
                      "extract-prepare", base, base, heads)
     _conflict(entry, runner.conflicts(stage))
     return stage
@@ -519,7 +530,7 @@ def _stage_receipts(root, inbox, entries, system, actor, outcomes):
     return staged
 
 
-def _process_batch(root, inbox, entries, system, actor, heads):
+def _process_batch(root, inbox, entries, system, actor, heads, concurrency=1):
     """``_process`` for a chunk of entries: their receipts commit as one catalog revision, then
     their extraction registrations as one. Each entry gets exactly the outcome ``_process`` would give.
 
@@ -556,7 +567,7 @@ def _process_batch(root, inbox, entries, system, actor, heads):
                 registering.append(entry)
             else:
                 outcomes[entry["relative"]] = failure
-        outcomes.update(_extract_batch(root, registering, actor, heads))
+        outcomes.update(_extract_batch(root, registering, actor, heads, concurrency))
     return outcomes
 
 
@@ -588,9 +599,13 @@ def _prepare_batch(root, entries, heads, outcomes):
     return registering
 
 
-def _extract_batch(root, entries, actor, heads):
-    """``_extract`` for a chunk: each document prepared in turn, their registrations committed together."""
+def _extract_batch(root, entries, actor, heads, concurrency=1):
+    """``_extract`` for a chunk: each document prepared in turn, their registrations committed together.
+
+    PDFs and images are converted first, up to ``concurrency`` at once and outside the ledger.
+    """
     outcomes = {}
+    cohort_runtime.convert_ahead(root, entries, heads, concurrency, _prepare_name)
     registering = _prepare_batch(root, entries, heads, outcomes)
     state = None
 
@@ -622,12 +637,12 @@ def _extract_batch(root, entries, actor, heads):
     return outcomes
 
 
-def _settled_batch(root, inbox, chunk, system, actor, heads):
+def _settled_batch(root, inbox, chunk, system, actor, heads, concurrency=1):
     """``_settled`` for a chunk: a busy ledger repeats the chunk (every step is idempotent), then fails
     only the entries it left busy, visibly and retryable, and the run continues."""
     todo, results = list(chunk), {}
     for _ in range(runner.BUSY_RETRIES):
-        outcomes = _process_batch(root, inbox, todo, system, actor, heads)
+        outcomes = _process_batch(root, inbox, todo, system, actor, heads, concurrency)
         results.update(outcomes)
         todo = [e for e in todo if outcomes[e["relative"]].get("code") == "ledger_busy"]
         if not todo:
@@ -655,7 +670,8 @@ def _counts(entries, admitted):
                 "%s/%s" % (e["stage"], e["code"]) for e in admitted if e.get("outcome") == "failed"))}
 
 
-def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False):
+def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False,
+           extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY):
     """Classify the inbox, then submit and extract admitted files; return the report.
 
     Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
@@ -668,8 +684,13 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
     ledger. ``ctime`` moves on every write, so an in-place edit that restores size and mtime changes
     it; a filesystem or copy tool that sets ctime back is outside what stat can show, which is why
     this is opt-in. Without the ``docs`` table (or a recorded stat) nothing is trusted.
+
+    PDFs and images are read only when the instance's Docling runtime is provisioned. Each chunk's
+    conversions run before its ledger stages, ``extract_concurrency`` at once (each in its own limited
+    child process); with ``batch_size=1`` they run one at a time inside the prepare stage.
     """
     contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
+    contracts.require(type(extract_concurrency) is int and extract_concurrency >= 1, "invalid_concurrency")
     trusted = {}
     if trust_stat:
         with store.locked(root) as c:
@@ -686,13 +707,13 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
         if entry["relative"] in fast:
             entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
     _process_all(root, inbox, [e for e in todo if e["relative"] not in fast], system, actor,
-                 batch_size, stats)
+                 batch_size, stats, extract_concurrency)
     for entry in entries:
         entry.pop("_source", None)
     return {"counts": _counts(entries, admitted), "entries": entries}
 
 
-def _process_all(root, inbox, todo, system, actor, batch_size, stats):
+def _process_all(root, inbox, todo, system, actor, batch_size, stats, concurrency=1):
     """Process ``todo`` in chunks of ``batch_size``, recording ``docs`` rows every ``FLUSH`` entries."""
     # One correction-chain index serves every entry, so following chains never rescans the ledger.
     heads = store.Heads()
@@ -701,7 +722,7 @@ def _process_all(root, inbox, todo, system, actor, batch_size, stats):
         if batch_size == 1:
             results = {chunk[0]["relative"]: _settled(root, inbox, chunk[0], system, actor, heads)}
         else:
-            results = _settled_batch(root, inbox, chunk, system, actor, heads)
+            results = _settled_batch(root, inbox, chunk, system, actor, heads, concurrency)
         for entry in chunk:
             entry.update(results[entry["relative"]])
             pending.append((entry, stats[entry["relative"]]))
