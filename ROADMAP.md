@@ -126,7 +126,7 @@ to exist in this distribution.
 |---|---|---|---|
 | Three-agent collaboration and returned findings | Open | Generic contracts captured; no orchestration or Jira/Kata integration | Exercise explicit handoffs, original-criterion preservation, correlation and returned disposition before adding a runner |
 | Broader extraction | Partial | Strict ordinary UTF-8 text with explicit line retrieval, Gemini TXT, MHTML (including Confluence `.doc` exports) and ODT; optional offline Docling PDF/image conversion. Office formats are classified `needs-reader` | Port DOCX/XLSX/PPTX and embedded-text PDF; preserve format limitations, dependency pins and source/engine-bound versions |
-| Archive-member and large-workbook handling | Open | No explicit retained-member extraction selector or row-chunk engine; cohort `classify` reads a zip only through an already expanded sibling `_extracted/<name>/` folder | Port member-policy/ancestor checks and versioned XLSX chunking without automatic recursive expansion or legacy-run rewriting |
+| Archive-member and large-workbook handling | Partial | Explicit `cohort expand-archives` expands zip/tar members by hash into instance storage with name, link and size checks, and `delete-archive-original` deletes a verified, fully registered original (Kata 12sc); no row-chunk engine or member-selection policy | Add versioned XLSX chunking and member-policy selection without automatic recursive expansion or legacy-run rewriting |
 | Bounded ingestion cohorts | Partial | Cohort driver delivered (`tools.intake.cohort`: classify, batched ingest, qualify, publish) with saved ledger requests, serialized writes, explicit per-file outcomes and daily backups; no `ReceiptMetadataSnapshot`-style operation-local catalog snapshot API | Port an operation-local catalog snapshot API only if cohort cost measurements need it |
 | Read-only remote discovery | Open | No remote connector; local explicit-root inventory, marked local drop and read-only local inbox classification exist | Generalize `drive-intake` planning and verified retained-byte bindings; remove installation-specific account/drive counts, paths and configuration |
 | Continuous copy and intake | Partial | Private exact-request intake ledger, explicit native writer stages, bounded attempts/DLQ/replay, acknowledgment recording, explicit manual file upload / marked local-drop intake and operator-run read-only cohort intake; no acquisition or scheduler | Add separately authorized connectors, scheduling and return transport; a read-only mount is not a local copy or ingestion service |
@@ -235,8 +235,8 @@ parallel metadata, review or intake-status authority.
 Run bounded, format-routed extraction only after registration and handling
 checks. Preserve source hashes, exact locators, parser versions, omitted scope
 and warnings. Unsupported, encrypted, malformed or over-budget files stay
-explicitly pending. No empty success fallback, macro execution or recursive
-archive expansion. New adapters need fidelity/recovery tests before scheduling.
+explicitly pending. No empty success fallback, macro execution or automatic
+recursive archive expansion (archives expand one level per explicit run). New adapters need fidelity/recovery tests before scheduling.
 
 ### 4. Review and incorporate context
 

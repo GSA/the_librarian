@@ -133,7 +133,10 @@ files through upload and extraction (see
   --system my-inbox --actor "$USER" --report .local/cohort-report.json
 ```
 
-Every file gets a counted disposition; nothing in the inbox is changed. Ingest commits
+Every file gets a counted disposition; nothing in the inbox is changed. Archives are
+`needs-reader` until `cohort expand-archives --apply` expands their members into instance
+storage; `delete-archive-original` removes an original only after every member is verified
+and registered ([context/intake.md](context/intake.md#archives)). Ingest commits
 catalog registrations in chunks of `--batch-size` documents (default 50) as one revision each;
 `--batch-size 1` keeps one revision per registration, and a re-run after any interruption completes the rest.
 Extracted renditions stay unselected until a standing-policy review qualifies
@@ -266,7 +269,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `progress`, `progress-serve` |
-| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `backfill-docs`, `audit-docs`, `docs-status` |
+| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |

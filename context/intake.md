@@ -359,8 +359,9 @@ content starts with MIME headers, such as a Confluence "Exported From Confluence
 images awaiting a verified Docling runtime), `needs-reader` (no existing
 reader, for example Office formats, or MIME that cannot be read strictly; the
 report carries a `code` such as `mime-malformed`, `mime-no-html`, `mime-encoding`,
-`mime-charset` or `mime-empty`, and raw encoded text is never admitted instead), `archive-expanded` (a zip whose sibling
-`_extracted/<name>/` is classified instead), `skipped-asset` (web site assets),
+`mime-charset` or `mime-empty`, and raw encoded text is never admitted instead), `archive-expanded` (a zip or tar
+archive whose sibling `_extracted/<name>/` is classified instead, or whose members were expanded
+into instance storage; see [Archives](#archives)), `skipped-asset` (web site assets),
 `skipped-artifact` (alternate-data-stream sidecars such as `:Zone.Identifier`),
 `unreadable` (fails strict UTF-8 or signature checks), `empty`, `over-limit` and
 `unsafe-path` (symlinks and non-regular files). Suffix is never format proof.
@@ -522,6 +523,67 @@ nothing in the instance. Keep the report privately; it is a measurement before c
 not a gate. Use `--repeat 2` to see how much of any disagreement is ordinary model variance.
 Stdout prints body-free `counts`, token `usage` and `retries`: per-code counts
 (`http-429`, `http-503`, `network`, ...) of transport retries during the run.
+
+### Archives
+
+Archives (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`) are never expanded
+during `classify`, `ingest` or `qualify`. A 0-byte archive is `empty`. An archive with a
+sibling `_extracted/<stem>/` folder is `archive-expanded` and that folder's files are
+classified as before. Any other archive is `needs-reader` (`archive-not-expanded`) until an
+operator expands it:
+
+    python -m tools.intake.cohort expand-archives --root ROOT --inbox DIR [--apply] [--report FILE]
+
+Without `--apply` this is a dry run. It reads every member with the stdlib `zipfile`/`tarfile`
+readers, hashes it and prints body-free counts, and it writes nothing. With `--apply`, each
+archive is expanded into `<intake home>/archives/<archive sha256>/members/`, never into the inbox.
+A `manifest.json` (`librarian-archive-manifest/1`) is published atomically with the expansion.
+It lists the archive's relative path, size and sha256, and each member's name, normalized path,
+size, sha256, `disposition` and `code`. A sibling folder is not copied. Instead, each member is
+compared by sha256 with the sibling file: `pre-expanded` if equal, otherwise refused as
+`pre-expanded-missing` or `pre-expanded-differs`.
+
+Members are checked before any byte is written:
+- **Refused names:** absolute paths, `..`, drive letters or any `:`, backslashes, control
+  characters, components longer than 255 bytes or ending in `!`. These are refused as
+  `unsafe-name`.
+- **Name normalization:** names are NFC-normalized and must stay unique. Clashes are refused as
+  `duplicate-name`, `case-collision` or `path-conflict`.
+- **Skipped members:** symlinks, hardlinks, devices and fifos are `skipped` (`link`, `special`).
+- **Unreadable members:** encrypted members (`encrypted`), unknown compression and bad CRCs are
+  refused (`unsupported-compression`, `corrupt-member`).
+- **Archive-level limits:** an archive over 100,000 members, 16 GiB expanded, or a 200:1
+  expansion ratio (counted once 64 MiB is expanded) is refused as a whole (`too-many-members`,
+  `expanded-size-cap`, `ratio-cap`). An unreadable archive is refused as `archive-unreadable`.
+  The refused manifest is kept and no members are stored. `classify` reports the archive as
+  `needs-reader` with code `archive-<code>`. To retry, remove that `<sha256>/` directory.
+
+A nested archive is stored as a member. The next `expand-archives --apply` run expands it, one
+level per run.
+
+Once an archives store exists, `classify` hashes each inbox archive that has no sibling folder to
+find its manifest. Each member then gets its own disposition under the name
+`<archive>!/<member>`. Members refused at expansion are `unreadable` or `unsafe-path`. A stored
+member whose bytes no longer match the manifest is `unsafe-path` (`archive-member-changed`).
+`ingest` reads admitted members from instance storage, and their upload locator (`!` encoded as
+`%21`) traces catalog receipts and search results back to the archive.
+
+    python -m tools.intake.cohort delete-archive-original --root ROOT --inbox DIR \
+        --archive RELATIVE [--actor A --apply] [--report FILE]
+
+This is the only command that writes the inbox, and only with `--apply`. A dry run reports
+`verified` or `blocked` with `blockers` (member, code, current disposition). It is blocked when
+any of these hold:
+- The archive's bytes no longer match an `expanded` or `pre-expanded` manifest.
+- A member was refused, or its stored or sibling bytes changed.
+- A nested archive has no verified expansion of its own.
+- A member that is not `empty`, `skipped-asset` or `skipped-artifact` (for example still
+  `needs-reader` or `needs-runtime`) has no catalog original whose sha256 equals the member's.
+
+There is no override. `--apply` (with `--actor`) re-checks all of this and appends a record (path,
+size, sha256, manifest sha256, actor, time) to `archives/deletions.jsonl`. It fsyncs that record,
+then unlinks the archive and fsyncs the directory. A rerun reports `already-deleted`. Exit status
+is 0 for `verified`, `deleted` and `already-deleted`, and 1 when blocked.
 
 ## Model-assisted standing review
 
