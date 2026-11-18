@@ -16,13 +16,15 @@ from urllib.parse import quote
 
 from tools.catalog import catalog_store as catalog
 from tools.extraction import extract, mhtml
-from . import contracts, docs, runner, store, upload
+from tools.durable import sha256_file
+from . import archives, contracts, docs, runner, store, upload
 from .contracts import IntakeError, LedgerBusy
 from .docsync import suffix_of
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
 RUNTIME_FORMATS = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image"}
 EXPANDED_DIRECTORY = "_extracted"
+MAX_NESTING = 8  # archive levels classify looks into (``a.zip!/b.zip!/...``)
 REASON = "Read-only local cohort intake; copy only, not extraction review or qualification."
 OUTCOMES = ("received", "extracted", "failed", "changed-since-intake", "not-processed")
 FLUSH = 500  # documents whose rows are written (or confirmed) in one ledger open
@@ -97,9 +99,6 @@ def _unread_disposition(path, size):
         return {"disposition": "skipped-artifact"}
     if suffix in ASSET_SUFFIXES:
         return {"disposition": "skipped-asset"}
-    if suffix == ".zip":
-        expanded = path.parent / EXPANDED_DIRECTORY / path.stem
-        return {"disposition": "archive-expanded" if expanded.is_dir() else "needs-reader"}
     if size == 0:
         return {"disposition": "empty"}
     if suffix in RUNTIME_FORMATS:
@@ -132,7 +131,61 @@ def _read_disposition(root, path, entry):
     return {**entry, "disposition": "admit"}
 
 
-def _disposition(root, path, relative, trusted=None):
+# Cohort dispositions of archive members that carry no stored bytes (``archives`` member codes).
+MEMBER_DISPOSITIONS = dict.fromkeys(archives.UNREADABLE, "unreadable")
+
+
+def _archive_disposition(root, path, inbox_file):
+    """An archive's disposition: expanded by a sibling ``_extracted/<stem>/`` folder (inbox files
+    only) or by a saved instance expansion, refused, or ``needs-reader`` until it is expanded.
+
+    An instance-expanded entry carries its manifest as the private ``_manifest`` field.
+    """
+    if inbox_file and (path.parent / EXPANDED_DIRECTORY / archives.stem(path.name)).is_dir():
+        return {"disposition": "archive-expanded", "expansion": "sibling"}
+    directory = archives.store_dir(root)
+    if directory is None:
+        return {"disposition": "needs-reader", "code": "archive-not-expanded"}
+    sha256 = sha256_file(path)
+    manifest = archives.load(directory, sha256)
+    if manifest is None or manifest["status"] == "pre-expanded":
+        return {"sha256": sha256, "disposition": "needs-reader", "code": "archive-not-expanded"}
+    if manifest["status"] == "refused":
+        return {"sha256": sha256, "disposition": "needs-reader", "code": "archive-" + manifest["code"]}
+    return {"sha256": sha256, "disposition": "archive-expanded", "expansion": "instance",
+            "_manifest": manifest}
+
+
+def _member_entries(root, relative, manifest, trusted):
+    """One entry per file member of an instance-expanded archive, named ``<archive>!/<member>``.
+
+    Stored members are classified like inbox files from their stored bytes (``_source``); members
+    stored without bytes keep their archive code. A nested archive deeper than ``MAX_NESTING`` is
+    not looked into.
+    """
+    directory = archives.store_dir(root)
+    stored = archives.members_dir(directory, manifest["archive"]["sha256"])
+    entries = []
+    for index, member in enumerate(manifest["members"]):
+        name = relative + archives.SEPARATOR + (member["path"] or "#%d" % index)
+        if member["disposition"] != "extracted":
+            entries.append({"relative": name, "disposition": MEMBER_DISPOSITIONS.get(member["code"], "unsafe-path"),
+                            "format": None, "bytes": member["bytes"], "code": "archive-" + member["code"]})
+            continue
+        source = stored / member["path"]
+        entry = _disposition(root, source, name, trusted, nested=name.count(archives.SEPARATOR))
+        current = entry.get("sha256")
+        if current is None and source.is_file() and not source.is_symlink():
+            # Dispositions decided without reading (empty, assets, over-limit, ...) still verify the bytes.
+            current = sha256_file(source)
+        if current != member["sha256"]:
+            entry = {"relative": name, "disposition": "unsafe-path", "format": None,
+                     "code": "archive-member-changed"}
+        entries.append({**entry, "_source": source})
+    return entries
+
+
+def _disposition(root, path, relative, trusted=None, nested=0):
     """One file's disposition.
 
     ``trusted`` (``{relative: ledger row}``, only under ``--trust-stat``) lets a file whose stat
@@ -151,6 +204,10 @@ def _disposition(root, path, relative, trusted=None):
         return {**entry, "format": row["format"], "bytes": info.st_size, "sha256": row["sha256"],
                 "disposition": "admit", "_fast": True}
     entry["bytes"] = info.st_size
+    if ":" not in path.name and archives.kind(path.name) and info.st_size > 0:
+        if nested >= MAX_NESTING:
+            return {**entry, "disposition": "needs-reader", "code": "archive-nesting"}
+        return {**entry, **_archive_disposition(root, path, not nested)}
     unread = _unread_disposition(path, info.st_size)
     if unread is not None:
         return {**entry, **unread}
@@ -175,12 +232,22 @@ def classify(root, inbox, trusted=None, keep_stat=False):
         here = Path(directory)
         for name in [*files, *(n for n in names if (here / n).is_symlink())]:
             path = here / name
-            entry = _disposition(root, path, path.relative_to(inbox).as_posix(), trusted)
-            if not keep_stat:
-                entry.pop("_stat", None)
-                entry.pop("_fast", None)
-            entries.append(entry)
+            pending = [_disposition(root, path, path.relative_to(inbox).as_posix(), trusted)]
+            while pending:
+                entry = pending.pop()
+                manifest = entry.pop("_manifest", None)
+                if manifest is not None:
+                    pending.extend(_member_entries(root, entry["relative"], manifest, trusted))
+                if not keep_stat:
+                    for key in ("_stat", "_fast", "_source"):
+                        entry.pop(key, None)
+                entries.append(entry)
     return sorted(entries, key=lambda e: e["relative"])
+
+
+def source_path(inbox, entry):
+    """The file an entry's bytes are read from: its inbox path, or a stored archive member."""
+    return entry.get("_source") or Path(inbox) / entry["relative"]
 
 
 def _staged(root, correlation_id, stage_id, operation, arguments, identity=None, heads=None):
@@ -338,7 +405,7 @@ def _process(root, inbox, entry, system, actor, heads=None):
     known = upload.known_requests(root, [_correlation(entry, system)])
     superseded, known = _identify(root, entry, system, known)
     try:
-        ack = upload.submit(root, Path(inbox) / entry["relative"], _descriptor(entry, system, actor, superseded),
+        ack = upload.submit(root, source_path(inbox, entry), _descriptor(entry, system, actor, superseded),
                             known=known)
     except LedgerBusy:
         raise  # retried by _settled, never reported as a receipt refusal
@@ -442,7 +509,7 @@ def _stage_receipts(root, inbox, entries, system, actor, outcomes):
             known = {c: v for c, v in known_all.items() if c == correlations[entry["relative"]]}
             superseded, known = _identify(root, entry, system, known)
             correlation_id, existing = upload.stage_submission(
-                root, Path(inbox) / entry["relative"], _descriptor(entry, system, actor, superseded), known=known)
+                root, source_path(inbox, entry), _descriptor(entry, system, actor, superseded), known=known)
             staged.append((entry, correlation_id, existing, known))
         except LedgerBusy:
             _conflict(entry)
@@ -620,6 +687,8 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
             entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
     _process_all(root, inbox, [e for e in todo if e["relative"] not in fast], system, actor,
                  batch_size, stats)
+    for entry in entries:
+        entry.pop("_source", None)
     return {"counts": _counts(entries, admitted), "entries": entries}
 
 

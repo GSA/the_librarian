@@ -199,13 +199,32 @@ restated here.
   `tests/test_intake_upload.py::test_missing_or_unmarked_drop_is_never_success`,
   `::test_blocked_receipt_is_reported_without_claiming_success`,
   `tests/test_intake_cohort.py::test_ingest_submits_and_extracts_admitted_files_with_body_free_counts`.
-- **Cohort intake never writes the inbox.** Every file gets exactly one counted
+- **Cohort intake never writes the inbox** (apart from an explicit
+  `delete-archive-original --apply`, below). Every file gets exactly one counted
   disposition; formats without a reader are `needs-reader`; a missing or
   unlistable inbox fails instead of counting nothing; the inbox tree is
   byte-identical after a run. Evidence:
   `tests/test_intake_cohort.py::test_every_file_gets_one_explicit_disposition`,
   `::test_missing_or_unlistable_inbox_fails_instead_of_counting_nothing`,
   `::test_over_limit_is_counted_not_dropped`.
+- **Archives expand only on an explicit run (Kata 12sc).** `cohort expand-archives`
+  (dry run unless `--apply`) reads zip and tar archives with stdlib readers into
+  `<intake home>/archives/<archive sha256>/`, never into the inbox. It refuses
+  unsafe member names, links, devices, encrypted or unsupported members,
+  case collisions, and archives over the member-count, expanded-size or ratio caps.
+  It writes a member manifest atomically and expands one nesting level per run.
+  An operator's sibling `_extracted/<stem>/` folder is verified against the
+  archive by hash instead. `classify` gives members their own dispositions and an
+  `<archive>!/<member>` locator. `delete-archive-original` is the only inbox write:
+  it refuses unless the archive and every member still match the manifest and
+  every readable member is registered with the same sha256, and it appends a
+  fsynced deletion record before unlinking. Evidence:
+  `tests/test_intake_archives.py::ExpandTests::test_tar_links_devices_and_traversal_are_not_written`,
+  `::ExpandTests::test_bomb_caps_refuse_the_whole_archive_and_store_no_members`,
+  `::ExpandTests::test_nested_archives_expand_one_level_per_explicit_run`,
+  `::IngestMemberTests::test_members_are_ingested_with_archive_provenance_and_rerun_is_idempotent`,
+  `::DeleteOriginalTests::test_refused_until_expanded_and_every_member_registered`,
+  `::DeleteOriginalTests::test_verified_dry_run_then_apply_records_before_deleting_and_is_idempotent`.
 - **Ingest follows correction-chain heads.** `ingest` and `qualify` report an
   extraction or registration through the head of its validated `correction_of`
   chain, never by request name: a repaired entry is `extracted` with the head's

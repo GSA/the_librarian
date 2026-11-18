@@ -21,7 +21,7 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
-from . import (cli, cohort_review, docsync, model_review, runner, selection_manifest, standing, store,
+from . import (cli, cohort_archives, cohort_review, docsync, model_review, runner, selection_manifest, standing, store,
                throttle, upload, usage_log)
 from . import contracts
 from .cohort_ingest import BATCH_SIZE, classify, ingest
@@ -503,6 +503,24 @@ def _parser():
     command.add_argument("--policy", required=True, dest="policy_path")
     command.add_argument("--manifest", required=True)
     command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
+    command = commands.add_parser(
+        "expand-archives", allow_abbrev=False,
+        help="Report every zip/tar archive the inbox reaches; with --apply expand those not yet "
+             "expanded into instance storage (one nesting level per run)")
+    command.add_argument("--root", required=True, type=Path)
+    command.add_argument("--inbox", required=True, type=Path)
+    command.add_argument("--apply", action="store_true")
+    command.add_argument("--report", type=Path, help="private (0600) per-archive report with paths")
+    command = commands.add_parser(
+        "delete-archive-original", allow_abbrev=False,
+        help="Verify that an expanded inbox archive can be deleted without loss; with --apply "
+             "record the deletion and delete it")
+    command.add_argument("--root", required=True, type=Path)
+    command.add_argument("--inbox", required=True, type=Path)
+    command.add_argument("--archive", required=True, help="inbox-relative path of the archive")
+    command.add_argument("--actor")
+    command.add_argument("--apply", action="store_true")
+    command.add_argument("--report", type=Path, help="private (0600) report listing blocking members")
     for name in ("classify", "ingest", "qualify"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--root", required=True, type=Path)
@@ -581,12 +599,31 @@ def _inbox_report(args):
             "entries": entries}
 
 
+def _archive_command(args):
+    """Run ``expand-archives`` or ``delete-archive-original``; print body-free counts only."""
+    if args.command == "expand-archives":
+        report = cohort_archives.expand(args.root, args.inbox, apply=args.apply)
+        summary, status = {"counts": report["counts"]}, 0
+    else:
+        report = cohort_archives.delete_original(args.root, args.inbox, args.archive,
+                                                 actor=args.actor, apply=args.apply)
+        summary = {k: report.get(k) for k in ("status", "deleted", "members", "registered",
+                                              "blocked_by_code")}
+        status = 0 if report["status"] in {"verified", "deleted", "already-deleted"} else 1
+    if args.report:
+        _write_private(args.report, report)
+    print(json.dumps(summary, sort_keys=True))
+    return status
+
+
 def main(argv=None):
     args = _parser().parse_args(argv)
     try:
         if args.command in {"recover-identity", "recover-unresolved-evidence", "recover-deferred", "backfill-docs", "audit-docs", "docs-status"}:
             print(json.dumps(_maintenance(args), sort_keys=True))
             return 0
+        if args.command in {"expand-archives", "delete-archive-original"}:
+            return _archive_command(args)
         if args.command == "publish":
             report = publish(args.root, policy_path=args.policy_path, manifest=args.manifest,
                              index_path=args.index_path)
