@@ -77,7 +77,15 @@ named stage. The ledger is operational recovery state, never corpus authority.
   `Reviewer-noted missing evidence:` statement (with a count; if more than the
   event's 30 statements would be needed, it states how many it recorded), and
   `get` shows them under the rendition's `qualification.reviewed_scope[].noted_issues`.
-  `reject` and `defer` stay so. The v2 advisory
+  `reject` and `defer` stay so, except that `cohort qualify --deferred
+  qualify-low-confidence` (or `cohort recover-deferred --apply` for already held deferrals)
+  qualifies a `defer` with complete inspected scope under the current policy as low confidence:
+  its event adds a `Reviewer-deferred:` statement and the index labels it `reviewer-deferred`.
+  Every indexed document carries a `confidence` label (`normal`, or `low` with reasons
+  `noted-issues`, `reviewer-deferred`, `converted-format`, `machine-ocr`, `agent-generated`,
+  `open-correction`); retrieval shows it, never hides the text. An upload can declare
+  agent-written content with `submit-file --agent-generator NAME [--agent-generated-on DATE]
+  [--agent-source-commit SHA]` (a version 2 descriptor). The v2 advisory
   `unverifiable_references` list (claims depending on material the document
   cites but does not contain) never blocks; a qualified event states only its
   count. Other outcomes

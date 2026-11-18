@@ -285,8 +285,8 @@ present, otherwise `config/selection.json`). Both `librarian-mcp` and
 `--timeout-seconds` (30), and `--diagnostics-log <path>.jsonl`.
 
 Exposed MCP tools:
-- `status()` — check selected index freshness
-- `search(query, limit?, path?)` — keyword discovery (default `limit` 5)
+- `status()` — check selected index freshness and document counts by confidence level
+- `search(query, limit?, path?, low_confidence?)` — keyword discovery (default `limit` 5); `low_confidence` is `"include"` (default, rank order), `"last"` or `"exclude"` (counted in `low_confidence_excluded`)
 - `get(locator, format?, max_chars?, max_output_chars?)` — read exact qualified text (`format`: `"full"` or `"compact"`)
 - `get_many(locators, format?, max_chars?, max_output_chars?)` — read 1–10 qualified packets (`format` default `"full"`)
 - `catalog(receipt?, source?, path?, kind?, coverage?, audience?, after?, expected_state?, limit?, format?, max_output_chars?)` — query live catalog metadata
@@ -320,6 +320,13 @@ the cited text. A search with no hits returns an `absence` reason: the indexed
 documents lack the terms (`absent-corpus`), contain only some of them
 (`absent-partial`), or contain them only in separate sections
 (`present-uncombined`).
+
+Every hit, `get` piece and `get_many` document carries a `confidence` label:
+`normal`, or `low` with stable reason codes (`noted-issues`, `reviewer-deferred`,
+`converted-format`, `machine-ocr`, `agent-generated`, `open-correction`). Low-confidence
+text is published and marked, never hidden; each response's top-level `confidence`
+block explains the reasons present and how to correct them (for example via a newer
+document, meeting transcript or answered question). Carry the reasons into answers.
 
 ## Instance copies
 

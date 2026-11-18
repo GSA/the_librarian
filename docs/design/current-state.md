@@ -231,7 +231,7 @@ restated here.
   rendition. The review-event contract holds at most 30 evidence statements: if
   the items do not fit, the event says how many it recorded (contradictions
   first) and points at the findings hash, never dropping silently. `reject`,
-  `defer`, incomplete inspection, independent-review, conflicting-review, scope,
+  `defer` (unless opted in to low confidence, below), incomplete inspection, independent-review, conflicting-review, scope,
   registration, fidelity and budget gates are unchanged and keep their order; the
   policy file format and sha are unchanged. `cohort recover-unresolved-evidence`
   re-evaluates only reviews blocked `standing-pending-review-unresolved-evidence`
@@ -251,6 +251,49 @@ restated here.
   `tests/test_intake_cohort.py::RecoverUnresolvedEvidenceTests`, `tests/test_model_review.py`
   (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
+- **Low-confidence information is published and marked, not withheld** (owner direction, Kata
+  chwz). Every indexed document has a `confidence-v1` label `{"level": "normal"|"low",
+  "reasons": [{"code", "details"}]}`, stored in the index's `document_confidence` table and
+  bound into the rendition identity, so a label change makes the index stale. Reason codes are
+  stable; `tools/context_index/confidence.py` holds each code's explanation and how to correct it
+  ("confirm or correct via a newer document, meeting transcript or answered question"):
+  `noted-issues` (an accepted review carrying `Reviewer-noted ...` statements, so existing
+  my2k qualifications become low confidence at the next rebuild without re-review),
+  `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `converted-format` and
+  `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
+  extraction payload format; `docling-pdf` and `docling-image` are `machine-ocr`, text, MHTML,
+  Gemini transcript and ODT renditions add no reason), `agent-generated` (an upload whose
+  version-2 descriptor declares `origin.agent_generated: {generator, generated_on,
+  source_commit}`; the hash-pinned `submission.json` sidecar is read at build and a missing,
+  changed or malformed one fails the build) and `open-correction` (reserved: `with_reason` adds
+  it at read time). Markdown documents are `normal`. `search` hits carry `{level, reasons:
+  [codes]}` and `--low-confidence include|last|exclude` (default `include`, rank order) ranks
+  low hits after normal ones or leaves them out while counting them in
+  `low_confidence_excluded`; `get` pieces, compact `documents` (`qualified-compact-v2`) and
+  `get_many` documents (`qualified-many-*-v2`) carry the full label, and each read has a
+  top-level `confidence` block with the worst level and each present reason's explanation and
+  correction. `status` (and intake progress) report `confidence: {normal, low, low_reasons}`;
+  the catalog has no label. An index built before this change is stale (engine fingerprint, and
+  `confidence schema missing; run build`) and is rebuilt once. A reviewer `defer` still holds
+  (`standing-deferred-reviewer-deferred`) unless the operator opts in with
+  `cohort qualify --deferred qualify-low-confidence` (or `cohort recover-deferred --apply` for
+  held ones, from saved findings, no model call). The opt-in is the optional `deferred`
+  argument of the standing-review/select stages (absent from requests staged without it, so
+  the standing-policy file and its sha are unchanged); a deferral with complete inspected scope
+  then qualifies with reasons `complete-inspected-scope`, `reviewer-deferred-low-confidence` and
+  an event `Reviewer-deferred:` statement. `reject`, incomplete inspection and every other gate
+  still stop it; deferrals reviewed under an older policy are not touched. Evidence:
+  `tests/test_standing.py` (`test_opted_in_deferral_qualifies_as_low_confidence`,
+  `test_deferral_opt_in_never_rescues_rejection_or_the_other_gates`,
+  `test_noted_issues_and_machine_reading_mark_text_low_confidence`,
+  `test_opted_in_deferral_publishes_visibly_marked_low_confidence`,
+  `test_deferral_opt_in_is_a_contract_checked_stage_argument`,
+  `test_text_renditions_are_normal_and_rendition_kinds_map_to_reasons`,
+  `test_open_correction_hook_adds_a_reason_to_an_existing_label`,
+  `test_an_index_without_the_confidence_table_is_stale`),
+  `tests/test_intake_cohort.py::DeferredLowConfidenceTests`,
+  `tests/test_intake_upload.py::test_agent_generated_origin_is_declared_in_a_v2_sidecar_and_labels_low_confidence`,
+  `tests/test_mcp.py::test_mcp_uses_instance_local_selection_and_storage_roots`.
 - **Only an absent registration is `unregistered-rendition`.** The standing check reads a
   receipt's registration from one catalog state. The catalog raises `MissingRecord` for an absent
   record or receipt, and only that, or a malformed receipt ID, yields the `unregistered-rendition`
