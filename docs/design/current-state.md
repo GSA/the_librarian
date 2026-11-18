@@ -225,6 +225,20 @@ restated here.
   `::IngestMemberTests::test_members_are_ingested_with_archive_provenance_and_rerun_is_idempotent`,
   `::DeleteOriginalTests::test_refused_until_expanded_and_every_member_registered`,
   `::DeleteOriginalTests::test_verified_dry_run_then_apply_records_before_deleting_and_is_idempotent`.
+- **Cohort PDFs and images read through a hardened, provisioned runtime.** Without the
+  pinned Docling interpreter and models (`pdf_image.status`, preflight
+  `pdf_image_runtime`) `.pdf`/`.png`/`.jpg`/`.jpeg` stay `needs-runtime` with code
+  `docling-not-provisioned`. With them, a PDF uses its embedded text layer
+  (`pypdfium2` in the pinned interpreter) when every image-bearing page has at least
+  200 alphanumeric characters at a ratio of 0.5 or more and the document has 200, and
+  falls back to Docling OCR otherwise; images always use OCR. The rendition payload
+  `format` is `pdf-text` or `ocr` (`method.kind` `pdf-text-layer` / `docling-ocr`).
+  Each file converts in its own child process with address-space, CPU, wall-clock,
+  file-size, page, record, output and header-pixel limits, `--extract-concurrency`
+  at a time before the ledger stages; a timeout or crash is retried once, then the
+  file is a blocked stage `extract-<code>` and the cohort continues. Evidence:
+  `tests/test_pdf_image.py::CohortTests`, `::HardeningTests`, `::RoutingTests`,
+  `::ImageLimitTests`; `::RuntimeTests` runs the real runtime when provisioned.
 - **Ingest follows correction-chain heads.** `ingest` and `qualify` report an
   extraction or registration through the head of its validated `correction_of`
   chain, never by request name: a repaired entry is `extracted` with the head's

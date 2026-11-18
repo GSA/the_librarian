@@ -183,6 +183,75 @@ geometry and incomplete-conversion errors are non-successful. Preserve saved
 `registration.json` after a committed-but-unconfirmed write and retry the exact
 same request.
 
+## PDF and image text in cohort intake
+
+`tools/extraction/pdf_image.py` lets cohort intake (`python -m tools.intake.cohort
+ingest|qualify`) read `.pdf`, `.png`, `.jpg` and `.jpeg` files through the pinned
+environment above. Simplest reader first:
+
+- **PDF text layer.** `pdf_text_worker.py` reads the embedded text with the locked
+  `pypdfium2`, run `-I` in the Docling interpreter inside `unshare -Urn` (no
+  network). It is used when the document has at least 200 letters or digits and
+  every page that draws an image has at least 200 letters or digits that are at
+  least half of its non-space characters (`TEXT_LAYER` in `pdf_image.py`). A
+  short page without images has nothing to OCR and is kept. Tables and layout
+  are not reconstructed; that loss is accepted.
+- **Docling OCR/layout** for every other PDF (scanned or low-text pages) and for
+  every image, through the unchanged `docling_adapter` and worker. The reason a
+  PDF fell back is recorded in `method.fallback` and as a warning. Docling sizes
+  an image page from its DPI metadata; the bytes handed to Docling get a DPI
+  (`method.ocr_dpi`, at least 72) at which the 3x OCR raster fits the 32,000,000
+  pixel cap, so ordinary screenshots are not refused. Pixel data is unchanged
+  and the rendition names the original bytes.
+
+Each rendition is an ordinary `A-extract-<run>` extraction with a page-located
+`lines` payload (`{"line", "page", "text"}`). The machine-readable marker is
+`payload.format`: `pdf-text` (`method.kind: "pdf-text-layer"`) or `ocr`
+(`method.kind: "docling-ocr"`), with `payload.source_format` `pdf` or `image`.
+Treat `ocr` as machine OCR whose characters and reading order may be misread.
+The extractor identity hashes `pdf_image.py`, `pdf_text_worker.py`, the lock,
+the Docling code and profile, the routing thresholds and limits, and the
+instance policy; changing any of them is a new run.
+
+**Hardening.** Every file converts in its own child process
+(`python -m tools.extraction.pdf_image child`) in a private directory below
+`data/extractions/.local/work/` that is removed afterwards, with an address-space
+limit of 16 GiB, 1,800 CPU seconds and a 900-second wall clock (its process
+group is killed on expiry). The text worker is limited to 2 GiB, 120 CPU seconds
+and 120 wall seconds. Sources are limited to 64 MiB, PDFs to 100 pages, results
+to 64 MiB and 10,000 line records. Image headers declaring more than 32,000,000
+pixels are refused before any decoder runs (cohort `over-limit`, code
+`pixel-limit`). A timeout or crashed worker is retried once; every refusal is
+then a blocked extraction stage with an `extract-<code>` code, for example
+`extract-encrypted` (any password or security handler), `extract-malformed-source`,
+`extract-page-limit`, `extract-pixel-limit`, `extract-record-limit`,
+`extract-output-limit`, `extract-empty-conversion`, `extract-timeout`,
+`extract-cpu-limit` or `extract-worker-crashed`. A refused file never stops the
+cohort or changes another file's ledger entries, and a rerun does not convert it
+again.
+
+**Concurrency.** Each chunk's conversions run before its ledger stages,
+`--extract-concurrency N` at once (default 2). The ledger's prepare stage then
+finds the published rendition (or the file's refusal) and does not convert
+under the ledger. Budget about 1.5 GiB resident per OCR conversion. With
+`--batch-size 1` conversions run one at a time inside the prepare stage.
+
+**Provisioning an instance.** Install the environment and models above at
+`tools/extraction/.local/venv-docling` and `tools/extraction/.local/models` below
+the instance root, or point `LIBRARIAN_DOCLING_PYTHON` and
+`LIBRARIAN_DOCLING_ARTIFACTS` at an existing installation. Check it with:
+
+```sh
+.venv/bin/python -m tools.extraction.pdf_image status --root ROOT
+```
+
+The MCP preflight reports the same as `pdf_image_runtime` (informational). Until
+the runtime is provisioned, cohort `classify` and `ingest` keep these files
+`needs-runtime` with code `docling-not-provisioned`; after provisioning, the next
+`ingest` or `qualify` reads them. Use
+`pdf_image probe --root ROOT --work DIR FILE...` to time conversions without
+storing anything. `DIR` must be a private scratch directory.
+
 ## MIME HTML (Confluence export)
 
 `--format mhtml` reads a text-suffix file whose content is a MIME message
