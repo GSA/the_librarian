@@ -21,8 +21,8 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
-from . import (cli, cohort_archives, cohort_review, docsync, model_review, runner, selection_manifest, standing, store,
-               throttle, upload, usage_log)
+from . import (agent_origin, cli, cohort_archives, cohort_review, docsync, model_review, runner, selection_manifest,
+               standing, store, throttle, upload, usage_log)
 from . import cohort_runtime, contracts
 from .cohort_ingest import BATCH_SIZE, classify, ingest
 from .cohort_recovery import recover_deferred, recover_identity, recover_unresolved_evidence
@@ -378,7 +378,8 @@ def _qualification_counts(report, extracted, others, published):
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
             context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
             initial_concurrency=None, inspected_form="list", trust_stat=False, deferred="hold",
-            extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY):
+            extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY,
+            origin=None):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
 
     ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
@@ -391,12 +392,14 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     ``deferred="qualify-low-confidence"`` (opt-in; default ``hold``) qualifies a reviewer deferral
     after a complete inspection under the current policy as low confidence instead of holding it,
     and restages this cohort's held deferrals that way from their saved findings (no model call).
+    An agent ``origin`` (``agent_origin.load``) is passed to ``ingest``: the cohort's files are
+    declared agent-generated and reviewed under the same standing policy as any other.
     """
     _check_options(concurrency, initial_concurrency, inspected_form, context, deferred)
     root = Path(root).resolve()
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
     report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat,
-                    extract_concurrency=extract_concurrency)
+                    extract_concurrency=extract_concurrency, origin=origin)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
     extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
@@ -529,6 +532,9 @@ def _parser():
         command.add_argument("--inbox", required=True, type=Path)
         command.add_argument("--report", type=Path,
                              help="private (0600) per-file report with paths and hashes")
+        command.add_argument("--agent-origin", type=Path,
+                             help="origin file (JSON) declaring the inbox agent-written: generator, "
+                                  "include/exclude paths and git provenance; indexed as low confidence")
         if name in {"ingest", "qualify"}:
             command.add_argument("--system", required=True)
             command.add_argument("--actor", required=True)
@@ -583,6 +589,7 @@ def _maintenance(args):
 
 def _inbox_report(args):
     """The report of an inbox command: ``qualify``, ``ingest`` or ``classify``."""
+    origin = agent_origin.load(args.agent_origin) if args.agent_origin else None
     if args.command == "qualify":
         return qualify(
             args.root, args.inbox, system=args.system, actor=args.actor,
@@ -594,15 +601,19 @@ def _inbox_report(args):
             concurrency=args.concurrency, adaptive=not args.no_adaptive,
             initial_concurrency=args.initial_concurrency,
             inspected_form=args.inspected_form, trust_stat=args.trust_stat,
-            deferred=args.deferred, extract_concurrency=args.extract_concurrency)
+            deferred=args.deferred, extract_concurrency=args.extract_concurrency, origin=origin)
     if args.command == "ingest":
         return ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                       limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat,
-                      extract_concurrency=args.extract_concurrency)
-    entries = classify(args.root, args.inbox)
-    return {"counts": {"files": len(entries),
-                       "disposition": dict(Counter(e["disposition"] for e in entries))},
-            "entries": entries}
+                      extract_concurrency=args.extract_concurrency, origin=origin)
+    entries = classify(args.root, args.inbox, origin=origin)
+    admitted = [e for e in entries if e["disposition"] == "admit"]
+    counts = {"files": len(entries), "disposition": dict(Counter(e["disposition"] for e in entries)),
+              "format": dict(Counter(e["format"] for e in admitted)),
+              "admitted_bytes": sum(e["bytes"] for e in admitted)}
+    if origin is not None:
+        counts["agent_origin"] = agent_origin.declare(args.inbox, origin, entries)
+    return {"counts": counts, "entries": entries}
 
 
 def _archive_command(args):

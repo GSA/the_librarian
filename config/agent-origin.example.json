@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "generator": "the_librarian (previous version)",
+  "source_repository": "example-docs",
+  "provenance": "git",
+  "include": ["ACTIVE", "REFERENCE/notes", "README.md"],
+  "exclude": ["REFERENCE/notes/drafts"]
+}
