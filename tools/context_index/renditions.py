@@ -43,7 +43,7 @@ def validate(config, engine, root=None):
         validate_item(item, engine, pattern, seen, valid_contexts)
 
 
-FORMATS = frozenset({"gemini-txt", "text", "mhtml", "odt", "docling", "pdf-text", "ocr"})
+FORMATS = frozenset({"gemini-txt", "text", "mhtml", "odt", "docling", "pdf-text", "ocr", "converted"})
 # Page-located line renditions of PDFs and images (tools/extraction/pdf_image.py).
 PAGE_LINE_FORMATS = frozenset({"pdf-text", "ocr"})
 
@@ -132,6 +132,7 @@ PAYLOAD_FIELDS = {
     "mhtml": ("format", "scope", "warnings", "lines", "method", "parts"),
     "pdf-text": ("format", "scope", "warnings", "lines", "source_format", "method", "pages"),
     "ocr": ("format", "scope", "warnings", "lines", "source_format", "method", "pages"),
+    "converted": ("format", "scope", "warnings", "lines", "conversion"),
 }
 ODT_PAYLOAD_FIELDS = ("format", "scope", "warnings", "nodes", "xml_sha256", "members", "unrendered_features")
 SELECTION_NOTES = {
@@ -142,6 +143,8 @@ SELECTION_NOTES = {
     "docling": "Strictly qualified selected Docling structural records.",
     "pdf-text": "All non-blank lines of the PDF's embedded text layer, by page; tables and layout are not kept.",
     "ocr": "All machine OCR/layout lines, by page; characters and reading order may be misread.",
+    "converted": "All Markdown lines machine-converted from an office/RTF original explicitly selected; "
+                 "conversion is not review.",
 }
 ODT_SELECTION_NOTE = "Located XML records only; text rendition, not a rendered or approved view."
 DOCLING_CITATION = ("Docling packet line ranges are null; source_location gives the exact retained-extraction "
@@ -150,7 +153,7 @@ EXTRACTION_CITATION = ("Packet line ranges cite extraction JSON, not original li
                        "Resolve source_location for the original line, byte range or XML member/element. "
                        "Extraction and retrieval are not new review, corroboration or acceptance.")
 PAYLOAD_METADATA = ("precedence", "xml_sha256", "unrendered_features", "bom_bytes", "ends_with_terminator",
-                    "method", "parts", "source_format")
+                    "method", "parts", "source_format", "conversion")
 
 
 def inputs(root, config, engine, review_snapshot=None):
@@ -535,7 +538,7 @@ def records(raw, value, engine):
     payload = value["payload"]
     # Full text/source-byte comparison was performed by inputs() before this
     # record generator receives a selected rendition.
-    key = "lines" if payload["format"] in {"gemini-txt", "text", "mhtml", *PAGE_LINE_FORMATS} else "nodes"
+    key = "lines" if payload["format"] in {"gemini-txt", "text", "mhtml", *PAGE_LINE_FORMATS, "converted"} else "nodes"
     if not payload[key]:
         return
     match = re.search(r'^\s*"' + key + r'": \[\s*$', text, re.M)
@@ -581,6 +584,10 @@ def _check_record(format_, record, index, engine):
         if (type(record["line"]) is not int or record["line"] != index + 1
                 or type(record["page"]) is not int or record["page"] < 1):
             engine.fail("Invalid page line numbering")
+    elif format_ == "converted":
+        engine.fields(record, ("line", "text"), "Converted line")
+        if type(record["line"]) is not int or record["line"] != index + 1 or not isinstance(record["text"], str):
+            engine.fail("Invalid converted line numbering")
     elif format_ != "text":
         engine.fields(record, ("member", "locator", "tag", "attributes", "text", "tail"),
                       "ODT node", optional=("paragraph_text",))
@@ -607,6 +614,9 @@ def _describe_record(format_, record, index, parents):
         return ("line-" + str(record["line"]), f"Page {record['page']} line {record['line']}", record["text"],
                 None, {"json_pointer": f"/payload/lines/{index}", "converted_line": record["line"],
                        "page": record["page"]})
+    if format_ == "converted":
+        return ("line-" + str(record["line"]), "Line " + str(record["line"]), record["text"], None,
+                {"json_pointer": f"/payload/lines/{index}", "converted_line": record["line"]})
     if format_ == "text":
         return ("line-" + str(record["line"]), "Line " + str(record["line"]), record["text"], None,
                 {"json_pointer": f"/payload/lines/{index}", "original_line": record["line"],

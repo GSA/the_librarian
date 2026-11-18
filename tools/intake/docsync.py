@@ -9,13 +9,15 @@ sidecar that is missing, changed or not a cohort ``local-path`` submission leave
 from pathlib import Path
 from urllib.parse import unquote
 
-from tools.extraction import mhtml
+from tools.extraction import convert, mhtml
 from . import docs, store, upload
 from .contracts import IntakeError, decode, decode_request, digest, relative
 
 
 def suffix_of(fmt):
     """The reader-version suffix of a format's extraction request names (see ``cohort_ingest._extract``)."""
+    if fmt in convert.FORMATS:
+        return convert.request_version(fmt)
     return "-m%d" % mhtml.METHOD_VERSION if fmt == "mhtml" else ""
 
 

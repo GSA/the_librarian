@@ -371,16 +371,22 @@ model service or return transport is supplied by this interface.
 
 `python -m tools.intake.cohort classify --root ROOT --inbox DIR [--report FILE]`
 gives every file below a read-only inbox exactly one disposition and prints
-body-free counts: `admit` (with format `text`, `gemini-txt`, `mhtml` or `odt`; a `.txt`
+body-free counts: `admit` (with format `text`, `gemini-txt`, `mhtml`, `odt`, or a converter
+format `docx`, `xlsx`, `pptx`, `vsdx`, `rtf` or `office-legacy`; a `.txt`
 that parses as a Gemini transcript is `gemini-txt`; a text-suffix file whose
 content starts with MIME headers, such as a Confluence "Exported From Confluence"
-`.doc`, is `mhtml`), `needs-runtime` (PDF and
+`.doc`, is `mhtml`; strict UTF-8 text under any other suffix or none, such as `.sql`, `.xml`
+or `.198`, is `text` and is kept as `<name>.txt`; Office packages and RTF are recognised by
+content and converted, see [Converted documents](../tools/extraction/README.md#converted-documents-office-rtf)), `needs-runtime` (PDF and
 images while the instance has no provisioned Docling runtime, code
 `docling-not-provisioned`; once provisioned they are `admit` with format `pdf` or
 `image`, and an image whose header declares more than 32,000,000 pixels is
 `over-limit` with code `pixel-limit`), `needs-reader` (no existing
-reader, for example Office formats, or MIME that cannot be read strictly; the
-report carries a `code` such as `mime-malformed`, `mime-no-html`, `mime-encoding`,
+reader, or content that cannot be read strictly; the
+report carries a `code` such as `needs-converter-runtime` (legacy `.doc`/`.xls`/`.ppt`/`.vsd`
+without LibreOffice), `encrypted-document`, `unsupported-container`, `container-invalid`,
+`suffix-mismatch`, `not-utf8-text`, `binary-content`, `control-characters`,
+`unsupported-encoding`, `mime-malformed`, `mime-no-html`, `mime-encoding`,
 `mime-charset` or `mime-empty`, and raw encoded text is never admitted instead), `archive-expanded` (a zip or tar
 archive whose sibling `_extracted/<name>/` is classified instead, or whose members were expanded
 into instance storage; see [Archives](#archives)), `skipped-asset` (web site assets),

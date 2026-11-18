@@ -239,6 +239,36 @@ restated here.
   file is a blocked stage `extract-<code>` and the cohort continues. Evidence:
   `tests/test_pdf_image.py::CohortTests`, `::HardeningTests`, `::RoutingTests`,
   `::ImageLimitTests`; `::RuntimeTests` runs the real runtime when provisioned.
+- **Office and RTF documents convert to derived Markdown; disguised text is read as text (Kata
+  khky).** `cohort_ingest` decides by content, not suffix. Zip packages holding `word/`, `xl/`,
+  `ppt/` or `visio/` parts become `docx`/`xlsx`/`pptx`/`vsdx`, `{\rtf` becomes `rtf`, and legacy
+  compound files (`.doc`/`.xls`/`.ppt`/`.vsd`) become `office-legacy` only when `soffice` is on
+  `PATH` (otherwise `needs-reader` with `needs-converter-runtime`). Other zips, encrypted packages,
+  bad containers and non-matching suffixes stay `needs-reader` with `unsupported-container`,
+  `encrypted-document`, `container-invalid` or `suffix-mismatch`. Strict UTF-8 text under any
+  other suffix (or none) is admitted as `text` and kept as `<name>.txt` (locator unchanged);
+  `unsupported-encoding`, `not-utf8-text`, `binary-content` and `control-characters` keep the
+  rest visible. Text-suffixed files the text reader already admitted keep their format and
+  identity. `tools/extraction/convert.py` runs `convert_worker.py` (stdlib zip/expat only) per
+  file in a separate `python -I` process with a 300 s wall clock, an 80 MiB output cap, rlimits
+  (address space, no file writes) and the source sha256 re-checked. The worker refuses
+  DTDs/entities, unsafe, duplicate or encrypted members, zip-bomb ratios and size, element and
+  depth caps, and caps output lines, sheet rows, columns and cell text, recording truncation and
+  dropped images in `fidelity`. Legacy files go through `soffice --headless --convert-to` in a
+  private profile under the extraction home first. There is no network namespace; the stdlib
+  worker opens no sockets. The rendition is a derived line rendition of the registered original
+  with `payload.format: "converted"` and `payload.conversion: {source_format, via, converter,
+  version, code_sha256, lock_sha256, runtime, fidelity}`; its engine identity hashes both
+  converter files (and the `soffice` version for legacy input), and cohort request names carry a
+  `-c<12 hex>` suffix of it (as MHTML carries `-mN`), so a converter change extracts again; a
+  `--trust-stat` row with an older suffix is not trusted. Each conversion failure is a blocked stage with its code. Evidence:
+  `tests/test_convert.py::CohortConversionTests::test_classify_routes_documents_to_converters_and_disguised_text_to_the_text_reader`,
+  `::CohortConversionTests::test_converted_documents_are_derived_renditions_reviewed_selected_and_retrievable`,
+  `::CohortConversionTests::test_conversion_failure_stays_visible_with_its_code`,
+  `::CohortConversionTests::test_legacy_binary_converts_through_soffice_when_present`,
+  `::HostileInputTests`, `::IsolatedWorkerTests::test_wall_clock_timeout_and_output_cap_kill_the_child`,
+  `::IsolatedWorkerTests::test_converter_identity_changes_with_converter_code`,
+  `::CohortConversionTests::test_converter_change_extracts_again_even_under_trust_stat`.
 - **Ingest follows correction-chain heads.** `ingest` and `qualify` report an
   extraction or registration through the head of its validated `correction_of`
   chain, never by request name: a repaired entry is `extracted` with the head's
@@ -295,7 +325,7 @@ restated here.
   `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `converted-format` and
   `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
   extraction payload format; `docling-pdf`, `docling-image` and cohort `ocr` are `machine-ocr`, a cohort PDF text layer
-  (`pdf-text`) is `converted-format`, text, MHTML,
+  (`pdf-text`) and `converted` (office/RTF conversion, below) are `converted-format`, text, MHTML,
   Gemini transcript and ODT renditions add no reason), `agent-generated` (an upload whose
   version-2 descriptor declares `origin.agent_generated: {generator, generated_on,
   source_commit}`; the hash-pinned `submission.json` sidecar is read at build and a missing,
