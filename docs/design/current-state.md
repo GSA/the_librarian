@@ -337,11 +337,14 @@ restated here.
   `corrections` (claim, statement, summary, source, status, resolver, `drift`), and an open
   record adds `open-correction` with its summary and source to that piece's confidence and the
   packet's top-level block. Compact and `get_many` documents keep the document label; a piece
-  carries its own label only when a correction lowers it. `search` hits list open and resolved
-  correction IDs, and `--low-confidence last|exclude` treats open-corrected sections as low.
-  A confirm restores normal confidence only for the claims it resolves; other reasons stay.
-  Drift is reported, never hidden: `claim-not-found` (the claim left the section; the correction
-  then applies to all overlapping text until resolved), `locator-missing`, `source-changed`.
+  carries its own label only when a correction lowers it. `search` hits (which index a section's
+  lead text) list open and resolved correction IDs when that lead text holds the claim, and
+  `--low-confidence last|exclude` treats those sections as low. A confirm restores normal
+  confidence only for the claims it resolves; other reasons stay. Drift is reported, never
+  hidden: `source-changed` (informational), `claim-not-found` (the claim left the section; the
+  correction then applies to all text overlapping it), `locator-missing` (e.g. a renamed heading;
+  it follows the claim within the same document), `locator-and-claim-missing` (it marks the
+  whole document) and `document-missing` (shown only in status).
   `status` reports `claim_corrections` counts including open drifted ones. No store means reads
   are unchanged; an invalid store refuses the read. Evidence: `tests/test_corrections.py`.
 - **Only an absent registration is `unregistered-rendition`.** The standing check reads a

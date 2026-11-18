@@ -4,8 +4,11 @@ claim drifted, and how it marks the pieces and search hits that carry the claim.
 Corrections are applied when text is read, never built into the index, so recording one needs no
 rebuild. A correction applies to indexed text on the same path whose coordinates overlap the corrected
 section and that contains the quoted claim (whitespace-collapsed); when the claim is no longer in that
-section (``claim-not-found``) it applies to all overlapping text, so a drifted open correction stays
-visible until it is confirmed or retracted.
+section (``claim-not-found``) it applies to all overlapping text. When the locator is gone but the
+document is still indexed it follows the claim within that document (``locator-missing``), or marks
+the whole document when the claim is gone too (``locator-and-claim-missing``). A drifted open
+correction therefore stays visible until it is confirmed or retracted; only a document that left the
+index (``document-missing``) shows it in status alone.
 """
 
 from contextlib import closing
@@ -90,28 +93,39 @@ def place(connection, snapshot):
             continue
         target_ = record["target"]
         section = connection.execute(
-            "SELECT s.path,s.line_start,s.line_end,s.text,d.hash FROM sections s "
+            "SELECT s.id,s.path,s.line_start,s.line_end,s.text,d.hash FROM sections s "
             "JOIN documents d ON d.path=s.path WHERE s.locator=?", (target_["locator"],)).fetchone()
         claim = store.normalize(target_["claim"])
         if section is None:
-            drift = "locator-missing"
+            texts = [row[0] for row in connection.execute("SELECT text FROM sections WHERE path=?",
+                                                          (target_["path"],))]
+            if not texts:
+                drift = "document-missing"
+            elif any(claim in store.normalize(text) for text in texts):
+                drift = "locator-missing"
+            else:
+                drift = "locator-and-claim-missing"
         elif claim not in store.normalize(section["text"]):
             drift = "claim-not-found"
         elif section["hash"] != target_["source_hash"]:
             drift = "source-changed"
         else:
             drift = None
-        placements.append({"section": section, "claim": claim, "drift": drift,
+        placements.append({"path": target_["path"], "section": section, "claim": claim, "drift": drift,
                            "open": snapshot.status(record) == "open",
                            "entry": _entry(snapshot, record, drift)})
     return placements
 
 
 def _applies(placement, path, start, end, text):
-    section = placement["section"]
-    if section is None or section["path"] != path or start > section["line_end"] or end < section["line_start"]:
+    section, drift = placement["section"], placement["drift"]
+    if placement["path"] != path or drift == "document-missing":
         return False
-    return placement["drift"] == "claim-not-found" or placement["claim"] in _store().normalize(text)
+    if drift == "locator-and-claim-missing":
+        return True
+    if section is not None and (start > section["line_end"] or end < section["line_start"]):
+        return False
+    return drift == "claim-not-found" or placement["claim"] in _store().normalize(text)
 
 
 def _detail(placement):
@@ -154,16 +168,21 @@ def annotate_pieces(connection, pieces, placements):
 
 
 def sections(connection, placements):
-    """``{section id: [placement]}`` for every indexed section a placement applies to."""
+    """``{section id: [placement]}`` for the search entries a placement applies to. Search indexes a
+    section's lead text, so a claim matches there; a section whose claim drifted flags itself only."""
     found = {}
     for placement in placements:
-        section = placement["section"]
-        if section is None:
+        section, drift = placement["section"], placement["drift"]
+        if drift == "document-missing":
             continue
-        for row in connection.execute(
-                "SELECT id,line_start,line_end,text FROM sections WHERE path=? AND line_start<=? AND line_end>=?",
-                (section["path"], section["line_end"], section["line_start"])):
-            if _applies(placement, section["path"], row["line_start"], row["line_end"], row["text"]):
+        for row in connection.execute("SELECT id,line_start,line_end,lead_text FROM sections WHERE path=?",
+                                      (placement["path"],)):
+            if drift == "claim-not-found":
+                applies = row["id"] == section["id"]
+            else:
+                applies = _applies(placement, placement["path"], row["line_start"], row["line_end"],
+                                   row["lead_text"])
+            if applies:
                 found.setdefault(row["id"], []).append(placement)
     return found
 

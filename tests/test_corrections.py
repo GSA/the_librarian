@@ -133,6 +133,29 @@ class Corrections(WorkspaceCase):
             self.assertEqual(cli.main(["--root", str(self.root), "status"]), 0)
         self.assertEqual(json.loads(out.getvalue())["claim_corrections"]["open"], 1)
 
+    def test_child_correction_does_not_flag_an_unrelated_parent_search_hit(self):
+        drafts = [{"kind": "dispute", "locator": "documents/policy.md#exceptions",
+                   "claim": "Legal holds suspend deletion.", "summary": "Audits too.", "source": QUESTION}]
+        corrections.append(self.root, drafts, "test-runner", "req-1", self.state())
+        self.assertEqual(len(self.search("Backups", "exclude")["hits"]), 1)
+        self.assertNotIn("corrections", self.search("Backups")["hits"][0])
+        self.assertIn("corrections", self.search("Legal")["hits"][0])
+
+    def test_renamed_heading_keeps_the_warning_on_the_claim(self):
+        correction = self.record("req-1")["correction_ids"][0]
+        self.write(POLICY.replace("# Retention policy", "# Retention rules"))
+        self.build()
+        piece = self.get("documents/policy.md#retention-rules")["pieces"][0]
+        self.assertEqual((piece["corrections"][0]["drift"], piece["confidence"]["level"]),
+                         ("locator-missing", "low"))
+        self.assertEqual(self.search("Backups")["hits"][0]["corrections"]["open"], [correction])
+        self.assertNotIn("corrections", self.get("documents/policy.md#exceptions")["pieces"][0])
+        # With the claim gone as well, the whole document carries the warning.
+        self.write(POLICY.replace("# Retention policy", "# Retention rules").replace("30 days", "90 days"))
+        self.build()
+        piece = self.get("documents/policy.md#exceptions")["pieces"][0]
+        self.assertEqual(piece["corrections"][0]["drift"], "locator-and-claim-missing")
+
     def test_refusals_leave_the_store_unchanged(self):
         before = self.state()
         cases = [
