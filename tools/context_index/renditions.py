@@ -9,7 +9,7 @@ import stat
 from bisect import bisect_right
 from pathlib import Path, PurePosixPath
 
-from tools.context_index import qualification
+from tools.context_index import confidence, qualification
 
 
 # One instance publishes a reviewed cohort (tens of thousands of files), not a hand-picked handful.
@@ -191,7 +191,12 @@ def inputs(root, config, engine, review_snapshot=None):
             review = qualification.extract(item, value, identity, review_snapshot, engine)
         if review is not None:
             identity["qualification"] = review
-        result.append((item, raw, value, _metadata(item, value, run, review)))
+        origin = confidence.declared_origin(
+            root, receipt_records[item["receipt_id"]]["records"], original,
+            lambda path: catalog.private_file(no_symlinks(path)), engine)
+        label = confidence.for_rendition(value, review, origin)
+        identity["confidence"] = label
+        result.append((item, raw, value, _metadata(item, value, run, review), label))
         identities.append(identity)
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
 
@@ -602,11 +607,13 @@ def _describe_record(format_, record, index, parents):
 
 
 def store(connection, selected, engine):
-    for item, raw, value, metadata in selected:
+    for item, raw, value, metadata, label in selected:
         path = item["path"]
         connection.execute("INSERT INTO documents VALUES (?,?,?,?,?)", (
             path, item["sha256"], "machine-rendition-not-independent-evidence", "[]", "{}",
         ))
+        connection.execute("INSERT INTO document_confidence VALUES (?,?,?)",
+                           (path, label["level"], json.dumps(label, ensure_ascii=False)))
         connection.execute("INSERT INTO rendition_documents VALUES (?,?)",
                            (path, json.dumps(metadata, ensure_ascii=False)))
         ids = {}

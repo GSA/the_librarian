@@ -300,6 +300,19 @@ class MCP(unittest.IsolatedAsyncioTestCase):
                     payload = json.loads(res.content[0].text)
                     self.assertEqual(len(payload["hits"]), 1)
                     self.assertEqual(payload["hits"][0]["path"], "documents/custom.md")
+                    self.assertEqual(payload["hits"][0]["confidence"], {"level": "normal", "reasons": []})
+                    res = await session.call_tool("search", {"query": "override", "low_confidence": "exclude"})
+                    payload = json.loads(res.content[0].text)
+                    self.assertEqual((len(payload["hits"]), payload["low_confidence_excluded"]), (1, 0))
+                    res = await session.call_tool("search", {"query": "override", "low_confidence": "hide"})
+                    self.assertTrue(res.is_error)
+                    res = await session.call_tool("status", {})
+                    self.assertEqual(json.loads(res.content[0].text)["confidence"]["normal"], 1)
+                    res = await session.call_tool("get_many", {"locators": [payload["hits"][0]["locator"]]})
+                    many = json.loads(res.content[0].text)
+                    self.assertEqual(many["format"], "qualified-many-full-v2")
+                    self.assertEqual([d["confidence"]["level"] for d in many["documents"].values()], ["normal"])
+                    self.assertEqual(many["confidence"]["level"], "normal")
 
 
 if __name__ == "__main__":

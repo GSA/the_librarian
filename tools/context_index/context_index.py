@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote
 import uuid
 
 from tools import policy
-from tools.context_index import renditions
+from tools.context_index import confidence, renditions
 
 
 SCHEMA = 1
@@ -62,6 +62,7 @@ def engine_fingerprint():
         no_symlinks(Path(__file__).with_name("renditions.py")),
         no_symlinks(Path(__file__).with_name("qualification.py")),
         no_symlinks(Path(__file__).with_name("packets.py")),
+        no_symlinks(Path(__file__).with_name("confidence.py")),
         no_symlinks(Path(policy.__file__)),
     )))
 
@@ -447,6 +448,10 @@ CREATE TABLE sections (
 CREATE TABLE aliases (locator TEXT PRIMARY KEY, section_id INTEGER REFERENCES sections(id));
 CREATE TABLE rendition_documents (path TEXT PRIMARY KEY REFERENCES documents(path), payload TEXT NOT NULL);
 CREATE TABLE rendition_locations (locator TEXT PRIMARY KEY REFERENCES sections(locator), payload TEXT NOT NULL);
+CREATE TABLE document_confidence (
+    path TEXT PRIMARY KEY REFERENCES documents(path),
+    level TEXT NOT NULL CHECK (level IN ('normal', 'low')), label TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE search_fts USING fts5(title, text, tokenize='unicode61');
 """
 
@@ -522,6 +527,8 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
             connection.execute("INSERT INTO documents VALUES (?,?,?,?,?)", (
                 path, hashes[path], document["role"], json.dumps(intro), json.dumps(definitions),
             ))
+            connection.execute("INSERT INTO document_confidence VALUES (?,?,?)",
+                               (path, "normal", json.dumps(confidence.label())))
             ids = {}
             for index, node in enumerate(nodes):
                 locator = path + ("#" + node["anchor"] if node["anchor"] else "")
@@ -573,8 +580,22 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
 
 
 def count_index(connection):
-    return {name: connection.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
-            for name in ("documents", "sections")}
+    counts = {name: connection.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
+              for name in ("documents", "sections")}
+    if has_table(connection, "document_confidence"):
+        levels = dict(connection.execute("SELECT level,count(*) FROM document_confidence GROUP BY level"))
+        reasons = dict(connection.execute(
+            "SELECT json_extract(r.value,'$.code') AS code,count(*) FROM document_confidence c, "
+            "json_each(c.label,'$.reasons') r GROUP BY code ORDER BY code"))
+        counts["confidence"] = {"contract": confidence.CONTRACT,
+                                **{level: levels.get(level, 0) for level in confidence.LEVELS},
+                                "low_reasons": reasons}
+    return counts
+
+
+def has_table(connection, name):
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
 def freshness(connection, root, manifest, db, config, manifest_hash, expected=None):
@@ -587,9 +608,10 @@ def freshness(connection, root, manifest, db, config, manifest_hash, expected=No
     if expected is None:
         expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)
     reasons = [f"metadata changed: {key}" for key in expected if actual.get(key) != expected[key]]
-    if not connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rendition_documents'").fetchone():
+    if not has_table(connection, "rendition_documents"):
         return [*reasons, "rendition schema missing; run build"]
+    if not has_table(connection, "document_confidence"):
+        return [*reasons, "confidence schema missing; run build"]
     stored = dict(connection.execute(
         "SELECT path,hash FROM documents WHERE path NOT IN (SELECT path FROM rendition_documents)"))
     current = {}
@@ -665,9 +687,16 @@ def classify_absence(connection, query, path):
     }
 
 
-def search(connection, query, limit, path, *, root=None):
+LOW_CONFIDENCE = ("include", "last", "exclude")
+
+
+def search(connection, query, limit, path, *, root=None, low_confidence="include"):
+    """Literal search; ``low_confidence`` keeps low-confidence hits in rank order (``include``),
+    ranks them after every normal hit (``last``) or leaves them out and counts them (``exclude``)."""
     if not 1 <= limit <= 50:
         fail("--limit must be between 1 and 50")
+    if low_confidence not in LOW_CONFIDENCE:
+        fail("--low-confidence must be one of " + ", ".join(LOW_CONFIDENCE))
     parameters = [literal_query(query)]
     restriction = ""
     if path is not None:
@@ -676,33 +705,47 @@ def search(connection, query, limit, path, *, root=None):
             fail(f"Search path is not in the selection: {path}")
         restriction = " AND s.path=?"
         parameters.append(path)
-    parameters.append(limit)
+    matching = ("FROM search_fts JOIN sections s ON s.id=search_fts.rowid "
+                "JOIN documents d ON d.path=s.path JOIN document_confidence c ON c.path=s.path "
+                "WHERE search_fts MATCH ?" + restriction)
+    order = " ORDER BY " + ("c.level='low'," if low_confidence == "last" else "")
     rows = connection.execute(
-        "SELECT s.*,d.role,snippet(search_fts,1,'','',' … ',36) AS excerpt "
-        "FROM search_fts JOIN sections s ON s.id=search_fts.rowid "
-        "JOIN documents d ON d.path=s.path WHERE search_fts MATCH ?" + restriction
-        + " ORDER BY bm25(search_fts),s.path,s.line_start LIMIT ?", parameters,
+        "SELECT s.*,d.role,c.label AS confidence,snippet(search_fts,1,'','',' … ',36) AS excerpt "
+        + matching + (" AND c.level='normal'" if low_confidence == "exclude" else "")
+        + order + "bm25(search_fts),s.path,s.line_start LIMIT ?", [*parameters, limit],
     ).fetchall()
-    rendition_formats = {path: json.loads(payload)["format"] for path, payload in
-                         connection.execute("SELECT path,payload FROM rendition_documents")}
     hits = [{
         "locator": row["locator"], "path": row["path"], "title": row["title"],
         "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
         "excerpt": row["excerpt"][:600], "caveat": DISCOVERY,
+        "confidence": confidence.codes(json.loads(row["confidence"])),
     } for row in rows]
     for hit in hits:
         location = connection.execute("SELECT payload FROM rendition_locations WHERE locator=?",
                                       (hit["locator"],)).fetchone()
         if location:
             hit["source_location"] = json.loads(location[0])
-            if rendition_formats.get(hit["path"]) == "docling":
+            payload = connection.execute("SELECT payload FROM rendition_documents WHERE path=?",
+                                         (hit["path"],)).fetchone()[0]
+            if json.loads(payload)["format"] == "docling":
                 hit["line_start"] = None
                 hit["line_end"] = None
                 hit["line_basis"] = "retained-extraction-byte-range-and-json-pointer"
             else:
                 hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
-    result = envelope(root=root, command="search", query=query, discovery_only=True, caveat=DISCOVERY, hits=hits)
-    if not hits:
+    result = envelope(root=root, command="search", query=query, discovery_only=True, caveat=DISCOVERY,
+                      hits=hits, low_confidence=low_confidence,
+                      confidence=confidence.summary(json.loads(row["confidence"]) for row in rows))
+    if low_confidence == "exclude":
+        result["low_confidence_excluded"] = connection.execute(
+            "SELECT count(*) " + matching + " AND c.level='low'", parameters).fetchone()[0]
+    if not hits and result.get("low_confidence_excluded"):
+        result["filtered"] = {
+            "classification": "low-confidence-excluded",
+            "caveat": "Matching sections exist but are all low confidence and were excluded; "
+                      "search with low_confidence include or last to read them with their reasons.",
+        }
+    elif not hits:
         result["absence"] = classify_absence(connection, query, path)
     return result
 

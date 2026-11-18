@@ -78,19 +78,38 @@ def _issues_now_qualify(root, current):
         return False
     arguments = store.request(root, current["correlation_id"])["stages"][0]["arguments"]
     try:
-        result = standing.evaluate(root, {key: arguments[key] for key in adapters.STANDING_REVIEW})
+        result = standing.evaluate(root, adapters.standing_arguments(arguments))
     except standing.Refusal:
         return False
     return result["outcome"] == "qualified"
 
 
-def _stage_correction(root, corr, active):
+DEFERRED_HELD = "standing-deferred-reviewer-deferred"
+
+
+def _deferral_now_qualifies(root, current, deferred):
+    """A review saved as a held reviewer deferral that ``deferred`` (the operator's opt-in) now
+    qualifies as low confidence, from its saved, hash-verified findings under its pinned policy.
+
+    Only a deferral after a complete inspection under the current policy qualifies; evaluating
+    never writes or calls a model."""
+    if deferred == "hold" or not _blocked_with(current["stages"][0], DEFERRED_HELD):
+        return False
+    arguments = store.request(root, current["correlation_id"])["stages"][0]["arguments"]
+    try:
+        result = standing.evaluate(root, {**adapters.standing_arguments(arguments), "deferred": deferred})
+    except standing.Refusal:
+        return False
+    return result["outcome"] == "qualified"
+
+
+def _stage_correction(root, corr, active, extra=None):
     """Restage a standing review whose pinned intent no longer matches its inputs as a
-    correction of it: same review arguments and event, fresh request identities."""
+    correction of it: same review arguments (plus ``extra``) and event, fresh request identities."""
     corrected = store.next_correction(root, corr)
     stages = store.request(root, active)["stages"]
     store.stage_request(root, corrected, [
-        {**s, "arguments": {**s["arguments"], "request_id": f"req-{corrected}-{s['id']}"}}
+        {**s, "arguments": {**s["arguments"], **(extra or {}), "request_id": f"req-{corrected}-{s['id']}"}}
         for s in stages], correction_of=active)
     return corrected
 
@@ -119,6 +138,10 @@ def _review(root, entry, run):
                                inspected_form=run["inspected_form"])
 
 
+def _deferred_argument(deferred):
+    return {} if deferred == "hold" else {"deferred": deferred}
+
+
 def _stage_review(root, entry, run, corr, event_id, reviewed):
     """Stage the review and selection of a reviewed rendition; return the request summary."""
     review_args = {
@@ -126,6 +149,7 @@ def _stage_review(root, entry, run, corr, event_id, reviewed):
         "rendition": entry["rendition"], "rendition_sha256": entry["rendition_sha256"],
         "findings_path": reviewed["findings_path"],
         "findings_sha256": reviewed["findings_sha256"], "event_id": event_id,
+        **_deferred_argument(run.get("deferred", "hold")),
     }
     return store.stage_request(root, corr, [
         {"id": "review", "kind": "review", "operation": "standing-review",
@@ -164,15 +188,19 @@ def _superseded(root, current, event_id, live):
             and event_id not in _live_events(event_reader.read_snapshot(root)))
 
 
-def _run_review(root, corr, current, entry):
-    """Run the review stage, restaging it as a correction when its pinned intent went stale.
+def _run_review(root, corr, current, entry, deferred="hold"):
+    """Run the review stage, restaging it as a correction when its pinned intent went stale, or
+    when ``deferred`` opts a held reviewer deferral in to qualifying as low confidence.
 
     Returns ``(active correlation ID, summary)``.
     """
     active = current["correlation_id"]
     if current["stages"][0]["status"] in RUNNABLE:
         current = runner.run(root, active, "review")
-    if (_blocked_with(current["stages"][0], "changed-standing-inputs")
+    if _deferral_now_qualifies(root, current, deferred):
+        active = _stage_correction(root, corr, active, _deferred_argument(deferred))
+        current = runner.run(root, active, "review")
+    elif (_blocked_with(current["stages"][0], "changed-standing-inputs")
             or _registration_recovered(root, current, entry)
             or _issues_now_qualify(root, current)):
         # The saved review's pinned intent is stale (e.g. an earlier-version review it
@@ -247,7 +275,7 @@ def _review_and_select(root, entry, run, prefetched=None):
         entry.update(qualification="pending-review", review_code="review-superseded",
                      superseded_event=event_id)
         return
-    active, current = _run_review(root, corr, current, entry)
+    active, current = _run_review(root, corr, current, entry, run.get("deferred", "hold"))
     current = _run_select(root, active, current, entry, run["manifest"])
     if current is None:
         entry.update(qualification="pending-review", review_code="selection-capacity")

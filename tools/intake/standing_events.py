@@ -49,6 +49,10 @@ def _statements(result, scope_counts):
         scope_counts + f" (findings sha256 {result['findings_sha256']}).",
         "Reviewer explanation: " + result["explanation"],
     ]
+    if result.get("deferred"):
+        # confidence.DEFERRED_PREFIX: the index reads this statement as a low-confidence reason.
+        statements.append("Reviewer-deferred: the reviewer deferred judgement; qualified as low "
+                          "confidence by operator opt-in, not accepted.")
     if result["exception_resolution"]:
         statements.append("Exception resolution: " + result["exception_resolution"])
     if result.get("unverifiable_references"):
@@ -80,7 +84,9 @@ def review_event(result, args, recorded_at=None):
                   "description": scope},
         "outcome": "reviewed",
         "counts": {"total": 1, "reviewed": 1, "pending": 0, "unreadable": 0, "dispositioned": 0},
-        "reason": "Qualified under explicit standing policy; parser completion is not verification.",
+        "reason": ("Qualified as low confidence under explicit standing policy after a reviewer "
+                   "deferral; parser completion is not verification." if result.get("deferred") else
+                   "Qualified under explicit standing policy; parser completion is not verification."),
         "reviewer": result["reviewer"], "reviewed_on": recorded.date().isoformat(),
         "recorded_at": recorded.isoformat(),
         "evidence": [{"kind": "agent_statement", "pointer": None, "quote": q}

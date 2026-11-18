@@ -1,5 +1,7 @@
 """Versioned, fail-closed admission policies for selected renditions."""
 
+from tools.context_index import confidence
+
 POLICY_VERSION = "docling-exact-rendition-review-v1"
 COMPLETE_SCOPE = "Complete exact Docling rendition review."
 EXTRACT_POLICY_VERSION = "extract-exact-rendition-review-v1"
@@ -58,12 +60,11 @@ def _bound(selection, source, snapshot, engine, complete_scope, label):
                 or event.get("uncertainties") != []):
             engine.fail(f"{label} review does not bind the exact complete rendition")
         reviewed_content.update(content)
-        noted = [e["quote"] for e in event["evidence"]
-                 if isinstance(e, dict) and isinstance(e.get("quote"), str)
-                 and e["quote"].startswith("Reviewer-noted ")]
+        noted, deferral = confidence.review_notes(event["evidence"])
         reviewed_scope.append({"event_id": event_id, "content": sorted(content),
                                "unit": "file", "extent": "defined_scope",
-                               **({"noted_issues": noted} if noted else {})})
+                               **({"noted_issues": noted} if noted else {}),
+                               **({"deferral": deferral} if deferral is not None else {})})
     return reviewed_content, reviewed_scope
 
 

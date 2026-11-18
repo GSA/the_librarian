@@ -127,8 +127,9 @@ def recover_identity(root, *, apply=False):
 UNRESOLVED = "standing-pending-review-unresolved-evidence"
 
 
-def _unresolved_blocked(root):
-    """Chain heads whose standing review is blocked ``unresolved-evidence``: ``(head summary, rendition, manifest)``."""
+def _unresolved_blocked(root, code=UNRESOLVED):
+    """Chain heads whose standing review is blocked with ``code`` (default ``unresolved-evidence``):
+    ``(head correlation ID, rendition, manifest)``."""
     found = []
     with store.locked(root) as c:
         rows = c.execute("SELECT s.correlation_id, r.raw FROM stages s JOIN requests r USING(correlation_id) "
@@ -143,7 +144,7 @@ def _unresolved_blocked(root):
             last = c.execute("SELECT code FROM attempts WHERE correlation_id=? AND stage_id=? "
                              "ORDER BY cycle DESC, ordinal DESC LIMIT 1",
                              (row["correlation_id"], review["id"])).fetchone()
-            if last is not None and last[0] == UNRESOLVED:
+            if last is not None and last[0] == code:
                 found.append((row["correlation_id"], review["arguments"]["rendition"],
                               request["stages"][1]["arguments"].get("manifest")))
     return found
@@ -162,11 +163,35 @@ def recover_unresolved_evidence(root, *, apply=False):
     untouched, as is every qualified, rejected, deferred or exception review. Run ``publish`` after.
     """
     root = Path(root).resolve()
+    return _recover(root, apply, UNRESOLVED,
+                    lambda current: cohort_review._issues_now_qualify(root, current))
+
+
+def recover_deferred(root, *, apply=False, deferred="qualify-low-confidence"):
+    """Report, and with ``apply`` qualify as low confidence, reviews held as reviewer deferrals.
+
+    The operator opt-in ``qualify --deferred qualify-low-confidence`` applied to reviews already
+    held: each chain head blocked ``reviewer-deferred`` is re-evaluated from its saved,
+    hash-verified findings under its pinned policy with the opt-in, without a model call. One that
+    now qualifies (a complete inspection under the current policy, no conflicting review, ...) is
+    restaged as a correction carrying the opt-in, reviewed, and selected under the shared
+    manifest's capacity. Anything else (incomplete inspection, a changed or older policy, ...) is
+    counted in ``skipped`` and untouched. Run ``publish`` after.
+    """
+    root = Path(root).resolve()
+    return _recover(root, apply, cohort_review.DEFERRED_HELD,
+                    lambda current: cohort_review._deferral_now_qualifies(root, current, deferred),
+                    deferred)
+
+
+def _recover(root, apply, code, now_qualifies, deferred="hold"):
+    """Re-evaluate the chain heads blocked with ``code`` that ``now_qualifies`` and, with
+    ``apply``, restage, review and select them as corrections."""
     heads = store.Heads()
     work, skipped = [], Counter()
-    for corr, rendition, manifest in _unresolved_blocked(root):
+    for corr, rendition, manifest in _unresolved_blocked(root, code):
         current = store.find_head(root, corr, heads)
-        if not cohort_review._issues_now_qualify(root, current):
+        if not now_qualifies(current):
             skipped["not-qualified"] += 1
         else:
             work.append((corr, current, rendition, manifest))
@@ -176,7 +201,7 @@ def recover_unresolved_evidence(root, *, apply=False):
     results = Counter()
     for corr, current, rendition, manifest in work:
         try:
-            active, current = cohort_review._run_review(root, corr, current, {"rendition": rendition})
+            active, current = cohort_review._run_review(root, corr, current, {"rendition": rendition}, deferred)
             current = cohort_review._run_select(root, active, current, {"rendition": rendition}, manifest)
         except (IntakeError, standing.Refusal) as error:
             results[getattr(error, "code", "refused")] += 1

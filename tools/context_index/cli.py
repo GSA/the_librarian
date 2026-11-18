@@ -9,7 +9,7 @@ import sys
 
 from tools import policy
 from tools.context_index.context_index import (
-    IndexError_, build, count_index, engine_fingerprint, envelope, fail, freshness,
+    IndexError_, LOW_CONFIDENCE, build, count_index, engine_fingerprint, envelope, fail, freshness,
     load_catalog, load_compaction, load_manifest, no_symlinks, publication_lock, readonly,
     search, validate_db_path,
 )
@@ -30,6 +30,9 @@ def arguments(argv=None):
     find.add_argument("query")
     find.add_argument("--limit", type=int, default=5)
     find.add_argument("--path")
+    find.add_argument("--low-confidence", choices=LOW_CONFIDENCE, default="include",
+                      help="Keep low-confidence hits in rank order (include, default), rank them "
+                           "after normal hits (last) or leave them out and count them (exclude)")
     get = commands.add_parser("get")
     get.add_argument("locator")
     get.add_argument("--max-chars", type=int, default=30000)
@@ -103,7 +106,8 @@ def main(argv=None):
             if args.command == "status":
                 result = envelope(root=root, command="status", fresh=True, database=str(db), **count_index(connection))
             elif args.command == "search":
-                result = search(connection, args.query, args.limit, args.path, root=root)
+                result = search(connection, args.query, args.limit, args.path, root=root,
+                                low_confidence=args.low_confidence)
             elif args.command == "get":
                 result = packet(connection, config, args.locator, args.max_chars, root=root)
                 if args.format == "compact":

@@ -49,6 +49,10 @@ def arguments(argv):
     submit.add_argument("--origin-system")
     submit.add_argument("--origin-locator")
     submit.add_argument("--origin-version")
+    submit.add_argument("--agent-generator",
+                        help="Declare the file was written by this AI agent; indexed as low confidence")
+    submit.add_argument("--agent-generated-on", help="YYYY-MM-DD the agent wrote it (with --agent-generator)")
+    submit.add_argument("--agent-source-commit", help="Commit the agent wrote it from (with --agent-generator)")
     submit.add_argument("--expected-sha256")
     for name in ("drop-scan", "drop-submit"):
         commands.add_parser(name).add_argument("--drop", type=Path, required=True)
@@ -89,6 +93,15 @@ def runs(values):
     return result
 
 
+def _agent_generated(args):
+    if args.agent_generator is None:
+        if args.agent_generated_on is not None or args.agent_source_commit is not None:
+            raise IntakeError("invalid_origin")
+        return None
+    return {"generator": args.agent_generator, "generated_on": args.agent_generated_on,
+            "source_commit": args.agent_source_commit}
+
+
 def main(argv=None):
     args = arguments(argv)
     try:
@@ -118,6 +131,7 @@ def main(argv=None):
                 correction_of=args.correction_of, origin_system=args.origin_system,
                 origin_locator=args.origin_locator, origin_version=args.origin_version,
                 origin_kind=args.origin_kind,
+                agent_generated=_agent_generated(args),
                 expected_sha256=args.expected_sha256)
             result = upload.submit(args.root, args.file, value)
         elif args.command == "drop-scan":
