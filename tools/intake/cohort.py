@@ -21,8 +21,8 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
-from . import (agent_origin, cli, cohort_archives, cohort_review, docsync, model_review, runner, selection_manifest,
-               standing, store, throttle, upload, usage_log)
+from . import (agent_origin, cli, cohort_archives, cohort_rereview, cohort_review, docsync, model_review, runner,
+               selection_manifest, standing, store, throttle, upload, usage_log)
 from . import cohort_runtime, contracts
 from .cohort_ingest import BATCH_SIZE, classify, ingest
 from .cohort_recovery import recover_deferred, recover_identity, recover_unresolved_evidence
@@ -318,7 +318,7 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
     raise IntakeError("publication_revisions_exhausted")
 
 
-def _check_options(concurrency, initial_concurrency, inspected_form, context, deferred="hold"):
+def _check_options(concurrency, initial_concurrency, inspected_form, deferred="hold"):
     if type(concurrency) is not int or concurrency < 1:
         raise IntakeError("invalid_concurrency")
     if initial_concurrency is not None and (
@@ -328,9 +328,6 @@ def _check_options(concurrency, initial_concurrency, inspected_form, context, de
         raise IntakeError("invalid_inspected_form")
     if deferred not in standing.DEFERRED_MODES:
         raise IntakeError("invalid_deferred_mode")
-    if not context:
-        # A maintained context document must be named; guessing one would not satisfy the policy.
-        raise IntakeError("context_required")
 
 
 def _reconcile_qualified(root, manifest, system, current, cohorts, extracted):
@@ -395,7 +392,10 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     An agent ``origin`` (``agent_origin.load``) is passed to ``ingest``: the cohort's files are
     declared agent-generated and reviewed under the same standing policy as any other.
     """
-    _check_options(concurrency, initial_concurrency, inspected_form, context, deferred)
+    _check_options(concurrency, initial_concurrency, inspected_form, deferred)
+    if not context:
+        # A maintained context document must be named; guessing one would not satisfy the policy.
+        raise IntakeError("context_required")
     root = Path(root).resolve()
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
     report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat,
@@ -435,6 +435,50 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         # Body-free per-code retry counts made by the transport during this run.
         report["retries"] = {code: count for code, count in sorted(
             (Counter(retries) - retried).items())}
+    return report
+
+
+def rereview(root, *, policy_path, manifest, model, transport=None, apply=False, limit=None,
+             include_current_deferred=False, deferred="qualify-low-confidence", concurrency=6,
+             adaptive=True, initial_concurrency=None, inspected_form="list", cost_estimate=None):
+    """Report, and with ``apply`` re-review under the current policy, held standing reviews.
+
+    See ``cohort_rereview``. Selected: chain heads held under an older policy (pending review or
+    deferred), ``insufficient-inspected-scope`` under the current one and, with
+    ``include_current_deferred``, current-policy deferrals; never a rejected or out-of-scope
+    rendition. ``deferred`` (default ``qualify-low-confidence``, the operator's choice for this
+    command) qualifies a reviewer deferral after a complete inspection as low confidence. The dry
+    run makes no model call and writes nothing; it reports the selection per reason and the
+    estimated model calls and tokens (``cost_estimate``: a ``model_review.estimate`` file keyed by
+    model). ``limit`` bounds the model calls of one run; rerunning continues where it stopped.
+    """
+    _check_options(concurrency, initial_concurrency, inspected_form, deferred)
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise IntakeError("invalid_limit")
+    root = Path(root).resolve()
+    for name in (policy_path, manifest):
+        if not _instance_file(root, name).is_file():
+            raise IntakeError("rereview_input_missing")
+    _validate_inputs(root, policy_path, manifest, None, DEFAULT_INDEX, model)
+    policy_sha = hashlib.sha256((root / policy_path).read_bytes()).hexdigest()
+    standing_policy = standing.load_policy(root, policy_path, policy_sha)
+    with store.locked(root) as c:
+        selected, skipped = cohort_rereview.select(root, c, policy_sha, include_current_deferred)
+    report, work = cohort_rereview.plan(root, selected, skipped, standing_policy, limit=limit,
+                                        inspected_form=inspected_form, model=model,
+                                        cost_estimate=cost_estimate)
+    report["deferred"] = deferred
+    if not apply:
+        return report
+    if transport is None:
+        raise IntakeError("transport_required")
+    report["apply"] = True
+    report.update(cohort_rereview.apply(root, work, {
+        "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
+        "manifest": manifest, "model": model, "transport": transport,
+        "usage": Counter({"prompt_tokens": 0, "completion_tokens": 0}),
+        "inspected_form": inspected_form, "deferred": deferred},
+        concurrency, adaptive=adaptive, initial_concurrency=initial_concurrency))
     return report
 
 
@@ -550,27 +594,62 @@ def _parser():
                                  help="documents whose catalog registrations share one revision "
                                       "(default %d; 1 commits each registration on its own)" % BATCH_SIZE)
         if name == "qualify":
-            command.add_argument("--policy", required=True, dest="policy_path")
-            command.add_argument("--manifest", required=True)
-            command.add_argument("--models-config", required=True, type=Path)
-            command.add_argument("--model", required=True)
+            _model_options(command, models_required=True, deferred="hold")
             command.add_argument("--context", action="append", dest="context")
             command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
-            command.add_argument("--concurrency", type=int, default=6,
-                                 help="most model review calls in flight (default 6; 1 is serial); "
-                                      "an adaptive run backs off below it on 429/503, never above")
-            command.add_argument("--initial-concurrency", type=int,
-                                 help="calls in flight at the start (default: --concurrency)")
-            command.add_argument("--no-adaptive", action="store_true",
-                                 help="hold --concurrency fixed instead of backing off on 429/503")
-            command.add_argument("--inspected-form", choices=model_review.FORMS, default="list",
-                                 help="ask the reviewer for inspected records as every index "
-                                      "(list, default) or as ranges (ranges)")
-            command.add_argument("--deferred", choices=standing.DEFERRED_MODES, default="hold",
-                                 help="hold reviewer deferrals unpublished (hold, default) or "
-                                      "qualify completely inspected ones as low confidence "
-                                      "(qualify-low-confidence)")
+    command = commands.add_parser(
+        "rereview", allow_abbrev=False,
+        help="Report (or with --apply re-review with the model under the current policy) standing "
+             "reviews held under an older policy or after an incomplete inspection")
+    command.add_argument("--root", required=True, type=Path)
+    command.add_argument("--apply", action="store_true")
+    _model_options(command, models_required=False, deferred="qualify-low-confidence")
+    command.add_argument("--limit", type=int, help="most model calls this run (default: all selected)")
+    command.add_argument("--include-current-deferred", action="store_true",
+                         help="also re-review reviewer deferrals held under the current policy")
+    command.add_argument("--cost-estimate", type=Path,
+                         help="token estimate file keyed by model (per_document tokens) for the dry run")
     return parser
+
+
+def _model_options(command, *, models_required, deferred):
+    """The model review options ``qualify`` and ``rereview`` share."""
+    command.add_argument("--policy", required=True, dest="policy_path")
+    command.add_argument("--manifest", required=True)
+    command.add_argument("--models-config", required=models_required, type=Path,
+                         help=None if models_required else "required with --apply")
+    command.add_argument("--model", required=True)
+    command.add_argument("--concurrency", type=int, default=6,
+                         help="most model review calls in flight (default 6; 1 is serial); "
+                              "an adaptive run backs off below it on 429/503, never above")
+    command.add_argument("--initial-concurrency", type=int,
+                         help="calls in flight at the start (default: --concurrency)")
+    command.add_argument("--no-adaptive", action="store_true",
+                         help="hold --concurrency fixed instead of backing off on 429/503")
+    command.add_argument("--inspected-form", choices=model_review.FORMS, default="list",
+                         help="ask the reviewer for inspected records as every index "
+                              "(list, default) or as ranges (ranges)")
+    command.add_argument("--deferred", choices=standing.DEFERRED_MODES, default=deferred,
+                         help="hold reviewer deferrals unpublished (hold) or qualify completely "
+                              "inspected ones as low confidence (qualify-low-confidence); "
+                              "default %s" % deferred)
+
+
+def _transport(models_config):
+    return model_review.usai_transport(
+        models_config, recorder=usage_log.Recorder("librarian intake", model_review.PROVIDER))
+
+
+def _rereview(args):
+    if args.apply and args.models_config is None:
+        raise IntakeError("models_config_required")
+    return rereview(
+        args.root, policy_path=args.policy_path, manifest=args.manifest, model=args.model,
+        transport=_transport(args.models_config) if args.apply else None, apply=args.apply,
+        limit=args.limit, include_current_deferred=args.include_current_deferred,
+        deferred=args.deferred, concurrency=args.concurrency, adaptive=not args.no_adaptive,
+        initial_concurrency=args.initial_concurrency, inspected_form=args.inspected_form,
+        cost_estimate=args.cost_estimate)
 
 
 def _maintenance(args):
@@ -594,9 +673,7 @@ def _inbox_report(args):
         return qualify(
             args.root, args.inbox, system=args.system, actor=args.actor,
             policy_path=args.policy_path, manifest=args.manifest, model=args.model,
-            transport=model_review.usai_transport(
-                args.models_config,
-                recorder=usage_log.Recorder("librarian intake", model_review.PROVIDER)),
+            transport=_transport(args.models_config),
             context=args.context, index_path=args.index_path,
             concurrency=args.concurrency, adaptive=not args.no_adaptive,
             initial_concurrency=args.initial_concurrency,
@@ -641,6 +718,9 @@ def main(argv=None):
             return 0
         if args.command in {"expand-archives", "delete-archive-original"}:
             return _archive_command(args)
+        if args.command == "rereview":
+            print(json.dumps(_rereview(args), sort_keys=True))
+            return 0
         if args.command == "publish":
             report = publish(args.root, policy_path=args.policy_path, manifest=args.manifest,
                              index_path=args.index_path)
