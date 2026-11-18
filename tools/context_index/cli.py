@@ -13,6 +13,7 @@ from tools.context_index.context_index import (
     load_catalog, load_compaction, load_manifest, no_symlinks, publication_lock, readonly,
     search, validate_db_path,
 )
+from tools.context_index import corrections
 from tools.context_index.packets import (
     compact_packet, packet, packet_many, render_result, validate_many_limits,
 )
@@ -104,7 +105,8 @@ def main(argv=None):
                                               database=str(db), **count_index(connection)), ensure_ascii=False))
                 fail("Index is stale; run build. " + "; ".join(reasons))
             if args.command == "status":
-                result = envelope(root=root, command="status", fresh=True, database=str(db), **count_index(connection))
+                result = envelope(root=root, command="status", fresh=True, database=str(db), **count_index(connection),
+                                  claim_corrections=corrections.summary(connection, corrections.load(root)))
             elif args.command == "search":
                 result = search(connection, args.query, args.limit, args.path, root=root,
                                 low_confidence=args.low_confidence)

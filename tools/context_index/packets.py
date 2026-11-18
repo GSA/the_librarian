@@ -6,7 +6,7 @@ import posixpath
 import re
 from urllib.parse import unquote, urlsplit
 
-from tools.context_index import confidence
+from tools.context_index import confidence, corrections
 from tools.context_index.context_index import (
     REFERENCE, canonical_locator, envelope, fail, get_section, visible_lines,
 )
@@ -44,7 +44,11 @@ def link_record(connection, path, target):
     }
 
 
-def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None):
+_LOAD = object()
+
+
+def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None, claims=_LOAD):
+    """``claims`` is the claim-correction snapshot (loaded from ``root`` unless the caller has one)."""
     if max_chars < 1:
         fail("--max-chars must be a positive integer")
     requested = canonical_locator(locator, root)
@@ -89,6 +93,9 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None
             f"Increase --max-chars to at least {required}, or select a narrower locator. "
             "No required context has been truncated."
         )
+    if claims is _LOAD:
+        claims = corrections.load(root)
+    corrections.annotate_pieces(connection, pieces, corrections.place(connection, claims))
     result = envelope(
         root=root, command="get", requested_locator=requested, locator=selected["locator"],
         caveat="Exact source text with inherited/configured context, not a synthesized or verified answer.",
@@ -188,6 +195,20 @@ def _outbound_links(connection, pieces, docs, rendition_metadata):
 DOCUMENT_KEYS = ("path", "role", "source_hash", "confidence")
 
 
+def _shared(piece):
+    """The per-document fields of ``piece``; its confidence without read-time (correction) reasons."""
+    return {**{key: piece[key] for key in DOCUMENT_KEYS},
+            "confidence": confidence.document_label(piece["confidence"])}
+
+
+def _own(piece, omit=DOCUMENT_KEYS):
+    """The per-piece fields; confidence stays on the piece only when an open correction changed it."""
+    value = {key: item for key, item in piece.items() if key not in omit}
+    if piece["confidence"] != confidence.document_label(piece["confidence"]):
+        value["confidence"] = piece["confidence"]
+    return value
+
+
 def compact_packet(result):
     documents = {}
     references = {}
@@ -197,13 +218,8 @@ def compact_packet(result):
         if path not in references:
             reference = f"d{len(documents) + 1}"
             references[path] = reference
-            documents[reference] = {
-                key: piece[key] for key in DOCUMENT_KEYS
-            }
-        pieces.append({
-            **{key: value for key, value in piece.items() if key not in DOCUMENT_KEYS},
-            "document_ref": references[path],
-        })
+            documents[reference] = _shared(piece)
+        pieces.append({**_own(piece), "document_ref": references[path]})
     return {
         **{key: value for key, value in result.items()
            if key not in ("pieces", "outbound_links")},
@@ -242,8 +258,10 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
     spans, span_refs = {}, {}
     requests = []
     characters = 0
+    claims = corrections.load(root)
+    labels = []
     for locator in locators:
-        original = packet(connection, config, locator, max_chars, fail_fast=True, root=root)
+        original = packet(connection, config, locator, max_chars, fail_fast=True, root=root, claims=claims)
         projected = compact_packet(original) if format_ == "compact" else original
         pieces = []
         for piece in original["pieces"]:
@@ -251,7 +269,7 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
             if document_key not in document_refs:
                 reference = f"d{len(documents) + 1}"
                 document_refs[document_key] = reference
-                documents[reference] = {key: piece[key] for key in DOCUMENT_KEYS}
+                documents[reference] = _shared(piece)
             span_key = tuple(piece[key] for key in
                              ("source_hash", "path", "line_start", "line_end", "text"))
             if span_key not in span_refs:
@@ -266,11 +284,9 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
                     "document_ref": document_refs[document_key],
                     **{key: piece[key] for key in ("line_start", "line_end", "text")},
                 }
-            pieces.append({
-                **{key: value for key, value in piece.items()
-                   if key not in (*DOCUMENT_KEYS, "line_start", "line_end", "text")},
-                "span_ref": span_refs[span_key],
-            })
+            pieces.append({**_own(piece, (*DOCUMENT_KEYS, "line_start", "line_end", "text")),
+                           "span_ref": span_refs[span_key]})
+            labels.append(piece["confidence"])
         requests.append({
             "request_ref": f"r{len(requests) + 1}",
             "input_locator": locator,
@@ -283,13 +299,14 @@ def packet_many(connection, config, locators, max_chars=30000, *, format_="compa
     return envelope(
         root=root, command="get-many", format=f"qualified-many-{format_}-v2",
         characters=characters, document_count=len(documents), span_count=len(spans),
-        confidence=confidence.summary(document["confidence"] for document in documents.values()),
+        confidence=confidence.summary(labels),
         documents=documents, spans=spans, requests=requests,
         reference_notice="All references are local to this response. Each request's ordered pieces "
                          "retain its qualification relationships; resolve span_ref through spans and "
                          "document_ref through documents. Shared audience and notice apply to every "
                          "request, as does the confidence legend; each document carries its own "
-                         "confidence label. Identical text in different sources is not corroboration. "
+                         "confidence label, and a piece carries its own only when an open claim "
+                         "correction lowers it (see its corrections). Identical text in different sources is not corroboration. "
                          "Later reads may reflect changed sources; compare source hashes.",
     )
 

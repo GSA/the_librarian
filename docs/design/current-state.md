@@ -284,8 +284,8 @@ restated here.
   Gemini transcript and ODT renditions add no reason), `agent-generated` (an upload whose
   version-2 descriptor declares `origin.agent_generated: {generator, generated_on,
   source_commit}`; the hash-pinned `submission.json` sidecar is read at build and a missing,
-  changed or malformed one fails the build) and `open-correction` (reserved: `with_reason` adds
-  it at read time). Markdown documents are `normal`. `search` hits carry `{level, reasons:
+  changed or malformed one fails the build) and `open-correction` (added at read time by
+  `with_reason` for an open claim correction, below; never stored in the index). Markdown documents are `normal`. `search` hits carry `{level, reasons:
   [codes]}` and `--low-confidence include|last|exclude` (default `include`, rank order) ranks
   low hits after normal ones or leaves them out while counting them in
   `low_confidence_excluded` (an empty result caused only by that filter reports
@@ -314,6 +314,39 @@ restated here.
   `tests/test_intake_cohort.py::DeferredLowConfidenceTests`,
   `tests/test_intake_upload.py::test_agent_generated_origin_is_declared_in_a_v2_sidecar_and_labels_low_confidence`,
   `tests/test_mcp.py::test_mcp_uses_instance_local_selection_and_storage_roots`.
+- **Claim corrections mark indexed claims shaky or confirmed without editing them** (owner
+  direction, Kata 5dr5). `python -m tools.review_events.corrections` keeps an append-only store at
+  `<review_events_home>/corrections/corrections.sqlite3` (contract `claim-correction-v1`, schema
+  `tools/schemas/corrections.sql`; hash-chained records and batches, immutable triggers, full
+  validation on every read, writer lock, `--expected-state`, idempotent `--request-id`, actor
+  attribution, daily and manual snapshots, `verify-backup`, same-lineage `restore` with a
+  safety backup). It is a separate store, not a review-event kind: a new kind would change the
+  review-event contract hash existing stores pin, and review-event appends change the review
+  state Docling selections bind, so every correction would force a rebuild. A `correct` (with
+  the corrected statement) or `dispute` quotes a claim at an indexed locator; recording needs a
+  fresh index and the claim in that section's text (whitespace-collapsed), and stores the
+  locator, path, coordinates, source hash, rendition receipt, claim and its SHA-256. Every record
+  except `retract` cites a source: a `document` or `transcript` receipt that is in the catalog and
+  differs from the corrected document's receipt, or a `question` with answer, `answered_by` and
+  `answered_on`. `confirm` and `retract` resolve open records on the same locator and claim (a
+  record resolves once; a new correction may supersede earlier ones). `intake FILE` records a
+  `claim-corrections-v1` JSON file (shared `source`, up to 100 corrections) that accompanies a
+  newer document or transcript in one all-or-nothing transaction. Retrieval applies the store at
+  read time (`tools/context_index/corrections.py`), so recording needs no rebuild: `get` and
+  `get_many` pieces whose text overlaps the corrected section and contains the claim list
+  `corrections` (claim, statement, summary, source, status, resolver, `drift`), and an open
+  record adds `open-correction` with its summary and source to that piece's confidence and the
+  packet's top-level block. Compact and `get_many` documents keep the document label; a piece
+  carries its own label only when a correction lowers it. `search` hits (which index a section's
+  lead text) list open and resolved correction IDs when that lead text holds the claim, and
+  `--low-confidence last|exclude` treats those sections as low. A confirm restores normal
+  confidence only for the claims it resolves; other reasons stay. Drift is reported, never
+  hidden: `source-changed` (informational), `claim-not-found` (the claim left the section; the
+  correction then applies to all text overlapping it), `locator-missing` (e.g. a renamed heading;
+  it follows the claim within the same document), `locator-and-claim-missing` (it marks the
+  whole document) and `document-missing` (shown only in status).
+  `status` reports `claim_corrections` counts including open drifted ones. No store means reads
+  are unchanged; an invalid store refuses the read. Evidence: `tests/test_corrections.py`.
 - **Only an absent registration is `unregistered-rendition`.** The standing check reads a
   receipt's registration from one catalog state. The catalog raises `MissingRecord` for an absent
   record or receipt, and only that, or a malformed receipt ID, yields the `unregistered-rendition`
@@ -539,7 +572,7 @@ restated here.
 
 ## 4. Backups
 
-- Catalog and review-event writes take a verified `daily` snapshot before the
+- Catalog, review-event and claim-correction writes take a verified `daily` snapshot before the
   commit only when the store has no snapshot for the current UTC day whose receipt is
   well formed, names this store and database, and whose file size equals the receipt's `bytes`;
   the per-write gate never reads the snapshot body, so it does not detect same-size

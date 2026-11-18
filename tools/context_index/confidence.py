@@ -39,8 +39,10 @@ REASONS = {
         "Confirm against primary sources via a newer document, meeting transcript or answered "
         "question."),
     "open-correction": (
-        "An open correction disputes or amends this text.",
-        "Resolve the correction with a confirming or correcting source."),
+        "An open claim correction disputes or amends this text; the piece's corrections list the "
+        "quoted claim, any corrected statement and the cited source.",
+        "Confirm the claim (or retract the correction) with a cited newer document, meeting "
+        "transcript or answered question: python -m tools.review_events.corrections resolve."),
 }
 # Rendition kind -> reason. Kinds are ``docling-<conversion format>`` or an extraction payload
 # format; a kind not listed here adds no reason.
@@ -75,6 +77,15 @@ def label(reasons=()):
 def with_reason(current, code, details=()):
     """``current`` with one more reason; the read-time hook (e.g. an open correction)."""
     return label([*current["reasons"], reason(code, details)])
+
+
+# Reasons added at read time to a piece of text, never stored on a document's indexed label.
+READ_TIME = ("open-correction",)
+
+
+def document_label(current):
+    """``current`` without its read-time reasons: the label the document itself was indexed with."""
+    return label(item for item in current["reasons"] if item["code"] not in READ_TIME)
 
 
 def rendition_kind(value):

@@ -15,6 +15,7 @@ SOURCES = {
     "review-events.sql": ("tools/review_events/event_history.py", "SQL", "VERSION"),
     "context-index.sql": ("tools/context_index/context_index.py", "DDL", "SCHEMA"),
     "intake.sql": ("tools/intake/store.py", "DDL", "SCHEMA"),
+    "corrections.sql": ("tools/review_events/corrections.py", "DDL", "SCHEMA"),
 }
 
 

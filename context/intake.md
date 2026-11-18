@@ -83,7 +83,11 @@ named stage. The ledger is operational recovery state, never corpus authority.
   its event adds a `Reviewer-deferred:` statement and the index labels it `reviewer-deferred`.
   Every indexed document carries a `confidence` label (`normal`, or `low` with reasons
   `noted-issues`, `reviewer-deferred`, `converted-format`, `machine-ocr`, `agent-generated`,
-  `open-correction`); retrieval shows it, never hides the text. An upload can declare
+  `open-correction`); retrieval shows it, never hides the text. When a newer document,
+  meeting transcript or answered question contradicts or settles a claim, record it with
+  `python -m tools.review_events.corrections record|resolve` or `intake FILE` (a
+  `claim-corrections-v1` JSON file beside the newer document); an open correct/dispute marks
+  the text containing the quoted claim `open-correction` at read time, without a rebuild. An upload can declare
   agent-written content with `submit-file --agent-generator NAME [--agent-generated-on DATE]
   [--agent-source-commit SHA]` (a version 2 descriptor). The v2 advisory
   `unverifiable_references` list (claims depending on material the document

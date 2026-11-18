@@ -708,18 +708,27 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
     matching = ("FROM search_fts JOIN sections s ON s.id=search_fts.rowid "
                 "JOIN documents d ON d.path=s.path JOIN document_confidence c ON c.path=s.path "
                 "WHERE search_fts MATCH ?" + restriction)
-    order = " ORDER BY " + ("c.level='low'," if low_confidence == "last" else "")
+    # Sections carrying an open claim correction are low confidence at read time, like low documents.
+    from tools.context_index import corrections
+    placed = corrections.sections(connection, corrections.place(connection, corrections.load(root)))
+    corrected = json.dumps(sorted(key for key, found in placed.items() if any(p["open"] for p in found)))
+    low = "(c.level='low' OR s.id IN (SELECT value FROM json_each(?)))"
+    order = " ORDER BY " + (low + "," if low_confidence == "last" else "")
     rows = connection.execute(
         "SELECT s.*,d.role,c.label AS confidence,snippet(search_fts,1,'','',' … ',36) AS excerpt "
-        + matching + (" AND c.level='normal'" if low_confidence == "exclude" else "")
-        + order + "bm25(search_fts),s.path,s.line_start LIMIT ?", [*parameters, limit],
+        + matching + (" AND NOT " + low if low_confidence == "exclude" else "")
+        + order + "bm25(search_fts),s.path,s.line_start LIMIT ?",
+        [*parameters, *([corrected] if low_confidence != "include" else []), limit],
     ).fetchall()
-    hits = [{
-        "locator": row["locator"], "path": row["path"], "title": row["title"],
-        "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
-        "excerpt": row["excerpt"][:600], "caveat": DISCOVERY,
-        "confidence": confidence.codes(json.loads(row["confidence"])),
-    } for row in rows]
+    hits, labels = [], []
+    for row in rows:
+        hit = {
+            "locator": row["locator"], "path": row["path"], "title": row["title"],
+            "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
+            "excerpt": row["excerpt"][:600], "caveat": DISCOVERY,
+        }
+        labels.append(corrections.flag_hit(hit, json.loads(row["confidence"]), placed.get(row["id"])))
+        hits.append(hit)
     for hit in hits:
         location = connection.execute("SELECT payload FROM rendition_locations WHERE locator=?",
                                       (hit["locator"],)).fetchone()
@@ -735,10 +744,10 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
                 hit["line_basis"] = "extraction-json; source_location identifies original line or XML element"
     result = envelope(root=root, command="search", query=query, discovery_only=True, caveat=DISCOVERY,
                       hits=hits, low_confidence=low_confidence,
-                      confidence=confidence.summary(json.loads(row["confidence"]) for row in rows))
+                      confidence=confidence.summary(labels))
     if low_confidence == "exclude":
         result["low_confidence_excluded"] = connection.execute(
-            "SELECT count(*) " + matching + " AND c.level='low'", parameters).fetchone()[0]
+            "SELECT count(*) " + matching + " AND " + low, [*parameters, corrected]).fetchone()[0]
     if not hits and result.get("low_confidence_excluded"):
         result["filtered"] = {
             "classification": "low-confidence-excluded",
