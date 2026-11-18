@@ -642,26 +642,27 @@ def work_directory(root):
     return path
 
 
-# Conversion failures of this process, by (receipt, run): the ledger stage that follows a failed
-# ahead-of-time conversion records that failure instead of converting again under the ledger lock.
+# Conversion failures of this process, by (receipt, run) -> (code, message): the ledger stage that
+# follows a failed ahead-of-time conversion consumes the entry and records that failure instead of
+# converting again under the ledger lock. Only the code and message are kept, never the exception.
 _FAILED = {}
 
 
 def _payload(root, value, format_name, paths=None, limits=None):
     """Convert the pinned source of ``value`` (re-read and re-hashed) in a limited child process.
 
-    A failure is remembered for this process (``_FAILED``) and raised.
+    A failure is remembered for this process (``_FAILED``) until the next call consumes it, and raised.
     """
     key = (value["source"]["receipt_id"], value["run_id"])
     if key in _FAILED:
-        raise _FAILED[key]
+        raise ConversionFailed(*_FAILED.pop(key))
     raw = bridge._read_source(catalog.safe_path(root / value["source"]["path"]))
     require(digest(raw) == value["source"]["sha256"], "Source changed during extraction")
     try:
         payload, _ = convert(raw, Path(value["source"]["path"]).name, format_name,
                              paths or runtime(root), work_directory(root), limits)
     except ConversionFailed as error:
-        _FAILED[key] = error
+        _FAILED[key] = (error.raw_code, str(error))
         raise
     return {**value, "payload": payload}
 

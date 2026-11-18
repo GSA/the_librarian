@@ -64,6 +64,11 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual((payload["format"], payload["source_format"], payload["method"]["kind"]),
                          ("pdf-text", "pdf", "pdf-text-layer"))
 
+    def test_pages_count_against_the_standing_page_budget(self):
+        payload = pdf_image.text_payload(report([page(1, "first"), page(2, "second")]))
+        _, pages, _, _ = standing._expected_inspection({"payload": payload}, [])
+        self.assertEqual(pages, 2)  # a max_pages 1 policy refuses this two-page PDF
+
     def test_line_records_are_capped(self):
         with mock.patch.dict(pdf_image.LIMITS, lines=2), self.assertRaises(pdf_image.ConversionFailed) as caught:
             pdf_image.text_payload(report([page(1, "a\nb\nc")]))
@@ -314,6 +319,7 @@ class CohortTests(unittest.TestCase):
             self.assertGreater(active["peak"], 1)
             self.assertLessEqual(active["peak"], 3)
             self.assertEqual(report_["counts"]["failed_by_code"], {"prepare/extract-encrypted": 1})
+            self.assertEqual(pdf_image._FAILED, {})  # recorded refusals are not retained
             pdf_image.forget_failures()
             again = cohort.ingest(self.root, self.inbox, system="inbox", actor="runner")
         self.assertEqual(len(calls), 4)  # a decided file is not converted again
