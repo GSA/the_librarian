@@ -103,24 +103,16 @@ def assemble(inventory, outcomes, limits=None):
     """The ``pdf-pages`` payload of an inventory and its OCR/failed page ``outcomes``.
 
     ``outcomes[page]`` is ``{"texts", "textless", "attempts", ...}`` for a read OCR page or
-    ``{"code", "attempts"}`` for a failed one. Raises ``ConversionFailed`` when every read page failed
-    (with their shared code, else ``all_pages_failed``) or nothing has any text.
+    ``{"code", "attempts"}`` for a failed one. Placeholders count against the line cap: once a page
+    does not fit, it and every later page fail as ``record_limit`` behind one range placeholder.
+    Raises ``ConversionFailed`` when every read page failed (with their shared code, else
+    ``all_pages_failed``) or nothing has any text.
     """
     limits = dict(LIMITS, **(limits or {}))
+    cap = limits["lines"] - 2  # room for the record-limit and unread range placeholders
     routes = plan(inventory["pages"])
     lines, pages, notes, ocr = [], [], [], None
-    used, texts = set(), 0
-
-    def add(number, chunks):
-        nonlocal texts
-        found = [text.rstrip() for chunk in chunks for text in chunk.split("\n") if text.strip()]
-        if len(lines) + len(found) > limits["lines"]:
-            return False
-        start = len(lines) + 1
-        lines.extend({"line": start + i, "page": number, "text": text} for i, text in enumerate(found))
-        texts += len(found)
-        return True
-
+    used, texts, stopped = set(), 0, None
     for page in inventory["pages"]:
         number, route = page["page"], routes[page["page"]]
         outcome = outcomes.get(number, {}) if route == "ocr" else {}
@@ -129,8 +121,7 @@ def assemble(inventory, outcomes, limits=None):
         elif route == "text-layer":
             entry = {"page": number, "outcome": "text-layer", "text_chars": pdf_image.page_chars(page["text"])[0],
                      "image_objects": page["image_objects"]}
-            if not add(number, [page["text"]]):
-                entry = {"page": number, "outcome": "failed", "code": _code("record_limit"), "attempts": 1}
+            chunks = [page["text"]]
         elif "code" in outcome:
             entry = {"page": number, "outcome": "failed", "code": _code(outcome["code"]),
                      "attempts": outcome["attempts"]}
@@ -138,23 +129,36 @@ def assemble(inventory, outcomes, limits=None):
             entry = {"page": number, "outcome": "ocr", "textless": outcome["textless"],
                      "attempts": outcome["attempts"], "render_scale": outcome["render"]["scale"],
                      "confidence": outcome["confidence"]}
-            if add(number, outcome["texts"]):
+            chunks = outcome["texts"]
+        if entry["outcome"] == "failed":
+            found = [placeholder(number, number, entry["code"].removeprefix("extract-").replace("-", "_"),
+                                 entry["attempts"])]
+        else:
+            found = [text.rstrip() for chunk in chunks for text in chunk.split("\n") if text.strip()]
+        if stopped is None and len(lines) + len(found) > cap:
+            stopped = number
+        if stopped is not None:
+            entry = {"page": number, "outcome": "failed", "code": _code("record_limit"),
+                     "attempts": entry.get("attempts", 1)}
+        else:
+            start = len(lines) + 1
+            lines.extend({"line": start + i, "page": number, "text": text} for i, text in enumerate(found))
+            if entry["outcome"] != "failed":
+                texts += len(found)
+            if entry["outcome"] == "ocr":
                 ocr = ocr or outcome["method"]
                 notes.extend("page %d: %s" % (number, note) for note in outcome["notes"])
-            else:
-                entry = {"page": number, "outcome": "failed", "code": _code("record_limit"),
-                         "attempts": outcome["attempts"]}
-        if entry["outcome"] == "failed":
-            lines.append({"line": len(lines) + 1, "page": number, "text": placeholder(
-                number, number, entry["code"].removeprefix("extract-").replace("-", "_"), entry["attempts"])})
         used.add(entry["outcome"])
         pages.append(entry)
+    if stopped is not None:
+        lines.append({"line": len(lines) + 1, "page": stopped,
+                      "text": placeholder(stopped, pages[-1]["page"], "record_limit")})
     read, count = len(inventory["pages"]), inventory["page_count"]
     unread = None
     if count > read:
-        unread = {"first": read + 1, "last": count, "code": _code("page_budget")}
-        lines.append({"line": len(lines) + 1, "page": read + 1,
-                      "text": placeholder(read + 1, count, "page_budget")})
+        reason = inventory.get("unread") or "page_budget"
+        unread = {"first": read + 1, "last": count, "code": _code(reason)}
+        lines.append({"line": len(lines) + 1, "page": read + 1, "text": placeholder(read + 1, count, reason)})
     failed = [entry for entry in pages if entry["outcome"] == "failed"]
     if len(failed) == len(pages):
         codes = {entry["code"] for entry in failed}
@@ -194,6 +198,11 @@ def ocr_result(report, render):
 
 def _alarm(_signal, _frame):
     raise ConversionFailed("timeout", "page unit wall timeout exceeded")
+
+
+def _cpu(_signal, _frame):
+    # As PID 1 of its namespace the unit ignores signals it has no handler for, SIGXCPU included.
+    raise ConversionFailed("cpu_limit", "page unit exceeded CPU time")
 
 
 def _worker(home, job, python, timeout):
@@ -265,6 +274,7 @@ def unit(home):
         pdf_image._limit(resource.RLIMIT_CPU, job["cpu_seconds"], job["cpu_seconds"] + 10)
         pdf_image._limit(resource.RLIMIT_FSIZE, pdf_image.MAX_RESULT * 2)
         signal.signal(signal.SIGALRM, _alarm)
+        signal.signal(signal.SIGXCPU, _cpu)
         signal.alarm(job["wall_seconds"])
         result = {"ok": True, "payload": read_unit(home, job)}
     except ConversionFailed as error:
@@ -287,8 +297,13 @@ def unit(home):
     return 0 if result["ok"] else 1
 
 
+# Each unit is PID 1 of its own PID namespace: when it ends or is killed, the kernel kills every
+# process it started, including the page and Docling workers that run in sessions of their own.
+NAMESPACE = ["unshare", "-Ur", "--pid", "--fork", "--kill-child"]
+
+
 def _child_argv(home):
-    return [sys.executable, "-E", "-s", "-m", "tools.extraction.pdf_pages", "unit", str(home)]
+    return [*NAMESPACE, sys.executable, "-E", "-s", "-m", "tools.extraction.pdf_pages", "unit", str(home)]
 
 
 def _attempt(directory, job, wall_seconds):

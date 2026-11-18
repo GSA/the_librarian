@@ -75,10 +75,20 @@ class AssemblyTests(unittest.TestCase):
                                                 "text": "[Pages 3-9 not extracted: extract-page-budget]"})
         self.assertIn("7 page(s) were not extracted", " ".join(payload["warnings"]))
 
-    def test_lines_beyond_the_record_cap_fail_their_page(self):
-        payload = pdf_pages.assemble(inventory([text_page(1), text_page(2)]), {}, {"lines": 8})
-        self.assertEqual([entry["outcome"] for entry in payload["pages"]], ["text-layer", "failed"])
-        self.assertEqual(payload["pages"][1]["code"], "extract-record-limit")
+    def test_pages_beyond_the_record_cap_fail_behind_one_placeholder_within_the_cap(self):
+        payload = pdf_pages.assemble(inventory([text_page(1), scan_page(2), text_page(3)], count=5),
+                                     {2: {"code": "timeout", "attempts": 2}}, {"lines": 9})
+        self.assertEqual([(entry["outcome"], entry.get("code")) for entry in payload["pages"]],
+                         [("text-layer", None), ("failed", "extract-timeout"), ("failed", "extract-record-limit")])
+        self.assertEqual([line["text"] for line in payload["lines"][-3:]],
+                         ["[Page 2 not extracted: extract-timeout after 2 attempts]",
+                          "[Page 3 not extracted: extract-record-limit]",
+                          "[Pages 4-5 not extracted: extract-page-budget]"])
+        self.assertEqual(len(payload["lines"]), 9)
+
+    def test_pages_the_inventory_could_not_return_are_recorded_with_its_reason(self):
+        payload = pdf_pages.assemble(dict(inventory([text_page(1)], count=3), unread="output_limit"), {})
+        self.assertEqual(payload["unread_pages"], {"first": 2, "last": 3, "code": "extract-output-limit"})
 
     def test_a_document_is_refused_only_when_every_page_fails_or_nothing_has_text(self):
         cases = [({2: {"code": "timeout", "attempts": 2}, 3: {"code": "timeout", "attempts": 2}}, "extract-timeout"),
@@ -120,6 +130,9 @@ if action == "orphan":
     child = subprocess.Popen(["sleep", "60"])
     open(behaviour["pids"] + "/" + key, "w").write(str(child.pid))
     time.sleep(60)
+if action == "escape":
+    subprocess.Popen(["sleep", behaviour["token"]], start_new_session=True)
+    time.sleep(60)
 if action == "crash":
     os.kill(os.getpid(), signal.SIGKILL)
 if action.startswith("sleep:"):
@@ -147,9 +160,9 @@ class HardeningTests(unittest.TestCase):
         self.state = self.base / "state"
         self.state.mkdir()
 
-    def convert(self, actions, pages, units=None, **limits):
-        behaviour = {"inventory": inventory(pages), "pids": str(self.state), "actions": actions}
-        argv = lambda home: [sys.executable, "-c", CHILD, str(home), json.dumps(behaviour)]  # noqa: E731
+    def convert(self, actions, pages, units=None, namespace=(), token=None, **limits):
+        behaviour = {"inventory": inventory(pages), "pids": str(self.state), "actions": actions, "token": token}
+        argv = lambda home: [*namespace, sys.executable, "-c", CHILD, str(home), json.dumps(behaviour)]  # noqa: E731
         log = []
         with mock.patch.object(pdf_pages, "_child_argv", argv):
             payload, stats = pdf_pages.convert(b"%PDF-1.4\n", "a.pdf", RUNTIME, self.work,
@@ -183,6 +196,27 @@ class HardeningTests(unittest.TestCase):
             time.sleep(0.1)
         else:
             self.fail("the timed-out unit's process group survived")
+
+    @unittest.skipUnless(subprocess.run([*pdf_pages.NAMESPACE, "true"], capture_output=True).returncode == 0,
+                         "unprivileged PID namespaces unavailable")
+    def test_a_killed_unit_takes_processes_in_other_sessions_with_it(self):
+        token = "59.%06d" % (os.getpid() % 1000000)  # a unique `sleep` argument to find it by
+
+        def running():
+            for entry in Path("/proc").iterdir():
+                try:
+                    if (entry / "cmdline").read_bytes().split(b"\0")[:2] == [b"sleep", token.encode()]:
+                        return True
+                except OSError:
+                    continue
+            return False
+        payload, _, _ = self.convert({"2": "escape"}, [text_page(1), scan_page(2)], namespace=pdf_pages.NAMESPACE,
+                                     token=token)
+        self.assertEqual(payload["pages"][1]["code"], "extract-timeout")
+        deadline = time.monotonic() + 5
+        while running() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(running(), "a process started by the killed unit survived it")
 
     def test_deterministic_page_refusals_are_not_retried(self):
         payload, _, log = self.convert({"2": "refuse:pixel_limit"}, [text_page(1), scan_page(2)])

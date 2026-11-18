@@ -233,16 +233,19 @@ units, each in its own child process (`python -m tools.extraction.pdf_pages unit
 in a private directory below `data/extractions/.local/work/` that is removed
 afterwards, with a 16 GiB address-space limit and 600 CPU seconds. The inventory
 has 330 wall seconds; an OCR page 180, ending its Docling conversion 15 seconds
-earlier. Each unit's process group is killed when it ends, and every unit alarm
-fires before its parent's, so no conversion outlives its unit even if the parent
-dies. The page worker itself is limited to 2 GiB, 300 CPU and wall seconds.
+earlier. Each unit runs as PID 1 of its own PID namespace (`unshare -Ur --pid
+--fork --kill-child`), so when it ends or is killed every process it started dies
+with it, including workers in sessions of their own; its process group is killed
+too, and every unit alarm fires before its parent's. The page worker itself is limited to 2 GiB, 300 CPU and wall seconds.
 **A unit that times out or crashes is retried once**; a page that still fails, or
 is refused (`extract-pixel-limit`, `extract-malformed-page`, ...), becomes a
 failed page with its code and attempts, and the rest of the document is kept.
 Budgets per document replace the old 100-page refusal: at most 5,000 pages are
 read (the rest are recorded in `unread_pages` with code `extract-page-budget`
-and one placeholder line), 200,000 line records (later pages fail as
-`extract-record-limit`), and 7,200 seconds of OCR units (later OCR pages fail as
+and one placeholder line; pages after 24 MiB of text-layer text likewise, with
+`extract-output-limit`), 200,000 line records including placeholders (the page
+that would not fit and all later ones fail as `extract-record-limit` behind one
+range placeholder), and 7,200 seconds of OCR units (later OCR pages fail as
 `extract-time-budget` without running). The document is refused only when it
 cannot be opened (`extract-encrypted`, `extract-malformed-source`, an inventory
 `extract-timeout` after two attempts), when every page failed (their shared

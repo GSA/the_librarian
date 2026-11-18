@@ -26,7 +26,7 @@ import zlib
 
 MIB = 1024**2
 LIMITS = {"source_bytes": 64 * MIB, "page_chars": 1_000_000, "page_image_objects": 10_000,
-          "result_bytes": 64 * MIB, "image_bytes": 128 * MIB, "address_space_bytes": 2 * 1024**3,
+          "result_bytes": 64 * MIB, "inventory_text_bytes": 24 * MIB, "image_bytes": 128 * MIB, "address_space_bytes": 2 * 1024**3,
           "cpu_seconds": 300, "wall_seconds": 300}
 JOB_FIELDS = {"inventory": {"schema", "operation", "source_path", "max_pages"},
               "render": {"schema", "operation", "source_path", "page", "scale", "max_pixels", "image_path"}}
@@ -103,15 +103,25 @@ def inventory(source, max_pages):
         count = len(document)
         if count < 1:
             raise WorkerError("PDF has no pages", "page_limit")
-        pages = []
+        pages, size, unread = [], 0, None
         for index in range(min(count, max_pages)):
             try:
-                pages.append(_page(pdfium, document, index))
+                page = _page(pdfium, document, index)
             except WorkerError as error:
-                pages.append({"page": index + 1, "error": error.code})
+                page = {"page": index + 1, "error": error.code}
             except Exception:  # noqa: BLE001 - one unreadable page is that page's failure
-                pages.append({"page": index + 1, "error": "malformed_page"})
-        return {"reader": "pypdfium2", "version": version, "page_count": count, "pages": pages}
+                page = {"page": index + 1, "error": "malformed_page"}
+            # The pages read so far are kept; the rest of a document whose text would overflow the
+            # result are reported unread rather than refusing the whole document.
+            size += len(page.get("text", "").encode("utf-8"))
+            if size > LIMITS["inventory_text_bytes"]:
+                unread = "output_limit"
+                break
+            pages.append(page)
+        if count > max_pages and unread is None:
+            unread = "page_budget"
+        return {"reader": "pypdfium2", "version": version, "page_count": count, "pages": pages,
+                "unread": unread}
     except WorkerError:
         raise
     except Exception as error:
