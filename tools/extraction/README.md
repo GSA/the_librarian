@@ -219,7 +219,8 @@ instance policy; changing any of them is a new run.
 (`python -m tools.extraction.pdf_image child`) in a private directory below
 `data/extractions/.local/work/` that is removed afterwards, with an address-space
 limit of 16 GiB, 1,800 CPU seconds and a 900-second wall clock (its process
-group is killed on expiry). The text worker is limited to 2 GiB, 120 CPU seconds
+group is killed on expiry); inside it Docling's own 600-second limit ends an OCR
+conversion first, so a file that times out costs about 20 minutes over its two attempts. The text worker is limited to 2 GiB, 120 CPU seconds
 and 120 wall seconds. Sources are limited to 64 MiB, PDFs to 100 pages, results
 to 64 MiB and 10,000 line records. Image headers declaring more than 32,000,000
 pixels are refused before any decoder runs (cohort `over-limit`, code
