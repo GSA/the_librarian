@@ -23,7 +23,7 @@ import zipfile
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.durable import fsync_directory
-from tools.extraction import mhtml
+from tools.extraction import convert, mhtml
 from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store
 from .contracts import IntakeError, canonical, decode, digest, fields, identifier, relative, require, sha, text
@@ -47,6 +47,8 @@ FORMATS = {
     "text": (set(TEXT_SUFFIXES), 16 * MIB),
     "gemini-txt": ({".txt"}, 16 * MIB),
     "mhtml": (set(TEXT_SUFFIXES), 16 * MIB),
+    # Office documents and RTF converted to a derived Markdown rendition (``tools/extraction/convert.py``).
+    **{name: (set(suffixes), convert.MAX_SOURCE) for name, suffixes in convert.FORMATS.items()},
 }
 IDENTITY_BASIS = {"declared-remote": "declared-origin", "operator-supplied": "operator-supplied-bytes",
                   "local-path": "local-path-copy"}
@@ -191,6 +193,8 @@ def check_type(raw, format_name, name):
         require(mimetype == b"application/vnd.oasis.opendocument.text", "type_mismatch")
     elif format_name == "mhtml":
         require(mhtml.recognised(raw), "type_mismatch")
+    elif format_name in convert.FORMATS:
+        require(convert.sniff(raw, suffix)[0] == format_name, "type_mismatch")
     else:
         try:
             decoded = raw.decode("utf-8")

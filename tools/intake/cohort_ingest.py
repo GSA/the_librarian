@@ -15,7 +15,7 @@ import unicodedata
 from urllib.parse import quote
 
 from tools.catalog import catalog_store as catalog
-from tools.extraction import extract, mhtml
+from tools.extraction import convert, extract, mhtml
 from tools.durable import sha256_file
 from . import agent_origin, archives, cohort_runtime, contracts, docs, runner, store, upload
 from .contracts import IntakeError, LedgerBusy
@@ -23,6 +23,7 @@ from .docsync import suffix_of
 
 ASSET_SUFFIXES = {".js", ".css", ".ico", ".map", ".woff", ".woff2", ".ttf", ".svg"}
 RUNTIME_FORMATS = cohort_runtime.SUFFIXES
+TEXT_FORMATS = ("text", "gemini-txt", "mhtml", "odt")
 EXPANDED_DIRECTORY = "_extracted"
 MAX_NESTING = 8  # archive levels classify looks into (``a.zip!/b.zip!/...``)
 REASON = "Read-only local cohort intake; copy only, not extraction review or qualification."
@@ -53,23 +54,45 @@ def submission(relative, system, fmt=None, content_sha256=None):
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "file"
     suffix = re.sub(r"[^A-Za-z0-9]+", "", suffix)
     name = (stem[:180] + (dot + suffix if suffix else "")).lstrip("-._")
+    if fmt in ("text", "mhtml") and Path(name).suffix.lower() not in extract.TEXT_SUFFIXES:
+        # Strict UTF-8 text (or MIME) under another (or no) suffix is retained as ``<name>.txt``; the bytes
+        # are unchanged and the locator keeps the real path.
+        name = name[:196] + ".txt"
     if name.endswith(upload.DESCRIPTOR_SUFFIX) or name == upload.SIDECAR:
         name = "file-" + name
     return {"submission_id": "inbox-" + key, "name": name,
             "locator": quote(relative, safe="/")}
 
 
+def _mime(raw):
+    try:
+        mhtml.payload(raw)
+    except mhtml.MhtmlError as error:
+        return None, error.code
+    return "mhtml", None
+
+
 def _format(path, raw, root):
-    """Return (format, refusal code); MIME content wins over any text suffix."""
+    """Return (format, refusal code); MIME content wins over any text suffix.
+
+    Content decides: office packages, compound files and RTF go to the converter, other strict
+    UTF-8 text is admitted as text whatever its suffix. A text-suffixed file the text reader
+    already admits keeps that format, so earlier intake identities are unchanged.
+    """
     suffix = path.suffix.lower()
     if suffix == ".odt":
         return "odt", None
+    if suffix not in extract.TEXT_SUFFIXES or convert.text_refusal(raw) is not None:
+        fmt, code = convert.admission(raw, suffix)
+        if fmt is not None or code is not None:
+            return fmt, code
+        if suffix not in extract.TEXT_SUFFIXES:
+            code = convert.text_refusal(raw)
+            if code is None and mhtml.recognised(raw):
+                return _mime(raw)
+            return (None, code) if code else ("text", None)
     if suffix in extract.TEXT_SUFFIXES and mhtml.recognised(raw):
-        try:
-            mhtml.payload(raw)
-        except mhtml.MhtmlError as error:
-            return None, error.code
-        return "mhtml", None
+        return _mime(raw)
     if suffix == ".txt":
         try:
             extract.gemini(raw, root)
@@ -106,19 +129,21 @@ def _unread_disposition(path, size, provisioned=False):
         return {"disposition": "empty"}
     if suffix in RUNTIME_FORMATS:
         return cohort_runtime.unread_disposition(path, size, provisioned)
-    if suffix not in extract.TEXT_SUFFIXES | {".odt"}:
-        return {"disposition": "needs-reader"}
-    if size > max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "mhtml", "odt")):
-        return {"disposition": "over-limit"}
+    if suffix in convert.SUFFIXES - extract.TEXT_SUFFIXES:
+        return {"disposition": "over-limit"} if size > convert.MAX_SOURCE else None
+    if size > max(upload.FORMATS[f][1] for f in TEXT_FORMATS):
+        # Unknown suffixes are read only within the text limit; a larger file still needs a reader.
+        return {"disposition": "over-limit" if suffix in extract.TEXT_SUFFIXES | {".odt"} else "needs-reader"}
     return None
 
 
 def _read_disposition(root, path, entry):
-    """The disposition of a text, ODT, PDF or image file from its bytes; ``entry`` gains its format and hash."""
+    """The disposition of a text, ODT, office/RTF, PDF or image file from its bytes; ``entry`` gains
+    its format and hash."""
     if path.suffix.lower() in RUNTIME_FORMATS:
         return cohort_runtime.read_disposition(path, entry)
     try:
-        raw = upload.read_file(path, max(upload.FORMATS[f][1] for f in ("text", "gemini-txt", "mhtml", "odt")))
+        raw = upload.read_file(path, max(upload.FORMATS[f][1] for f in (*TEXT_FORMATS, *convert.FORMATS)))
     except IntakeError as error:
         return {**entry, "disposition": "unsafe-path", "code": error.code}
     fmt, refusal = _format(path, raw, root)

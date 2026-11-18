@@ -1,5 +1,5 @@
 """Fixed native stage adapters; no executable request-defined callbacks."""
-from contextlib import closing, nullcontext
+from contextlib import ExitStack, closing, nullcontext
 from datetime import timedelta
 import errno
 import json
@@ -12,7 +12,7 @@ from zipfile import BadZipFile
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_reader
 from tools.review_events import event_history, event_store as events
-from tools.extraction import docling_adapter as docling
+from tools.extraction import convert, docling_adapter as docling
 from tools.extraction import extract
 from tools.extraction import pdf_image
 from tools.context_index import context_index as index
@@ -34,6 +34,9 @@ def native_failure(error):
     while current is not None:
         # A refused PDF/image conversion names its own durable code (``extract-encrypted``, ...).
         if isinstance(current, pdf_image.ConversionFailed):
+            return StageFailure("blocked", current.code)
+        # A converter refusal (container, encryption, limits, timeout) keeps its precise code.
+        if isinstance(current, convert.ConversionError):
             return StageFailure("blocked", current.code)
         # Concurrent catalog writers: a lost race retries; an overlapping write cannot.
         if isinstance(current, catalog.ConflictingWrite):
@@ -114,8 +117,11 @@ def pinned_metadata(intent, checksum):
 
 
 def extractor_for(format_name):
-    """The extraction lifecycle module for ``format_name``: PDF/image renditions or ``extract``."""
-    return pdf_image if format_name in pdf_image.FORMATS else extract
+    """The extraction lifecycle module for ``format_name``: PDF/image renditions, the office/RTF
+    document converter or ``extract``."""
+    if format_name in pdf_image.FORMATS:
+        return pdf_image
+    return convert if format_name in convert.FORMATS else extract
 
 
 def extract_intent(operation, root, prepared):
@@ -372,7 +378,12 @@ NATIVE_ERRORS = (catalog.CatalogError, events.contract.ReviewError, docling.Adap
 
 def batch_scope(operation, count):
     """What a batch of ``count`` stages of ``operation`` runs inside (a parse memo for registrations)."""
-    return extract.keeping_parsed(count) if operation == "extract-register" else nullcontext()
+    if operation != "extract-register":
+        return nullcontext()
+    scope = ExitStack()
+    scope.enter_context(extract.keeping_parsed(count))
+    scope.enter_context(convert.keeping_parsed(count))
+    return scope
 
 
 def _failure_of(error):
@@ -464,8 +475,8 @@ def execute_batch(root, entries):
                       "expected_state": args.get("expected_state"), "prepared": prepared})
         owners.append(index)
     registered = {}
-    # Text-family and PDF/image renditions register through their own lifecycle, one batch each.
-    for module in (extract, pdf_image):
+    # Text-family, PDF/image and converted renditions register through their own lifecycle, one batch each.
+    for module in (extract, pdf_image, convert):
         chosen = [(owner, item) for owner, item in zip(owners, items)
                   if extractor_for(item["format_name"]) is module]
         if not chosen:

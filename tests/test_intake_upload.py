@@ -229,7 +229,7 @@ class RefusalTests(UploadCase):
         self.assertEqual(upload.FORMATS["gemini-txt"][0], {".txt"})
 
     def test_unsupported_and_mismatched_types_are_refused(self):
-        self.assertCode("unsupported_type", value, name="memo.docx", fmt="docx")
+        self.assertCode("unsupported_type", value, name="memo.pages", fmt="pages")
         self.assertCode("unsupported_type", value, name="memo.pdf", fmt="text")
         self.assertCode("type_mismatch", upload.submit, self.root, self.file("a.pdf", b"not a pdf"),
                         value(name="a.pdf", fmt="pdf"))
