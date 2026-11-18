@@ -2464,6 +2464,29 @@ class RereviewTests(QualifyCase):
             if request["correction_of"]:
                 self.assertEqual(request["correlation_id"], request["correction_of"] + "-c1")
 
+    def test_a_rendition_rejected_under_an_older_policy_stays_out_when_its_current_review_is_incomplete(self):
+        self.ingest()
+        self.write_policy(1)
+        self._qualify(self.transport(reject=["Fund codes"]))
+        self.write_policy(2)
+        self._qualify(self.transport(incomplete=["Fund codes"]))
+        dry = self.rereview(include_current_deferred=True)
+        self.assertEqual(dry["selected"], {})
+        self.assertEqual(dry["skipped"]["rejected"], 1)
+
+    def test_a_review_interrupted_before_selection_is_selected_on_rerun_without_a_model_call(self):
+        self._qualify(self.transport(incomplete=["Just text"]))
+        spent = len(self.calls)
+        with unittest.mock.patch.object(cohort_review, "_run_select", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(len(self.calls), spent + 1)
+        self.assertEqual(self.rereview()["selected"], {"resume": 1})
+        applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(applied["results"], {"qualified": 1})
+        self.assertEqual(len(self.calls), spent + 1)
+        self.assertEqual(self.rereview()["selected"], {})
+
     def test_cli_dry_run_prints_the_report_and_apply_needs_a_models_config(self):
         self._qualify(self.transport(incomplete=["Just text"]))
         args = ["rereview", "--root", str(self.root), "--policy", self.POLICY,

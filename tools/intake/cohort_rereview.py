@@ -95,11 +95,12 @@ def _stale(c, args):
 def select(root, c, policy_sha, include_current_deferred=False):
     """``(selected, skipped)`` from the ledger on connection ``c``; reads, never writes.
 
-    Chain heads are grouped by rendition; when any is pinned under the current policy only those
-    decide. A rendition with a succeeded review, or a rejected or out-of-scope one, is skipped; a
-    head whose review is still runnable is resumed without a model call. A current-policy review
-    whose saved findings are re-evaluated (``unresolved-evidence``, and deferrals when included)
-    is selected only when its inspection was incomplete.
+    Chain heads are grouped by rendition. A rendition settled under any chain (reviewed and
+    selected), rejected or refused as out of scope under any chain is skipped. Otherwise, when any
+    head is pinned under the current policy only those decide: a head whose review or selection is
+    still unfinished is resumed without a model call, and a current-policy review whose saved
+    findings are re-evaluated (``unresolved-evidence``, and deferrals when included) is selected
+    only when its inspection was incomplete.
     """
     snapshot = adapters.OneRead(root)
     groups = {}
@@ -107,12 +108,19 @@ def select(root, c, policy_sha, include_current_deferred=False):
         groups.setdefault((head["args"]["rendition"], head["args"]["rendition_sha256"]), []).append(head)
     with_docs = docs.present(c)
     selected, skipped = [], Counter()
-    for _, heads in sorted(groups.items()):
-        heads = [h for h in heads if h["args"]["policy_sha256"] == policy_sha] or heads
-        heads.sort(key=lambda h: h["corr"])
-        codes = {h["code"] or "" for h in heads}
-        if any(h["review"] == "succeeded" for h in heads):
+    for _, every in sorted(groups.items()):
+        codes = {h["code"] or "" for h in every}
+        heads = sorted([h for h in every if h["args"]["policy_sha256"] == policy_sha] or every,
+                       key=lambda h: h["corr"])
+        # A succeeded review settles its rendition, except that a current-policy one whose
+        # selection is unfinished (interrupted, or the manifest was full) is resumed.
+        reviewed = [h for h in every if h["review"] == "succeeded"]
+        selecting = [h for h in reviewed if h["select"] in cohort_review.RUNNABLE | {"blocked"}
+                     and h["args"]["policy_sha256"] == policy_sha]
+        if reviewed and len(selecting) < len(reviewed):
             skipped["reviewed"] += 1
+        elif selecting:
+            selected.append({**selecting[0], "reason": "resume"})
         elif any(code.startswith("standing-rejected-") for code in codes):
             skipped["rejected"] += 1
         elif "standing-exception-prohibited-scope" in codes:

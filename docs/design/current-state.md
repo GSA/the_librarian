@@ -620,8 +620,9 @@ restated here.
   `unresolved-evidence`, `insufficient-inspected-scope`) or deferred, current-policy heads blocked
   `insufficient-inspected-scope` (including `unresolved-evidence` ones that re-evaluate as
   insufficient), and with `--include-current-deferred` current-policy deferrals whose saved
-  findings cannot qualify without a model. A rendition already qualified under any chain,
-  rejected (any reject code), out of the policy's scope, superseded in the docs table
+  findings cannot qualify without a model. A rendition already reviewed and selected under any
+  chain, rejected or refused as out of scope under any chain (older policies included), out of the
+  current policy's scope, superseded in the docs table
   (`stale-rendition`) or recoverable from saved findings (`recoverable-without-model`, left to
   `recover-*`) is skipped with that reason; a rejected or out-of-scope rendition is never
   selected. The dry run counts selected/skipped heads by reason and estimates model calls and
@@ -632,8 +633,9 @@ restated here.
   stages the review as an append-only correction of the old head (an older-policy head under the
   current-policy chain name, so a later `qualify` finds it), then selects. `--deferred` defaults
   to `qualify-low-confidence` here, so a head still deferred qualifies as `reviewer-deferred` low
-  confidence; a rejection stays out. A staged but unfinished re-review is resumed without a new
-  model call, so an interrupted run is rerunnable. Nothing is published until `cohort publish`.
+  confidence; a rejection stays out. A staged but unfinished re-review, or a current-policy review whose
+  selection is unfinished (interrupted, or the manifest was full), is resumed without a new model
+  call, so an interrupted run is rerunnable. Nothing is published until `cohort publish`.
   Insufficient-scope reviews on a live cohort were accepts over long renditions (median about
   2,200 records) whose inspected-record list was abbreviated; `--inspected-form ranges` lets the
   reviewer state full coverage compactly while the completeness gate is unchanged. Evidence:
