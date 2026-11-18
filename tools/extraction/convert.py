@@ -79,7 +79,9 @@ def require(condition, code, message):
 def sniff(raw, suffix):
     """``(format, None)`` for a convertible document, ``(None, code)`` for a refused container,
     ``(None, None)`` when the bytes are not a container this module reads (text is decided elsewhere)."""
-    if raw.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+    package = suffix in SUFFIXES and suffix not in LEGACY and suffix != ".rtf"
+    if raw.startswith((b"PK\x03\x04", b"PK\x05\x06")) or (package and raw.startswith(b"PK")):
+        # A package-suffixed file starting "PK" is a (possibly truncated) zip, never text.
         try:
             with ZipFile(io.BytesIO(raw)) as archive:
                 names = set(archive.namelist())

@@ -271,6 +271,8 @@ class SniffAndAdmissionTests(unittest.TestCase):
         self.assertEqual(convert.sniff(RTF, ".rtf"), ("rtf", None))
         self.assertEqual(convert.sniff(package({"a.txt": "x"}), ".zip"), (None, "unsupported-container"))
         self.assertEqual(convert.sniff(b"PK\x03\x04", ".docx"), (None, "container-invalid"))
+        self.assertEqual(convert.sniff(b"PK", ".xlsx"), (None, "container-invalid"))
+        self.assertEqual(convert.sniff(b"PKG notes", ".txt"), (None, None))
         self.assertEqual(convert.sniff(convert.OLE + convert.ENCRYPTED, ".docx"), (None, "encrypted-document"))
         self.assertEqual(convert.sniff(convert.OLE, ".mpp"), (None, "unsupported-container"))
         self.assertEqual(convert.sniff(b"plain", ".sql"), (None, None))
@@ -411,6 +413,9 @@ class CohortConversionTests(QualifyCase):
             hit = index.search(db, "Speaker reminder", 10, None, root=self.root)["hits"][0]
             self.assertRegex(hit["locator"], r"#line-\d+$")
             got = packets.packet(db, config, hit["locator"], 60000, root=self.root)
+            self.assertEqual(hit["confidence"], {"level": "low", "reasons": ["converted-format"]})
+            self.assertEqual(index.search(db, "SELECT code", 10, None, root=self.root)["hits"][0]
+                             ["confidence"]["level"], "normal")
             metadata = got["renditions"][hit["path"]]
             self.assertEqual(metadata["format"], "converted")
             self.assertEqual(metadata["conversion"]["source_format"], "pptx")

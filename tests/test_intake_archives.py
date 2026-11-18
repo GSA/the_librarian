@@ -166,7 +166,7 @@ class ExpandTests(ArchiveCase):
         got = {k: (e["disposition"], e.get("code")) for k, e in entries.items() if "!/" in k}
         self.assertEqual(got["drop/bundle.zip!/docs/a.md"], ("admit", None))
         self.assertEqual(got["drop/bundle.zip!/web/app.js"], ("skipped-asset", None))
-        self.assertEqual(got["drop/bundle.zip!/report.docx"], ("needs-reader", None))
+        self.assertEqual(got["drop/bundle.zip!/report.docx"], ("needs-reader", "container-invalid"))
         self.assertEqual(got["drop/bundle.zip!/inner.zip"], ("needs-reader", "archive-not-expanded"))
         self.assertEqual(got["drop/bundle.zip!/secret.md"], ("unreadable", "archive-encrypted"))
         self.assertEqual(got["drop/bundle.zip!/docs/link"], ("unsafe-path", "archive-link"))

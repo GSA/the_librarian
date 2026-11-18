@@ -266,3 +266,42 @@ with a stable code (`mime-malformed`, `mime-encoding`, `mime-charset`,
 `mime-no-html`, `mime-empty`) instead of being read as raw text. The payload
 records `method` (`mhtml-html-text` and its version) and the parts read.
 Select it in `config/selection.local.json` with `format: "mhtml"`.
+
+## Converted documents (Office, RTF)
+
+`tools/extraction/convert.py` turns DOCX, XLSX, PPTX, VSDX and RTF into a derived Markdown line
+rendition (`payload.format: "converted"`). It needs only the standard library: no
+virtual environment, pins or lock. Cohort intake picks the format from content (package part names,
+`{\rtf`), not the suffix. Each file converts in a separate `python -I` process
+(`convert_worker.py`) with a 300 s wall clock, an 80 MiB output cap and rlimits. It reads zip
+members through count, size and ratio caps and refuses unsafe, duplicate or encrypted
+members. It parses XML with expat and refuses any DTD or entity. Output is capped at 100,000
+lines, 10,000 rows, 64 columns and 1,000 characters per sheet cell.
+
+- DOCX: the Title style as `#` and Heading N as N+1 `#` (capped at six), numbered and bulleted lists, tables as Markdown tables,
+  text boxes as `>` quotes, then footnotes, endnotes and comments. Headers, footers, tracked
+  deletions and images are omitted; images are counted in `fidelity.dropped`.
+- PPTX: `## Slide N` in presentation order, the title as `###`, other text as bullets, tables,
+  then `#### Notes` (slide numbers and dates skipped).
+- XLSX: `## Sheet: name`, each 50 rows as a Markdown table under the first row as header with
+  the spreadsheet row number. Shared strings, booleans and date formats are resolved; formulas
+  show their cached value.
+- VSDX: `## Page: name` with one bullet per shape text; geometry and connectors are omitted.
+- RTF: text with `\par` lines, `\'hh` (by `\ansicpg`) and `\u` characters, and table cells joined
+  with `|`. Hidden destinations (font tables, `\*` groups, pictures, metadata) are skipped.
+- Legacy `.doc`/`.xls`/`.ppt`/`.vsd` (`office-legacy`): converted first with
+  `soffice --headless --convert-to` (private profile, extraction home, same timeout) to
+  DOCX/XLSX/PPTX/ODG, then as above. This only happens when LibreOffice's `soffice` is on `PATH`.
+  It is not installed or required; without it the file stays `needs-reader`
+  (`needs-converter-runtime`).
+
+`payload.conversion` records `source_format`, `via`, `converter` (`librarian-convert`), `version`,
+`code_sha256` (both converter files), `lock_sha256` (`null`), `runtime` and `fidelity`
+(`truncated`, `dropped`, `notes`). The engine identity covers the converter code and policy (and
+the `soffice` version), so changing either re-extracts. The catalogued source remains the original
+bytes. Failures are blocked stages with a code: `container-invalid`, `container-limit`,
+`unsafe-member`, `encrypted-document`, `zip-bomb`, `xml-dtd`, `xml-invalid`, `xml-limit`,
+`ooxml-invalid`, `rtf-invalid`, `conversion-empty`, `conversion-limit`, `conversion-timeout`,
+`source-changed`, `converter-runtime-failed` or `legacy-conversion-failed`. The `converted`
+kind is labelled low confidence (`converted-format`). Select these renditions with
+`format: "converted"`; they retrieve by `#line-N` like text.
