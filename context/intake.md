@@ -299,7 +299,9 @@ settings, never a path to read, and has no network, ledger or catalog handle (sp
 dies (killed, out of memory, a parser crash) fails only its file (`classify`: `unreadable/parse-worker-died`;
 chunk parse: `failed prepare/parse-worker-died`) and a rerun reads it afresh. Memory is bounded by the queue: at most
 a few chunks of documents and 64 MiB of source in flight, and 32 MiB of remembered parses beyond the chunk. PDFs,
-images and converted office documents keep their own bounded child processes (`--extract-concurrency`). Measure it
+images and converted office documents keep their own bounded child processes (`--extract-concurrency`). A script that
+calls `cohort.ingest` with workers must guard its entry point with `if __name__ == "__main__"` (spawned workers re-import
+it); without the guard the workers die and their files report `parse-worker-died`. Measure it
 on synthetic seeds:
 
 ```sh
