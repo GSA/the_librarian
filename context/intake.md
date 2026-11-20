@@ -286,6 +286,26 @@ after publication and before and after registration (`Source changed during extr
 design document for why each check remains. Measure it with `tools/diagnostics/ingest_benchmark.py` (the
 `tools.extraction.extract.run` and `upload.reserved_ids` timers) on a seeded instance.
 
+**Parse worker processes.** Reading, hashing and parsing a text-family file (strict UTF-8, MIME HTML, transcripts,
+ODT) are pure functions of its bytes, so `ingest` and `qualify` do them in `--parse-workers` processes while the one
+writer commits (default: the CPUs, at most 4, and none until an inbox has more than 32 files; `1` is the old
+single-process path). `classify` reads and hashes each file in this process and has a worker judge it (format, strict
+decoding, MIME and transcript parsing), and each chunk's documents are parsed ahead of its ledger stages while the
+previous chunk commits; the prepare stage and its guards find the parse remembered by (format, source SHA-256,
+extractor SHA-256), exactly the key they already re-check, so a parse of other bytes is never used and every
+changed-input check is unchanged. Results return in input order, so the report, ledger and catalog are the same at 1
+and N workers (`tests/test_intake_parse_workers.py`). A worker receives bytes, a bare file name and the policy
+settings, never a path to read, and has no network, ledger or catalog handle (spawned, not forked); a worker that
+dies (killed, out of memory, a parser crash) fails only its file (`classify`: `unreadable/parse-worker-died`;
+chunk parse: `failed prepare/parse-worker-died`) and a rerun reads it afresh. Memory is bounded by the queue: at most
+a few chunks of documents and 64 MiB of source in flight, and 32 MiB of remembered parses beyond the chunk. PDFs,
+images and converted office documents keep their own bounded child processes (`--extract-concurrency`). Measure it
+on synthetic seeds:
+
+```sh
+python3 tools/diagnostics/batch_ingest_benchmark.py --seed 2000 --files 600 --padding 1700 --batch-sizes 50 --parse-workers 1,4,8
+```
+
 **Catalog lookup indexes.** Every write probes the committed catalog for records that reference a record it
 rewrites and for artifacts that already hold a path it moves. Catalogs created now have lookup indexes and a
 `refs` table for that, so those probes no longer scan the catalog; first ingest into a large catalog was about
@@ -435,7 +455,7 @@ new `mhtml` submission that is recorded as a correction of the old one
 (`correction_of`), so it is extracted again rather than kept. Bump
 `mhtml.METHOD_VERSION` when conversion output changes.
 
-`ingest ... --system LABEL --actor A [--limit N] [--batch-size N] [--extract-concurrency N]` submits each admitted file as
+`ingest ... --system LABEL --actor A [--limit N] [--batch-size N] [--parse-workers N] [--extract-concurrency N]` submits each admitted file as
 a `local-path` upload (stable `inbox-<hash>` submission ID, ASCII-safe name,
 percent-encoded inbox-relative locator, pinned SHA-256) and runs
 `extract-prepare` then `extract-register` through the ledger. When an inbox

@@ -156,6 +156,7 @@ storage; `delete-archive-original` removes an original only after every member i
 and registered ([context/intake.md](context/intake.md#archives)). Ingest commits
 catalog registrations in chunks of `--batch-size` documents (default 50) as one revision each;
 `--batch-size 1` keeps one revision per registration, and a re-run after any interruption completes the rest.
+Reading and parsing text files runs in `--parse-workers` processes (default: CPUs, at most 4); `1` keeps one process.
 Extracted renditions stay unselected until a standing-policy review qualifies
 them. If a registration reports `register/changed-extraction-identity` (the
 extractor changed after it was first prepared), `python -m tools.intake.cohort
