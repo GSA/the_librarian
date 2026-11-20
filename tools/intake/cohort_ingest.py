@@ -14,10 +14,11 @@ import time
 import unicodedata
 from urllib.parse import quote
 
+from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.extraction import convert, extract, mhtml
 from tools.durable import sha256_file
-from . import agent_origin, archives, cohort_runtime, contracts, docs, runner, store, upload
+from . import agent_origin, archives, cohort_runtime, contracts, docs, parse_pool, runner, store, upload
 from .contracts import IntakeError, LedgerBusy
 from .docsync import suffix_of
 
@@ -72,7 +73,7 @@ def _mime(raw):
     return "mhtml", None
 
 
-def _format(path, raw, root):
+def _format(path, raw, root, settings=None):
     """Return (format, refusal code); MIME content wins over any text suffix.
 
     Content decides: office packages, compound files and RTF go to the converter, other strict
@@ -95,7 +96,7 @@ def _format(path, raw, root):
         return _mime(raw)
     if suffix == ".txt":
         try:
-            extract.gemini(raw, root)
+            extract.gemini(raw, root, settings)
             return "gemini-txt", None
         except (extract.ExtractionError, UnicodeDecodeError):
             return "text", None
@@ -139,27 +140,59 @@ def _unread_disposition(path, size, provisioned=False):
     return None
 
 
-def _read_disposition(root, path, entry):
+def judge(name, raw, settings, nbytes):
+    """The format and disposition of a text, ODT or office/RTF file from its bytes alone.
+
+    A pure function of ``name`` (only its suffix counts), the bytes, the instance policy ``settings`` and the
+    file's size, so it runs in a parse worker as well as in this process. Returns ``{"format", "disposition"}``
+    and, for a refusal, ``"code"``.
+    """
+    fmt, refusal = _format(Path(name), raw, None, settings)
+    if refusal:
+        # MIME that cannot be read strictly is never admitted as raw encoded text.
+        return {"format": fmt, "disposition": "needs-reader", "code": refusal}
+    if nbytes > upload.FORMATS[fmt][1]:
+        return {"format": fmt, "disposition": "over-limit"}
+    try:
+        upload.check_type(raw, fmt, name)
+    except IntakeError as error:
+        return {"format": fmt, "disposition": "unreadable", "code": error.code}
+    return {"format": fmt, "disposition": "admit"}
+
+
+WORKER_DIED = {"format": None, "disposition": "unreadable", "code": "parse-worker-died"}
+
+
+def _read_disposition(root, path, entry, parse=None, deliver=None, settings=None):
     """The disposition of a text, ODT, office/RTF, PDF or image file from its bytes; ``entry`` gains
-    its format and hash."""
+    its format and hash. Passed to ``deliver`` (returned when there is none).
+
+    The read and hash happen here; ``judge`` (the parsing) runs in ``parse``'s workers when given, so
+    ``deliver`` may be called later, in the order the files were submitted.
+    """
     if path.suffix.lower() in RUNTIME_FORMATS:
-        return cohort_runtime.read_disposition(path, entry)
+        result = cohort_runtime.read_disposition(path, entry)
+        return deliver(result) if deliver else result
     try:
         raw = upload.read_file(path, max(upload.FORMATS[f][1] for f in (*TEXT_FORMATS, *convert.FORMATS)))
     except IntakeError as error:
-        return {**entry, "disposition": "unsafe-path", "code": error.code}
-    fmt, refusal = _format(path, raw, root)
-    entry.update(format=fmt, sha256=hashlib.sha256(raw).hexdigest())
-    if refusal:
-        # MIME that cannot be read strictly is never admitted as raw encoded text.
-        return {**entry, "disposition": "needs-reader", "code": refusal}
-    if entry["bytes"] > upload.FORMATS[fmt][1]:
-        return {**entry, "disposition": "over-limit"}
-    try:
-        upload.check_type(raw, fmt, path.name)
-    except IntakeError as error:
-        return {**entry, "disposition": "unreadable", "code": error.code}
-    return {**entry, "disposition": "admit"}
+        result = {**entry, "disposition": "unsafe-path", "code": error.code}
+        return deliver(result) if deliver else result
+    sha256 = hashlib.sha256(raw).hexdigest()
+    settings = settings or policy.for_root(root)[0]
+
+    def finish(judged, error):
+        if error is not None:
+            if not isinstance(error, parse_pool.WorkerDied):
+                raise error
+            judged = WORKER_DIED
+        entry.update(format=judged["format"], sha256=sha256)
+        result = {**entry, **{k: v for k, v in judged.items() if k != "format"}}
+        return deliver(result) if deliver else result
+    if parse is None:
+        return finish(judge(path.name, raw, settings, entry["bytes"]), None)
+    parse.submit(judge, (path.name, raw, settings, entry["bytes"]), len(raw), finish)
+    return None
 
 
 # Cohort dispositions of archive members that carry no stored bytes (``archives`` member codes).
@@ -221,7 +254,15 @@ def _member_entries(root, relative, manifest, trusted, provisioned=False, exclud
 
 
 def _disposition(root, path, relative, trusted=None, nested=0, provisioned=False):
-    """One file's disposition.
+    """One file's disposition (see ``_classified``), read and judged in this process."""
+    found = []
+    _classified(root, path, relative, trusted, nested, provisioned, None, found.append)
+    return found[0]
+
+
+def _classified(root, path, relative, trusted, nested, provisioned, parse, deliver, settings=None):
+    """One file's disposition, passed to ``deliver`` once: now, or later when ``parse`` (a ``parse_pool.Workers``)
+    judges the file's bytes in a worker process.
 
     ``trusted`` (``{relative: ledger row}``, only under ``--trust-stat``) lets a file whose stat
     identity equals its extracted row's skip the read and hash: the row's format and SHA-256 stand in
@@ -231,30 +272,32 @@ def _disposition(root, path, relative, trusted=None, nested=0, provisioned=False
     """
     entry = {"relative": relative, "disposition": None, "format": None}
     if path.is_symlink() or not path.is_file():
-        return {**entry, "disposition": "unsafe-path"}
+        return deliver({**entry, "disposition": "unsafe-path"})
     info = path.stat(follow_symlinks=False)
     entry["_stat"] = _stat(info)
     row = (trusted or {}).get(relative)
     if _unchanged(row, entry["_stat"]):
-        return {**entry, "format": row["format"], "bytes": info.st_size, "sha256": row["sha256"],
-                "disposition": "admit", "_fast": True}
+        return deliver({**entry, "format": row["format"], "bytes": info.st_size, "sha256": row["sha256"],
+                        "disposition": "admit", "_fast": True})
     entry["bytes"] = info.st_size
     if ":" not in path.name and archives.kind(path.name) and info.st_size > 0:
         if nested >= MAX_NESTING:
-            return {**entry, "disposition": "needs-reader", "code": "archive-nesting"}
-        return {**entry, **_archive_disposition(root, path, not nested)}
+            return deliver({**entry, "disposition": "needs-reader", "code": "archive-nesting"})
+        return deliver({**entry, **_archive_disposition(root, path, not nested)})
     unread = _unread_disposition(path, info.st_size, provisioned)
     if unread is not None:
-        return {**entry, **unread}
-    return _read_disposition(root, path, entry)
+        return deliver({**entry, **unread})
+    return _read_disposition(root, path, entry, parse, deliver, settings)
 
 
-def classify(root, inbox, trusted=None, keep_stat=False, origin=None):
+def classify(root, inbox, trusted=None, keep_stat=False, origin=None, parse=None):
     """Return one explicit disposition per inbox file; never writes the inbox.
 
     ``ingest`` passes ``keep_stat`` to keep each entry's private ``_stat`` (and ``_fast``) fields.
     An agent ``origin`` (``agent_origin.load``) limits the walk to its includes and marks files
-    under its excludes ``excluded`` without reading them.
+    under its excludes ``excluded`` without reading them. With ``parse`` (a ``parse_pool.Workers``) the
+    files are read and hashed here, one at a time, and judged (format, strict decoding, MIME and
+    transcript parsing) in the pool's workers; the entries are the same at any worker count.
     """
     root, inbox = Path(root).resolve(), Path(inbox).resolve()
     if root == inbox or inbox in root.parents:
@@ -265,6 +308,7 @@ def classify(root, inbox, trusted=None, keep_stat=False, origin=None):
     def unavailable(error):
         raise IntakeError("inbox_unavailable") from error
     provisioned = cohort_runtime.ready(root)
+    settings = policy.for_root(root)[0]  # read once; a worker is handed it, never the instance
     entries = []
 
     def add(path):
@@ -272,17 +316,20 @@ def classify(root, inbox, trusted=None, keep_stat=False, origin=None):
         if agent_origin.excluded(origin, relative):
             entries.append({"relative": relative, "disposition": "excluded", "format": None})
             return
-        pending = [_disposition(root, path, relative, trusted, provisioned=provisioned)]
-        while pending:
-            entry = pending.pop()
-            manifest = entry.pop("_manifest", None)
-            if manifest is not None:
-                pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned,
-                                               lambda name: agent_origin.excluded(origin, name)))
-            if not keep_stat:
-                for key in ("_stat", "_fast", "_source"):
-                    entry.pop(key, None)
-            entries.append(entry)
+
+        def settle(first):
+            pending = [first]
+            while pending:
+                entry = pending.pop()
+                manifest = entry.pop("_manifest", None)
+                if manifest is not None:
+                    pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned,
+                                                   lambda name: agent_origin.excluded(origin, name)))
+                if not keep_stat:
+                    for key in ("_stat", "_fast", "_source"):
+                        entry.pop(key, None)
+                entries.append(entry)
+        _classified(root, path, relative, trusted, 0, provisioned, parse, settle, settings)
     for include, start in agent_origin.starts(origin, inbox):
         if include and any(p.is_symlink() for p in (start, *start.parents) if inbox in p.parents):
             entries.append({"relative": include, "disposition": "unsafe-path", "format": None})
@@ -294,6 +341,8 @@ def classify(root, inbox, trusted=None, keep_stat=False, origin=None):
             here = Path(directory)
             for name in [*files, *(n for n in names if (here / n).is_symlink())]:
                 add(here / name)
+    if parse is not None:
+        parse.drain()
     return sorted(entries, key=lambda e: e["relative"])
 
 
@@ -811,7 +860,7 @@ def _counts(entries, admitted):
 
 def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False,
            extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY,
-           origin=None):
+           origin=None, parse_workers=None):
     """Classify the inbox, then submit and extract admitted files; return the report.
 
     Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
@@ -831,28 +880,40 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
 
     An agent ``origin`` (``agent_origin.load``) selects the files of an agent-written tree and
     submits each admitted one with its ``agent_generated`` declaration (counted in ``agent_origin``).
+
+    Reading, hashing and parsing a text-family file are pure functions of its bytes, so ``parse_workers``
+    processes (``parse_pool``) do them while this process, the only writer, commits: ``classify`` has them
+    judge each file, and each chunk's documents are parsed ahead of the chunk's ledger stages (the prepare
+    stage then finds the parse remembered, keyed by the source and extractor hashes it re-checks). Results
+    come back in input order, so the report, ledger and catalog are the same at any worker count. A
+    worker that dies fails (or, in ``classify``, refuses) its file as ``parse-worker-died`` and the run
+    continues. ``None`` sizes the pool from the CPUs (at most ``parse_pool.DEFAULT_WORKERS``), running a
+    small inbox inline; ``1`` is the original single-process path.
     """
     contracts.require(type(batch_size) is int and batch_size >= 1, "invalid_batch_size")
     contracts.require(type(extract_concurrency) is int and extract_concurrency >= 1, "invalid_concurrency")
+    contracts.require(parse_workers is None or type(parse_workers) is int and parse_workers >= 1,
+                      "invalid_concurrency")
     trusted = {}
     # A stat-trusted file skips submission, so a changed agent declaration would go unchecked.
     if trust_stat and origin is None:
         with store.locked(root) as c:
             trusted = docs.load(c, system)
-    entries = classify(root, inbox, trusted, True, origin)
-    declared = agent_origin.declare(inbox, origin, entries) if origin is not None else None
-    admitted = [e for e in entries if e["disposition"] == "admit"]
-    # Private stat fields never reach the report: take them off every entry now.
-    stats = {e["relative"]: e.pop("_stat", None) for e in entries}
-    fast = {e["relative"] for e in entries if e.pop("_fast", False)}
-    todo = admitted if limit is None else admitted[:limit]
-    for entry in admitted[len(todo):]:
-        entry["outcome"] = "not-processed"
-    for entry in todo:
-        if entry["relative"] in fast:
-            entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
-    _process_all(root, inbox, [e for e in todo if e["relative"] not in fast], system, actor,
-                 batch_size, stats, extract_concurrency)
+    with _pool(parse_workers, batch_size) as pool:
+        entries = classify(root, inbox, trusted, True, origin, pool)
+        declared = agent_origin.declare(inbox, origin, entries) if origin is not None else None
+        admitted = [e for e in entries if e["disposition"] == "admit"]
+        # Private stat fields never reach the report: take them off every entry now.
+        stats = {e["relative"]: e.pop("_stat", None) for e in entries}
+        fast = {e["relative"] for e in entries if e.pop("_fast", False)}
+        todo = admitted if limit is None else admitted[:limit]
+        for entry in admitted[len(todo):]:
+            entry["outcome"] = "not-processed"
+        for entry in todo:
+            if entry["relative"] in fast:
+                entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
+        _process_all(root, inbox, [e for e in todo if e["relative"] not in fast], system, actor,
+                     batch_size, stats, extract_concurrency, pool)
     for entry in entries:
         entry.pop("_source", None)
     counts = _counts(entries, admitted)
@@ -861,20 +922,82 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
     return {"counts": counts, "entries": entries}
 
 
-def _process_all(root, inbox, todo, system, actor, batch_size, stats, concurrency=1):
-    """Process ``todo`` in chunks of ``batch_size``, recording ``docs`` rows every ``FLUSH`` entries."""
+def _pool(parse_workers, batch_size):
+    # The queue holds a chunk or two of documents, so the next chunk is parsed while this one commits.
+    limit = {"max_pending": max(4 * (parse_workers or parse_pool.DEFAULT_WORKERS), 2 * batch_size)}
+    if parse_workers is None:
+        return parse_pool.Workers(parse_pool.default_workers(), inline_first=parse_pool.AUTO_INLINE, **limit)
+    return parse_pool.Workers(parse_workers, **limit)
+
+
+def preparse(format_name, raw, settings):
+    """``(SHA-256, payload)`` of a source read as ``format_name``; runs in a parse worker."""
+    return hashlib.sha256(raw).hexdigest(), extract.parse_payload(format_name, raw, None, settings)
+
+
+def _parse_ahead(root, inbox, chunk, pool, failed, fingerprints):
+    """Queue the parse of a chunk's text-family documents in ``pool``; return the last job's sequence number.
+
+    A finished parse is remembered (``extract.remember``, keyed by format, source hash and extractor
+    hash) as its result is delivered, so the writer's prepare stage and guards find it without parsing; they
+    re-read the retained original and look the parse up by the hashes they observe, so a parse of other
+    bytes is never used. A document this pass cannot read, hash or parse is simply parsed by the writer as it
+    always was. A document that kills a worker is not parsed again: it is put in ``failed`` (by path)
+    and fails alone, and a later run reads it afresh.
+    """
+    last, settings = None, None
+    for entry in chunk:
+        fmt = entry["format"]
+        if fmt not in BATCH_PREPARE:
+            continue
+        try:
+            raw = upload.read_file(source_path(inbox, entry), upload.FORMATS[fmt][1])
+            settings = settings or policy.for_root(root)[0]
+        except (IntakeError, OSError):
+            continue  # the ledger stages report a missing or changed source as they always did
+
+        def remember(result, error, entry=entry, fmt=fmt, size=len(raw)):
+            if isinstance(error, parse_pool.WorkerDied):
+                failed[entry["relative"]] = {"outcome": "failed", "stage": "prepare", "code": "parse-worker-died"}
+            elif error is None and result[0] == entry["sha256"]:
+                if fmt not in fingerprints:
+                    fingerprints[fmt] = extract.fingerprint(root, fmt)
+                extract.remember((fmt, result[0], fingerprints[fmt]), result[1], size)
+        sequence = pool.submit(preparse, (fmt, raw, settings), len(raw), remember)
+        last = sequence if sequence is not None else last
+    return last
+
+
+def _process_all(root, inbox, todo, system, actor, batch_size, stats, concurrency=1, pool=None):
+    """Process ``todo`` in chunks of ``batch_size``, recording ``docs`` rows every ``FLUSH`` entries.
+
+    With a parallel ``pool`` the documents of the next chunk are parsed while this chunk commits.
+    """
     # One correction-chain index serves every entry, so following chains never rescans the ledger.
     heads = store.Heads()
-    pending = []
-    for chunk in (todo[i:i + batch_size] for i in range(0, len(todo), batch_size)):
-        if batch_size == 1:
-            results = {chunk[0]["relative"]: _settled(root, inbox, chunk[0], system, actor, heads)}
-        else:
-            results = _settled_batch(root, inbox, chunk, system, actor, heads, concurrency)
-        for entry in chunk:
-            entry.update(results[entry["relative"]])
-            pending.append((entry, stats[entry["relative"]]))
-        if len(pending) >= FLUSH:
-            _record(root, system, pending, heads)
-            pending = []
+    pending, failed, fingerprints = [], {}, {}
+    chunks = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
+    pool = pool or parse_pool.Workers(1)
+    ahead = None  # last job of the chunk queued ahead
+    # Room for this chunk's parses and the next chunk's (still bounded by ``extract._KEEP_BYTES`` of source).
+    with extract.keeping_parsed(2 * batch_size):
+        if pool.parallel and chunks:
+            ahead = _parse_ahead(root, inbox, chunks[0], pool, failed, fingerprints)
+        for number, chunk in enumerate(chunks):
+            if pool.parallel:
+                pool.deliver_through(ahead)
+            results = {e["relative"]: failed.pop(e["relative"]) for e in chunk if e["relative"] in failed}
+            if pool.parallel and number + 1 < len(chunks):
+                ahead = _parse_ahead(root, inbox, chunks[number + 1], pool, failed, fingerprints)
+            todo_now = [e for e in chunk if e["relative"] not in results]
+            if todo_now and batch_size == 1:
+                results.update({todo_now[0]["relative"]: _settled(root, inbox, todo_now[0], system, actor, heads)})
+            elif todo_now:
+                results.update(_settled_batch(root, inbox, todo_now, system, actor, heads, concurrency))
+            for entry in chunk:
+                entry.update(results[entry["relative"]])
+                pending.append((entry, stats[entry["relative"]]))
+            if len(pending) >= FLUSH:
+                _record(root, system, pending, heads)
+                pending = []
     _record(root, system, pending, heads)
