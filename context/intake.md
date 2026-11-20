@@ -351,10 +351,11 @@ renders it as text or HTML and `progress_serve.py` serves it.
   then its extraction and registration (`extracting` while either is
   missing or staged, else their block or `extracted`), then the standing
   review of its current rendition under the newest policy (`pending-review`,
-  `qualified`, `selected`, `rejected`, `deferred`, `exception` ...);
-  `selected` becomes `published` once a later publication request
-  finished. With the derived `docs` table its extraction and registration
-  heads and current rendition are used and `mismatch`/`ambiguous` rows keep
+  `qualified`, `selected`, `rejected`, `deferred`, `exception` ...).
+  `selected` is the furthest document state: publication requests do not
+  name their documents, so publication is shown by `publications` and the
+  index panel. With the derived `docs` table its extraction and registration
+  heads (by exact ID, however a correction is named) and current rendition are used and `mismatch`/`ambiguous` rows keep
   that state; without it the source is `requests` (the newest request by
   first attempt) and rendition changes are not detected. Document attention
   groups (`group:`) count documents by state, funnel and code. Publication

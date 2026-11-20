@@ -363,7 +363,7 @@ class DocumentTests(ProgressCase):
         self.assertEqual(sum(documents["funnel"].values()), 8)
         self.assertEqual({k: v for k, v in documents["funnel"].items() if v},
                          {"qualified": 1, "pending-review": 2, "extracted": 2, "needs-reader": 1,
-                          "staged": 1, "published": 1})
+                          "staged": 1, "selected": 1})
         self.assertEqual({(g["state"], g["funnel"], g["code"]): g["count"] for g in documents["attention_groups"]},
                          {("blocked", "needs-reader", "needs-reader-docx"): 1,
                           ("blocked", "pending-review", "standing-pending-review-unresolved-evidence"): 1})
@@ -396,7 +396,7 @@ class DocumentTests(ProgressCase):
         # Without the docs table a rendition's staleness is unknown, so document 6 shows its review.
         self.assertEqual({k: v for k, v in documents["funnel"].items() if v},
                          {"qualified": 1, "pending-review": 2, "extracted": 1, "rejected": 1,
-                          "needs-reader": 1, "staged": 1, "published": 1})
+                          "needs-reader": 1, "staged": 1, "selected": 1})
         self.assertEqual(result["overall"]["superseded_by"]["policy"], 2)
         self.assertIn("request names (no docs table)", progress_render.render_text(result))
 
@@ -410,6 +410,17 @@ class DocumentTests(ProgressCase):
         self.assertEqual({k: v for k, v in result["documents"]["funnel"].items() if v}, {"received": 1})
         self.assertEqual(result["overall"]["superseded_by"],
                          {"correction": 1, "policy": 0, "rendition": 0, "submission": 3})
+
+
+    def test_a_differently_named_correction_named_by_the_docs_row_decides(self):
+        sid = self.document(1, register="blocked", code="extract-failed")
+        self.put("repair-1", REGISTER, ["succeeded"], correction_of="register-" + sid)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("UPDATE docs SET state='extracted', rendition='r', rendition_sha256=?, register_head=? "
+                      "WHERE submission_id=?", ("e" * 64, "repair-1", sid))
+        documents = progress.snapshot(self.root)["documents"]
+        self.assertEqual({k: v for k, v in documents["funnel"].items() if v}, {"extracted": 1})
+        self.assertEqual(documents["requests"]["unattributed"], 0)
 
 
 class BindTests(unittest.TestCase):

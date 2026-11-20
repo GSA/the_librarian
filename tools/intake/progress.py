@@ -40,7 +40,7 @@ FORMAT_CODES = {"unsupported-type", "type-mismatch", "unsupported-format", "skip
 READER_PREFIX = "needs-reader"
 # One state per document (receipt), the furthest its current requests reached (see ``fold``).
 DOC_FUNNEL = ("staged", "received", "extracting", "extracted", "pending-review", "qualified",
-              "selected", "published", "rejected", "deferred", "exception", "skipped-by-format",
+              "selected", "rejected", "deferred", "exception", "skipped-by-format",
               "needs-reader", "blocked", "dead-letter", "mismatch", "ambiguous")
 # Why a counted request is left out: corrected by another request, a standing review under an older
 # policy than another review of the same rendition, a review of a rendition that is no longer the
@@ -213,7 +213,7 @@ class LedgerIndex:
 
     def __init__(self):
         self.uploads, self.stale, self.first_use, self.ranks = {}, {}, {}, {}
-        self.docs, self.special = None, {}
+        self.docs, self.special, self.foreign = None, {}, {}
 
     def policy_rank(self, p8):
         rank = self.ranks.get(p8)
@@ -232,7 +232,8 @@ class LedgerIndex:
 
     def is_docs_head(self, role, sid, correlation_id):
         tail = self.docs[sid][0 if role == "extract" else 1]
-        return tail is not None and correlation_id == f"{role}-{sid}{tail}"
+        return tail is not None and (correlation_id == f"{role}-{sid}{tail}"
+                                     or self.foreign.get(correlation_id) == (role, sid))
 
     def supersede(self, sid, r12, members):
         """Mark the reviews of one rendition that a newer policy or a newer rendition supersedes."""
@@ -281,6 +282,10 @@ def ledger_index(c, corrected):
                 sid = sys.intern(sid)
                 index.docs[sid] = (tail_of("extract-", sid, extract_head), tail_of("register-", sid, register_head),
                                    sha[:12] if state == "extracted" and sha else None)
+                # A correction may carry any name; the row names the head explicitly.
+                for role, head in (("extract", extract_head), ("register", register_head)):
+                    if head is not None and not head.startswith(f"{role}-{sid}"):
+                        index.foreign[head] = (role, sid)
                 if state in {"mismatch", "ambiguous"}:
                     index.special[sid] = state
         c.execute("COMMIT")
@@ -305,6 +310,9 @@ def role_of(correlation_id, layout, index):
     """``(role, submission ID)`` of one request: a document's receipt, extraction, registration or
     standing review, a publication, or ``(None, None)`` for anything else."""
     operations = tuple(operation for _, _, operation in layout)
+    foreign = index.foreign.get(correlation_id)
+    if foreign is not None and operations == ROLE_OPERATIONS[foreign[0] + "-"][1]:
+        return foreign
     for prefix, (role, expected) in ROLE_OPERATIONS.items():
         if correlation_id.startswith(prefix) and operations == expected:
             rest = correlation_id[len(prefix):]
@@ -412,12 +420,12 @@ AS_DOCUMENT = {"extract": {"staged": "extracting"}, "register": {"staged": "extr
                "review": {"staged": "pending-review"}}
 
 
-def fold(entry, special, published):
+def fold(entry, special):
     """One document's ``(funnel state, deciding (funnel, status, code) or None)``.
 
     The receipt decides until it succeeds, then the extraction and the registration, then the
-    current standing review; a selected document whose selection finished before the latest
-    successful publication is ``published``."""
+    current standing review. A selected document stays ``selected``: publication requests do not
+    name the documents they publish, so the publications and index sections report publication."""
     receipt, extract, register, review = entry
     if special is not None:
         return special, None
@@ -435,11 +443,8 @@ def fold(entry, special, published):
             return funnel, slot[1]
     if review is None:
         return "extracted", None
-    found, updated = review[1]
-    funnel = AS_DOCUMENT["review"].get(found[0], found[0])
-    if funnel == "selected" and published is not None and updated is not None and updated <= published:
-        funnel = "published"
-    return funnel, found
+    found = review[1][0]
+    return AS_DOCUMENT["review"].get(found[0], found[0]), found
 
 
 def summarize_documents(tally, index):
@@ -448,8 +453,7 @@ def summarize_documents(tally, index):
     for sid, head in index.uploads.items():
         if not head:
             continue
-        state, found = fold(documents[sid], index.special.get(sid),
-                            tally["published"])
+        state, found = fold(documents[sid], index.special.get(sid))
         funnel[state] += 1
         if found is None and state in {"mismatch", "ambiguous"}:
             groups[(state, state, None)] += 1
