@@ -107,6 +107,7 @@ def reference(root, runs=None, limit=50):
                 "exceptions": sum(any(s in {"blocked", "dead-letter"} for _, s in v["kinds"]) for v in values),
                 "retrying": sum(any(s == "retryable" for _, s in v["kinds"]) for v in values),
                 "superseded": 0,  # these seeded ledgers hold no corrections
+                "superseded_by": dict.fromkeys(progress.SUPERSEDED, 0),
                 "last_activity": max(updated) if updated else None}
     return {"overall": aggregate(items),
             "runs": {name: aggregate([v for v in items if v["correlation_id"].startswith(prefix)])
@@ -190,7 +191,7 @@ class EquivalenceTests(Case):
         report = progress.snapshot(self.root)
         text = json.dumps(report) + progress_render.render_html(report) + progress_render.render_text(report)
         self.assertNotIn(SECRET, text)
-        self.assertIn("Needs attention by cause", progress_render.render_html(report))
+        self.assertIn("Requests needing attention by cause", progress_render.render_html(report))
 
 
 class SupersededTests(Case):
