@@ -493,7 +493,6 @@ class AdapterProcess(unittest.TestCase):
         """Review 56: the shared asset tree can be swapped (and restored) during inference
         without the worker ever seeing different bytes."""
         assets = self.assets_tree()
-        swap = self.root / "swap-done"
         worker = self.stub_worker(
             "import stat\n"
             "root=job['artifacts_path']\n"
