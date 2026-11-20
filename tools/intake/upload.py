@@ -504,15 +504,28 @@ def plan(root, value, raw):
     return directory, original_path, sidecar_path, sidecar
 
 
-def records_for(root, value, raw, original_path, sidecar_path, sidecar):
+def submission_ids(sid):
+    """The record IDs one submission always writes; distinct role suffixes keep every submission's IDs
+    disjoint from every other's."""
+    return f"A-upload-{sid}-original", f"A-upload-{sid}-submission", f"R-upload-{sid}-version-of"
+
+
+def records_for(root, value, raw, original_path, sidecar_path, sidecar, view=None):
+    """The catalog records of a new submission, and the catalog state they are pinned to.
+
+    ``view`` is a ``(state, Taken)`` a caller staging a chunk read once for every submission in it
+    (``Taken.present`` probed with all their IDs); the caller advances ``Taken.highest`` after each
+    submission so the next one is numbered after it. Without it the view is read for this submission alone.
+    """
     sid = value["submission_id"]
-    # Distinct role suffixes keep every submission's IDs disjoint from every other's.
-    artifact_id, meta_id = f"A-upload-{sid}-original", f"A-upload-{sid}-submission"
-    relation_id = f"R-upload-{sid}-version-of"
+    artifact_id, meta_id, relation_id = submission_ids(sid)
     mine = {artifact_id, meta_id, relation_id}
-    state, taken = catalog_view(root, mine)
-    taken |= reserved_ids(root, mine)
-    require(not taken.present, "identifier_conflict")
+    if view is None:
+        state, taken = catalog_view(root, mine)
+        taken |= reserved_ids(root, mine)
+    else:
+        state, taken = view
+    require(not (taken.present & mine), "identifier_conflict")
     parent_artifact = None
     if value["correction_of"]:
         parent = ledger_request(root, correlation(value["correction_of"]))
@@ -629,41 +642,127 @@ def known_requests(root, correlation_ids):
     return found
 
 
-def _stage_locked(root, path, value, known):
-    """Publish the retained copy and stage the receipt request; the caller holds ``upload_lock``.
-
-    Returns ``(correlation_id, existing)``. Nothing is committed to the catalog.
-    """
+def _read_submission(root, path, value):
+    """Validate a descriptor and read its file: ``(value, raw, correlation ID, directory, original path,
+    sidecar path, sidecar)``."""
     value = validate_descriptor(value)
     raw = read_file(path, FORMATS[value["format"]][1])
     if value["expected_sha256"] is not None:
         require(digest(raw) == value["expected_sha256"], "changed_input")
     check_type(raw, value["format"], value["name"])
-    correlation_id = correlation(value["submission_id"])
     directory, original_path, sidecar_path, sidecar = plan(root, value, raw)
-    prior = known[correlation_id][0] if known and correlation_id in known else ledger_request(root, correlation_id)
-    existing = prior is not None
-    if existing:
-        saved = {r["data"]["path"]: r["data"]["sha256"] for r in submit_records(prior) if r["kind"] == "artifact"}
-        require(saved == {original_path: digest(raw), sidecar_path: digest(sidecar)}, "submission_conflict")
-    else:
-        state, records = records_for(root, value, raw, original_path, sidecar_path, sidecar)
-        request = {"version": 1, "correlation_id": correlation_id,
-                   "correction_of": correlation(value["correction_of"]) if value["correction_of"] else None,
-                   "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
-                   "retry": {"max_attempts": 3, "backoff_seconds": 0},
-                   "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit",
-                               "arguments": {"records": records, "actor": value["actor"],
-                                             "request_id": correlation_id, "expected_state": state["state_token"],
-                                             "reason": "Manual upload: " + value["reason"][:400]}}]}
+    return value, raw, correlation(value["submission_id"]), directory, original_path, sidecar_path, sidecar
+
+
+def _same_submission(prior, raw, original_path, sidecar_path, sidecar):
+    saved = {r["data"]["path"]: r["data"]["sha256"] for r in submit_records(prior) if r["kind"] == "artifact"}
+    require(saved == {original_path: digest(raw), sidecar_path: digest(sidecar)}, "submission_conflict")
+
+
+def _receipt_request(root, value, correlation_id, records, state):
+    return canonical({
+        "version": 1, "correlation_id": correlation_id,
+        "correction_of": correlation(value["correction_of"]) if value["correction_of"] else None,
+        "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
+        "retry": {"max_attempts": 3, "backoff_seconds": 0},
+        "stages": [{"id": "receipt", "kind": "receipt", "operation": "catalog-submit",
+                    "arguments": {"records": records, "actor": value["actor"],
+                                  "request_id": correlation_id, "expected_state": state["state_token"],
+                                  "reason": "Manual upload: " + value["reason"][:400]}}]}).encode()
+
+
+def _publish_copies(root, directory, value, raw, sidecar):
     # Retained bytes are durable before the receipt stage exists, so no
     # run/resume can commit a present artifact whose file is missing.
     target = private_directory(root, directory, 2)
     publish(target, value["name"], raw)
     publish(target, SIDECAR, sidecar)
+
+
+def _stage_locked(root, path, value, known):
+    """Publish the retained copy and stage the receipt request; the caller holds ``upload_lock``.
+
+    Returns ``(correlation_id, existing)``. Nothing is committed to the catalog.
+    """
+    value, raw, correlation_id, directory, original_path, sidecar_path, sidecar = _read_submission(root, path, value)
+    prior = known[correlation_id][0] if known and correlation_id in known else ledger_request(root, correlation_id)
+    existing = prior is not None
+    if existing:
+        _same_submission(prior, raw, original_path, sidecar_path, sidecar)
+    else:
+        state, records = records_for(root, value, raw, original_path, sidecar_path, sidecar)
+        request = _receipt_request(root, value, correlation_id, records, state)
+    _publish_copies(root, directory, value, raw, sidecar)
     if not existing:
-        store.stage(root, canonical(request).encode())
+        store.stage(root, request)
     return correlation_id, existing
+
+
+def saved_requests(root, correlation_ids):
+    """One ledger lock: ``{id: decoded request}`` for each saved request among ``correlation_ids``."""
+    with store.locked(root) as c:
+        rows = [(i, c.execute("SELECT raw FROM requests WHERE correlation_id=?", (i,)).fetchone())
+                for i in correlation_ids]
+        return {i: decode(row[0]) for i, row in rows if row is not None}
+
+
+def stage_submissions(root, items, known=None):
+    """``stage_submission`` for a chunk of ``(path, descriptor)``: the receipt requests of every new
+    submission are staged with one ledger commit, and the catalog is read once for all of them.
+
+    Returns one ``(correlation_id, existing)`` or ``IntakeError`` per item, in order; a refused submission
+    never blocks the others. IDs are numbered across the chunk in order, so the result equals staging the
+    items one at a time. Each file is read, checked and its retained copy published in turn, and only its
+    request (about 2.5 KB) is kept for the shared commit, so memory does not grow with the chunk. A busy
+    ledger raises ``LedgerBusy`` with no request staged. The retained copies are durable before the
+    requests that name them, and everything is idempotent, so a crash is completed by running the chunk
+    again. ``known`` is a ``known_requests`` result read earlier; requests it lacks are read here.
+    """
+    root = store.safe(root)
+    results = [None] * len(items)
+    with upload_lock(root):
+        values = {}
+        for index, (_, value) in enumerate(items):
+            try:
+                values[index] = validate_descriptor(value)
+            except IntakeError as error:
+                results[index] = error
+        correlations = {i: correlation(v["submission_id"]) for i, v in values.items()}
+        saved = {c: known[c][0] for c in correlations.values() if known and c in known}
+        saved.update(saved_requests(root, [c for c in correlations.values() if c not in saved]))
+        view = None
+        probe = {i for index, v in values.items() if correlations[index] not in saved
+                 for i in submission_ids(v["submission_id"])}
+        if probe:
+            state, taken = catalog_view(root, probe)
+            taken |= reserved_ids(root, probe)
+            view = (state, taken)
+        requests = {}
+        for index, value in values.items():
+            path = items[index][0]
+            try:
+                _, raw, correlation_id, directory, original_path, sidecar_path, sidecar = _read_submission(root, path, value)
+                prior = saved.get(correlation_id)
+                if prior is not None:
+                    _same_submission(prior, raw, original_path, sidecar_path, sidecar)
+                    records = None
+                else:
+                    records = records_for(root, value, raw, original_path, sidecar_path, sidecar, view)[1]
+                _publish_copies(root, directory, value, raw, sidecar)
+            except IntakeError as error:
+                results[index] = error
+                continue
+            if records is None:
+                results[index] = (correlation_id, True)
+                continue
+            for prefix in PREFIXES:
+                view[1].highest[prefix] = max(view[1].highest[prefix],
+                                              highest_number((r["id"] for r in records), prefix))
+            requests[index] = (correlation_id, _receipt_request(root, value, correlation_id, records, view[0]))
+        order = list(requests)
+        for index, outcome in zip(order, store.stage_many(root, [requests[i][1] for i in order])):
+            results[index] = outcome if isinstance(outcome, IntakeError) else (requests[index][0], False)
+    return results
 
 
 def stage_submission(root, path, value, *, known=None):

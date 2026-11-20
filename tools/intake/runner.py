@@ -100,9 +100,15 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             charged, lost = spent(attempts)
             require(charged < request["retry"]["max_attempts"] and lost < CONTENTION_BUDGET, "attempt_limit")
 
-        def begin():
-            if unfinished is None:
-                with c:
+        def begin(intent=None):
+            """Save the new ``intent`` and record the attempt as running in one commit (the intent is
+            written first, so it is durable whenever the attempt is)."""
+            if intent is None and unfinished is not None:
+                return
+            with c:
+                if intent is not None:
+                    save_artifact(c, correlation_id, stage_id, "intent", intent)
+                if unfinished is None:
                     c.execute("INSERT INTO attempts(correlation_id,stage_id,cycle,ordinal,started) VALUES (?,?,?,?,?)", (correlation_id, stage_id, saved["cycle"], ordinal, started))
                     c.execute("UPDATE stages SET status='running' WHERE correlation_id=? AND stage_id=?", (correlation_id, stage_id))
                     docs.refresh(c, correlation_id)
@@ -124,10 +130,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
         except (adapters.StageFailure, OSError, sqlite3.Error, IntakeError) as error:
             begin()
             return failed(error)
-        if saved["intent"] is None:
-            with c:
-                save_artifact(c, correlation_id, stage_id, "intent", intent)
-        begin()
+        begin(intent if saved["intent"] is None else None)
         previous = decode(saved["evidence"].encode()) if saved["evidence"] else None
         try:
             evidence = adapters.execute(store.safe(root), stage, intent, previous)

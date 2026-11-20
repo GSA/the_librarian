@@ -1149,7 +1149,17 @@ the receipt stage and again for the extraction-registration stage (`extract.regi
   (`failure_status` is the one rule shared with `run`); a chunk's intents and attempts are one ledger commit
   before the native work and evidence is one commit after, a refused stage is recorded on that stage only, and a
   lost catalog race stays within the contention budget. Evidence names the committed revision, which the
-  chunk's documents share, so a chunk's stages settle together.
+  chunk's documents share, so a chunk's stages settle together. A chunk's ledger commits do not grow with its
+  size (Kata gfpd): `upload.stage_submissions` stages the receipt requests of all its new submissions with one
+  `store.stage_many` commit (one catalog read, IDs numbered across the chunk in order, so the records equal
+  one-at-a-time staging; each retained copy is durable before the request that names it), the prepare requests
+  of text-family documents are staged with one commit and settle through `run_batch` (`extract-prepare` is a
+  batch operation that runs each stage alone), and the registration requests are staged with one commit.
+  `stage_many` reports a refused request on that request alone, and inserts the accepted ones in one
+  transaction. PDFs, images and converted office documents still prepare one at a time, because their
+  preparation can take seconds and a chunk settles under one ledger lock hold. `run` (the one-at-a-time path)
+  also saves a new intent and records the running attempt in one commit; the intent is written first in the
+  transaction, so it is durable whenever the attempt is, and a retry is never charged for an unfinished attempt.
 - **Crash model.** A kill before the catalog COMMIT leaves SQLite's rollback journal and the prior revision
   (recovered like any killed catalog writer); a kill after it leaves the batch committed with stages still
   `running`, and the re-run finds each marker present and records its evidence; a kill between ledger members leaves
@@ -1164,7 +1174,8 @@ the receipt stage and again for the extraction-registration stage (`extract.regi
 Evidence: `tests/test_catalog_batch.py` (one revision, idempotent markers, per-member rebase, refusal isolation
 and equivalence with committing one by one on random inputs, kills before COMMIT/after COMMIT/after the receipt,
 a failure between members, two-process contention) and `tests/test_intake_batch.py` (batched equals one-at-a-time
-end state, revisions per chunk, failed documents isolated, a kill at 14 points of the chunk completed by a re-run
+end state, revisions per chunk, ledger commits per chunk that do not grow with its size, `store.stage_many`,
+failed documents isolated, a kill at 20 points of the chunk completed by a re-run
 with no duplicate or lost document, two processes ingesting one instance). Measure with
 `tools/diagnostics/batch_ingest_benchmark.py`.
 

@@ -175,7 +175,10 @@ def measure(args):
         store.inspect(root, "upload-inbox-" + hashlib.sha256(b"0").hexdigest()[:24]) if args.seed else None
         revisions = lambda: sqlite3.connect(root / ".local/catalog/catalog.sqlite3").execute(
             "SELECT count(*) FROM revisions").fetchone()[0]
+        ledger_db = root / ".local/intake/intake.sqlite3"
+        change_counter = lambda: int.from_bytes(ledger_db.read_bytes()[24:28], "big")  # +1 per committed write
         before_revisions, before_io = revisions(), Path("/proc/self/io").read_text()
+        before_commits, before_size = change_counter(), ledger_db.stat().st_size
         sync0 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
         start, cpu = time.perf_counter(), time.process_time()
         parameters = inspect.signature(cohort.ingest).parameters
@@ -192,6 +195,8 @@ def measure(args):
                   "fsync_per_doc": None if not shim else round((sync1[0] - sync0[0]) / files, 2),
                   "fdatasync_per_doc": None if not shim else round((sync1[1] - sync0[1]) / files, 2),
                   "catalog_revisions_per_doc": round((revisions() - before_revisions) / files, 3),
+                  "ledger_commits_per_doc": round((change_counter() - before_commits) / files, 2),
+                  "ledger_kib_per_doc": round((ledger_db.stat().st_size - before_size) / files / 1024, 2),
                   "kib_written_per_doc": round((int(io["write_bytes"]) - int(io0["write_bytes"])) / files / 1024, 1)}
         catalog.status(root, audit=True)  # the result must replay in full
         print("RESULT " + json.dumps(result, sort_keys=True))

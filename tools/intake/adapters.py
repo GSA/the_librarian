@@ -373,14 +373,14 @@ def receipt_marker(args):
     return marker if any(r["id"] == marker for r in records) else None
 
 
-BATCH_OPERATIONS = ("catalog-submit", "extract-register")
+BATCH_OPERATIONS = ("catalog-submit", "extract-register", "extract-prepare")
 NATIVE_ERRORS = (catalog.CatalogError, events.contract.ReviewError, docling.AdapterError, docling.bridge.BridgeError,
                  index.IndexError_, extract.ExtractionError, BadZipFile, ET.ParseError)
 
 
 def batch_scope(operation, count):
     """What a batch of ``count`` stages of ``operation`` runs inside (a parse memo for registrations)."""
-    if operation != "extract-register":
+    if operation not in {"extract-register", "extract-prepare"}:
         return nullcontext()
     scope = ExitStack()
     scope.enter_context(extract.keeping_parsed(count))
@@ -421,6 +421,12 @@ def execute_batch(root, entries):
         except (StageFailure, OSError, sqlite3.Error, IntakeError) as error:
             outcomes[index] = error
 
+    if operation == "extract-prepare":
+        # Publishes each rendition under its own run directory; nothing is shared, so each stage runs alone
+        # (the parse memo of ``batch_scope`` serves the guards and the registration that follow).
+        for index in range(len(entries)):
+            single(index)
+        return outcomes
     if operation == "catalog-submit":
         groups = {}
         for index, (stage, intent, previous) in enumerate(entries):

@@ -372,6 +372,10 @@ def _prepare_name(entry):
     return "extract-" + entry["submission_id"] + _identity(entry)[1]
 
 
+def _register_name(entry):
+    return "register-" + entry["submission_id"] + _identity(entry)[1]
+
+
 def _prepare(root, entry, heads):
     base, _ = _identity(entry)
     stage = _request(root, _prepare_name(entry), "prepare",
@@ -555,24 +559,42 @@ def _record(root, system, pending, heads):
 def _stage_receipts(root, inbox, entries, system, actor, outcomes):
     """Stage each entry's receipt request; return ``(entry, correlation ID, existing, known)`` per staged entry.
 
+    The requests of the chunk's new submissions are staged with one ledger commit (``upload.stage_submissions``).
     An entry that cannot be staged gets its outcome in ``outcomes``. Raises ``LedgerBusy`` when the
-    saved requests of the chunk cannot be read at all.
+    saved requests of the chunk cannot be read or staged at all.
     """
     correlations = {e["relative"]: _correlation(e, system) for e in entries}
     known_all = upload.known_requests(root, list(correlations.values()))
-    staged = []
+    identified = []
     for entry in entries:
+        known = {c: v for c, v in known_all.items() if c == correlations[entry["relative"]]}
         try:
-            known = {c: v for c, v in known_all.items() if c == correlations[entry["relative"]]}
             superseded, known = _identify(root, entry, system, known)
-            correlation_id, existing = upload.stage_submission(
-                root, source_path(inbox, entry), _descriptor(entry, system, actor, superseded), known=known)
-            staged.append((entry, correlation_id, existing, known))
+            item = (source_path(inbox, entry), _descriptor(entry, system, actor, superseded))
         except LedgerBusy:
             _conflict(entry)
             outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+            continue
         except IntakeError as error:
             outcomes[entry["relative"]] = _receipt_refused(error)
+            continue
+        identified.append((entry, known, item))
+    staged = []
+    merged = {c: v for _, known, _ in identified for c, v in known.items()}
+    try:
+        results = upload.stage_submissions(root, [item for _, _, item in identified], known=merged)
+    except LedgerBusy:
+        for entry, _, _ in identified:
+            _conflict(entry)
+        raise
+    for (entry, known, _), result in zip(identified, results):
+        if isinstance(result, LedgerBusy):
+            _conflict(entry)
+            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+        elif isinstance(result, IntakeError):
+            outcomes[entry["relative"]] = _receipt_refused(result)
+        else:
+            staged.append((entry, result[0], result[1], known))
     return staged
 
 
@@ -617,18 +639,89 @@ def _process_batch(root, inbox, entries, system, actor, heads, concurrency=1):
     return outcomes
 
 
-def _stage_registration(root, entry, heads, arguments):
-    """Stage (or find) one entry's registration request; return ``(correlation ID, stage ID)``."""
-    base, version = _identity(entry)
-    current = _staged(root, "register-" + entry["submission_id"] + version, "register",
-                      "extract-register", lambda: arguments(base), base, heads)
-    return current["correlation_id"], current["stages"][0]["id"]
+def _stage_chunk(root, entries, name_of, stage_id, operation, arguments, heads):
+    """``_staged`` for a chunk: ``{relative path: chain head summary}`` and ``{relative path: failure outcome}``.
+
+    One ledger open finds every chain head and one commit stages the requests that do not exist, so a
+    chunk costs a constant number of ledger commits. Each request is judged as ``_staged`` judges it
+    (a head must repeat the operation and the entry's receipt and format). ``arguments(base)`` is called
+    only for a request that must be staged. A chain that cannot be followed fails its entry alone;
+    a busy ledger raises ``LedgerBusy``.
+    """
+    names = [name_of(entry) for entry in entries]
+    found = heads.find_many(root, names)
+    summaries, failed, new = {}, {}, []
+    for entry, name, current in zip(entries, names, found):
+        base, _ = _identity(entry)
+        if isinstance(current, IntakeError):
+            if current.code not in CHAIN_REFUSALS:
+                raise current
+            failed[entry["relative"]] = {"outcome": "failed", "stage": stage_id, "code": current.code}
+        elif current is None:
+            new.append((entry, store.request_json(root, name, [{
+                "id": stage_id, "kind": "extraction", "operation": operation, "arguments": arguments(base)}])))
+        else:
+            if current["correlation_id"] != name:
+                saved = store.request(root, current["correlation_id"])["stages"]
+                if (len(saved) != 1 or saved[0]["operation"] != operation
+                        or any(saved[0]["arguments"].get(k) != v for k, v in base.items())):
+                    failed[entry["relative"]] = {"outcome": "failed", "stage": stage_id, "code": "correction_mismatch"}
+                    continue
+            summaries[entry["relative"]] = current
+    for (entry, _), result in zip(new, store.stage_many(root, [raw for _, raw in new])):
+        if isinstance(result, IntakeError):
+            if result.code not in CHAIN_REFUSALS:
+                raise result
+            failed[entry["relative"]] = {"outcome": "failed", "stage": stage_id, "code": result.code}
+        else:
+            summaries[entry["relative"]] = result
+    return summaries, failed
+
+
+# Formats whose prepare is a parse measured in milliseconds: their prepare stages settle as one chunk.
+# A converted document, PDF or image can take seconds, and a chunk settles under one ledger lock hold.
+BATCH_PREPARE = {"text", "gemini-txt", "mhtml", "odt"}
 
 
 def _prepare_batch(root, entries, heads, outcomes):
-    """Prepare each entry's extraction in turn; return those ready to register (``outcomes`` gets the rest)."""
+    """Prepare a chunk's extractions; return those ready to register (``outcomes`` gets the rest).
+
+    The quick formats stage their requests with one commit and settle together; the rest are prepared in turn.
+    """
     registering = []
+    quick = [e for e in entries if e["format"] in BATCH_PREPARE]
+    try:
+        summaries, failed = _stage_chunk(root, quick, _prepare_name, "prepare", "extract-prepare", lambda base: base, heads)
+        outcomes.update(failed)
+        open_ = [(s["correlation_id"], s["stages"][0]["id"]) for s in summaries.values()
+                 if s["stages"][0]["status"] in cohort_runtime.OPEN]
+        settled = runner.settle_batch(root, open_) if open_ else {}
+    except LedgerBusy:
+        for entry in quick:
+            _conflict(entry)
+            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+        quick, summaries, settled = [], {}, {}
+    for entry in quick:
+        current = summaries.get(entry["relative"])
+        if current is None:
+            continue
+        stage = settled.get(current["correlation_id"], current)["stages"][0]
+        _conflict(entry, runner.conflicts(stage))
+        if stage["status"] in cohort_runtime.OPEN:
+            # Still retryable after the chunk's pass: ``settle`` keeps retrying a stage within its attempt budget.
+            try:
+                stage = _prepare(root, entry, heads)
+            except LedgerBusy:
+                _conflict(entry)
+                outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+                continue
+        if stage["status"] != "succeeded":
+            outcomes[entry["relative"]] = _failure(stage["id"], stage)
+        else:
+            registering.append(entry)
     for entry in entries:
+        if entry["format"] in BATCH_PREPARE:
+            continue
         try:
             stage = _prepare(root, entry, heads)
             if stage["status"] != "succeeded":
@@ -646,7 +739,8 @@ def _prepare_batch(root, entries, heads, outcomes):
 
 
 def _extract_batch(root, entries, actor, heads, concurrency=1):
-    """``_extract`` for a chunk: each document prepared in turn, their registrations committed together.
+    """``_extract`` for a chunk: the text-family documents' prepare stages settle together, their registrations
+    are staged with one commit and committed together.
 
     PDFs and images are converted first, up to ``concurrency`` at once and outside the ledger.
     """
@@ -660,16 +754,15 @@ def _extract_batch(root, entries, actor, heads, concurrency=1):
         # One state read pins every registration staged now; each is rebased on its own.
         state = state or catalog.status(root)["state_token"]
         return {**base, "actor": actor, "expected_state": state}
-    heads_of = []  # (entry, correlation ID, stage ID)
-    for entry in registering:
-        try:
-            heads_of.append((entry, *_stage_registration(root, entry, heads, arguments)))
-        except LedgerBusy:
-            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-        except IntakeError as error:
-            if error.code not in CHAIN_REFUSALS:
-                raise
-            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "register", "code": error.code}
+    try:
+        staged, failed = _stage_chunk(root, registering, _register_name, "register", "extract-register",
+                                      lambda base: arguments(base), heads)
+    except LedgerBusy:
+        outcomes.update((entry["relative"], dict(BUSY_FAILURE)) for entry in registering)
+        return outcomes
+    outcomes.update(failed)
+    heads_of = [(entry, staged[entry["relative"]]["correlation_id"], staged[entry["relative"]]["stages"][0]["id"])
+                for entry in registering if entry["relative"] in staged]
     try:
         pending = [(corr, stage_id) for _, corr, stage_id in heads_of]
         summaries = runner.settle_batch(root, pending) if pending else {}

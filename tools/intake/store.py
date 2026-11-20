@@ -428,14 +428,66 @@ def stage(root, raw):
         return summary(c, correlation)
 
 
-def stage_request(root, correlation_id, stages, correction_of=None):
-    """Stage a version-1 request of ``stages`` under the instance policy; return its summary."""
-    return stage(root, json.dumps({
+def stage_many(root, raws):
+    """``stage`` for many requests under one ledger lock and one commit; one result per request, in order.
+
+    Each result is the request's summary, or the ``IntakeError`` that ``stage`` would have raised for it
+    alone (an invalid request, a correlation ID already staged with other bytes, an unknown correction
+    parent); a refused request writes nothing and never blocks the others. The accepted requests
+    are inserted in one transaction, so a crash leaves all of them or none. A request repeated within
+    ``raws`` is staged once. A busy or unavailable ledger raises, with nothing written.
+    """
+    results, accepted, seen = [None] * len(raws), [], {}
+    with locked(root) as c:
+        for index, raw in enumerate(raws):
+            try:
+                value = decode_request(raw)
+                correlation = value["correlation_id"]
+                prior = c.execute("SELECT raw FROM requests WHERE correlation_id=?", (correlation,)).fetchone()
+                if prior is None and correlation in seen:
+                    prior = (seen[correlation],)
+                if prior:
+                    require(prior[0] == raw, "correlation_conflict")
+                    continue
+                parent = value["correction_of"]
+                if parent:
+                    require(parent in seen or c.execute("SELECT 1 FROM requests WHERE correlation_id=?",
+                                                        (parent,)).fetchone() is not None,
+                            "unknown_correction_parent")
+                seen[correlation] = raw
+                accepted.append((raw, value))
+            except IntakeError as error:
+                results[index] = error
+        if accepted:
+            home = str(safe(root))
+            with c:
+                for raw, value in accepted:
+                    correlation = value["correlation_id"]
+                    c.execute("INSERT INTO requests VALUES (?,?,?,?,?)",
+                              (correlation, value["correction_of"], raw, digest(raw), home))
+                    c.executemany("INSERT INTO stages(correlation_id,stage_id,ordinal,status) VALUES (?,?,?,'staged')",
+                                  [(correlation, s["id"], i) for i, s in enumerate(value["stages"])])
+                    if value["correction_of"]:
+                        docs.repoint(c, value["correction_of"], correlation)
+        for index, raw in enumerate(raws):
+            if results[index] is None:
+                results[index] = summary(c, decode_request(raw)["correlation_id"])
+    return results
+
+
+def request_json(root, correlation_id, stages, correction_of=None):
+    """The bytes of a version-1 request of ``stages`` under the instance policy."""
+    return json.dumps({
         "version": 1, "correlation_id": correlation_id, "correction_of": correction_of,
         "policy": {"version": 1, "sha256": policy.for_root(root)[1]},
         "retry": {"max_attempts": 3, "backoff_seconds": 0},
         "stages": stages,
-    }).encode())
+    }).encode()
+
+
+def stage_request(root, correlation_id, stages, correction_of=None):
+    """Stage a version-1 request of ``stages`` under the instance policy; return its summary."""
+    return stage(root, request_json(root, correlation_id, stages, correction_of))
 
 
 def inspect(root, correlation_id):
@@ -521,6 +573,19 @@ class Heads:
             require(len(children) == 1 and children[0] not in seen, "ambiguous_correction")
             current = children[0]
             seen.add(current)
+
+    def find_many(self, root, correlation_ids):
+        """``find_head`` for many IDs under one ledger lock: per ID the head's summary, None when no such
+        request was staged, or the ``IntakeError`` (an ambiguous chain) that ``head`` would raise for it."""
+        found = []
+        with locked(root) as c:
+            for correlation_id in correlation_ids:
+                try:
+                    current = self.resolve(c, correlation_id)
+                    found.append(None if current is None else summary(c, current))
+                except IntakeError as error:
+                    found.append(error)
+        return found
 
     def head(self, root, correlation_id):
         with locked(root) as c:
