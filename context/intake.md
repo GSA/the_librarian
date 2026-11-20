@@ -264,7 +264,10 @@ Each document is judged on its own inside the chunk:
 - **Atomic.** The accepted documents are validated together and written in one SQLite transaction: all or none.
   If the union does not validate, documents are validated one at a time in order to find the refused ones.
 - **Ledger.** Each stage keeps its own attempt and status; evidence names the revision the document committed in
-  (documents of one chunk share it) and a chunk's stages settle together.
+  (documents of one chunk share it) and a chunk's stages settle together. A chunk commits its receipt requests,
+  its prepare requests (text-family documents) and its registration requests once each, and each stage settlement
+  twice (intent and running attempt, then evidence), so ledger commits per document fall toward zero as the chunk
+  grows (12 per document at `--batch-size 1` before, 6 at the default 50, under 0.2 now).
 
 A process killed at any point leaves a catalog at a revision boundary (a killed writer's rollback journal needs the
 usual explicit recovery, `migrate-indexes --recover`) and a ledger whose unfinished attempts the next run reuses; run
