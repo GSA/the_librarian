@@ -568,8 +568,17 @@ def _stage_receipts(root, inbox, entries, system, actor, outcomes):
     identified = []
     for entry in entries:
         known = {c: v for c, v in known_all.items() if c == correlations[entry["relative"]]}
-        superseded, known = _identify(root, entry, system, known)
-        identified.append((entry, known, (source_path(inbox, entry), _descriptor(entry, system, actor, superseded))))
+        try:
+            superseded, known = _identify(root, entry, system, known)
+            item = (source_path(inbox, entry), _descriptor(entry, system, actor, superseded))
+        except LedgerBusy:
+            _conflict(entry)
+            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
+            continue
+        except IntakeError as error:
+            outcomes[entry["relative"]] = _receipt_refused(error)
+            continue
+        identified.append((entry, known, item))
     staged = []
     merged = {c: v for _, known, _ in identified for c, v in known.items()}
     try:

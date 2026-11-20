@@ -167,6 +167,42 @@ class LedgerCommits(unittest.TestCase):
         self.assertEqual(ids(root_a), ids(root_b))
 
 
+class ChunkStaging(unittest.TestCase):
+    def test_one_document_is_read_and_published_before_the_next_is_read(self):
+        root, inbox = make_instance(self, 4)
+        events, staging = [], []
+        read, publish, many = upload.read_file, upload.publish, upload.stage_submissions
+
+        def tracked_read(*a, **k):
+            if staging:
+                events.append("read")
+            return read(*a, **k)
+
+        def tracked_publish(*a, **k):
+            events.append("publish")
+            return publish(*a, **k)
+        with patch.object(upload, "stage_submissions", lambda *a, **k: staging.append(1) or many(*a, **k)), \
+                patch.object(upload, "read_file", tracked_read), patch.object(upload, "publish", tracked_publish):
+            cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
+        # a document's bytes are published (original, then sidecar) before the next document is read
+        self.assertEqual(events[:6], ["read", "publish", "publish", "read", "publish", "publish"])
+
+    def test_a_document_whose_descriptor_is_refused_fails_alone(self):
+        root, inbox = make_instance(self, 4)
+        victim = next(p.relative_to(inbox).as_posix() for p in inbox.rglob("note-000001.*"))
+        real = cohort_ingest._descriptor
+
+        def refusing(entry, *args):
+            if entry["relative"] == victim:
+                raise IntakeError("invalid_origin")
+            return real(entry, *args)
+        with patch.object(cohort_ingest, "_descriptor", refusing):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
+        outcomes = {e["relative"]: e for e in report["entries"] if "outcome" in e}
+        self.assertEqual((outcomes[victim]["outcome"], outcomes[victim]["code"]), ("failed", "invalid_origin"))
+        self.assertEqual(sum(e["outcome"] == "extracted" for e in outcomes.values()), 3)
+
+
 class StageMany(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()

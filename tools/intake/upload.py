@@ -712,59 +712,56 @@ def stage_submissions(root, items, known=None):
 
     Returns one ``(correlation_id, existing)`` or ``IntakeError`` per item, in order; a refused submission
     never blocks the others. IDs are numbered across the chunk in order, so the result equals staging the
-    items one at a time. A busy ledger raises ``LedgerBusy`` with no request staged. The retained copies are
-    durable before the requests that name them, and everything is idempotent, so a crash is completed by
-    running the chunk again. ``known`` is a ``known_requests`` result read earlier; requests it lacks are read here.
+    items one at a time. Each file is read, checked and its retained copy published in turn, and only its
+    request (about 2.5 KB) is kept for the shared commit, so memory does not grow with the chunk. A busy
+    ledger raises ``LedgerBusy`` with no request staged. The retained copies are durable before the
+    requests that name them, and everything is idempotent, so a crash is completed by running the chunk
+    again. ``known`` is a ``known_requests`` result read earlier; requests it lacks are read here.
     """
     root = store.safe(root)
     results = [None] * len(items)
     with upload_lock(root):
-        read = {}
-        for index, (path, value) in enumerate(items):
+        values = {}
+        for index, (_, value) in enumerate(items):
             try:
-                read[index] = _read_submission(root, path, value)
+                values[index] = validate_descriptor(value)
             except IntakeError as error:
                 results[index] = error
-        saved = {c: known[c][0] for c in (r[2] for r in read.values()) if known and c in known}
-        saved.update(saved_requests(root, [r[2] for r in read.values() if r[2] not in saved]))
-        fresh = []
-        for index, (value, raw, correlation_id, _, original_path, sidecar_path, sidecar) in list(read.items()):
-            prior = saved.get(correlation_id)
-            try:
-                if prior is not None:
-                    _same_submission(prior, raw, original_path, sidecar_path, sidecar)
-                    results[index] = (correlation_id, True)
-                else:
-                    fresh.append(index)
-            except IntakeError as error:
-                results[index] = error
-                del read[index]
-        requests = {}
-        if fresh:
-            probe = {i for index in fresh for i in submission_ids(read[index][0]["submission_id"])}
+        correlations = {i: correlation(v["submission_id"]) for i, v in values.items()}
+        saved = {c: known[c][0] for c in correlations.values() if known and c in known}
+        saved.update(saved_requests(root, [c for c in correlations.values() if c not in saved]))
+        view = None
+        probe = {i for index, v in values.items() if correlations[index] not in saved
+                 for i in submission_ids(v["submission_id"])}
+        if probe:
             state, taken = catalog_view(root, probe)
             taken |= reserved_ids(root, probe)
-            for index in fresh:
-                value, raw, correlation_id, _, original_path, sidecar_path, sidecar = read[index]
-                try:
-                    records = records_for(root, value, raw, original_path, sidecar_path, sidecar, (state, taken))[1]
-                except IntakeError as error:
-                    results[index] = error
-                    del read[index]
-                    continue
-                for prefix in PREFIXES:
-                    taken.highest[prefix] = max(taken.highest[prefix],
-                                                highest_number((r["id"] for r in records), prefix))
-                requests[index] = _receipt_request(root, value, correlation_id, records, state)
-        for index, (value, raw, correlation_id, directory, *_, sidecar) in read.items():
+            view = (state, taken)
+        requests = {}
+        for index, value in values.items():
+            path = items[index][0]
             try:
+                _, raw, correlation_id, directory, original_path, sidecar_path, sidecar = _read_submission(root, path, value)
+                prior = saved.get(correlation_id)
+                if prior is not None:
+                    _same_submission(prior, raw, original_path, sidecar_path, sidecar)
+                    records = None
+                else:
+                    records = records_for(root, value, raw, original_path, sidecar_path, sidecar, view)[1]
                 _publish_copies(root, directory, value, raw, sidecar)
             except IntakeError as error:
                 results[index] = error
-                requests.pop(index, None)
+                continue
+            if records is None:
+                results[index] = (correlation_id, True)
+                continue
+            for prefix in PREFIXES:
+                view[1].highest[prefix] = max(view[1].highest[prefix],
+                                              highest_number((r["id"] for r in records), prefix))
+            requests[index] = (correlation_id, _receipt_request(root, value, correlation_id, records, view[0]))
         order = list(requests)
-        for index, outcome in zip(order, store.stage_many(root, [requests[i] for i in order])):
-            results[index] = outcome if isinstance(outcome, IntakeError) else (read[index][2], False)
+        for index, outcome in zip(order, store.stage_many(root, [requests[i][1] for i in order])):
+            results[index] = outcome if isinstance(outcome, IntakeError) else (requests[index][0], False)
     return results
 
 
