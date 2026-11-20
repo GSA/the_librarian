@@ -191,7 +191,7 @@ print(json.dumps({'prepared':prepared['created'],'registered':registered['regist
 class ScriptConventionTests(unittest.TestCase):
     MODULES = (
         "tools.initialize", "tools.package", "tools.schemas.export_schemas",
-        "tools.catalog.inventory", "tools.extraction.docling_extract",
+        "tools.catalog.inventory", "tools.extraction.docling_extract", "tools.evals.cli",
     )
 
     def test_commands_expose_strict_parser_and_injectable_main(self):

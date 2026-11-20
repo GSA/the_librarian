@@ -93,6 +93,21 @@ The first write of each UTC day replays the history once for its daily snapshot
 (profile it with
 `tools/diagnostics/catalog_daily_replay_benchmark.py`).
 
+Retrieval quality is measured per instance against ignored local cases
+(`config/evals.local.json`). Capture a baseline before a policy change, rereview
+or publish, and compare after it:
+
+```sh
+python -m tools.evals --root ROOT generate --seed 1 --count 200 --absences 10
+python -m tools.evals --root ROOT run   # baseline; scorecard under ROOT/tools/evals/.local/runs/
+# ...change policy, rereview, publish...
+python -m tools.evals --root ROOT run   # after
+python -m tools.evals compare BASELINE.json NEW.json
+```
+
+Case format, metrics and procedure are in
+[context/retrieval-evals.md](context/retrieval-evals.md).
+
 ## Ingesting files
 
 Every path below is started by an operator. The intake commands record each
@@ -304,6 +319,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `progress`, `progress-serve` |
 | `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `recover-deferred`, `rereview`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
+| `python -m tools.evals` | Retrieval-quality evaluation: `generate` seeded cases, `run` them against a fresh index into a body-free scorecard, `compare BASE NEW` (exit 1 on a regression) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
 | `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index |
