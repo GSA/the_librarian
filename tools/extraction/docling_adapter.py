@@ -219,6 +219,10 @@ def _private_assets(source_root: Path, destination: Path):
     conversions share nothing. The worker still hashes the copy against the pinned assets
     (a file swapped while it is copied cannot match its pin) and detects any later change.
     """
+    # Keep the worker's selected-path rule: no symlink anywhere in the asset root's chain.
+    # (Content swapped after this check still cannot match the pinned hashes.)
+    for entry in (source_root, *source_root.parents):
+        require(not entry.is_symlink(), "Symlink in model assets path", "unsafe_assets")
     destination.mkdir(mode=0o700)
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:

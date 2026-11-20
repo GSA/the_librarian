@@ -540,6 +540,17 @@ class AdapterProcess(unittest.TestCase):
                 shutil.rmtree(assets)
                 shutil.rmtree(outside)
 
+    def test_symlinked_ancestor_of_the_asset_root_is_refused_by_convert(self):
+        """roborev 850: the copy must not weaken the worker's rule against linked path chains."""
+        assets = self.assets_tree()
+        link = self.root / "model-link"
+        link.symlink_to(self.root, target_is_directory=True)
+        worker = self.stub_worker("payload={}\n")
+        with self.assertRaises(adapter.AdapterError) as raised:
+            self.run_convert(worker, link / "assets")
+        self.assertEqual(raised.exception.code, "unsafe_assets")
+        self.assertEqual(self.run_convert(worker, assets), {})
+
     def test_concurrent_conversions_get_distinct_private_copies(self):
         from concurrent.futures import ThreadPoolExecutor
         assets = self.assets_tree()
