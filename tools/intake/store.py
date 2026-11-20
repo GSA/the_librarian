@@ -258,10 +258,11 @@ def validate(c, root):
 
     Read in keyset pages, each in its own short read transaction and verified after it ends, so
     memory is a page and no read lock is held across digest work. Nothing is retained between
-    pages (``PageMemo(limit=0)``), so every digest is computed afresh.
+    pages (each page gets a fresh ``PageMemo(limit=0)``), so every
+    digest is computed afresh and memory stays a page.
     """
     check_identity(c)
-    memo, after, count = PageMemo(limit=0), None, 0
+    after, count = None, 0
     while True:
         c.execute("BEGIN")
         try:
@@ -270,7 +271,7 @@ def validate(c, root):
             c.execute("COMMIT")
         if not rows[0]:
             return count
-        verify_page(rows, root, memo)
+        verify_page(rows, root, PageMemo(limit=0))
         count += len(rows[0])
         after = rows[0][-1]["correlation_id"]
 

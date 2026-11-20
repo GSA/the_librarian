@@ -228,6 +228,18 @@ class AuditTests(Case):
                         store.audit(self.root)
                     self.assertEqual(caught.exception.code, expected)
 
+    def test_audit_retains_nothing_between_pages(self):
+        self.seed(7)
+        memos = []
+        real = store.verify_page
+        with mock.patch.object(store, "AUDIT_PAGE", 3), \
+                mock.patch.object(store, "verify_page", side_effect=lambda rows, root, memo: (
+                    memos.append(memo), real(rows, root, memo))[1]):
+            store.audit(self.root)
+        self.assertEqual(len(memos), 3)
+        self.assertEqual(len({id(memo) for memo in memos}), 3)  # a fresh memo per page
+        self.assertTrue(all(len(memo) == 0 for memo in memos))  # nothing kept as proven
+
     def test_audit_refuses_a_page_boundary_row(self):
         self.seed(6)
         with closing(sqlite3.connect(self.db)) as connection, connection:

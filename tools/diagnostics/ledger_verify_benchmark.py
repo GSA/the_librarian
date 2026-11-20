@@ -45,7 +45,11 @@ def main(argv=None):
             start = time.perf_counter()
             store.check_identity(connection)
             open_seconds = round(time.perf_counter() - start, 3)
-        full = getattr(store, "audit", None) or (lambda r: store.validate(sqlite3.connect(db), r))
+        def validate_old(r):
+            with closing(sqlite3.connect(db)) as connection:
+                connection.row_factory = sqlite3.Row
+                store.validate(connection, r)
+        full = getattr(store, "audit", None) or validate_old
         before, seconds = resident_mb(), []
         for _ in range(args.passes):
             start = time.perf_counter()
