@@ -145,12 +145,18 @@ class MemoTests(Case):
             raw = connection.execute("SELECT raw FROM requests WHERE correlation_id='upload-rewrite'").fetchone()[0]
             connection.execute("UPDATE requests SET raw=? WHERE correlation_id='upload-rewrite'",
                                (raw.replace(b'"S1"', b'"S5"'),))
-        # The stored digest no longer matches the bytes: the ledger refuses before any memo is consulted.
+        # The stored digest no longer matches the bytes: the audit refuses (writers no longer re-verify
+        # every row, Kata qwtp), and a request read afresh is checked against its own digest.
+        with self.assertRaises(IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
+        upload.PROMISES.clear()
+        upload.forget_reserved()
         with self.assertRaises(IntakeError) as caught:
             upload.reserved_ids(self.root)
         self.assertEqual(caught.exception.code, "corrupt_request")
 
-    def test_row_whose_digest_names_a_memoized_request_is_still_caught_by_ledger_validation(self):
+    def test_row_whose_digest_names_a_memoized_request_is_still_caught_by_the_audit(self):
         upload.submit(self.root, self.file(), value("one"))
         upload.submit(self.root, self.file("two.txt", b"two\n"), value("two", "two.txt"))
         upload.reserved_ids(self.root)
@@ -161,7 +167,7 @@ class MemoTests(Case):
             connection.execute("UPDATE requests SET raw=?, request_sha256=? WHERE correlation_id='upload-two'",
                                (one[0], one[1]))
         with self.assertRaises(IntakeError):
-            upload.reserved_ids(self.root)
+            store.audit(self.root)
 
     def test_a_request_staged_by_another_agent_after_the_memo_was_filled_is_never_missed(self):
         upload.submit(self.root, self.file(), value("mine"))

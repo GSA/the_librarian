@@ -12,9 +12,8 @@ import time
 
 from tools import policy
 from tools.durable import fsync_directory, reserve
-from tools.file_identity import file_identity
 from . import docs
-from .contracts import IntakeError, LedgerBusy, decode, decode_request, digest, request_layout, request_shape, require
+from .contracts import IntakeError, LedgerBusy, decode, decode_request, digest, request_layout, require
 
 APPLICATION_ID = 0x4C494E54
 SCHEMA = 1
@@ -115,28 +114,14 @@ def initialize(root):
     return {"initialized": True, "schema": SCHEMA}
 
 
-# Verified-ledger memo. ``verify`` walks every row in the same order each time, so a fixed-size
-# LRU smaller than the ledger never hits. Instead each pass consults the previous pass's memo and
-# builds the next one from the rows it just verified: memory follows the live ledger, not history,
-# and a cyclic walk cannot thrash. Entries are keyed by the exact bytes (request bytes, artifact
-# text) and record the digest those bytes were proven to have, so a hit requires identical bytes
-# and an identical stored digest; any rewritten row is a miss and is decoded and hashed afresh.
-# Entries are recorded only after the whole pass succeeded; failures are never cached.
-MEMO_BYTES = 128 * 1024 * 1024  # key bytes retained; rows beyond it are re-verified every pass
-_MEMO_ENTRY_OVERHEAD = 160  # digest string and dict slot per entry
-_verified = ({}, {})  # (request bytes -> (sha256, shape), artifact text -> sha256)
+# Cadence (Kata qwtp). A writer pays only the structural check below, once per process for each ledger
+# file (``_checked``); the O(ledger) digest and shape verification is ``audit`` (and ``relocate``).
+_checked = set()
 
 
-def forget_verified():
-    global _verified
-    _verified = ({}, {})
-
-
-def verified_bytes():
-    """Bytes of keys (plus per-entry overhead) the memo currently holds."""
-    requests, artifacts = _verified
-    return (sum(len(raw) for raw in requests) + sum(len(text) for text in artifacts)
-            + _MEMO_ENTRY_OVERHEAD * (len(requests) + len(artifacts)))
+def forget_checked():
+    """Make the next writer in this process check the ledger's structure again (tests, long-lived callers)."""
+    _checked.clear()
 
 
 def check_identity(c):
@@ -181,8 +166,7 @@ def check_request(row, shape, root, stages_of, attempts_of, replays_of, artifact
     """Every check on one saved request's identity, stages, artifacts, attempts and replays.
 
     ``shape`` is its validated (correlation ID, correction parent, stage IDs); ``artifact(text,
-    stored_sha256)`` proves one saved intent or evidence. Shared by ``verify`` and ``verify_page``,
-    so there is one copy of the rules.
+    stored_sha256)`` proves one saved intent or evidence. Used by ``verify_page``, the one copy of the rules.
     """
     correlation_id, correction_of, stage_ids = shape
     require(row["root"] == str(root) and correlation_id == row["correlation_id"]
@@ -207,37 +191,6 @@ def check_request(row, shape, root, stages_of, attempts_of, replays_of, artifact
         require(replays_of.get((row["correlation_id"], stage_id), []) == list(range(1, saved["cycle"] + 1)), "corrupt_replay")
 
 
-def verify(rows, root):
-    """Digest and shape checks over a ``snapshot``; pure, so it needs no database lock."""
-    global _verified
-    requests, stages_of, attempts_of, replays_of = rows
-    known_requests, known_artifacts = _verified
-    remembered_requests, remembered_artifacts, held = {}, {}, 0
-
-    def remember(into, key, value):
-        nonlocal held
-        if key not in into and held + len(key) + _MEMO_ENTRY_OVERHEAD <= MEMO_BYTES:
-            held += len(key) + _MEMO_ENTRY_OVERHEAD
-            into[key] = value
-
-    def artifact(raw, stored):
-        if known_artifacts.get(raw) != stored:
-            require(digest(raw.encode()) == stored and isinstance(decode(raw.encode()), dict), "corrupt_artifact")
-        remember(remembered_artifacts, raw, stored)
-
-    for row in requests:
-        raw = row["raw"]
-        known = known_requests.get(raw)
-        if known is not None and known[0] == row["request_sha256"]:
-            shape = known[1]
-        else:
-            shape = request_shape(raw)
-            require(digest(raw) == row["request_sha256"], "corrupt_request")
-        remember(remembered_requests, raw, (row["request_sha256"], shape))
-        check_request(row, shape, root, stages_of, attempts_of, replays_of, artifact)
-    _verified = (remembered_requests, remembered_artifacts)
-
-
 class PageMemo:
     """What ``verify_page`` has already proven, keyed by SHA-256 digests (no raw bytes retained).
 
@@ -258,11 +211,11 @@ class PageMemo:
 
 
 def verify_page(rows, root, memo):
-    """``verify`` for one page of ``snapshot(c, after, limit)``; returns each request's stage layout.
+    """Verify one page of ``snapshot(c, after, limit)``; returns each request's stage layout.
 
     The layout is a tuple of (stage ID, kind, operation) per stage, from the validated request.
-    Every check of ``verify`` runs, with the digest-keyed ``memo`` standing in for its
-    byte-keyed one; failures are never recorded.
+    Every check runs; a digest-keyed ``memo`` may stand in for work already proven, and failures
+    are never recorded.
     """
     requests, stages_of, attempts_of, replays_of = rows
 
@@ -297,10 +250,54 @@ def verify_page(rows, root, memo):
     return layouts
 
 
+AUDIT_PAGE = 5000  # requests per short read transaction of a full verification
+
+
 def validate(c, root):
-    """Full O(ledger) validation, run when no trusted attestation covers the file."""
+    """Full O(ledger) validation: ``check_identity``, then every request's digests and shape.
+
+    Read in keyset pages, each in its own short read transaction and verified after it ends, so
+    memory is a page and no read lock is held across digest work. Nothing is retained between
+    pages (``PageMemo(limit=0)``), so every digest is computed afresh.
+    """
     check_identity(c)
-    verify(snapshot(c), root)
+    memo, after, count = PageMemo(limit=0), None, 0
+    while True:
+        c.execute("BEGIN")
+        try:
+            rows = snapshot(c, after, AUDIT_PAGE)
+        finally:
+            c.execute("COMMIT")
+        if not rows[0]:
+            return count
+        verify_page(rows, root, memo)
+        count += len(rows[0])
+        after = rows[0][-1]["correlation_id"]
+
+
+def audit(root):
+    """Read-only full verification of the intake ledger; raises the first ``corrupt_*`` refusal.
+
+    Takes no writer lock and writes nothing, so it can run beside a live run. It is the one check
+    of every stored digest and every request, stage, attempt and replay rule (what each writer
+    used to repeat per process); each page is consistent, the pass as a whole is not one snapshot.
+    """
+    root, home, db = locations(root)
+    private(home, True)
+    private(db)
+    try:
+        c = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    except sqlite3.Error as error:
+        raise IntakeError("ledger_unavailable") from error
+    with closing(c):
+        c.row_factory = sqlite3.Row
+        try:
+            requests = validate(c, root)
+        except sqlite3.OperationalError as error:
+            raise IntakeError("ledger_unavailable") from error
+        except sqlite3.DatabaseError as error:
+            raise IntakeError("corrupt_store") from error
+    return {"audited": True, "requests": requests}
 
 
 LOCK_WAIT_ENV = "LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS"
@@ -343,26 +340,24 @@ def _acquire(fd, wait):
             time.sleep(random.uniform(0.02, 0.1))
 
 
-def _take_attestation(fd, root):
-    """The identity the previous clean writer left in the lock file, consumed on read.
+def _check_structure(c, db, root):
+    """Application identity always; SQLite integrity, foreign keys and the bound host path once per
+    process per file.
 
-    The lock file is truncated as soon as this writer holds the lock, so a crash,
-    or any commit that does not finish with a fresh attestation, forces the next
-    writer to validate in full.
+    The file is identified by path, device and inode, so a replaced or restored file is checked
+    again. A failed check is never remembered.
     """
-    try:
-        raw = os.pread(fd, 4096, 0)
-        os.ftruncate(fd, 0)
-        value = json.loads(raw)
-        if value["version"] == 1 and value["root"] == str(root) and isinstance(value["identity"], list):
-            return value["identity"]
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return None
-
-
-def _attest(fd, root, identity):
-    os.pwrite(fd, json.dumps({"version": 1, "root": str(root), "identity": identity}).encode(), 0)
+    info = os.stat(db, follow_symlinks=False)
+    key = (str(db), info.st_dev, info.st_ino)
+    if key in _checked:
+        require(c.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
+                and c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA, "incompatible_store")
+        return
+    check_identity(c)
+    # A ledger bound to another host path is refused until ``relocate`` rebinds it.
+    require(c.execute("SELECT 1 FROM requests WHERE root!=? LIMIT 1", (str(root),)).fetchone() is None,
+            "corrupt_request")
+    _checked.add(key)
 
 
 @contextmanager
@@ -375,50 +370,26 @@ def locked(root, wait=None):
     safe(lock)
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     c = None
-    clean = False
-    entered = None
     try:
         try:
             private(lock)
             _acquire(fd, seconds)
-            known = _take_attestation(fd, root)
             c = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=seconds)
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("PRAGMA synchronous=FULL")
-            # Changes only when another connection commits; read before the identity check
-            # so no foreign commit can land unseen between the two.
-            foreign = c.execute("PRAGMA data_version").fetchone()[0]
-            # Another writer's clean hand-off left its attestation; a file that still matches
-            # it was last written by a validated writer, so the O(ledger) pass is skipped.
-            if known is None or known != file_identity(db, c):
-                validate(c, root)
+            _check_structure(c, db, root)
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='requests_correction'").fetchone() is None:
                 with c:
                     c.execute(CORRECTION_INDEX)
-            entered = file_identity(db, c)
         except sqlite3.Error as error:
             raise (LedgerBusy() if _busy(error) else IntakeError("corrupt_store")) from error
         try:
-            # A failure after validation is an unavailable ledger, not a corrupt one.
+            # A failure after the check is an unavailable ledger, not a corrupt one.
             yield c
         except sqlite3.Error as error:
             raise (LedgerBusy() if _busy(error) else IntakeError("ledger_unavailable")) from error
-        clean = True
     finally:
-        try:
-            # Recorded while still holding the writer lock, after this process's own commits,
-            # and only when no other connection committed since validation.
-            if c is not None:
-                identity = file_identity(db, c)
-                # A block that raised is attested only when the file is exactly as it was when
-                # validated (a read-only refusal such as ``unknown_request``): nothing was
-                # written, so a partial write can never be handed off as validated.
-                if identity is not None and (clean or identity == entered) \
-                        and c.execute("PRAGMA data_version").fetchone()[0] == foreign:
-                    _attest(fd, root, identity)
-        except (OSError, sqlite3.Error):
-            pass
         if c is not None:
             c.close()
         os.close(fd)

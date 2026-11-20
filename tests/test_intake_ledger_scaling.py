@@ -1,6 +1,8 @@
 """Intake ledger writers scale: bounded hand-off validation, bounded waits, short readers."""
+import contextlib
 from contextlib import closing
 import fcntl
+import io
 import json
 import multiprocessing
 import os
@@ -31,15 +33,16 @@ def request(correlation, **changes):
 
 
 def writer(root, commands, results):
-    """A long-lived writer process that stages one request per command and reports how
-    much full-ledger validation it performed."""
-    calls = []
-    real = store.validate
-    with mock.patch.object(store, "validate", side_effect=lambda *a: calls.append(1) or real(*a)):
+    """A long-lived writer process that stages one request per command and reports how many times
+    it validated the whole ledger and checked its structure."""
+    full, structure = [], []
+    real_validate, real_check = store.validate, store.check_identity
+    with mock.patch.object(store, "validate", side_effect=lambda *a: full.append(1) or real_validate(*a)), \
+            mock.patch.object(store, "check_identity", side_effect=lambda *a: structure.append(1) or real_check(*a)):
         for correlation in iter(commands.get, None):
-            before = len(calls)
+            before = (len(full), len(structure))
             store.stage(Path(root), request(correlation))
-            results.put((correlation, len(calls) - before))
+            results.put((correlation, len(full) - before[0], len(structure) - before[1]))
 
 
 class Case(unittest.TestCase):
@@ -62,8 +65,14 @@ class Case(unittest.TestCase):
         return descriptor
 
 
-class HandOffTests(Case):
-    def test_alternating_writers_do_not_revalidate_the_ledger_per_hand_off(self):
+class CadenceTests(Case):
+    """What a writer checks, and when (Kata qwtp); everything else is ``store.audit``."""
+
+    def tamper_digest(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
+
+    def test_alternating_writers_never_validate_in_full_and_check_structure_once_each(self):
         self.seed(40)
         context = multiprocessing.get_context("spawn")
         results = context.Queue()
@@ -76,68 +85,190 @@ class HandOffTests(Case):
             processes.append(process)
             self.addCleanup(process.join, 30)
         self.addCleanup(lambda: [q.put(None) for q in queues])
-        validations = {}
+        seen = {}
         for turn in range(6):
             name = "turn-%d" % turn
             queues[turn % 2].put(name)
-            got, calls = results.get(timeout=60)
-            validations[got] = calls
-        # Each hand-off sees a foreign commit; none may repeat the O(ledger) pass.
-        self.assertEqual(validations, {"turn-%d" % n: 0 for n in range(6)})
+            got, full, structure = results.get(timeout=60)
+            seen[got] = (full, structure)
+        # No writer repeats the O(ledger) pass; each process checks the file's structure on its first lock only.
+        self.assertEqual(seen, {"turn-%d" % n: (0, 1 if n < 2 else 0) for n in range(6)})
 
-    def test_read_only_refusal_still_hands_off_the_attestation(self):
-        # Cohort ingest probes for requests that do not exist yet; that refusal wrote nothing,
-        # so the next writer must not repeat the O(ledger) validation because of it.
+    def test_a_read_only_refusal_costs_the_next_writer_nothing(self):
         self.seed(3)
         store.list_requests(self.root)
-        with mock.patch.object(store, "validate", wraps=store.validate) as validate:
+        with mock.patch.object(store, "validate", wraps=store.validate) as validate, \
+                mock.patch.object(store, "check_identity", wraps=store.check_identity) as structure:
             with self.assertRaises(contracts.IntakeError) as caught:
                 store.inspect(self.root, "no-such-request")
             self.assertEqual(caught.exception.code, "unknown_request")
-            store.list_requests(self.root)
             store.stage(self.root, request("after-probe"))
             store.list_requests(self.root)
-        self.assertEqual(validate.call_count, 0)
+        self.assertEqual((validate.call_count, structure.call_count), (0, 0))
 
-    def test_refusal_after_a_write_does_not_hand_off_the_attestation(self):
-        self.seed(2)
-        store.list_requests(self.root)
-        with self.assertRaises(RuntimeError):
-            with store.locked(self.root) as connection:
-                with connection:
-                    connection.execute("UPDATE stages SET status='blocked' WHERE correlation_id='seed-000'")
-                raise RuntimeError("failed after committing")
-        with mock.patch.object(store, "validate", wraps=store.validate) as validate:
-            store.list_requests(self.root)
-        self.assertEqual(validate.call_count, 1)
-
-    def test_tampering_after_a_read_only_refusal_is_still_fully_validated(self):
-        self.seed(3)
-        with self.assertRaises(contracts.IntakeError):
-            store.inspect(self.root, "no-such-request")
-        with closing(sqlite3.connect(self.db)) as connection, connection:
-            connection.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
-        with self.assertRaises(contracts.IntakeError) as caught:
-            store.list_requests(self.root)
-        self.assertEqual(caught.exception.code, "corrupt_request")
-
-    def test_foreign_tampering_between_hand_offs_is_still_fully_validated(self):
+    def test_a_writer_does_not_see_a_digest_edit_but_audit_does(self):
         self.seed(3)
         store.list_requests(self.root)
-        with closing(sqlite3.connect(self.db)) as connection, connection:
-            connection.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
+        self.tamper_digest()
+        self.assertEqual(len(store.list_requests(self.root)), 3)
+        store.stage(self.root, request("after-tamper"))
         with self.assertRaises(contracts.IntakeError) as caught:
-            store.list_requests(self.root)
+            store.audit(self.root)
         self.assertEqual(caught.exception.code, "corrupt_request")
 
-    def test_stale_attestation_is_not_trusted_after_the_ledger_is_replaced(self):
+    def test_a_fresh_process_still_refuses_sqlite_level_corruption_and_a_wrong_identity(self):
+        self.seed(3)
+        store.forget_checked()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("delete from requests where correlation_id='seed-001'")
+        with self.assertRaises(contracts.IntakeError) as caught:  # orphaned stage rows: foreign_key_check
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_store")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("PRAGMA application_id=1")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "incompatible_store")
+
+    def test_a_passed_check_is_not_trusted_for_a_replaced_file_or_an_identity_change(self):
         self.seed(2)
+        store.list_requests(self.root)
         backup = self.db.read_bytes()
         store.stage(self.root, request("later"))
-        self.db.write_bytes(backup)
-        with mock.patch.object(store, "validate", wraps=store.validate) as validate:
+        replacement = self.db.with_name("replacement")
+        replacement.write_bytes(backup)
+        replacement.chmod(0o600)
+        os.replace(replacement, self.db)  # a different inode: structure is checked again
+        with mock.patch.object(store, "check_identity", wraps=store.check_identity) as structure:
             store.list_requests(self.root)
-        self.assertEqual(validate.call_count, 1)
+            store.list_requests(self.root)
+        self.assertEqual(structure.call_count, 1)
+        # The application identity is read on every lock, not only on the first.
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("PRAGMA application_id=1")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "incompatible_store")
+
+    def test_a_ledger_bound_to_another_host_path_is_refused_until_relocated(self):
+        self.seed(2)
+        store.forget_checked()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("update requests set root='/elsewhere'")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.list_requests(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
+        self.assertEqual(store.relocate(self.root)["updated_requests"], 2)
+        self.assertEqual(len(store.list_requests(self.root)), 2)
+
+    def test_a_failed_check_is_not_remembered(self):
+        self.seed(2)
+        store.forget_checked()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("delete from requests where correlation_id='seed-001'")
+            connection.execute("PRAGMA foreign_keys=ON")
+        for _ in range(2):
+            with self.assertRaises(contracts.IntakeError) as caught:
+                store.list_requests(self.root)
+            self.assertEqual(caught.exception.code, "corrupt_store")
+
+    def test_the_writer_lock_file_carries_no_hand_off(self):
+        self.seed(2)
+        store.list_requests(self.root)
+        self.assertEqual(self.lock.stat().st_size, 0)
+
+    def test_the_documented_residual_a_digest_edit_is_served_to_writers_until_audit(self):
+        """Pins the trust model: an actor with write access to the file who keeps it structurally
+        sound is not seen by writers (no attestation is consulted any more); ``audit`` refuses."""
+        self.seed(2)
+        store.list_requests(self.root)
+        stamp = self.db.stat()
+        self.tamper_digest()
+        os.utime(self.db, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.assertEqual(len(store.list_requests(self.root)), 2)
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
+
+
+class AuditTests(Case):
+    def test_a_clean_ledger_audits_and_nothing_is_written(self):
+        self.seed(7)
+        before = (self.db.read_bytes(), self.lock.stat().st_size)
+        with mock.patch.object(store, "AUDIT_PAGE", 3):
+            self.assertEqual(store.audit(self.root), {"audited": True, "requests": 7})
+        self.assertEqual((self.db.read_bytes(), self.lock.stat().st_size), before)
+        self.assertFalse(os.path.lexists(f"{self.db}-journal"))
+
+    def test_audit_runs_beside_a_held_writer_lock(self):
+        self.seed(3)
+        self.hold_lock()
+        self.assertEqual(store.audit(self.root)["requests"], 3)
+
+    def test_audit_refuses_each_rule_a_writer_used_to_enforce(self):
+        edits = {
+            "corrupt_request": ["UPDATE requests SET request_sha256='%s' WHERE correlation_id='seed-002'" % ("0" * 64),
+                                "UPDATE requests SET root='/elsewhere'"],
+            "corrupt_stage": ["UPDATE stages SET status='x'", "UPDATE stages SET cycle=-1"],
+            "corrupt_artifact": ["UPDATE stages SET intent_sha256='%s'" % ("0" * 64), "UPDATE stages SET intent='[]'"],
+            "corrupt_replay": ["UPDATE stages SET cycle=1"],
+        }
+        for expected, statements in edits.items():
+            for statement in statements:
+                with self.subTest(statement=statement):
+                    self.setUp()
+                    self.seed(4)
+                    with closing(sqlite3.connect(self.db)) as connection, connection:
+                        connection.execute(statement)
+                        if "intent='[]'" in statement:
+                            connection.execute("UPDATE stages SET intent_sha256=?", (contracts.digest(b"[]"),))
+                    with self.assertRaises(contracts.IntakeError) as caught:
+                        store.audit(self.root)
+                    self.assertEqual(caught.exception.code, expected)
+
+    def test_audit_refuses_a_page_boundary_row(self):
+        self.seed(6)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("update requests set request_sha256=? where correlation_id='seed-003'", ("0" * 64,))
+        with mock.patch.object(store, "AUDIT_PAGE", 3), self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
+
+    def test_audit_refuses_structural_damage_and_a_missing_store(self):
+        self.seed(2)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("PRAGMA application_id=1")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "incompatible_store")
+        self.db.unlink()
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "missing_store")
+
+    def test_the_command_line_audits(self):
+        from tools.intake import cli
+        self.seed(2)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["--root", str(self.root), "audit"]), 0)
+        self.assertEqual(json.loads(out.getvalue()), {"audited": True, "requests": 2})
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("update requests set request_sha256=?", ("0" * 64,))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["--root", str(self.root), "audit"]), 1)
+        self.assertEqual(json.loads(out.getvalue()), {"error": "corrupt_request"})
+
+    def test_relocate_still_validates_the_whole_ledger(self):
+        self.seed(2)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.relocate(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
 
 
 class BusyTests(Case):
@@ -268,7 +399,7 @@ class BusyTests(Case):
 class ReaderTests(Case):
     def test_progress_reader_validating_does_not_block_a_writer_commit(self):
         self.seed(3)
-        store.list_requests(self.root)  # attest the ledger so the writer does not validate
+        store.list_requests(self.root)  # the writer has checked the structure
         progress.forget()
         outcome = []
         real = store.verify_page
@@ -357,7 +488,7 @@ class CorrectionIndexTests(Case):
         store.head(self.root, "seed-000")
         self.assertEqual(self.db.stat().st_mtime_ns, stamp)
 
-    def test_the_upgrade_hands_off_a_valid_attestation_and_the_ledger_stays_verified(self):
+    def test_the_upgrade_leaves_the_ledger_sound_and_runs_no_full_validation(self):
         self.seed_corrections()
         self.drop_index()
         store.head(self.root, "seed-000")
@@ -383,133 +514,6 @@ class CorrectionIndexTests(Case):
         reader.execute("ROLLBACK")
         self.assertEqual(store.head(self.root, "seed-000")["correlation_id"], "seed-fix")
         self.assertIsNotNone(self.index())
-
-
-class MemoTests(Case):
-    """The verify memo is right-sized to the live ledger and never trusts changed bytes."""
-
-    def setUp(self):
-        super().setUp()
-        store.forget_verified()
-        self.addCleanup(store.forget_verified)
-
-    def snapshot(self):
-        with closing(sqlite3.connect(self.db)) as c:
-            c.row_factory = sqlite3.Row
-            return store.snapshot(c)
-
-    def refused(self, code):
-        with self.assertRaises(contracts.IntakeError) as caught:
-            store.verify(self.snapshot(), self.root)
-        self.assertEqual(caught.exception.code, code)
-
-    def test_repeat_verification_of_a_ledger_larger_than_the_old_caches_decodes_nothing(self):
-        from tools.diagnostics.ledger_scale_benchmark import seed_ledger
-        count = 16384 + 100
-        seed_ledger(self.root, count)
-        rows = self.snapshot()
-        with mock.patch.object(contracts, "decode_request", wraps=contracts.decode_request) as decoded, \
-                mock.patch.object(store, "decode", wraps=store.decode) as artifacts:
-            store.verify(rows, self.root)
-            self.assertEqual((decoded.call_count, artifacts.call_count), (count, 2 * count))
-            store.verify(self.snapshot(), self.root)
-            self.assertEqual((decoded.call_count, artifacts.call_count), (count, 2 * count))
-
-    def warm(self):
-        self.seed(2)
-        store.verify(self.snapshot(), self.root)
-
-    def test_request_rewritten_at_a_cached_position_is_refused(self):
-        self.warm()
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update requests set raw=? where correlation_id='seed-000'", (request("seed-000", retry={"max_attempts": 3, "backoff_seconds": 0}),))
-        self.refused("corrupt_request")  # stale digest
-
-    def test_request_and_digest_rewritten_to_an_invalid_request_is_refused(self):
-        self.warm()
-        bad = b'{"version": 1}'
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update requests set raw=?, request_sha256=? where correlation_id='seed-000'",
-                      (bad, contracts.digest(bad)))
-        with self.assertRaises(contracts.IntakeError):
-            store.verify(self.snapshot(), self.root)
-
-    def test_request_with_a_forged_digest_for_cached_bytes_is_refused(self):
-        self.warm()
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update requests set request_sha256=? where correlation_id='seed-000'", ("0" * 64,))
-        self.refused("corrupt_request")
-
-    def test_artifact_rewritten_at_a_cached_position_is_refused(self):
-        self.warm()
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update stages set intent='{\"changed\": 1}' where correlation_id='seed-000'")
-            c.execute("update stages set intent='{}', intent_sha256=? where correlation_id='seed-001'",
-                      ("0" * 64,))
-        self.refused("corrupt_artifact")
-
-    def test_artifact_with_a_forged_digest_for_cached_text_is_refused(self):
-        self.warm()
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update stages set intent='{}', intent_sha256=? where correlation_id='seed-000'",
-                      (contracts.digest(b"{}"),))
-        store.verify(self.snapshot(), self.root)  # now '{}' is a cached, verified text
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update stages set intent_sha256=? where correlation_id='seed-000'", ("0" * 64,))
-        self.refused("corrupt_artifact")
-
-    def test_artifact_and_digest_rewritten_to_a_non_object_is_refused(self):
-        self.warm()
-        store.verify(self.snapshot(), self.root)
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update stages set evidence='[1]', evidence_sha256=? where correlation_id='seed-000'",
-                      (contracts.digest(b"[1]"),))
-        self.refused("corrupt_artifact")
-
-    def test_memo_total_is_capped_and_a_capped_ledger_is_still_fully_verified(self):
-        self.seed(5)
-        with mock.patch.object(store, "MEMO_BYTES", 1):
-            store.verify(self.snapshot(), self.root)
-            self.assertEqual(store.verified_bytes(), 0)
-            store.verify(self.snapshot(), self.root)
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update requests set request_sha256=? where correlation_id='seed-000'", ("0" * 64,))
-        with mock.patch.object(store, "MEMO_BYTES", 1):
-            self.refused("corrupt_request")
-
-    def test_shared_artifact_text_is_charged_to_the_memo_budget_once(self):
-        self.seed(6)
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update stages set intent='{}', intent_sha256=?, evidence='{}', evidence_sha256=?",
-                      (contracts.digest(b"{}"),) * 2)
-        store.verify(self.snapshot(), self.root)
-        full = store.verified_bytes()
-        with mock.patch.object(store, "MEMO_BYTES", full):
-            store.forget_verified()
-            store.verify(self.snapshot(), self.root)
-            self.assertEqual(store.verified_bytes(), full)
-
-    def test_memo_follows_the_live_ledger_and_does_not_accumulate_history(self):
-        self.seed(3)
-        store.verify(self.snapshot(), self.root)
-        full = store.verified_bytes()
-        self.assertGreater(full, 0)
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("pragma foreign_keys=off")
-            for table in ("attempts", "replays", "stages"):
-                c.execute(f"delete from {table} where correlation_id!='seed-000'")
-            c.execute("delete from requests where correlation_id!='seed-000'")
-        store.verify(self.snapshot(), self.root)
-        self.assertLess(store.verified_bytes(), full)
-
-    def test_failed_verification_leaves_the_previous_memo_intact_and_caches_no_failure(self):
-        self.warm()
-        before = store.verified_bytes()
-        with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute("update requests set request_sha256=? where correlation_id='seed-001'", ("0" * 64,))
-        self.refused("corrupt_request")
-        self.assertEqual(store.verified_bytes(), before)
-        self.refused("corrupt_request")
 
 
 if __name__ == "__main__":

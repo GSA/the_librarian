@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Repeat ``store.verify`` cost over a synthetic production-sized intake ledger.
+"""Cost of the ledger's two checks over a synthetic production-sized intake ledger (Kata qwtp).
 
-Seeds ``--ledger`` completed single-stage requests in a temporary instance, snapshots them once and
-times ``--passes`` consecutive ``store.verify`` calls in one process (what every ``progress`` call and
-every un-attested writer pays), plus the resident-memory growth. Body-free JSON. Use ``--tree`` to
-compare another checkout's ``tools`` package. Synthetic fixtures only; never point it at a real instance.
+Seeds ``--ledger`` completed single-stage requests in a temporary instance, then times in a fresh
+connection each pass: ``audit`` (every digest and rule, ``store.audit``) and, once, the writer's open
+(``check_identity``: application identity, SQLite integrity, foreign keys) that every writer process
+pays. Body-free JSON. Use ``--tree`` to compare another checkout's ``tools`` package (a tree that
+predates ``store.audit`` is timed with its ``store.validate``). Synthetic fixtures only; never point
+it at a real instance.
 
     python3 tools/diagnostics/ledger_verify_benchmark.py --ledger 36309 --passes 5
 """
@@ -38,18 +40,21 @@ def main(argv=None):
         root = Path(temp)
         store.initialize(root)
         seed_ledger(root, args.ledger)
-        with closing(sqlite3.connect(root / ".local/intake/intake.sqlite3")) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = store.snapshot(connection)
+        db = root / ".local/intake/intake.sqlite3"
+        with closing(sqlite3.connect(db)) as connection:
+            start = time.perf_counter()
+            store.check_identity(connection)
+            open_seconds = round(time.perf_counter() - start, 3)
+        full = getattr(store, "audit", None) or (lambda r: store.validate(sqlite3.connect(db), r))
         before, seconds = resident_mb(), []
         for _ in range(args.passes):
             start = time.perf_counter()
-            store.verify(rows, root)
+            full(root)
             seconds.append(round(time.perf_counter() - start, 3))
-        print(json.dumps({"label": args.label, "ledger_requests": args.ledger, "pass_seconds": seconds,
+        print(json.dumps({"label": args.label, "ledger_requests": args.ledger, "writer_open_s": open_seconds,
+                          "pass_seconds": seconds,
                           "repeat_median_s": sorted(seconds[1:])[len(seconds[1:]) // 2] if len(seconds) > 1 else None,
-                          "resident_delta_mb": round(resident_mb() - before, 1),
-                          "memo_mb": round(getattr(store, "verified_bytes", lambda: 0)() / 2**20, 1)}, sort_keys=True))
+                          "resident_delta_mb": round(resident_mb() - before, 1)}, sort_keys=True))
 
 
 if __name__ == "__main__":

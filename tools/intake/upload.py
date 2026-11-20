@@ -357,7 +357,7 @@ def catalog_view(root, probe=()):
 # Promised IDs of a saved request, by the SHA-256 the ledger stores for its exact bytes. The key is
 # the content, so a hit is correct for any row carrying that digest; a rewritten request has a
 # different digest and is decoded afresh. Each fresh entry is checked against its own bytes, and
-# the ledger's validation (or its attested hand-off, see "Intake ledger" in docs/design/current-state.md) is what ties every other
+# ``store.audit`` (see "Intake ledger" in docs/design/current-state.md) is what ties every other
 # stored digest to its row. The memo is per process, bounded, and never persisted.
 PROMISES = {}
 PROMISES_LIMIT = 65536

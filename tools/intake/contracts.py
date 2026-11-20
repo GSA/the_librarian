@@ -153,19 +153,9 @@ def decode_request(raw):
     return value
 
 
-def request_shape(raw):
-    """Immutable identity (correlation ID, correction parent, stage IDs) of a fully validated saved request.
-
-    A pure function of the bytes; ``store.verify`` memoizes it by the exact bytes.
-    """
-    value = decode_request(raw)
-    return (value["correlation_id"], value["correction_of"],
-            tuple(stage["id"] for stage in value["stages"]))
-
-
 def request_layout(raw):
-    """``request_shape`` plus each stage's kind and operation: (correlation ID, correction parent,
-    ((stage ID, kind, operation), ...)) of a fully validated saved request."""
+    """Identity of a fully validated saved request: (correlation ID, correction parent,
+    ((stage ID, kind, operation), ...))."""
     value = decode_request(raw)
     return (value["correlation_id"], value["correction_of"],
             tuple((stage["id"], stage["kind"], stage["operation"]) for stage in value["stages"]))

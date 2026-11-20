@@ -316,7 +316,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
 | `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore` |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
-| `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `progress`, `progress-serve` |
+| `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `audit`, `progress`, `progress-serve` |
 | `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `recover-deferred`, `rereview`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
 | `python -m tools.evals` | Retrieval-quality evaluation: `generate` seeded cases, `run` them against a fresh index into a body-free scorecard, `compare BASE NEW` (exit 1 on a regression) |

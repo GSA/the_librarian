@@ -403,7 +403,7 @@ class MemoTests(Case):
             value = contracts.decode_request(row["raw"])
             self.assertEqual(layout, tuple((s["id"], s["kind"], s["operation"]) for s in value["stages"]))
 
-    def test_every_refusal_of_verify_is_a_refusal_of_verify_page(self):
+    def test_every_rule_refuses_in_verify_page_and_in_the_audit(self):
         statements = {
             "corrupt_request": ["UPDATE requests SET root='/elsewhere'", "UPDATE requests SET correction_of='x'"],
             "corrupt_stage": ["UPDATE stages SET cycle=-1", "UPDATE stages SET status='x'",
@@ -425,11 +425,12 @@ class MemoTests(Case):
                     with closing(sqlite3.connect(self.db)) as c:
                         c.row_factory = sqlite3.Row
                         rows = store.snapshot(c)
-                    with self.assertRaises(contracts.IntakeError) as old:
-                        store.verify(rows, self.root)
+                    with self.assertRaises(contracts.IntakeError) as audited:
+                        store.audit(self.root)
                     with self.assertRaises(contracts.IntakeError) as new:
                         store.verify_page(rows, self.root, store.PageMemo())
-                    self.assertEqual(new.exception.code, old.exception.code)
+                    # The audit's structural check (foreign keys) may name an orphaned parent first.
+                    self.assertIn(audited.exception.code, {new.exception.code, "corrupt_store"})
                     self.assertEqual(new.exception.code, expected)
 
     def test_text_fast_path_equals_the_per_character_rule(self):

@@ -869,17 +869,18 @@ synthetic documents the two scans were about half of the time per document).
 
 ### Trust model and residual risk (kept)
 
-- The catalog receipt and the ledger hand-off attestation are **unkeyed**. For the
-  **catalog**, an actor who rewrites the database *and* the receipt so that they
+- The catalog receipt is **unkeyed**. For the **catalog**, an actor who rewrites the
+  database *and* the receipt so that they
   agree, or who rewrites the file while restoring size, mtime, ctime and the change
   counter, can get one write or read accepted without a replay; the next UTC day's
   full check, `status --audit` and backup verification replay all history and
-  refuse. For the **intake ledger** there is no daily bound: the attestation is
-  checked against file identity only, with no date, so an identity-preserving
-  rewrite is detected only when a full ledger validation actually happens (a writer
-  with no valid attestation, or a validating `progress` read). Catalog audit and
+  refuse. For the **intake ledger** nothing is trusted on the strength of a stored
+  marker any more (Kata qwtp): a writer checks structure only, so an edit that keeps SQLite
+  sound (a changed digest or status) is served to writers until `intake.cli audit` or a
+  `progress` read verifies it, with no daily bound. Catalog audit and
   backup verification do not validate the ledger. Neither is a defense against that
-  actor.
+  actor. Pinned by `tests/test_intake_ledger_scaling.py::CadenceTests`
+  (`test_the_documented_residual_a_digest_edit_is_served_to_writers_until_audit`).
 - What the byte-hash binding saw and the identity binding does not: silent media
   corruption with no write through the OS, and an identity-restoring edit. Both
   are now caught at the next daily full check or audit, a window of at most one UTC
@@ -893,8 +894,8 @@ synthetic documents the two scans were about half of the time per document).
   (`test_forged_receipt_for_other_bytes_does_not_vouch_for_tampered_bytes`,
   `test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt`,
   `test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot`).
-  The ledger's equivalent residual (a file rewrite that preserves identity and
-  change counter) is stated but not pinned by a test **(untested)**, Kata yy1k.
+  The ledger has no receipt to forge: writers check structure only (see "Intake ledger"), and that
+  residual is pinned by `CadenceTests` as above (Kata yy1k, qwtp).
 - **Never close a descriptor on a database file while a connection to it is open
   in this process.** On POSIX, closing any descriptor drops all of the process's
   fcntl locks on that file, including SQLite's, which let a concurrent commit tear a
@@ -1162,27 +1163,35 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
 
 ### Intake ledger
 
-- A writer fully validates the ledger (SQLite integrity, digests, stage and
-  attempt shape) unless the previous clean writer attested the file. On clean
-  unlock a writer records file identity and SQLite change counter in `writer.lock`;
-  the next writer, in any process, consumes it while holding the lock and skips
-  full validation only if the live file matches. A crash, failure after a partial
-  write, or a foreign commit leaves no attestation. A block that raises a
-  read-only refusal (for example `unknown_request`) still hands off when the file
-  identity equals what the writer validated on entry.
+- **Cadence (Kata qwtp).** A writer takes the lock and checks the ledger's *structure*, not its
+  contents: the application ID and schema version on every lock, and SQLite `integrity_check` and
+  `foreign_key_check` once per process for each ledger file (path, device and inode, so a replaced or
+  restored file is checked again; a failed check is never remembered). There is no attestation or
+  hand-off in `writer.lock`, which stays empty. A 36,000-request ledger opens in about 0.1 s in a fresh
+  process instead of about 1.1 s, and every later lock costs about 10 ms. The O(ledger) pass (every
+  request, stage, artifact digest, attempt and replay rule) is `python -m tools.intake.cli audit`
+  (`store.audit`), also run by `relocate`. It is read-only, takes no writer lock, reads in keyset pages
+  of 5,000 requests in short read transactions (about 0.9 s and 25 MB at 36,000 requests), and raises
+  the first `corrupt_*` refusal. Who finds which tamper class: SQLite damage, orphaned rows and a wrong
+  application ID or schema version are refused by the first writer or reader of a process; a changed
+  request or artifact digest, a stage or attempt that breaks the shape rules, or a rewritten request is
+  refused by `audit` and by `progress` (which verifies every page), and is **not** seen by a writer
+  that opened the ledger earlier or whose structure is still sound. A writer reads and writes only the
+  rows it touches; the ledger cannot reconstruct authority (the catalog and review events are
+  authority), so a hand-edited ledger row misdirects work at worst, and `audit` is the check to run
+  before an upgrade, a backup or after any unexplained failure.
 - The writer lock is polled non-blocking with jitter for at most
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values refuse)
   and the same value is the SQLite busy timeout. Exceeding it, or a transient SQLite
   BUSY/LOCKED during a stage, raises retryable `ledger_busy`; nothing was written.
   `settle` and cohort ingest retry up to three times. `progress` (`progress.read_ledger`) reads the ledger in
   keyset pages of 5,000 requests, each in its own short read transaction, and
-  verifies each page afterwards (`store.verify_page`, sharing `store.check_request`
-  with `store.verify`), so it cannot hold a read lock across O(ledger) work and its
+  verifies each page afterwards (`store.verify_page`, the same rules `audit` runs), so it cannot hold a read lock across O(ledger) work and its
   memory is a page plus counters. It reduces the ledger to counts per distinct
   request signature and expands only the newest `--limit` items; each page is
   consistent, the pass as a whole is not one global snapshot.
 - `progress` keeps its finished summary in memory keyed by the ledger's file identity
-  (the writer hand-off's `file_identity`), `--limit`, the run set and the UTC date,
+  (`file_identity`: device, inode, size, times and SQLite's change counter), `--limit`, the run set and the UTC date,
   stored only when the identity is unchanged from before the first to after the last
   page. A commit, a tampered row or a new UTC day re-verifies in full; the residual
   is that of the catalog receipt (an edit that restores size, times and change
@@ -1245,15 +1254,15 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   NULL` (Kata 5m1h), so every "who corrects this request" lookup (`docs.repoint`, `_descendants`,
   `store.head`, the cohort and runner head checks) is a search, not a scan of the whole table. A new
   ledger gets it from `DDL`; a ledger created earlier gets the same `CREATE INDEX IF NOT EXISTS` from
-  the next writer to open it, inside that writer's lock and after validation, as one small committed
+  the next writer to open it, inside that writer's lock and after its structure check, as one small committed
   transaction. The schema version stays 1, no row is written, a ledger that already has the index is
   not touched, and a reader or writer that holds the file past the lock wait makes the upgrade a
   retryable `ledger_busy` that a later writer completes. Evidence:
   `tests/test_intake_ledger_scaling.py::CorrectionIndexTests` (query plans, new and old ledger,
-  idempotence, attestation hand-off, busy reader).
-- Evidence: `tests/test_intake_ledger_scaling.py` (alternating writers, tamper and
-  replaced-ledger cases, bounded waits, progress, forged-digest memo cases, memo
-  cap), `tests/test_progress_scale.py` (reference-equal counts across page sizes,
+  idempotence, no full validation, busy reader).
+- Evidence: `tests/test_intake_ledger_scaling.py` (`CadenceTests`: what a writer checks and when,
+  alternating writer processes, replaced file, residual; `AuditTests`: every rule, page boundaries, no
+  writes, beside a held lock, command line; bounded waits, progress), `tests/test_progress_scale.py` (reference-equal counts across page sizes,
   tamper after a cached render, digest-keyed memo, single-flight), `tests/test_upload_planning.py`
   (including `IncrementalTests` for the row-id index).
 - A measured production-sized ledger (about 130 MB, 36k requests) made the
