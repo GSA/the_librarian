@@ -1148,14 +1148,14 @@ class QualifyTests(QualifyCase):
         with self.assertRaises(ReviewError):
             events.contract.schema_validate({**event_history.bundle(known, self.root), "authority": "x"},
                                             event_history.store_schema(self.root), root=self.root)
-        # A tampered ledger artifact or request is refused although its peers were memoised.
+        # A tampered ledger artifact or request is refused by the audit although its peers were memoised.
         db = self.root / ".local/intake/intake.sqlite3"
         store.list_requests(self.root)
         with sqlite3.connect(db) as connection:
             connection.execute("UPDATE stages SET evidence=evidence||' ' WHERE rowid="
                                "(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
         with self.assertRaises(IntakeError) as caught:
-            store.list_requests(self.root)
+            store.audit(self.root)
         self.assertEqual(caught.exception.code, "corrupt_artifact")
         with sqlite3.connect(db) as connection:
             connection.execute("UPDATE stages SET evidence=substr(evidence,1,length(evidence)-1) "
@@ -1163,7 +1163,7 @@ class QualifyTests(QualifyCase):
             connection.execute("UPDATE stages SET evidence=NULL, evidence_sha256=NULL "
                                "WHERE rowid=(SELECT max(rowid) FROM stages WHERE status='succeeded')")
         with self.assertRaises(IntakeError) as caught:
-            store.list_requests(self.root)
+            store.audit(self.root)
         self.assertEqual(caught.exception.code, "corrupt_stage")
 
     def test_qualify_republishes_when_the_index_is_missing(self):

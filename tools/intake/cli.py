@@ -32,6 +32,7 @@ def arguments(argv):
     parser.add_argument("--root", type=Path, required=True)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("initialize")
+    commands.add_parser("audit", help="Read-only full verification of every ledger digest and rule")
     stage = commands.add_parser("stage")
     stage.add_argument("--request", type=Path, required=True)
     listing = commands.add_parser("list")
@@ -126,6 +127,8 @@ def main(argv=None):
                                           allow_non_loopback=args.allow_non_loopback)
         elif args.command == "initialize":
             result = store.initialize(args.root)
+        elif args.command == "audit":
+            result = store.audit(args.root)
         elif args.command == "stage":
             result = store.stage(args.root, read_input(args.request))
         elif args.command in {"list", "dead-letter"}:

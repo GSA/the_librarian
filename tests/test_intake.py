@@ -103,35 +103,42 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(db.parent.stat().st_mode & 0o777, 0o700)
         with closing(sqlite3.connect(db)) as connection, connection:
             connection.execute("update requests set request_sha256=?", ("0" * 64,))
-        with self.assertRaises(contracts.IntakeError):
-            store.inspect(self.root, "req-one")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_request")
 
-    def test_unchanged_ledger_is_validated_once_per_process(self):
+    def test_a_writer_checks_the_ledger_structure_once_per_process_and_never_validates_it_in_full(self):
         store.stage(self.root, request())
-        calls = []
-        real = store.validate
-        with mock.patch.object(store, "validate", side_effect=lambda *a: calls.append(1) or real(*a)):
+        store.forget_checked()
+        checks, validations = [], []
+        real_check, real_validate = store.check_identity, store.validate
+        with mock.patch.object(store, "check_identity", side_effect=lambda *a: checks.append(1) or real_check(*a)), \
+                mock.patch.object(store, "validate", side_effect=lambda *a: validations.append(1) or real_validate(*a)):
             store.inspect(self.root, "req-one")
             store.stage(self.root, request("req-two"))
             store.list_requests(self.root)
-            self.assertEqual(calls, [])
+            self.assertEqual((checks, validations), ([1], []))
             with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
                 connection.execute("update requests set request_sha256=? where correlation_id='req-two'", ("0" * 64,))
+            self.assertEqual(len(store.list_requests(self.root)), 2)  # a digest is not a writer's check
+            self.assertEqual((checks, validations), ([1], []))
             with self.assertRaises(contracts.IntakeError) as caught:
-                store.list_requests(self.root)
-            self.assertEqual((caught.exception.code, calls), ("corrupt_request", [1]))
+                store.audit(self.root)
+            self.assertEqual((caught.exception.code, validations), ("corrupt_request", [1]))
             with self.assertRaises(contracts.IntakeError):
-                store.list_requests(self.root)
-            self.assertEqual(calls, [1, 1])
+                store.audit(self.root)
+            self.assertEqual(validations, [1, 1])
 
-    def test_foreign_commit_during_a_clean_lock_is_not_trusted(self):
+    def test_a_digest_edit_made_beside_a_writer_is_found_by_audit_not_by_the_writers(self):
+        # Kata qwtp: writers check structure once per process; digests are the audit's job.
         store.stage(self.root, request())
         store.list_requests(self.root)
         with store.locked(self.root):
             with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
                 connection.execute("update requests set request_sha256=?", ("0" * 64,))
+        self.assertEqual(len(store.list_requests(self.root)), 1)
         with self.assertRaises(contracts.IntakeError) as caught:
-            store.list_requests(self.root)
+            store.audit(self.root)
         self.assertEqual(caught.exception.code, "corrupt_request")
 
     def test_wrong_identity_modes_and_missing_store_refuse(self):
@@ -176,45 +183,37 @@ class LedgerTests(unittest.TestCase):
         store.stage(self.root, request())
         with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
             connection.execute("update stages set status='succeeded'")
-        with self.assertRaises(contracts.IntakeError):
-            store.inspect(self.root, "req-one")
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)
+        self.assertEqual(caught.exception.code, "corrupt_stage")
 
-    def test_repeated_validation_decodes_each_distinct_request_once(self):
-        from unittest.mock import patch
-        for number in range(5):
-            store.stage(self.root, request(f"req-{number}"))
-        store.inspect(self.root, "req-0")
-        with patch.object(contracts, "decode_request", wraps=contracts.decode_request) as decoded, \
-                patch.object(store, "decode_request", wraps=contracts.decode_request) as in_store:
-            for _ in range(4):
-                store.inspect(self.root, "req-0")
-        self.assertEqual(decoded.call_count + in_store.call_count, 0)
-
-    def test_cached_decode_does_not_hide_a_rewritten_request(self):
+    def test_audit_refuses_a_rewritten_request(self):
         store.stage(self.root, request())
-        store.inspect(self.root, "req-one")  # primes any decode cache
+        store.audit(self.root)
         changed = request(retry={"max_attempts": 3, "backoff_seconds": 5})
         with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
             connection.execute("update requests set raw=?", (changed,))
-        with self.assertRaises(contracts.IntakeError):
-            store.inspect(self.root, "req-one")  # digest no longer matches
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)  # digest no longer matches
+        self.assertEqual(caught.exception.code, "corrupt_request")
         with closing(sqlite3.connect(self.root / ".local/intake/intake.sqlite3")) as connection, connection:
             connection.execute("update requests set raw=?, request_sha256=?",
                                (changed, hashlib.sha256(changed).hexdigest()))
             connection.execute("update requests set correlation_id='req-two'")
-        with self.assertRaises(contracts.IntakeError):
-            store.inspect(self.root, "req-two")  # identity no longer matches the saved request
+        with self.assertRaises(contracts.IntakeError) as caught:
+            store.audit(self.root)  # identity no longer matches the saved request (stages orphaned)
+        self.assertEqual(caught.exception.code, "corrupt_store")
 
     def test_rejected_ledger_releases_lock_for_later_operations(self):
         import multiprocessing
         store.stage(self.root, request())
         db = self.root / ".local/intake/intake.sqlite3"
         with closing(sqlite3.connect(db)) as connection, connection:
-            connection.execute("update stages set status='succeeded'")
+            connection.execute("pragma application_id=1")
         with self.assertRaises(contracts.IntakeError):
             store.inspect(self.root, "req-one")
         with closing(sqlite3.connect(db)) as connection, connection:
-            connection.execute("update stages set status='staged'")
+            connection.execute("pragma application_id=%d" % store.APPLICATION_ID)
         # A separate process would block forever on a leaked exclusive lock.
         def probe(root, sink):
             sink.send(store.inspect(root, "req-one")["stages"][0]["status"])

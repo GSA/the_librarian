@@ -6,7 +6,8 @@ single-stage requests and whose catalog holds ``--catalog`` upload-shaped regist
 directly, without per-write validation, so large sizes build quickly), then ingests ``--files`` new
 synthetic markdown files through ``tools.intake.cohort_ingest.ingest``. Reports body-free JSON: wall and CPU
 seconds, seconds per file, how many times the whole ledger was validated and what share of the wall
-time that took. With a healthy hand-off ("Intake ledger" in docs/design/current-state.md) the ledger is validated about once per
+time that took. Since Kata qwtp a writer no longer validates the ledger in full (see "Intake ledger" in docs/design/current-state.md), so this reports 0 full validations;
+the structural check runs about once per
 process, not once per lock acquisition. Synthetic fixtures only; never point it at a real instance.
 
     python3 tools/diagnostics/ledger_scale_benchmark.py --ledger 36000 --catalog 25600 --files 40

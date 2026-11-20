@@ -128,20 +128,15 @@ named stage. The ledger is operational recovery state, never corpus authority.
 - Undecodable or invalid native inputs block durably with a recorded attempt
   outcome instead of surfacing a traceback, and ledger write failures after
   validation report an unavailable ledger rather than claiming corruption.
-- A writer fully validates the ledger (SQLite integrity, digests, stage and
-  attempt shape) unless the previous clean writer attested the file
-  ([design](../docs/design/current-state.md#intake-ledger)).
-  On clean unlock a writer records the file identity and SQLite change counter
-  in `writer.lock` (any process, not just the same one); the next writer consumes
-  and truncates it under the lock, and skips the O(ledger) pass only when the file
-  still matches. A foreign commit, journal, replaced file, crash or failed unlock
-  leaves no matching attestation and forces full validation, so alternating
-  writers do not repeat it per hand-off. The attestation is a hint that a
-  validated writer finished last, not proof against someone who edits the file
-  and forges the counter.
-- A locked block that raises a read-only refusal (for example `unknown_request` from a
-  cohort existence probe) still hands off the attestation, because the file is
-  byte-identical to what the writer validated; a raise after any write does not.
+- A writer checks the ledger's structure, not every row: application ID and schema version on each
+  lock, SQLite `integrity_check` and `foreign_key_check` once per process for each ledger file
+  ([design](../docs/design/current-state.md#intake-ledger)). Digests and the request, stage, attempt
+  and replay rules are verified by `python -m tools.intake.cli --root ROOT audit` (read-only, no
+  writer lock, safe beside a live run; about 1 s per 36,000 requests) and by every `progress` read.
+  A request or artifact digest edited while the ledger stays structurally sound is therefore **not**
+  seen by a running writer: run `audit` before an upgrade or backup and after any unexplained
+  failure. `writer.lock` carries no hand-off; a read-only refusal such as `unknown_request` from a
+  cohort existence probe costs the next writer nothing.
 - The ledger writer lock wait is bounded (default 30s, set
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` or pass `wait`; the same value is the SQLite
   busy timeout). Exceeding it, or a transient SQLite BUSY/LOCKED during a stage,
