@@ -254,8 +254,12 @@ def _conclude(entry, current, event_id):
 
 def _carried(root, entry, run):
     """``(head, event ID)`` of a qualified review under an earlier policy version the current one
-    ``carries``: both stages succeeded and its event is live. None when there is none."""
-    for _, _, sha in standing.carried(run.get("policy", {})):
+    ``carries``: both stages succeeded and its event is live. None when there is none, or when
+    the current policy's scope refuses the rendition (it then ends ``prohibited-scope``)."""
+    carries = standing.carried(run.get("policy", {}))
+    if carries and standing.refused_scope(root, run["policy"], entry["rendition"], entry["rendition_sha256"]):
+        return None
+    for _, _, sha in carries:
         head = store.find_head(root, "standing-" + _standing_token(entry, sha), run["heads"])
         if head is None or not all(s["status"] == "succeeded" for s in head["stages"]):
             continue

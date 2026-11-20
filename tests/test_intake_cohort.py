@@ -2528,6 +2528,21 @@ class RereviewTests(QualifyCase):
         self.assertEqual({tuple(h["confidence"]["reasons"]) for h in hits},
                          {("embedded-instructions", "sparse-record")})
 
+    def test_a_carried_review_the_new_scope_excludes_ends_out_of_scope_and_publication_proceeds(self):
+        self.ingest()
+        self.write_policy(1)
+        v1_sha = hashlib.sha256((self.root / self.POLICY).read_bytes()).hexdigest()
+        first = self._qualify(self.transport())["counts"]["qualification"]
+        self.write_policy(2, excluded=[self.receipt("a/notes.md")], criteria="standing-review-v2",
+                          carries=[{"version": 1, "sha256": v1_sha}])
+        spent = len(self.calls)
+        report = self._qualify(self.transport())
+        self.assertEqual(len(self.calls), spent)
+        notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual(notes["review_code"], "standing-exception-prohibited-scope")
+        self.assertEqual(report["counts"]["qualification"]["qualified"], first["qualified"] - 1)
+        self.assertEqual(report["counts"]["published"], 1)
+
     def test_a_rendition_rejected_under_an_older_policy_stays_out_when_its_current_review_is_incomplete(self):
         self.ingest()
         self.write_policy(1)

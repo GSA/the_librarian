@@ -85,7 +85,8 @@ def _statements(result, scope_counts):
                           "references to material outside the rendition.")
     headers, instructions = _flagged(result)
     statements += headers
-    statements += _noted(result, MAX_EVIDENCE - len(statements))
+    # Keep one slot for the embedded instructions (an item, or their truncation statement).
+    statements += _noted(result, MAX_EVIDENCE - len(statements) - bool(instructions))
     return statements + _fit(instructions, MAX_EVIDENCE - len(statements), result["findings_sha256"])
 
 
