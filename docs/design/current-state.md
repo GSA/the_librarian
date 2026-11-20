@@ -1287,6 +1287,41 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   `test_paths_outside_local_symlinks_and_unsafe_modes_are_refused`); `.local`
   exclusion: `tests/test_workspace.py` (`index.eligible(".local/database.md")` is false).
   The diagnostics log and the audit log are deliberately separate files and formats.
+- **Retrieval-quality evaluation** (`python -m tools.evals`, contract in
+  `context/retrieval-evals.md`): a separate, explicit measurement, not derived from
+  the diagnostics or audit logs. Cases (`retrieval-eval-cases-v1`) live in the
+  ignored `config/evals.local.json` and are validated strictly before anything runs
+  (unknown or duplicate fields, duplicate ids and contradictory expectations are
+  refused). `generate` samples documents stratified by role, confidence level and
+  rendition format with a seed, and builds each known-item query from distinctive
+  terms of one indexed section (the FTS row's own title and text, since renditions
+  index a search text that differs from their stored record), passing over queries
+  already used or matching more than 200 sections so near-duplicates cannot share one;
+  the document is always findable while rank is left to the run; it replaces only that seed's
+  generated cases and is byte-identical when rerun on an unchanged index. `run`
+  calls the CLI's own `load_manifest`, `readonly`, `freshness` and `search` in
+  process, checking freshness once before and once after the whole batch (two
+  checks, not one per case) and refusing a stale index, or a claim-correction change
+  during the batch, without writing anything.
+  The scorecard (`retrieval-eval-scorecard-v1`, 0600 under the ignored
+  `tools/evals/.local/runs/`) is body-free: ids, closed failure codes, ranks,
+  counts, confidence levels, aggregates (hit@1, hit@k, recall@k, MRR, must-not
+  violations, absence accuracy, confidence-match rate, returned-confidence
+  distribution), timings and provenance hashes (index metadata, standing policy
+  identity without its scope, correction-store state, cases file, toolkit commit).
+  `compare` exits 1 on a metric drop beyond tolerance or on per-case regressions
+  above `--max-regressions`, and 2 on a scorecard missing a gated metric. Nothing reads a scorecard to change selection,
+  ranking or qualification. Evidence: `tests/test_evals.py`
+  (`test_refuses_malformed_cases`,
+  `test_generation_is_deterministic_and_keeps_authored_cases`,
+  `test_near_duplicate_documents_do_not_share_a_known_item_query`,
+  `test_scores_hits_ranks_misses_must_not_absence_and_confidence`,
+  `test_scorecard_is_body_free_and_private`,
+  `test_stale_index_is_refused_without_a_scorecard`,
+  `test_freshness_is_checked_once_before_and_once_after_the_batch`,
+  `test_a_correction_recorded_during_the_run_is_refused`,
+  `test_malformed_scorecards_are_refused`,
+  `test_regressions_and_metric_drops_exit_nonzero`).
 - **The MCP adapter is read-only** and exposes six tools (`status`, `search`,
   `get`, `get_many`, `catalog`, `review_events`); `tests/test_mcp.py` asserts that
   set. Adding a write tool would be a change to that test and a design discussion.

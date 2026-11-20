@@ -1,7 +1,7 @@
 # The Librarian development and ingestion roadmap
 
 **Audience:** maintainers, operators and their agents.
-**Updated:** November 16, 2026.
+**Updated:** November 20, 2026.
 **Status:** capability inventory and proposed work, not an implementation,
 permission grant, delivery commitment or program-readiness register.
 
@@ -112,6 +112,13 @@ a bare read count) and the opt-in full-text MCP audit log are delivered; agent
 execution traces were not built. Details under
 [Retrieval diagnostics from agent execution](#retrieval-diagnostics-from-agent-execution).
 
+### Retrieval-quality evaluation harness - November 20
+
+**Delivered.** `python -m tools.evals` generates seeded known-item and absence
+cases, runs instance-local cases against a fresh index into a body-free scorecard
+and compares scorecards with regression gating (`tests/test_evals.py`). Details
+under [Retrieval-quality evaluation](#retrieval-quality-evaluation).
+
 ## Reuse gaps identified on October 19
 
 Status labels in this table reflect the repository as of the **Updated** date
@@ -135,7 +142,7 @@ to exist in this distribution.
 | Retrieval refinements | Open | Exact/compact/batched reads exist; later source-budget batch plans and reversible discovery archives absent | Port deterministic complete-packet sizing guidance and explicit archive inclusion without losing qualifiers or silently retrying |
 | Reader diagnostics and regressions | Open | Earlier native event reader retained | Review later fixes, including required/allowed output sizes; preserve exact payloads and outer response-budget caveats |
 | Explicit relationship traversal | Open | No derived graph | Evaluate a generic `context-graph` adaptation after core field use; preserve canonical evidence routes and stale-read refusal. Evaluation recorded in the [design](docs/design/current-state.md#7-relationship-traversal) (no real failed question has been recorded) |
-| Agent execution traces | Partial | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free coverage-gap diagnostics (implemented); reads are not attributed to documents and no retrieval-quality figure is derived. Agent findings route through the contribution contract; see the [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) |
+| Agent execution traces | Partial | No trace endpoint, instructions or schema; nothing records what an agent did with returned context. Search absence is classified and optionally logged body-free, alongside a bare read count | Body-free coverage-gap diagnostics (implemented); reads are not attributed to documents and no retrieval-quality figure is derived from diagnostics. Retrieval quality is measured separately, against instance-local cases, by the evaluation harness (see [Retrieval-quality evaluation](#retrieval-quality-evaluation)). Agent findings route through the contribution contract; see the [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics) |
 | Discovery-card experiments | Open (lesson only) | Not shipped | Retain the lesson: skims can miss relevant material; evaluate candidate recall with deferred controls, never use cards as proof of absence |
 | Operating guidance | Partial | Generic role/feedback contracts and the intake operator contract included; private corpus procedures intentionally omitted | Keep task-triggered loading and source fidelity/authority boundaries; add generic format/recovery guides alongside each future port |
 
@@ -337,13 +344,29 @@ read-only tool set).
   (`absent-corpus`) from a findability-gap rate (`present-uncombined`);
   `retrieval_log.py prune --keep N` is explicit and never automatic.
 - **Not derived.** Reads are not attributed to documents and no search-to-read
-  ratio or retrieval-quality figure is reported; the counts cannot separate an
+  ratio or retrieval-quality figure is derived from the log; the counts cannot separate an
   unconvincing excerpt from an agent that needed nothing more
   (`test_reads_are_counted_but_never_attributed`,
   `test_report_counts_reads_without_deriving_a_ratio`).
 - **Boundaries.** The log is never indexed, searched or returned by a read tool,
   is never a review or catalog authority, and nothing derived from it changes
   selection, ranking or qualification. No log content ships in the package.
+
+### Retrieval-quality evaluation
+
+**Delivered.** `python -m tools.evals` (`generate`, `run`, `compare`) scores an
+instance's published index against ignored local cases
+(`config/evals.local.json`): authored or seeded known-item and absence cases with
+expected documents or locators within `k`, must-not documents, expected
+confidence level and absence classification. A run checks freshness once before
+and once after the batch and refuses a stale index; its scorecard is body-free and
+records hit@1, hit@k, recall@k, MRR, must-not violations, absence accuracy,
+confidence-match rate and the index, policy, standing-policy, cases and toolkit
+provenance. `compare` gates on metric drops and per-case regressions. Contract and
+procedure: [context/retrieval-evals.md](context/retrieval-evals.md); behavior and
+tests: the [design](docs/design/current-state.md#6-observation-audit-log-and-diagnostics).
+Remaining: real-question authored cases per instance, and judging answer
+correctness rather than findability.
 
 ### Open questions
 
@@ -364,7 +387,7 @@ read-only tool set).
 | C: local continuous inbox | Partial: operator-run cohort intake of one local inbox delivered; scheduling open | One allowlisted local inbox; scheduled discovery/copy/register/extract; explicit review/publication boundaries | Restart, duplicate, mutation, failure and committed-retry cases below pass without duplicate authoritative records |
 | D: remote discovery/copy | Open | One approved read-only provider/folder scope, then additional scopes | Complete paginated reconciliation, binary/native identity behavior and authorization failures demonstrated; no destructive synchronization |
 | E: agent-driven maintenance | Partial: standing-policy review and publication delivered; gate not demonstrated | Bounded review/incorporation and approved publication policy | Evidence fidelity, independent-review triggers, recoverability and qualified-answer preservation shown under ongoing intake |
-| F: retrieval diagnostics | Delivered | Body-free coverage-gap observation plus bare search and read counts; reads are not attributed to documents and no retrieval-quality figure is derived | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
+| F: retrieval diagnostics | Delivered | Body-free coverage-gap observation plus bare search and read counts; reads are not attributed to documents and no retrieval-quality figure is derived from them (quality is measured against instance-local cases by `tools.evals`) | Diagnostics are written and read without appearing at any retrieval surface or being countable as reviews; no query text, prompt, model output, source excerpt or locator is ever stored; retention is bounded and pruning is verified; no retrieval behavior changes automatically from diagnostic content. Coverage-gap classification, the bare read count and the opt-in log satisfy this gate |
 | Later, only if justified | Open | Graph, richer discovery, hosted/multi-user services | Demonstrated use case and explicit handling, authorization, concurrency and recovery design; not prerequisites for the local demo. Graph evaluation notes are in the [design](docs/design/current-state.md#7-relationship-traversal) |
 
 These are proposed dependencies, not assignments or dates. The full automation
