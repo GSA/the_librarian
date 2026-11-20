@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 import io
+import os
+import shutil
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -460,6 +462,103 @@ class AdapterProcess(unittest.TestCase):
                     adapter.os.kill(child_pid, adapter.signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def stub_worker(self, body):
+        worker = self.root / "worker.py"
+        worker.write_text(
+            "import json,os,sys\n"
+            "job=json.load(open(sys.argv[1]))\n" + body +
+            "with open(sys.argv[2],'w') as f:\n"
+            " json.dump({'schema':'docling-worker-result-v1','ok':True,'payload':payload},f)\n"
+            "os.chmod(sys.argv[2],0o600)\n")
+        worker.with_name("requirements-docling.txt").write_text("# fixture\n")
+        return worker
+
+    def assets_tree(self):
+        assets = self.root / "assets"
+        (assets / "nested").mkdir(parents=True)
+        (assets / "weights.bin").write_bytes(b"pinned weights")
+        (assets / "nested" / "config.json").write_bytes(b"{}")
+        return assets
+
+    def run_convert(self, worker, assets, operation="convert"):
+        popen = adapter.subprocess.Popen
+        with patch.object(adapter, "WORKER", worker), \
+             patch.object(adapter.subprocess, "Popen",
+                          side_effect=lambda args, **kwargs: popen(args[2:], **kwargs)):
+            return adapter._operation(operation, assets, Path(sys.executable), source=b"x",
+                                      name="x.png", format_name="image")[0]
+
+    def test_conversion_reads_a_private_copy_that_later_swaps_cannot_change(self):
+        """Review 56: the shared asset tree can be swapped (and restored) during inference
+        without the worker ever seeing different bytes."""
+        assets = self.assets_tree()
+        swap = self.root / "swap-done"
+        worker = self.stub_worker(
+            "import stat\n"
+            "root=job['artifacts_path']\n"
+            f"assets={str(assets)!r}\n"
+            "before=open(root+'/weights.bin','rb').read()\n"
+            "original=open(assets+'/weights.bin','rb').read()\n"
+            "open(assets+'/weights.bin','wb').write(b'substituted')\n"
+            "mid=open(root+'/weights.bin','rb').read()\n"
+            "open(assets+'/weights.bin','wb').write(original)\n"
+            "payload={'root':root,'before':before.decode(),'mid':mid.decode(),"
+            "'nested':open(root+'/nested/config.json').read(),"
+            "'file_mode':stat.S_IMODE(os.stat(root+'/weights.bin').st_mode),"
+            "'dir_mode':stat.S_IMODE(os.stat(root).st_mode),'shared':assets}\n")
+        payload = self.run_convert(worker, assets)
+        self.assertEqual((payload["before"], payload["mid"]), ("pinned weights",) * 2)
+        self.assertEqual(payload["nested"], "{}")
+        self.assertNotEqual(payload["root"], str(assets))
+        self.assertEqual((payload["file_mode"], payload["dir_mode"]), (0o400, 0o700))
+        self.assertFalse(Path(payload["root"]).exists(), "private copy outlives the operation")
+        self.assertEqual((assets / "weights.bin").read_bytes(), b"pinned weights")
+
+    def test_inspection_reports_the_shared_tree_without_copying(self):
+        assets = self.assets_tree()
+        worker = self.stub_worker("payload={'root':job['artifacts_path']}\n")
+        self.assertEqual(self.run_convert(worker, assets, "inspect"), {"root": str(assets)})
+
+    def test_private_copy_refuses_links_and_nonregular_assets(self):
+        for kind in ("file_link", "dir_link", "fifo"):
+            with self.subTest(kind=kind):
+                assets = self.assets_tree()
+                outside = self.root / "outside"
+                outside.mkdir(exist_ok=True)
+                (outside / "secret").write_bytes(b"secret")
+                if kind == "file_link":
+                    (assets / "evil").symlink_to(outside / "secret")
+                elif kind == "dir_link":
+                    (assets / "evil").symlink_to(outside, target_is_directory=True)
+                else:
+                    os.mkfifo(assets / "evil")
+                worker = self.stub_worker("payload={}\n")
+                with self.assertRaises(adapter.AdapterError) as raised:
+                    self.run_convert(worker, assets)
+                self.assertIn(raised.exception.code, ("unsafe_assets", "mutation"))
+                shutil.rmtree(assets)
+                shutil.rmtree(outside)
+
+    def test_concurrent_conversions_get_distinct_private_copies(self):
+        from concurrent.futures import ThreadPoolExecutor
+        assets = self.assets_tree()
+        worker = self.stub_worker(
+            "import time\n"
+            "root=job['artifacts_path']\n"
+            "time.sleep(0.3)\n"
+            "payload={'root':root,'bytes':open(root+'/weights.bin').read()}\n")
+        popen = adapter.subprocess.Popen
+        # Patch once, outside the threads: the patches themselves are not thread-safe.
+        with patch.object(adapter, "WORKER", worker), \
+             patch.object(adapter.subprocess, "Popen",
+                          side_effect=lambda args, **kwargs: popen(args[2:], **kwargs)), \
+             ThreadPoolExecutor(max_workers=3) as pool:
+            payloads = list(pool.map(lambda _: adapter._operation(
+                "convert", assets, Path(sys.executable), source=b"x", name="x.png",
+                format_name="image")[0], range(3)))
+        self.assertEqual(len({p["root"] for p in payloads}), 3)
+        self.assertEqual({p["bytes"] for p in payloads}, {"pinned weights"})
 
     def test_mutated_interpreter_is_terminated(self):
         identity = adapter._executable_identity(Path(sys.executable))

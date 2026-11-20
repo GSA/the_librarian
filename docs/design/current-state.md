@@ -171,6 +171,13 @@ restated here.
   package; the first step then is to pin that package, not to add a lock file.
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
+  Each conversion reads a private 0700/0400 copy of the assets made inside its own
+  operation directory (about 0.15 s for 379 MB), so swapping the shared tree during
+  inference, even with a restore, cannot change what the worker reads, and concurrent
+  conversions share nothing
+  (`tests/test_docling.py::AdapterProcess::test_conversion_reads_a_private_copy_that_later_swaps_cannot_change`,
+  `::test_concurrent_conversions_get_distinct_private_copies`). The worker still hashes the
+  copy against the pins and fails on any change to it.
   Its direct dependencies are exact pins in `tools/extraction/requirements-docling.in`;
   `requirements-docling.txt` is the full Python 3.14 Linux CPU lock the worker
   enforces at runtime, and every direct pin must appear in it unchanged

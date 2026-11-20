@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import select
+import shutil
 import threading
 import stat
 import subprocess
@@ -210,6 +211,37 @@ class _DiagnosticCollector:
             self.thread.join()
 
 
+def _private_assets(source_root: Path, destination: Path):
+    """Copy the model assets into this operation's private directory, refusing links.
+
+    Inference then reads bytes no other process can substitute: the destination is a fresh
+    0700 directory of 0400 files, owned by this operation and removed with it, so concurrent
+    conversions share nothing. The worker still hashes the copy against the pinned assets
+    (a file swapped while it is copied cannot match its pin) and detects any later change.
+    """
+    destination.mkdir(mode=0o700)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        for parent, dirs, files in os.walk(source_root, followlinks=False):
+            relative = Path(parent).relative_to(source_root)
+            for name in dirs:
+                require(not (Path(parent) / name).is_symlink(),
+                        "Symlink in model assets", "unsafe_assets")
+                (destination / relative / name).mkdir(mode=0o700)
+            for name in files:
+                with os.fdopen(os.open(Path(parent) / name, flags), "rb") as stream:
+                    require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode),
+                            "Nonregular model asset", "unsafe_assets")
+                    target = os.open(destination / relative / name,
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                                     | os.O_CLOEXEC, 0o400)
+                    with os.fdopen(target, "wb") as copy:
+                        shutil.copyfileobj(stream, copy, 8 * 1024 * 1024)
+    except OSError as error:
+        raise AdapterError("Model assets unavailable or changed while copying",
+                           "mutation") from error
+
+
 def _operation(operation, artifacts_path: Path, python: Path, *, source=None,
                name=None, format_name=None):
     require(operation in ("inspect", "convert"), "Unsupported worker operation")
@@ -237,6 +269,9 @@ def _operation(operation, artifacts_path: Path, python: Path, *, source=None,
         job = {"schema": "docling-worker-job-v1", "operation": operation,
                "artifacts_path": str(artifacts_path)}
         if operation == "convert":
+            # Only inference needs a stable view; inspection is a read-only report.
+            _private_assets(artifacts_path, home / "models")
+            job["artifacts_path"] = str(home / "models")
             require(isinstance(source, bytes) and isinstance(name, str) and name,
                     "Conversion requires source bytes and a source name")
             require(format_name in ("pdf", "image"), "Unsupported Docling format")
