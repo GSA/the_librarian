@@ -161,12 +161,23 @@ PAYLOAD_METADATA = ("precedence", "xml_sha256", "unrendered_features", "bom_byte
                     "method", "parts", "source_format", "conversion", "page_count", "unread_pages")
 
 
-def inputs(root, config, engine, review_snapshot=None):
-    """Pin selected catalog records, original bytes and retained extraction bytes."""
+def inputs(root, config, engine, review_snapshot=None, *, reads=None, keep=True):
+    """Pin selected catalog records, original bytes and retained extraction bytes.
+
+    ``reads``, a set, receives every selected extraction, original and sidecar path read (the stores
+    are the caller's to name). Without ``keep`` only the identity is returned, so a freshness check
+    holds one extraction at a time instead of every payload.
+    """
     selections = config.get("renditions", [])
     if not selections:
         return [], ""
-    no_symlinks = _checker(root, engine)
+    checked = _checker(root, engine)
+
+    def no_symlinks(path):
+        path = checked(path)
+        if reads is not None:
+            reads.add(path)
+        return path
     catalog = engine.load_catalog()
     if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
             and review_snapshot is None):
@@ -210,7 +221,8 @@ def inputs(root, config, engine, review_snapshot=None):
             lambda path: catalog.private_file(no_symlinks(path)), engine)
         label = confidence.for_rendition(value, review, origin)
         identity["confidence"] = label
-        result.append((item, raw, value, _metadata(item, value, run, review), label))
+        if keep:
+            result.append((item, raw, value, _metadata(item, value, run, review), label))
         identities.append(identity)
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
 

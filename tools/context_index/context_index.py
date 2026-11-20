@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote
 import uuid
 
 from tools import policy
-from tools.context_index import confidence, renditions
+from tools.context_index import confidence, proof_cache, renditions
 
 
 SCHEMA = 1
@@ -393,7 +393,9 @@ def readonly(path):
     return connection
 
 
-def metadata_expected(root, manifest_hash, config=None, rendition_identity=None, review_snapshot=None):
+def metadata_expected(root, manifest_hash, config=None, rendition_identity=None, review_snapshot=None,
+                      cache_db=None):
+    """With ``cache_db`` (an index path) a proven identity is reused while its inputs are unchanged."""
     try:
         corpus_root = policy.logical_corpus_root(root)
         settings = policy.for_root(root)[0]
@@ -401,8 +403,11 @@ def metadata_expected(root, manifest_hash, config=None, rendition_identity=None,
     except ValueError as error:
         fail(str(error))
     if rendition_identity is None:
-        _, rendition_identity = renditions.inputs(
-            root, config or {}, rendition_api(root), review_snapshot=review_snapshot)
+        def compute(reads):
+            return renditions.inputs(root, config or {}, rendition_api(root), review_snapshot=review_snapshot,
+                                     reads=reads, keep=False)[1]
+        rendition_identity = (compute(None) if cache_db is None
+                              else proof_cache.identity(root, config or {}, cache_db, compute))
     return {
         "schema_version": str(SCHEMA), "engine_fingerprint": engine_fingerprint(),
         "manifest_hash": manifest_hash, "corpus_root": corpus_root,
@@ -484,11 +489,12 @@ def publication_lock(db):
 
 
 def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
+    proof = proof_cache.Proof(root, config)
     review_snapshot = (load_event_reader().read_snapshot(root, full=True)
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
     selected, rendition_identity = renditions.inputs(
-        root, config, rendition_api(root), review_snapshot=review_snapshot)
+        root, config, rendition_api(root), review_snapshot=review_snapshot, reads=proof.reads)
     expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
         existing = readonly(db)
@@ -571,6 +577,8 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
         if publication_guard is not None:
             publication_guard()
         os.replace(temporary, db)
+        # Readers may reuse this full proof while its inputs keep their identity.
+        proof.store(db, rendition_identity)
         return envelope(command="build", fresh=True, database=str(db), root=root, **counts)
     finally:
         if connection is not None:
@@ -598,15 +606,16 @@ def has_table(connection, name):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
-def freshness(connection, root, manifest, db, config, manifest_hash, expected=None):
-    """Reasons the index is stale; ``expected`` is a ``metadata_expected`` the caller just computed."""
+def freshness(connection, root, manifest, db, config, manifest_hash, expected=None, *, reuse=False):
+    """Reasons the index is stale; ``expected`` is a ``metadata_expected`` the caller just computed.
+
+    ``reuse`` (readers only, never publication) lets the rendition identity come from the proof memo
+    (``proof_cache``) while every input it was proven from is unchanged.
+    """
     no_symlinks(db)
     actual = dict(connection.execute("SELECT key,value FROM metadata"))
-    review_snapshot = (load_event_reader().read_snapshot(root, full=True)
-                       if any(item["format"] == "docling" for item in config.get("renditions", []))
-                       else None)
     if expected is None:
-        expected = metadata_expected(root, manifest_hash, config, review_snapshot=review_snapshot)
+        expected = metadata_expected(root, manifest_hash, config, cache_db=db if reuse else None)
     reasons = [f"metadata changed: {key}" for key in expected if actual.get(key) != expected[key]]
     if not has_table(connection, "rendition_documents"):
         return [*reasons, "rendition schema missing; run build"]

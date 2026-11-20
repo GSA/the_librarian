@@ -93,6 +93,7 @@
   "tools/context_index/packets.py",
   "tools/context_index/confidence.py",
   "tools/context_index/corrections.py",
+  "tools/context_index/proof_cache.py",
   "tools/context-mcp/README.md",
   "tools/context-mcp/pyproject.toml",
   "tools/context-mcp/src/the_librarian_mcp/__init__.py",

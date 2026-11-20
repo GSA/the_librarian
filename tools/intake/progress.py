@@ -455,7 +455,7 @@ def read_index(root):
                              or db.parent.stat().st_mode & 0o777 != 0o700):
             return {"available": False, "error": "not_private", "fresh": False}
         with closing(index.readonly(db)) as connection:
-            reasons = index.freshness(connection, root, manifest, db, config, checksum)
+            reasons = index.freshness(connection, root, manifest, db, config, checksum, reuse=True)
             counts = index.count_index(connection)
     except (index.IndexError_, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         return {**failure(error), "fresh": False}

@@ -36,7 +36,7 @@ def target(root, locator, claim):
     config, manifest_hash = load_manifest(manifest, root)
     db = validate_db_path(root, root / policy.validate_instance_roots(root)["context_index_db"])
     with closing(readonly(db)) as connection:
-        reasons = freshness(connection, root, manifest, db, config, manifest_hash)
+        reasons = freshness(connection, root, manifest, db, config, manifest_hash, reuse=True)
         if reasons:
             fail("Index is stale; run build before recording a correction. " + "; ".join(reasons))
         section = get_section(connection, locator, root)
