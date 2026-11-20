@@ -169,7 +169,10 @@ policy, hash-consistent, and within its inherited audience and handling rules.
 The Docling source limit is 64 MiB; PDFs allow at most 100 pages and
 32,000,000 pixels per page. Worker and final results are limited to 64 MiB,
 diagnostics to 64 KiB, address space to 16 GiB, and wall time to 600 seconds.
-Conversion always runs in `unshare -Urn` with offline model flags. Native
+Conversion always runs in `unshare -Urn` with offline model flags, reading a private
+read-only copy of the model assets (about 0.15 s and 380 MB of temporary disk per
+running conversion, removed with the operation) so a change to the shared model
+directory mid-run cannot affect it. Native
 (stdlib) formats parse inside the toolkit process without that sandbox, so
 their source limit is lower: 16 MiB, with renditions limited to 64 MiB.
 
