@@ -125,9 +125,11 @@ def _ensure_standing_inputs(root, policy_path, manifest, model, context):
     policy_file = root / policy_path
     if not policy_file.is_file():
         _replace_json(policy_file, {
-            "schema": standing.POLICY_SCHEMA,
+            "schema": standing.POLICY_SCHEMA_V2,
             "policy_id": "cohort-standing",
             "version": 1,
+            "criteria": standing.CRITERIA[-1],
+            "carries": [],
             "status": "active",
             "reviewer": f"{model_review.PROVIDER}:{model}",
             "scope": {
@@ -439,13 +441,15 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
 
 
 def rereview(root, *, policy_path, manifest, model, transport=None, apply=False, limit=None,
-             include_current_deferred=False, deferred="qualify-low-confidence", concurrency=6,
+             include_current_deferred=False, include_older_rejected=False,
+             deferred="qualify-low-confidence", concurrency=6,
              adaptive=True, initial_concurrency=None, inspected_form="list", cost_estimate=None):
     """Report, and with ``apply`` re-review under the current policy, held standing reviews.
 
     See ``cohort_rereview``. Selected: chain heads held under an older policy (pending review or
     deferred), ``insufficient-inspected-scope`` under the current one and, with
-    ``include_current_deferred``, current-policy deferrals; never a rejected or out-of-scope
+    ``include_current_deferred``, current-policy deferrals and, with ``include_older_rejected``,
+    renditions rejected only under older policies (for new review criteria); never an out-of-scope
     rendition. ``deferred`` (default ``qualify-low-confidence``, the operator's choice for this
     command) qualifies a reviewer deferral after a complete inspection as low confidence. The dry
     run makes no model call and writes nothing; it reports the selection per reason and the
@@ -463,7 +467,8 @@ def rereview(root, *, policy_path, manifest, model, transport=None, apply=False,
     policy_sha = hashlib.sha256((root / policy_path).read_bytes()).hexdigest()
     standing_policy = standing.load_policy(root, policy_path, policy_sha)
     with store.locked(root) as c:
-        selected, skipped = cohort_rereview.select(root, c, policy_sha, include_current_deferred)
+        selected, skipped = cohort_rereview.select(root, c, policy_sha, include_current_deferred,
+                                                   include_older_rejected)
     report, work = cohort_rereview.plan(root, selected, skipped, standing_policy, limit=limit,
                                         inspected_form=inspected_form, model=model,
                                         cost_estimate=cost_estimate)
@@ -607,6 +612,9 @@ def _parser():
     command.add_argument("--limit", type=int, help="most model calls this run (default: all selected)")
     command.add_argument("--include-current-deferred", action="store_true",
                          help="also re-review reviewer deferrals held under the current policy")
+    command.add_argument("--include-older-rejected", action="store_true",
+                         help="also re-review renditions rejected only under older policies "
+                              "(after the review criteria change)")
     command.add_argument("--cost-estimate", type=Path,
                          help="token estimate file keyed by model (per_document tokens) for the dry run")
     return parser
@@ -647,7 +655,7 @@ def _rereview(args):
         args.root, policy_path=args.policy_path, manifest=args.manifest, model=args.model,
         transport=_transport(args.models_config) if args.apply else None, apply=args.apply,
         limit=args.limit, include_current_deferred=args.include_current_deferred,
-        deferred=args.deferred, concurrency=args.concurrency, adaptive=not args.no_adaptive,
+        include_older_rejected=args.include_older_rejected, deferred=args.deferred, concurrency=args.concurrency, adaptive=not args.no_adaptive,
         initial_concurrency=args.initial_concurrency, inspected_form=args.inspected_form,
         cost_estimate=args.cost_estimate)
 

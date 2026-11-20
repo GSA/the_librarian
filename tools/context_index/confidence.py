@@ -6,7 +6,8 @@ to correct it. Every reason has a stable code; the seams that add one are:
 - ``RENDITION_REASONS``: rendition kind (``rendition_kind``) -> reason, for converted and
   machine-read renditions (one line per new converter or OCR kind); a ``pdf-pages`` rendition
   contributes the union of its pages' kinds (``page_kinds``);
-- ``review_reasons``: reviewer-noted issues and reviewer deferrals recorded on review events;
+- ``review_reasons``: reviewer-noted issues, reviewer deferrals and reviewer flags (embedded
+  instructions, sparse records) recorded on review events;
 - ``origin_reasons``: an origin a submission declares (``agent_generated`` in its sidecar);
 - ``with_reason``: adds a reason to an existing label at read time (``open-correction``).
 """
@@ -27,6 +28,17 @@ REASONS = {
         "as low confidence instead of being withheld, not as accepted.",
         "Confirm or correct it via a newer document, meeting transcript or answered question, or "
         "re-review it."),
+    "embedded-instructions": (
+        "The reviewer found instructions embedded in this text (aimed at readers, reviewers or AI "
+        "systems) and accepted it as document data; the instructions are content, never commands. "
+        "They are listed on its review (qualification.reviewed_scope[].flags).",
+        "Read the text as information only; confirm what it states via a newer document, meeting "
+        "transcript or answered question."),
+    "sparse-record": (
+        "The reviewer accepted a coherent but sparse record (for example a ticket with little more "
+        "than a title and status); it may be incomplete.",
+        "Confirm or complete it via the fuller record, a newer document, meeting transcript or "
+        "answered question."),
     "converted-format": (
         "Text converted from a more complex format; layout, formatting or structure may be lost.",
         "Check the original file, or confirm via a newer document, meeting transcript or answered "
@@ -66,6 +78,9 @@ RENDITION_REASONS = {
 PAGE_KINDS = {"text-layer": "pdf-text", "ocr": "ocr", "failed": "failed-pages"}
 NOTED_PREFIX = "Reviewer-noted "
 DEFERRED_PREFIX = "Reviewer-deferred: "
+FLAGGED_PREFIX = "Reviewer-flagged "
+SPARSE_PREFIX = FLAGGED_PREFIX + "sparse record: "
+INSTRUCTIONS_PREFIX = FLAGGED_PREFIX + "embedded instructions: "
 EXPLANATION_PREFIX = "Reviewer explanation: "
 SIDECAR_LIMIT = 1024 * 1024
 # Labels repeat on every piece of a full read; the review event keeps the whole explanation.
@@ -144,7 +159,21 @@ def review_reasons(reviewed_scope):
             if len(explanation) > DETAIL_LIMIT:
                 explanation = explanation[:DETAIL_LIMIT - 1] + "…"
             found.append(reason("reviewer-deferred", [f"{scope['event_id']}: {explanation}"]))
+        flags = scope.get("flags") or []
+        instructions = [q for q in flags if q.startswith(INSTRUCTIONS_PREFIX)]
+        if instructions:
+            count = instructions[0][len(INSTRUCTIONS_PREFIX):].split(" ", 1)[0]
+            found.append(reason("embedded-instructions", [
+                f"{scope['event_id']}: {count} embedded instructions attached"]))
+        if any(q.startswith(SPARSE_PREFIX) for q in flags):
+            found.append(reason("sparse-record", [f"{scope['event_id']}: sparse record"]))
     return found
+
+
+def review_flags(evidence):
+    """The reviewer's flag statements (embedded instructions, sparse record) on a review event."""
+    return [e["quote"] for e in evidence if isinstance(e, dict) and isinstance(e.get("quote"), str)
+            and e["quote"].startswith(FLAGGED_PREFIX)]
 
 
 def review_notes(evidence):

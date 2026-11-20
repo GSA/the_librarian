@@ -6,8 +6,10 @@ reviewer deferral, or an ``insufficient-inspected-scope`` review stays blocked f
 ``rereview`` finds those chain heads in the ledger, one per rendition, and with ``apply`` reviews
 each again with the model under the current policy. The new review is staged as a correction of
 the blocked head (the ledger stays append-only) under the name ``qualify`` itself uses for the
-current policy, so a later ``qualify`` finds it and never pays for it twice. Rejected and
-out-of-scope renditions are never selected. Run ``cohort publish`` after an applied run.
+current policy, so a later ``qualify`` finds it and never pays for it twice. Out-of-scope
+renditions are never selected; rejected ones only with ``include_older_rejected``, when every
+rejection was under an older policy (new review criteria may accept them). Run ``cohort publish``
+after an applied run.
 """
 from collections import Counter
 from pathlib import Path
@@ -24,7 +26,7 @@ UNRESOLVED = "standing-pending-review-unresolved-evidence"
 # Codes of an older-policy review that a review under the current policy can settle.
 OLDER_PENDING = frozenset({UNRESOLVED, INSUFFICIENT,
                            "standing-policy-changed"})
-REASONS = ("resume", "older-policy-pending", "older-policy-deferred",
+REASONS = ("resume", "older-policy-pending", "older-policy-deferred", "older-policy-rejected",
            "insufficient-inspected-scope", "current-policy-deferred")
 # ``standing-<submission>-<rendition sha256[:12]>-<policy sha256[:8]>`` and its ``-c<n>`` corrections.
 NAME = re.compile(r"standing-(.+)-([0-9a-f]{12})-[0-9a-f]{8}(?:-c[0-9]+)?")
@@ -92,7 +94,7 @@ def _stale(c, args):
     return bool(known) and args["rendition_sha256"] not in known
 
 
-def select(root, c, policy_sha, include_current_deferred=False):
+def select(root, c, policy_sha, include_current_deferred=False, include_older_rejected=False):
     """``(selected, skipped)`` from the ledger on connection ``c``; reads, never writes.
 
     Chain heads are grouped by rendition. A rendition settled under any chain (reviewed and
@@ -100,7 +102,9 @@ def select(root, c, policy_sha, include_current_deferred=False):
     head is pinned under the current policy only those decide: a head whose review or selection is
     still unfinished is resumed without a model call, and a current-policy review whose saved
     findings are re-evaluated (``unresolved-evidence``, and deferrals when included) is selected
-    only when its inspection was incomplete.
+    only when its inspection was incomplete. With ``include_older_rejected``, a rendition rejected
+    only under older policies is not skipped: without a current-policy review it is selected
+    (``older-policy-rejected``); with one, that review decides as above.
     """
     snapshot = adapters.OneRead(root)
     groups = {}
@@ -117,12 +121,22 @@ def select(root, c, policy_sha, include_current_deferred=False):
         reviewed = [h for h in every if h["review"] == "succeeded"]
         selecting = [h for h in reviewed if h["select"] in cohort_review.RUNNABLE | {"blocked"}
                      and h["args"]["policy_sha256"] == policy_sha]
+        rejected = [h for h in every if (h["code"] or "").startswith("standing-rejected-")]
+        current = any(h["args"]["policy_sha256"] == policy_sha for h in every)
+        reconsidered = (include_older_rejected and rejected
+                        and all(h["args"]["policy_sha256"] != policy_sha for h in rejected))
         if reviewed and len(selecting) < len(reviewed):
             skipped["reviewed"] += 1
         elif selecting:
             selected.append({**selecting[0], "reason": "resume"})
-        elif any(code.startswith("standing-rejected-") for code in codes):
+        elif rejected and not reconsidered:
             skipped["rejected"] += 1
+        elif reconsidered and not current:
+            head = sorted(rejected, key=lambda h: h["corr"])[-1]
+            if with_docs and _stale(c, head["args"]):
+                skipped["stale-rendition"] += 1
+            else:
+                selected.append({**head, "reason": "older-policy-rejected"})
         elif "standing-exception-prohibited-scope" in codes:
             skipped["out-of-scope"] += 1
         elif with_docs and _stale(c, heads[0]["args"]):
@@ -158,7 +172,8 @@ def _check(root, head, standing_policy, inspected_form):
     if not standing.permits(standing_policy["scope"], value["source"]["receipt_id"], value["source"]["audience"]):
         return None, "out-of-scope"
     try:
-        prepared = model_review.task(root, args["rendition"], inspected_form)
+        prepared = model_review.task(root, args["rendition"], inspected_form,
+                                     standing.criteria(standing_policy))
     except (OSError, ValueError, KeyError):
         return None, "rendition-unreadable"
     if len(prepared["expected"]["records"]) > standing_policy["budget"]["max_records"]:

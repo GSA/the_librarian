@@ -322,7 +322,8 @@ restated here.
   `test_retrieval_surfaces_the_issues_a_qualified_document_carries`,
   `test_advisory_references_do_not_block_...`),
   `tests/test_intake_cohort.py::RecoverUnresolvedEvidenceTests`, `tests/test_model_review.py`
-  (`test_control_task_must_not_be_accepted` covers a synthetic injection control,
+  (`test_v2_criteria_prompt_records_embedded_instructions_and_sparse_records`,
+  `test_control_task_must_not_be_accepted` covers a synthetic injection control,
   `test_redirects_are_refused`, `test_usai_transport_refuses_unconfigured_models_and_providers`).
 - **Low-confidence information is published and marked, not withheld** (owner direction, Kata
   chwz). Every indexed document has a `confidence-v1` label `{"level": "normal"|"low",
@@ -332,7 +333,8 @@ restated here.
   ("confirm or correct via a newer document, meeting transcript or answered question"):
   `noted-issues` (an accepted review carrying `Reviewer-noted ...` statements, so existing
   my2k qualifications become low confidence at the next rebuild without re-review),
-  `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `converted-format` and
+  `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `embedded-instructions`
+  and `sparse-record` (`Reviewer-flagged ...` statements, below), `converted-format` and
   `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
   extraction payload format; `docling-pdf`, `docling-image` and cohort `ocr` are `machine-ocr`, a cohort PDF text layer
   (`pdf-text`) and `converted` (office/RTF conversion, below) are `converted-format`, a cohort
@@ -656,6 +658,30 @@ restated here.
   the index build, so an incremental build is not pursued. Evidence:
   `tests/test_intake_cohort.py::PublishTests`.
 
+- **Review criteria are pinned by the policy, and a criteria change carries qualified reviews**
+  (owner direction, Kata 11nz). A `standing-policy-v2` file adds `criteria` (`standing-review-v1`
+  is the original prompt, byte-identical; `standing-review-v2` is the default for new policies)
+  and `carries`, a list of `{version, sha256}` of earlier versions of the same policy id. Under
+  v2 criteria the reviewer treats every instruction in the records, including any addressed to
+  the reviewer, as document content, judges the remaining content, and accepts a coherent but
+  sparse record (`sparse: true`); garbled text, noise, boilerplate and text with nothing beyond
+  instructions are still rejected. Its findings are `standing-findings-v3` (`embedded_instructions`,
+  `sparse`); evaluation requires the findings schema the policy's criteria write, so old findings
+  never pass under new criteria or vice versa. An accept with flags qualifies; its event adds
+  `Reviewer-flagged sparse record:` and `Reviewer-flagged embedded instructions: N ...` plus one
+  `Reviewer-flagged embedded instruction:` item each (fitted after the noted issues into the 30
+  statements, with a truncation statement), and the index reads them into
+  `reviewed_scope[].flags` and the low-confidence reasons `embedded-instructions` and
+  `sparse-record`. Events without flags are byte-identical to before. A carried version's
+  review whose stages succeeded and whose event is live is reused by `qualify` without a model
+  call (entry `carried`), and `standing-publish` authorizes selections citing the current or a
+  carried version. Evidence: `tests/test_standing.py`
+  (`test_policy_v2_pins_criteria_and_carries_only_earlier_versions`,
+  `test_findings_schema_must_match_the_policy_criteria`,
+  `test_reviewer_flags_qualify_and_label_the_text_low_confidence`),
+  `tests/test_model_review.py::FindingsTests::test_v2_criteria_prompt_records_embedded_instructions_and_sparse_records`,
+  `tests/test_intake_cohort.py::RereviewTests::test_new_criteria_carry_qualified_reviews_and_re_review_older_rejections_as_low_confidence`.
+
 - **Re-review of blocked standing reviews.** `cohort rereview` (dry run by default, `--apply`)
   selects standing-review chain heads that can still qualify only with a new model review:
   heads reviewed under an older policy that are pending (`standing-policy-changed`,
@@ -664,7 +690,9 @@ restated here.
   insufficient), and with `--include-current-deferred` current-policy deferrals whose saved
   findings cannot qualify without a model. A rendition already reviewed and selected under any
   chain, rejected or refused as out of scope under any chain (older policies included), out of the
-  current policy's scope, superseded in the docs table
+  current policy's scope (with `--include-older-rejected`, a rendition rejected only under older
+  policies and without a current-policy review is selected as `older-policy-rejected`, for
+  changed review criteria), superseded in the docs table
   (`stale-rendition`) or recoverable from saved findings (`recoverable-without-model`, left to
   `recover-*`) is skipped with that reason; a rejected or out-of-scope rendition is never
   selected. The dry run counts selected/skipped heads by reason and estimates model calls and
@@ -675,7 +703,7 @@ restated here.
   stages the review as an append-only correction of the old head (an older-policy head under the
   current-policy chain name, so a later `qualify` finds it), then selects. `--deferred` defaults
   to `qualify-low-confidence` here, so a head still deferred qualifies as `reviewer-deferred` low
-  confidence; a rejection stays out. A staged but unfinished re-review, or a current-policy review whose
+  confidence; a new rejection stays out. A staged but unfinished re-review, or a current-policy review whose
   selection is unfinished (interrupted, or the manifest was full), is resumed without a new model
   call, so an interrupted run is rerunnable. Nothing is published until `cohort publish`.
   Insufficient-scope reviews on a live cohort were accepts over long renditions (median about

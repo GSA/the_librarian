@@ -13,7 +13,7 @@ from tools.review_events import event_reader
 from tools.review_events import event_store as events
 from . import selection_manifest
 from .contracts import canonical
-from .standing import Refusal, permits, read_private
+from .standing import Refusal, carried, permits, read_private
 from .standing_events import standing_claims
 
 
@@ -21,7 +21,8 @@ def authorize_publication(root, manifest_name, standing, pinned):
     """Refuse a manifest whose standing-authorized selections this policy did not authorize.
 
     Selections backed only by independent reviews are outside standing authority
-    and are left to the native qualification rules.
+    and are left to the native qualification rules. A review under an earlier version the policy
+    ``carries`` is authorized as its own.
     """
     try:
         path = index.no_symlinks(Path(root) / manifest_name)
@@ -33,13 +34,14 @@ def authorize_publication(root, manifest_name, standing, pinned):
     except (OSError, UnicodeError, ValueError, index.IndexError_,
             events.contract.ReviewError) as error:
         raise Refusal("blocked", "standing-selection-unauthorized") from error
-    expected = (pinned["policy_id"], str(pinned["version"]), pinned["sha256"])
+    accepted = {(pinned["policy_id"], str(pinned["version"]), pinned["sha256"])} | {
+        (policy_id, str(version), sha) for policy_id, version, sha in carried(standing)}
     for item in raw.get("renditions", []):
         for event_id in item.get("review_event_ids") or []:
             claims = standing_claims(snapshot.event(event_id))
             if not claims:
                 continue
-            if (claims != [expected] or not permits(
+            if (len(claims) != 1 or tuple(claims[0]) not in accepted or not permits(
                     standing["scope"], item["receipt_id"], _audience(root, item["path"]) or "")):
                 raise Refusal("blocked", "standing-selection-unauthorized")
 
