@@ -27,7 +27,42 @@ def load(path):
             and isinstance(value.get("aggregates"), dict) and isinstance(value.get("cases"), list)
             and isinstance(value.get("provenance"), dict),
             f"Not a {SCHEMA} scorecard: {path}")
+    shaped(value, path)
     return value
+
+
+def number(value, integer=False):
+    if integer:
+        return type(value) is int and value >= 0
+    return type(value) in (int, float) and value >= 0
+
+
+def shaped(card, path):
+    """Refuse a scorecard whose gated fields are missing or malformed, so it cannot pass by absence."""
+    def check(condition, detail):
+        require(condition, f"Malformed scorecard {path}: {detail}")
+    totals = card["aggregates"]
+    for name in RATES:
+        check(name in totals and (totals[name] is None or number(totals[name])),
+              f"aggregates.{name} must be a number or null")
+    for name in COUNTS:
+        check(number(totals.get(name), integer=True), f"aggregates.{name} must be a count")
+    for name in ("returned_confidence", "expected_hit_confidence"):
+        levels = totals.get(name)
+        check(isinstance(levels, dict) and all(number(v, integer=True) for v in levels.values()),
+              f"aggregates.{name} must map levels to counts")
+    seen = set()
+    for item in card["cases"]:
+        check(isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"] not in seen,
+              "every case needs a unique id")
+        seen.add(item["id"])
+        check(item.get("status") in ("pass", "fail", "error"), f"case {item['id']} has no valid status")
+        check(isinstance(item.get("reasons"), list), f"case {item['id']} reasons must be a list")
+        check(item.get("rank") is None or number(item["rank"], integer=True),
+              f"case {item['id']} rank must be a count or null")
+    for section, _ in PROVENANCE:
+        check(card["provenance"].get(section) is None or isinstance(card["provenance"][section], dict),
+              f"provenance.{section} must be an object")
 
 
 def tolerances(overrides=()):

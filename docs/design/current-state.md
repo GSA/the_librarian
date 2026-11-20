@@ -1171,7 +1171,8 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   generated cases and is byte-identical when rerun on an unchanged index. `run`
   calls the CLI's own `load_manifest`, `readonly`, `freshness` and `search` in
   process, checking freshness once before and once after the whole batch (two
-  checks, not one per case) and refusing a stale index without writing anything.
+  checks, not one per case) and refusing a stale index, or a claim-correction change
+  during the batch, without writing anything.
   The scorecard (`retrieval-eval-scorecard-v1`, 0600 under the ignored
   `tools/evals/.local/runs/`) is body-free: ids, closed failure codes, ranks,
   counts, confidence levels, aggregates (hit@1, hit@k, recall@k, MRR, must-not
@@ -1179,7 +1180,7 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   distribution), timings and provenance hashes (index metadata, standing policy
   identity without its scope, correction-store state, cases file, toolkit commit).
   `compare` exits 1 on a metric drop beyond tolerance or on per-case regressions
-  above `--max-regressions`. Nothing reads a scorecard to change selection,
+  above `--max-regressions`, and 2 on a scorecard missing a gated metric. Nothing reads a scorecard to change selection,
   ranking or qualification. Evidence: `tests/test_evals.py`
   (`test_refuses_malformed_cases`,
   `test_generation_is_deterministic_and_keeps_authored_cases`,
@@ -1188,6 +1189,8 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   `test_scorecard_is_body_free_and_private`,
   `test_stale_index_is_refused_without_a_scorecard`,
   `test_freshness_is_checked_once_before_and_once_after_the_batch`,
+  `test_a_correction_recorded_during_the_run_is_refused`,
+  `test_malformed_scorecards_are_refused`,
   `test_regressions_and_metric_drops_exit_nonzero`).
 - **The MCP adapter is read-only** and exposes six tools (`status`, `search`,
   `get`, `get_many`, `catalog`, `review_events`); `tests/test_mcp.py` asserts that

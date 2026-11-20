@@ -63,6 +63,8 @@ class CaseSchemaTests(unittest.TestCase):
              "only a generated case"),
             ([case(id="Bad Id", expect_paths=["a.md"])], "needs an id"),
             ([case(expect_paths=["a.md"], low_confidence="hide")], "low_confidence must be"),
+            ([case(expect_paths=["a.md"], must_not_paths=["a.md"])], "must-not path cannot"),
+            ([case(expect_locators=["a.md#x"], must_not_paths=["a.md"])], "must-not path cannot"),
         ):
             with self.subTest(message=message):
                 self.refused(cases, message)
@@ -260,6 +262,27 @@ class RunTests(EvalWorkspace):
             self.scorecard([case(id="hit", query="saffron", expect_paths=["documents/kitchen.md"])])
         self.assertEqual(check.call_count, 2)
 
+    def test_a_correction_recorded_during_the_run_is_refused(self):
+        from tools.review_events import corrections, event_store
+        self.registration()
+        event_store.initialize(self.root)
+        corrections.initialize(self.root)
+        self.build()
+        search = runner.search
+
+        def correcting(*args, **kwargs):
+            corrections.append(self.root, [{
+                "kind": "dispute", "locator": "documents/kitchen.md#kitchen-inventory",
+                "claim": "Saffron cardamom",
+                "summary": "Disputed.", "source": {"type": "question", "question": "Is it saffron?",
+                                                   "answer": "No.", "answered_by": "cook",
+                                                   "answered_on": "2024-05-01"}}],
+                "test-runner", "req-1", corrections.status(self.root)["state_token"])
+            return search(*args, **kwargs)
+        with patch.object(runner, "search", side_effect=correcting), \
+                self.assertRaisesRegex(EvalError, "Claim corrections changed"):
+            self.scorecard([case(id="hit", query="saffron", expect_paths=["documents/kitchen.md"])])
+
     def test_freshness_is_checked_once_before_and_once_after_the_batch(self):
         cases = [case(id=f"c{n}", query="saffron", expect_paths=["documents/kitchen.md"]) for n in range(5)]
         with patch.object(runner, "freshness", wraps=runner.freshness) as check:
@@ -285,6 +308,17 @@ class CompareTests(EvalWorkspace):
             path.write_text(json.dumps(card))
             paths.append(str(path))
         return paths
+
+    def test_malformed_scorecards_are_refused(self):
+        base, new = self.cards()
+        hollow = {"schema": runner.SCHEMA, "aggregates": {}, "cases": [], "provenance": {}}
+        twice = copy.deepcopy(new)
+        twice["cases"].append(copy.deepcopy(twice["cases"][0]))
+        for card, message in ((hollow, "aggregates.pass_rate"), (twice, "unique id")):
+            with self.subTest(message=message):
+                code, _, err = self.main("compare", *self.files(base, card))
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
 
     def test_identical_scorecards_pass(self):
         base, new = self.cards()

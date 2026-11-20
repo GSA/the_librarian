@@ -217,6 +217,10 @@ def run(root, document, cases_sha, *, manifest=None, db=None, tags=(), standing_
         if dict(connection.execute("SELECT key, value FROM metadata")).get("engine_fingerprint") != \
                 record["index"]["engine_fingerprint"]:
             raise EvalError("Index changed during the run; no scorecard written")
+        snapshot = corrections.load(root)
+        if (None if snapshot is None else snapshot.state["state_token"]) != \
+                record["claim_corrections"].get("state_token"):
+            raise EvalError("Claim corrections changed during the run; no scorecard written")
     finally:
         connection.close()
     durations = [o["duration_ms"] for o in outcomes]

@@ -100,6 +100,9 @@ def validate_case(case):
         if key in case:
             path_list(case, key, label)
     targets = len(case.get("expect_paths", [])) + len(case.get("expect_locators", []))
+    expected = {*case.get("expect_paths", ()), *(item.split("#", 1)[0] for item in case.get("expect_locators", ()))}
+    require(not expected & set(case.get("must_not_paths", ())),
+            f"Case {name}: a must-not path cannot also be an expected document")
     if "expect_absent" in case:
         require(case["expect_absent"] is True, f"Case {name}: expect_absent may only be true")
         require(not targets and "expect_confidence" not in case,

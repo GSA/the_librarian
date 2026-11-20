@@ -12,8 +12,9 @@ local files and never ship in the package.
 
 The default file is `<root>/config/evals.local.json` (`--cases` overrides it), a
 strict JSON object `{"schema": "retrieval-eval-cases-v1", "cases": [...]}`.
-Duplicate keys, unknown fields, duplicate ids and contradictory expectations are
-refused before anything runs. Each case has:
+Duplicate keys, unknown fields, duplicate ids and contradictory expectations (for
+example a must-not path that is also an expected document) are refused before
+anything runs. Each case has:
 
 - `id` (stable; lowercase letters, digits and `. _ : -`), `origin` (`authored` or
   `generated`), literal `query` (the same rules as `search`) and `k` (1..50, the
@@ -59,7 +60,9 @@ an identical file), refuses an id clash, and writes the file 0600.
 
 `run [--tag T ...]` checks freshness once, runs every selected case in process,
 then checks freshness once more. A stale index, or one that becomes stale during
-the batch, is refused and no scorecard is written; rebuild first. A case whose
+the batch, is refused and no scorecard is written; rebuild first. A claim
+correction recorded or resolved during the batch is refused the same way, so one
+scorecard never mixes correction states. A case whose
 search raises (for example a `path` no longer in the selection) is an `error`.
 
 The scorecard is written 0600 under `<root>/tools/evals/.local/runs/` (0700,
@@ -90,7 +93,8 @@ runs share. It exits 1 when a rate drops by more than its tolerance (defaults:
 `pass_rate`, `hit_at_k`, `recall_at_k` 0.01; `hit_at_1`, `mrr`,
 `confidence_match_rate` 0.02; `absence_accuracy` 0), when `must_not_violations`
 or `errors` rise at all, or when regressions exceed `--max-regressions` (default
-0). Unreadable input exits 2.
+0). Unreadable input, or a scorecard missing a gated metric or with malformed
+cases, exits 2 rather than comparing as OK.
 
 ## Operating procedure
 
