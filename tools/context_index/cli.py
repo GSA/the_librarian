@@ -98,7 +98,7 @@ def main(argv=None):
                 result = build(root, manifest, db, config, manifest_hash)
         else:
             connection = readonly(db)
-            reasons = freshness(connection, root, manifest, db, config, manifest_hash)
+            reasons = freshness(connection, root, manifest, db, config, manifest_hash, reuse=True)
             if reasons:
                 if args.command == "status":
                     print(json.dumps(envelope(root=root, command="status", fresh=False, reasons=reasons,
@@ -118,7 +118,7 @@ def main(argv=None):
                 result = packet_many(connection, config, args.locators, args.max_chars,
                                      format_=args.format, root=root)
             # Refuse a result if the inputs changed while assembling it.
-            reasons = freshness(connection, root, manifest, db, config, manifest_hash)
+            reasons = freshness(connection, root, manifest, db, config, manifest_hash, reuse=True)
             if reasons:
                 fail("Index became stale during read; run build. " + "; ".join(reasons))
         sys.stdout.write(render_result(

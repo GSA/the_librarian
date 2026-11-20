@@ -336,7 +336,7 @@ renders it as text or HTML and `progress_serve.py` serves it.
   database past its read timeout. The catalog uses its validated read path without writing a
   receipt: a read-validation receipt that covers this exact file (0017) or this process's own
   full inspection of the identical binding today vouches for it, otherwise the whole history is
-  inspected. Review events are validated in full on a miss of the in-process memo ([design](../docs/design/current-state.md#review-event-validation)), so a render after any review-event commit, restart or new UTC day replays them; the index reports freshness, stale
+  inspected. Review events are validated in full on a miss of the in-process memo ([design](../docs/design/current-state.md#review-event-validation)), so a render after any review-event commit, restart or new UTC day replays them; the index check reuses an unchanged [freshness proof](../docs/design/current-state.md#index-freshness-proof-memo-kata-t5df) and reports freshness, stale
   reasons, indexed documents/sections and selected documents/renditions.
 - Nothing is re-verified while the ledger is unchanged. The finished summary is kept in
   memory keyed by the ledger's file identity (device, inode, size, mtime, ctime, SQLite change

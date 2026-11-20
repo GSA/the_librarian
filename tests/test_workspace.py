@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -13,8 +14,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
+from urllib.parse import unquote, urlsplit
 from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
@@ -24,6 +27,7 @@ from tools.catalog import storage
 from tools.context_index import compact_records
 from tools.context_index import context_index as index
 from tools.context_index import packets
+from tools.context_index import proof_cache
 from tools.context_index import qualification
 from tools.diagnostics import retrieval_log as diagnostics
 from tools.extraction import docling_bridge, extract
@@ -1324,6 +1328,169 @@ class WorkspaceTests(WorkspaceCase):
         with self.assertRaisesRegex(ValueError, "populated extractions_home"):
             policy.migrate_storage(kit)
         self.assertFalse((kit / ".local/migration.json").exists())
+
+    # Freshness proof memo (Kata t5df). Inputs a fixture just wrote are "racily" new, so these tests
+    # stand the memo's clock a few seconds ahead unless they test that rule itself.
+    def aged_inputs(self):
+        clock = patch.object(proof_cache, "_now_ns", lambda: time.time_ns() + 3 * 10 ** 9)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def reader_check(self, config=None, checksum=None):
+        if config is None:
+            config, checksum = index.load_manifest(self.manifest, self.root)
+        with closing(index.readonly(self.db)) as db:
+            return index.freshness(db, self.root, self.manifest, self.db, config, checksum, reuse=True)
+
+    def full_proofs(self):
+        return patch.object(index.renditions, "inputs", wraps=index.renditions.inputs)
+
+    def test_build_leaves_a_private_freshness_proof_that_readers_reuse_without_the_full_proof(self):
+        self.aged_inputs()
+        self.selected_text()
+        memo = proof_cache.location(self.db)
+        self.assertEqual(stat.S_IMODE(memo.stat().st_mode), 0o600)
+        refused = AssertionError("full proof on a memo hit")
+        with patch.object(index.renditions, "inputs", side_effect=refused), \
+                patch.object(event_reader, "read_snapshot", side_effect=refused):
+            self.assertEqual(self.reader_check(), [])
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(index.main(["--root", str(self.root), "search", "last"]), 0)
+            self.assertTrue(json.loads(stdout.getvalue())["hits"])
+            # Publication never reuses the memo.
+            config, checksum = index.load_manifest(self.manifest, self.root)
+            with closing(index.readonly(self.db)) as db, self.assertRaises(AssertionError):
+                index.freshness(db, self.root, self.manifest, self.db, config, checksum)
+
+    def test_freshness_proof_memo_misses_on_every_input_change(self):
+        self.aged_inputs()
+        prepared = self.selected_text()
+        extraction = self.root / prepared["rendition"]
+        original = self.root / "sources/notes.txt"
+        cases = {
+            "original bytes (same size)": lambda: original.write_bytes(b"First\r\n\xce\xb2\nlast"),
+            "extraction bytes": lambda: extraction.write_bytes(extraction.read_bytes() + b" "),
+            "extraction permissions": lambda: extraction.chmod(0o640),
+            "extraction directory replaced by a symlink": lambda: (
+                extraction.parent.rename(extraction.parent.with_name("moved")),
+                extraction.parent.symlink_to(extraction.parent.with_name("moved"))),
+        }
+        for name, change in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as saved:
+                shutil.copytree(self.root, Path(saved) / "root", symlinks=True)
+                self.assertEqual(self.reader_check(), [])
+                change()
+                with self.assertRaises((index.IndexError_, ValueError)):
+                    self.reader_check()
+                shutil.rmtree(self.root)
+                shutil.copytree(Path(saved) / "root", self.root, symlinks=True)
+        # A catalog commit, a new selection context and a policy change each force the full proof.
+        self.assertEqual(self.reader_check(), [])
+        unrelated = {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}}
+        catalog.submit(self.root, [unrelated], actor="test-runner", request_id="after-proof",
+                       expected_state=catalog.status(self.root)["state_token"], reason="Memo test")
+        with self.full_proofs() as full:
+            self.assertEqual(self.reader_check(), [])
+            self.assertEqual(full.call_count, 1)
+            self.assertEqual(self.reader_check(), [])
+            self.assertEqual(full.call_count, 1)
+        self.config["renditions"][0]["context"] = ["documents/README.md"]
+        self.save_config()
+        with self.full_proofs() as full:
+            self.assertIn("metadata changed: manifest_hash", self.reader_check())
+            self.assertEqual(full.call_count, 1)
+        (self.root / "config/policy.local.json").write_text(json.dumps({"excluded_name_patterns": ["private"]}))
+        with self.full_proofs() as full:
+            self.assertIn("metadata changed: policy_hash", self.reader_check())
+            self.assertEqual(full.call_count, 1)
+
+    def test_freshness_proof_memo_binds_the_review_event_store_when_selections_are_reviewed(self):
+        self.aged_inputs()
+        self.registration()
+        state = events.initialize(self.root)
+        config = {"renditions": [{"path": "x", "format": "text", "review_event_ids": ["rev-pending"]}]}
+        self.db.parent.mkdir(parents=True)
+        computed = []
+
+        def compute(reads):
+            computed.append(1)
+            return "a" * 64
+        for _ in range(2):
+            self.assertEqual(proof_cache.identity(self.root, config, self.db, compute), "a" * 64)
+        self.assertEqual(len(computed), 1)
+        events.append(self.root, event_history.bundle([self.pending()]), "test-runner", "req-pending",
+                      0, state["state_token"])
+        proof_cache.identity(self.root, config, self.db, compute)
+        self.assertEqual(len(computed), 2)
+
+    def test_corrupt_forged_or_unsafe_freshness_proof_memo_is_ignored(self):
+        self.aged_inputs()
+        self.selected_text()
+        memo = proof_cache.location(self.db)
+        record = json.loads(memo.read_text())
+        forged = dict(record, identity="0" * 64)
+        tampered = {
+            "corrupt": lambda: memo.write_bytes(b"{not json"),
+            "forged identity": lambda: memo.write_text(json.dumps(forged)),
+            "world readable": lambda: memo.chmod(0o644),
+            "symlink": lambda: (memo.rename(memo.with_name("elsewhere.json")),
+                                memo.symlink_to(memo.with_name("elsewhere.json"))),
+        }
+        for name, tamper in tampered.items():
+            with self.subTest(name):
+                tamper()
+                with self.full_proofs() as full:
+                    self.assertEqual(self.reader_check(), [])
+                    self.assertEqual(full.call_count, 1)
+                self.assertFalse(memo.is_symlink())
+                self.assertEqual(stat.S_IMODE(memo.stat().st_mode), 0o600)
+                rewritten = json.loads(memo.read_text())
+                self.assertEqual((rewritten["identity"], rewritten["files"]), (record["identity"], record["files"]))
+
+    def test_freshness_proof_with_racily_new_inputs_is_not_remembered(self):
+        self.selected_text()
+        self.assertFalse(proof_cache.location(self.db).exists())
+        with self.full_proofs() as full:
+            self.assertEqual(self.reader_check(), [])
+            self.assertEqual(full.call_count, 1)
+
+    def test_freshness_proof_memo_signs_every_file_the_full_proof_opens(self):
+        self.aged_inputs()
+        prepared = self.selected_text()
+        proof_cache.location(self.db).unlink()
+        opened, active = set(), []
+        full_proof = index.renditions.inputs
+
+        def hook(event, args):
+            if active and event == "open" and isinstance(args[0], (str, bytes, os.PathLike)):
+                opened.add(os.path.abspath(os.fsdecode(args[0])))
+            elif active and event == "sqlite3.connect":
+                opened.add(os.path.abspath(unquote(urlsplit(str(args[0])).path)))
+
+        def recorded(*args, **kwargs):
+            active.append(True)
+            try:
+                return full_proof(*args, **kwargs)
+            finally:
+                active.clear()
+        sys.addaudithook(hook)
+        with patch.object(index.renditions, "inputs", side_effect=recorded):
+            self.assertEqual(self.reader_check(), [])
+        signed = {os.path.join(self.root, name)
+                  for name in json.loads(proof_cache.location(self.db).read_text())["files"]}
+        self.assertIn(str(self.root / prepared["rendition"]), signed)
+        self.assertIn(str(self.root / "sources/notes.txt"), signed)
+        catalog_home = self.root / policy.validate_instance_roots(self.root)["catalog_home"]
+        # Not inputs: the catalog's own read-validation receipt and the writer lock it probes for a
+        # live journal (a journal beside a store is never memoized), and the instance policy and
+        # binding, which the memo key re-reads and re-validates on every lookup.
+        derived = (str(catalog_home / ".local"), str(catalog_home / "writer.lock"),
+                   str(self.root / policy.INSTANCE_FILE), str(self.root / "config"))
+        unsigned = {path for path in opened if path.startswith(str(self.root) + os.sep)
+                    and not path.startswith(derived) and path not in signed and not os.path.isdir(path)}
+        self.assertTrue(opened & signed)
+        self.assertEqual(unsigned, set())
 
 
 if __name__ == "__main__":

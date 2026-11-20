@@ -947,7 +947,8 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   PENDING while readers finish, and every new reader, the 5 s instance-identity probe
   (`policy._probe_store_id`) among them, fails meanwhile. The long readers were the index
   freshness check (`renditions.inputs` → `read_records_by_receipt`, about 6 s at 458,000
-  current records, on every `progress-serve` refresh and twice per MCP call) and the
+  current records, on every `progress-serve` refresh and twice per MCP call; since Kata t5df
+  only on a miss of the [freshness proof memo](#index-freshness-proof-memo-kata-t5df)) and the
   `progress` catalog panel's full inspection (about 21 s) when no receipt vouched.
   `read_records_by_receipt` now copies the validated snapshot's current records into a
   temporary table and commits before its joins and lookups, which read only that copy. The
@@ -1007,6 +1008,84 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   restored mtime, swapped and swapped-tampered file, a connection opened before a swap,
   a concurrent writer process's commit, an overlapping commit, the stated residual and its
   expiry, contract change, audit).
+
+### Index freshness proof memo (Kata t5df)
+
+Every index read (`status`, `search`, `get`, `get-many`, claim corrections and the
+`progress` index panel) checks freshness before and after it reads. The expensive part of that
+check is the expected `rendition_identity`. To compute it, `renditions.inputs` replays the
+review-event history in full, validates the catalog by receipt, and re-reads and re-validates
+every selected extraction, original and submission sidecar. On an instance with 35,671 documents
+(35,670 renditions and a 10 GB index) one `status` took 82.6 s and 5.84 GB RSS, so an MCP call
+exceeded the reader's 30 s `--timeout-seconds`.
+
+- **What is remembered.** `tools/context_index/proof_cache.py` remembers only the identity. It
+  lives in the ignored file `<index>.sqlite3.freshness.json`, beside the index. Every other part
+  of the expected metadata is recomputed on each check, and Markdown document hashes are re-read
+  each time: the policy hash, engine fingerprint, manifest hash, corpus root and audience.
+  Freshness still compares the database's stored metadata with the expected metadata, so a
+  rebuilt, replaced or stale index is judged exactly as before.
+- **Key.** The memo key is a SHA-256 over these inputs:
+  - the memo format and the UTC date (daily expiry, like the catalog receipt and the review-event
+    memo);
+  - the instance root;
+  - the selected `renditions` configuration;
+  - `policy.fingerprint` and the validated instance roots;
+  - the hash of every toolkit `.py`, `.json` and `.sql` file;
+  - the runtime: Python, SQLite and Unicode data versions, `jsonschema` and `referencing`.
+- **Signed files.** The memo records an `lstat` signature (device, inode, mode, size, mtime_ns,
+  ctime_ns) for every file the computation opened. That covers each extraction, original and
+  sidecar `renditions.inputs` passes through its symlink-safe checker, plus `catalog.sqlite3`.
+  It also covers `events.sqlite3` whenever a selection names review events or is a `docling`
+  rendition. Each ancestor directory up to the root, the root included, is recorded with its
+  device, inode and mode, which catches a directory swapped for a symlink or a changed mode.
+  The proof lists no directory, so entries added to a directory are not inputs.
+- **Hit.** A lookup is a hit only when all of these hold:
+  - the memo is a regular, non-symlink file owned by this user, with no group or other bits and
+    at most 256 MiB;
+  - it parses, and its checksum and format match;
+  - its key equals the current key;
+  - every recorded signature is identical;
+  - no `-journal`, `-wal` or `-shm` file exists beside a signed store, so the full path keeps
+    its refusals.
+
+  Anything else, including any error, is a miss, and a miss computes the identity in full with
+  the unchanged refusals.
+- **Store.** A full computation remembers its identity, whether or not the index is fresh. That
+  is sound because the identity is a pure function of the signed inputs. It is stored only when
+  every signed file's ctime is more than 2 s before the computation started, when no store
+  sidecar is present, and when the key is unchanged afterwards. This is git's "racily clean"
+  rule. Every write moves ctime, and `utime` cannot set it, so an old ctime proves the bytes
+  read match the signature. The memo is written with mode 0600 to an `O_EXCL|O_NOFOLLOW`
+  temporary file and then renamed into place. Publication never reuses the memo: the
+  `adapters` index-build guards and build's own post-check always compute in full. `build`
+  leaves its identity behind for readers.
+- **Invalidation.** Any of these makes the next read compute in full:
+  - an edited, replaced, removed or re-moded selected file or sidecar;
+  - any catalog or review-event commit (during intake, the first read after each commit);
+  - a manifest selection, policy, instance roots, toolkit code or runtime change;
+  - a new UTC day.
+- **Cheaper full check.** `freshness` no longer pre-reads the review-event snapshot (inputs
+  reads it once when a selection needs it). `inputs(keep=False)` no longer builds the per-file
+  result list that metadata only hashed.
+- **Cost** (same instance, read-only, toolkit run against its data): a cold `status` (one full
+  check) takes 51 s and 2.1 GB, down from 82.6 s and 5.84 GB. A warm `status` takes 1.5 s and
+  231 MB. A warm freshness, `search`, `get` and freshness sequence takes 2.1 s in total, with
+  0.9 s and 0.8 s for the two checks and 280 MB. The memo is 24 MB, signing about 107,000 files
+  and 107,000 directories. The first read of a UTC day, or the first after a store commit, still
+  pays the cold cost, which can exceed the MCP timeout; any `status` warms it.
+- **Residual** (the catalog receipt's, 0017). The memo is unkeyed: an actor who can write the
+  index's `.local` directory can forge it, the same trust as the index database itself. An edit
+  that restores an input's size, mtime_ns and ctime_ns (root, or a clock change) is served until
+  the next UTC day.
+- Evidence (`tests/test_workspace.py`):
+  - `::test_build_leaves_a_private_freshness_proof_that_readers_reuse_without_the_full_proof`
+  - `::test_freshness_proof_memo_misses_on_every_input_change` (same-size original, extraction
+    bytes and mode, a directory swapped for a symlink, a catalog commit, manifest, policy)
+  - `::test_freshness_proof_memo_binds_the_review_event_store_when_selections_are_reviewed`
+  - `::test_corrupt_forged_or_unsafe_freshness_proof_memo_is_ignored`
+  - `::test_freshness_proof_with_racily_new_inputs_is_not_remembered`
+  - `::test_freshness_proof_memo_signs_every_file_the_full_proof_opens` (an audit hook)
 
 ### Concurrent writers
 
