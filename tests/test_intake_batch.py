@@ -121,6 +121,126 @@ class Equivalence(unittest.TestCase):
         self.assertEqual(revisions(root), [])
 
 
+def ledger_commits(root):
+    """Commits the ledger took so far (SQLite's file change counter)."""
+    return int.from_bytes(Path(store.locations(root)[2]).read_bytes()[24:28], "big")
+
+
+class LedgerCommits(unittest.TestCase):
+    """A chunk costs a constant number of ledger commits, whatever its size (Kata gfpd)."""
+
+    def commits_for(self, files, batch_size):
+        root, inbox = make_instance(self, files)
+        before = ledger_commits(root)
+        report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=batch_size)
+        self.assertEqual(report["counts"]["outcome"]["failed"], 0)
+        return ledger_commits(root) - before, root
+
+    def test_the_commits_of_a_chunk_do_not_grow_with_its_size(self):
+        small, _ = self.commits_for(4, 4)
+        large, _ = self.commits_for(12, 12)
+        self.assertEqual(small, large)
+        # a text chunk: its requests staged, its receipts, prepares and registrations each run (intents
+        # and attempts, evidence), and its documents recorded: nothing per document
+        self.assertLessEqual(small, 12)
+
+    def test_a_single_document_run_writes_its_intent_and_running_attempt_in_one_commit(self):
+        root, inbox = make_instance(self, 1)
+        before = ledger_commits(root)
+        cohort.ingest(root, inbox, system="s", actor="a", batch_size=1)
+        # three requests staged (one commit each) and three stages run (intent plus running attempt, then
+        # evidence: it was three commits each before the intent and the attempt shared one), and the
+        # document's row recorded once
+        self.assertEqual(ledger_commits(root) - before, 3 + 3 * 2 + 1)
+
+    def test_the_requests_of_a_chunk_are_the_same_as_staging_each_document_alone(self):
+        root_a, inbox_a = make_instance(self, 6)
+        root_b, inbox_b = make_instance(self, 6)
+        cohort.ingest(root_a, inbox_a, system="s", actor="a", batch_size=1)
+        cohort.ingest(root_b, inbox_b, system="s", actor="a", batch_size=6)
+        raw = lambda root: dict(sqlite3.connect(store.locations(root)[2]).execute(
+            "SELECT correlation_id, raw FROM requests WHERE correlation_id LIKE 'upload-%'").fetchall())
+        # the retained records number their IDs across the chunk exactly as one-at-a-time staging does
+        # (catalog state tokens differ between the two histories, so compare the records)
+        ids = lambda root: {k: [r["id"] for r in json.loads(v)["stages"][0]["arguments"]["records"]]
+                            for k, v in raw(root).items()}
+        self.assertEqual(ids(root_a), ids(root_b))
+
+
+class StageMany(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        store.initialize(self.root)
+        catalog.initialize(self.root)
+
+    def raw(self, name, parent=None):
+        return store.request_json(self.root, name, [{
+            "id": "prepare", "kind": "extraction", "operation": "extract-prepare",
+            "arguments": {"receipt": "D1", "format_name": "text"}}], parent)
+
+    def test_every_request_is_staged_in_one_commit_and_equals_staging_it_alone(self):
+        before = ledger_commits(self.root)
+        results = store.stage_many(self.root, [self.raw("one"), self.raw("two")])
+        self.assertEqual(ledger_commits(self.root) - before, 1)
+        self.assertEqual([r["correlation_id"] for r in results], ["one", "two"])
+        self.assertEqual(results[0], store.inspect(self.root, "one"))
+        self.assertEqual([s["status"] for s in results[1]["stages"]], ["staged"])
+
+    def test_a_request_already_staged_with_the_same_bytes_is_not_written_again(self):
+        store.stage(self.root, self.raw("one"))
+        before = ledger_commits(self.root)
+        self.assertEqual(store.stage_many(self.root, [self.raw("one")])[0]["correlation_id"], "one")
+        self.assertEqual(ledger_commits(self.root), before)
+
+    def test_a_refused_request_is_reported_alone_and_writes_nothing(self):
+        store.stage(self.root, self.raw("one"))
+        other = store.request_json(self.root, "one", [{"id": "prepare", "kind": "extraction",
+                                   "operation": "extract-prepare", "arguments": {"receipt": "D2", "format_name": "text"}}])
+        results = store.stage_many(self.root, [other, self.raw("two"), self.raw("three", "missing"), b"{}"])
+        self.assertEqual([r.code if isinstance(r, IntakeError) else r["correlation_id"] for r in results],
+                         ["correlation_conflict", "two", "unknown_correction_parent", "invalid_request"])
+        self.assertEqual(store.inspect(self.root, "one")["stages"][0]["status"], "staged")
+        self.assertIsNone(store.find(self.root, "three"))
+
+    def test_a_correction_may_follow_its_parent_in_the_same_call(self):
+        results = store.stage_many(self.root, [self.raw("parent"), self.raw("child", "parent")])
+        self.assertEqual(results[1]["correction_of"], "parent")
+        self.assertEqual(store.head(self.root, "parent")["correlation_id"], "child")
+
+    def test_a_request_repeated_in_one_call_is_staged_once(self):
+        results = store.stage_many(self.root, [self.raw("one"), self.raw("one")])
+        self.assertEqual([r["correlation_id"] for r in results], ["one", "one"])
+        self.assertEqual(len(store.list_requests(self.root)), 1)
+
+    def test_a_failure_during_the_write_stages_none_of_them(self):
+        with patch.object(store.docs, "repoint", side_effect=sqlite3.OperationalError("boom")):
+            with self.assertRaises(IntakeError):
+                store.stage_many(self.root, [self.raw("parent"), self.raw("child", "parent")])
+        self.assertEqual(store.list_requests(self.root), [])
+
+
+class UnfinishedAttemptsAreNotCharged(unittest.TestCase):
+    def test_a_kill_after_the_intent_and_attempt_commit_resumes_the_same_attempt(self):
+        root, inbox = make_instance(self, 1)
+        cohort.ingest(root, inbox, system="s", actor="a", batch_size=1, limit=0)
+        script = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, %r)\n"
+                  "from tools.intake import adapters, cohort\n"
+                  "adapters.execute = lambda *a, **k: os._exit(9)\n"
+                  "cohort.ingest(Path(%r), Path(%r), system='s', actor='a', batch_size=1)\n") % (
+                      str(ROOT), str(root), str(inbox))
+        self.assertEqual(subprocess.run([sys.executable, "-c", script], cwd=ROOT).returncode, 9)
+        running = [(r["correlation_id"], s["attempts"]) for r in store.list_requests(root)
+                   for s in r["stages"] if s["status"] == "running"]
+        self.assertEqual([(c.split("-")[0], len(a)) for c, a in running], [("upload", 1)])
+        self.assertIsNone(running[0][1][0]["outcome"])
+        report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=1)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 1)
+        attempts = [len(s["attempts"]) for r in store.list_requests(root) for s in r["stages"]]
+        self.assertEqual(attempts, [1, 1, 1])  # the interrupted attempt finished; no second one was charged
+
+
 class FailedDocumentDoesNotBlockItsBatch(unittest.TestCase):
     def test_a_file_changed_after_classification_fails_alone(self):
         root, inbox = make_instance(self, 6)
@@ -291,7 +411,7 @@ class RetriesAndBusyStores(unittest.TestCase):
 
     def test_a_busy_ledger_repeats_the_chunk_and_then_fails_visibly_without_stopping_the_run(self):
         root, inbox = make_instance(self, 4)
-        real = upload.stage_submission
+        real = upload.stage_submissions
         calls = []
 
         def busy_once(*args, **kwargs):
@@ -299,11 +419,11 @@ class RetriesAndBusyStores(unittest.TestCase):
             if len(calls) == 1:
                 raise LedgerBusy()
             return real(*args, **kwargs)
-        with patch.object(upload, "stage_submission", busy_once):
+        with patch.object(upload, "stage_submissions", busy_once):
             report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4)
         self.assertEqual(report["counts"]["outcome"]["extracted"], 4)
-        self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 1)
-        with patch.object(upload, "stage_submission", side_effect=LedgerBusy()):
+        self.assertEqual(report["counts"]["retried_after_conflict"]["entries"], 4)
+        with patch.object(upload, "stage_submissions", side_effect=LedgerBusy()):
             again = cohort.ingest(root, inbox, system="s2", actor="a", batch_size=4)
         self.assertEqual(again["counts"]["failed_by_code"], {"ledger/ledger_busy": 4})
 
@@ -367,6 +487,10 @@ elif point == "between-catalog-members":  # between two member inserts inside th
     catalog._commit_revision = commit
 elif point == "after-catalog-commit":     # committed, ledger evidence not yet saved
     wrap(adapters, "execute_batch", after=hit)
+elif point == "after-requests-staged":    # a chunk's requests are one commit; killed once it landed
+    wrap(store, "stage_many", after=hit)
+elif point == "before-native-work":       # intents and running attempts committed, the effect not yet run
+    wrap(adapters, "execute_batch", before=lambda kwargs: hit())
 elif point == "after-ledger-update":      # everything of this batch is durable
     wrap(runner, "run_batch", after=hit)
 elif point == "between-ledger-members":   # inside the ledger transaction that records the evidence
@@ -389,7 +513,9 @@ POINTS = [
     ("before-catalog-commit", 1), ("before-catalog-commit", 2),
     ("between-catalog-members", 1), ("between-catalog-members", 2),
     ("after-catalog-commit", 1), ("after-catalog-commit", 2),
-    ("after-ledger-update", 1), ("after-ledger-update", 2),
+    ("after-ledger-update", 1), ("after-ledger-update", 2), ("after-ledger-update", 3),
+    ("after-requests-staged", 1), ("after-requests-staged", 2), ("after-requests-staged", 3),
+    ("before-native-work", 1), ("before-native-work", 2), ("before-native-work", 3),
     ("between-ledger-members", 3), ("between-ledger-members", 7),
     ("between-retained-copies", 3), ("between-completion-files", 2), ("between-prepare-guards", 4),
 ]

@@ -951,9 +951,10 @@ class QualifyTests(QualifyCase):
         transport, calls = self._transport()
         first = self._qualify(transport)
         spent = len(calls)
-        with patch.object(upload, "stage_submission", wraps=upload.stage_submission) as staged:
+        with patch.object(upload, "stage_submission", wraps=upload.stage_submission) as staged, \
+                patch.object(upload, "stage_submissions", wraps=upload.stage_submissions) as staged_many:
             again = self._qualify(transport, trust_stat=True)
-        self.assertEqual(staged.call_count, 0)
+        self.assertEqual((staged.call_count, staged_many.call_count), (0, 0))
         self.assertEqual(again["counts"]["qualification"], first["counts"]["qualification"])
         self.assertEqual(len(calls), spent)
 
