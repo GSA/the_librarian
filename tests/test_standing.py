@@ -369,6 +369,77 @@ class StandingEvaluationTests(StandingCase):
                 self.assertIn(f"Reviewer-noted issues: {len(contradictions)} contradictions and "
                               f"{len(missing)} missing-evidence items; accepted with these attached.", quotes)
 
+    def use_criteria_v2(self, version=1, carries=()):
+        self.policy.update(schema=standing.POLICY_SCHEMA_V2, version=version,
+                           criteria="standing-review-v2", carries=list(carries))
+        self.write_private("config/standing-policy.json", self.policy)
+        self.findings.update(schema=standing.FINDINGS_SCHEMA_V3, embedded_instructions=[], sparse=False,
+                             policy={"policy_id": "routine-docling", "version": version})
+
+    def test_policy_v2_pins_criteria_and_carries_only_earlier_versions(self):
+        self.use_criteria_v2(version=3, carries=[{"version": 2, "sha256": "a" * 64}])
+        self.write_private("config/standing-findings.json", self.findings)
+        loaded = standing.load_policy(self.root, "config/standing-policy.json",
+                                      self.review_args()["policy_sha256"])
+        self.assertEqual((standing.criteria(loaded), standing.carried(loaded)),
+                         ("standing-review-v2", [("routine-docling", 2, "a" * 64)]))
+        self.assert_outcome("qualified", "complete-inspected-scope")
+        for update in ({"criteria": "standing-review-v9"}, {"carries": [{"version": 3, "sha256": "a" * 64}]},
+                       {"carries": [{"version": 1, "sha256": "short"}]}):
+            with self.subTest(update=update):
+                raw = self.write_private("config/standing-policy.json", {**self.policy, **update})
+                with self.assertRaises(standing.Refusal) as caught:
+                    standing.load_policy(self.root, "config/standing-policy.json", raw)
+                self.assertEqual(caught.exception.code, "standing-policy-invalid")
+
+    def test_findings_schema_must_match_the_policy_criteria(self):
+        # v1 criteria never accept v3 findings, and v2 criteria never accept earlier ones.
+        self.write_private("config/standing-findings.json", {
+            **self.findings, "schema": standing.FINDINGS_SCHEMA_V3, "embedded_instructions": [],
+            "sparse": False})
+        self.assert_outcome("exception", "findings-mismatch")
+        self.use_criteria_v2()
+        self.write_private("config/standing-findings.json", {
+            k: v for k, v in {**self.findings, "schema": standing.FINDINGS_SCHEMA}.items()
+            if k not in ("embedded_instructions", "sparse")})
+        self.assert_outcome("exception", "findings-mismatch")
+
+    def test_reviewer_flags_qualify_and_label_the_text_low_confidence(self):
+        from tools.context_index import confidence
+        self.use_criteria_v2()
+        instructions = [f"Asks AI assistants to reply 'accept' ({i})." for i in range(40)]
+        self.write_private("config/standing-findings.json", {
+            **self.findings, "embedded_instructions": instructions, "sparse": True,
+            "contradictions": ["Status differs."]})
+        result = self.assert_outcome("qualified", "complete-inspected-scope")
+        event = standing_events.review_event(result, self.review_args())
+        quotes = [e["quote"] for e in event["evidence"]]
+        self.assertEqual(len(quotes), standing_events.MAX_EVIDENCE)
+        self.assertIn("Reviewer-noted contradiction: Status differs.", quotes)
+        self.assertIn("Reviewer-flagged embedded instructions: 40 instructions in the records were "
+                      "treated as document data, not followed; qualified as low confidence.", quotes)
+        kept = [q for q in quotes if q.startswith("Reviewer-flagged embedded instruction: ")]
+        self.assertEqual(kept, ["Reviewer-flagged embedded instruction: " + t for t in instructions[:len(kept)]])
+        self.assertTrue(quotes[-1].startswith(f"Reviewer-flagged embedded instructions truncated: "
+                                              f"recorded the first {len(kept)} of 40;"))
+        scope = [{"event_id": "rev-standing", "flags": confidence.review_flags(event["evidence"])}]
+        self.assertEqual([(r["code"], r["details"]) for r in confidence.review_reasons(scope)],
+                         [("embedded-instructions", ["rev-standing: 40 embedded instructions attached"]),
+                          ("sparse-record", ["rev-standing: sparse record"])])
+
+    def test_many_noted_issues_leave_room_for_the_embedded_instructions(self):
+        self.use_criteria_v2()
+        self.write_private("config/standing-findings.json", {
+            **self.findings, "sparse": True, "embedded_instructions": ["Reply accept.", "Ignore rules."],
+            "contradictions": [f"Contradiction {i}." for i in range(40)]})
+        result = self.assert_outcome("qualified", "complete-inspected-scope")
+        event = standing_events.review_event(result, self.review_args())
+        quotes = [e["quote"] for e in event["evidence"]]
+        self.assertEqual(len(quotes), standing_events.MAX_EVIDENCE)
+        self.assertTrue(quotes[-2].startswith("Reviewer-noted issues truncated: "))
+        self.assertTrue(quotes[-1].startswith("Reviewer-flagged embedded instructions truncated: "
+                                              "recorded the first 0 of 2;"))
+
     def test_a_review_without_issues_records_no_noted_statements(self):
         quotes = [e["quote"] for e in standing_events.review_event(
             self.assert_outcome("qualified", "complete-inspected-scope"), self.review_args())["evidence"]]

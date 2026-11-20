@@ -252,6 +252,27 @@ def _conclude(entry, current, event_id):
     entry.update(qualification="qualified", review_event_id=event_id, selection=selection)
 
 
+def _carried(root, entry, run):
+    """``(head, event ID)`` of a qualified review under an earlier policy version the current one
+    ``carries``: both stages succeeded and its event is live. None when there is none, or when
+    the current policy's scope refuses the rendition (it then ends ``prohibited-scope``)."""
+    carries = standing.carried(run.get("policy", {}))
+    if carries and standing.refused_scope(root, run["policy"], entry["rendition"], entry["rendition_sha256"]):
+        return None
+    for _, _, sha in carries:
+        head = store.find_head(root, "standing-" + _standing_token(entry, sha), run["heads"])
+        if head is None or not all(s["status"] == "succeeded" for s in head["stages"]):
+            continue
+        event_id = store.request(root, head["correlation_id"])["stages"][0]["arguments"]["event_id"]
+        if not _superseded(root, head, event_id, run["live"]):
+            return head, event_id
+    return None
+
+
+def _carried_tokens(policy):
+    return [sha for _, _, sha in standing.carried(policy)]
+
+
 def _review_and_select(root, entry, run, prefetched=None, spent=None):
     """Review and select one extracted rendition; identity is bound to the exact rendition.
 
@@ -272,6 +293,13 @@ def _review_and_select(root, entry, run, prefetched=None, spent=None):
         except Exception as error:
             failure = error
     current = store.find_head(root, corr, run["heads"])
+    if current is None and (kept := _carried(root, entry, run)) is not None:
+        # Qualified under a version this policy carries: kept as it is, with no model call.
+        if reviewed is not None:
+            run["usage"].update(reviewed["usage"])
+        entry["carried"] = True
+        _conclude(entry, *kept)
+        return
     if current is None:
         if failure is not None:
             raise failure
@@ -342,13 +370,14 @@ def review_all(root, extracted, run, concurrency):
     # A request another writer stages later is still found by the fresh per-entry
     # read in _review_and_select, which then discards the unused review.
     existing = store.correlation_ids(root)
+    carried = _carried_tokens(run.get("policy", {}))
 
     def ahead(entry, waiting):
         # A review is started ahead only while the manifest has room for every entry
         # still in the window; any other entry is checked exactly, in turn, in
         # _review_and_select, so no call is paid for an entry that cannot be selected.
-        corr = "standing-" + _standing_token(entry, run["policy_sha"])
-        return corr not in existing and _free_room(root, run["manifest"]) > waiting
+        corrs = ["standing-" + _standing_token(entry, sha) for sha in [run["policy_sha"], *carried]]
+        return not existing.intersection(corrs) and _free_room(root, run["manifest"]) > waiting
     pipeline(extracted, concurrency, ahead, lambda entry: _review(root, entry, run),
              lambda entry, prefetched: _settle(root, entry, run, prefetched))
 

@@ -41,6 +41,31 @@ def _noted(result, room):
             "holds all of them."]
 
 
+FLAGGED = "Reviewer-flagged "  # confidence.FLAGGED_PREFIX
+
+
+def _flagged(result):
+    """Header statements for the reviewer's flags (v2 criteria), and each embedded-instruction item."""
+    headers, instructions = [], result.get("embedded_instructions", [])
+    if result.get("sparse"):
+        headers.append(FLAGGED + "sparse record: accepted as a coherent record with little "
+                       "content; qualified as low confidence.")
+    if instructions:
+        headers.append(FLAGGED + f"embedded instructions: {len(instructions)} instructions in the "
+                       "records were treated as document data, not followed; qualified as low "
+                       "confidence.")
+    return headers, [FLAGGED + "embedded instruction: " + text for text in instructions]
+
+
+def _fit(items, room, findings_sha256):
+    if len(items) <= room:
+        return items
+    kept = items[:max(room - 1, 0)]
+    return kept + [f"Reviewer-flagged embedded instructions truncated: recorded the first "
+                   f"{len(kept)} of {len(items)}; findings sha256 {findings_sha256} holds all "
+                   "of them."]
+
+
 def _statements(result, scope_counts):
     policy_ref = result["policy"]
     statements = [
@@ -58,7 +83,11 @@ def _statements(result, scope_counts):
     if result.get("unverifiable_references"):
         statements.append(f"Reviewer noted {result['unverifiable_references']} advisory "
                           "references to material outside the rendition.")
-    return statements + _noted(result, MAX_EVIDENCE - len(statements))
+    headers, instructions = _flagged(result)
+    statements += headers
+    # Keep one slot for the embedded instructions (an item, or their truncation statement).
+    statements += _noted(result, MAX_EVIDENCE - len(statements) - bool(instructions))
+    return statements + _fit(instructions, MAX_EVIDENCE - len(statements), result["findings_sha256"])
 
 
 def review_event(result, args, recorded_at=None):

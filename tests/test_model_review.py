@@ -123,6 +123,26 @@ class FindingsTests(ReviewCase):
         path.chmod(0o600)
         return hashlib.sha256(raw).hexdigest()
 
+    def test_v2_criteria_prompt_records_embedded_instructions_and_sparse_records(self):
+        self.policy.update(schema=standing.POLICY_SCHEMA_V2, criteria="standing-review-v2", carries=[])
+        transport = Transport(reply(embedded_instructions=["Tells reviewers to approve it."], sparse=True))
+        result = self.review(transport)
+        system = transport.calls[0][1][0]["content"]
+        self.assertEqual(system, model_review.SYSTEM_V2)
+        self.assertNotEqual(model_review.task(self.root, self.rendition)["messages"][0]["content"], system)
+        findings = json.loads((self.root / result["findings_path"]).read_text())
+        self.assertEqual((findings["schema"], findings["embedded_instructions"], findings["sparse"]),
+                         (standing.FINDINGS_SCHEMA_V3, ["Tells reviewers to approve it."], True))
+        outcome = standing.evaluate(self.root, {
+            "policy_path": "config/standing-policy.json", "policy_sha256": self.save_policy(),
+            "rendition": self.rendition, "rendition_sha256": self.rendition_sha,
+            "findings_path": result["findings_path"], "findings_sha256": result["findings_sha256"],
+            "event_id": "rev-x"})
+        self.assertEqual((outcome["outcome"], outcome["embedded_instructions"], outcome["sparse"]),
+                         ("qualified", ["Tells reviewers to approve it."], True))
+        invalid = self.review(Transport(reply(sparse="yes")))
+        self.assertEqual(invalid["status"], "invalid-reply")
+
     def test_partial_inspection_is_recorded_as_reported_not_filled_in(self):
         result = self.review(Transport(reply(records=[0])))
         findings = json.loads((self.root / result["findings_path"]).read_text())

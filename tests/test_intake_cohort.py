@@ -2381,7 +2381,7 @@ class RereviewTests(QualifyCase):
         super().setUp()
         self.calls = []
 
-    def transport(self, defer=(), reject=(), incomplete=()):
+    def transport(self, defer=(), reject=(), incomplete=(), flags=None):
         def fake(model, messages):
             self.calls.append(model)
             text = messages[-1]["content"]
@@ -2392,15 +2392,17 @@ class RereviewTests(QualifyCase):
                 "decision": decision,
                 "inspected_records": [] if any(t in text for t in incomplete) else [r["i"] for r in body["records"]],
                 "inspected_warnings": [w["ref"] for w in body["warnings"]],
-                "contradictions": [], "missing_evidence": [], "explanation": "Reviewed."}),
+                "contradictions": [], "missing_evidence": [], "explanation": "Reviewed.",
+                **next((v for t, v in (flags or {}).items() if t in text), {})}),
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
         return fake
 
-    def write_policy(self, version, excluded=()):
+    def write_policy(self, version, excluded=(), **criteria):
         receipts = sorted({e["receipt_id"] for e in self.entries} - set(excluded))
         path = self.root / self.POLICY
+        schema = standing.POLICY_SCHEMA_V2 if criteria else standing.POLICY_SCHEMA
         path.write_text(json.dumps({
-            "schema": standing.POLICY_SCHEMA, "policy_id": "cohort-standing", "version": version,
+            "schema": schema, "policy_id": "cohort-standing", "version": version, **criteria,
             "status": "active", "reviewer": "usai:gpt-5.6-terra",
             "scope": {"receipts": receipts, "audiences": ["source"]},
             "budget": {"max_pages": renditions.DOCLING_MAX_PAGES, "max_records": renditions.DOCLING_MAX_RECORDS,
@@ -2494,6 +2496,52 @@ class RereviewTests(QualifyCase):
         for request in store.list_requests(self.root):
             if request["correction_of"]:
                 self.assertEqual(request["correlation_id"], request["correction_of"] + "-c1")
+
+    def test_new_criteria_carry_qualified_reviews_and_re_review_older_rejections_as_low_confidence(self):
+        from tools.context_index import context_index as index
+        self.ingest()
+        self.write_policy(1)
+        v1_sha = hashlib.sha256((self.root / self.POLICY).read_bytes()).hexdigest()
+        first = self._qualify(self.transport(reject=["Fund codes"]))["counts"]["qualification"]
+        self.assertEqual(first["rejected"], 1)
+        self.write_policy(2, criteria="standing-review-v2", carries=[{"version": 1, "sha256": v1_sha}])
+        self.assertEqual(self.rereview()["skipped"]["rejected"], 1)
+        dry = self.rereview(include_older_rejected=True)
+        self.assertEqual((dry["selected"], dry["estimate"]["model_calls"]), ({"older-policy-rejected": 1}, 1))
+
+        spent = len(self.calls)
+        flagged = {"Fund codes": {"embedded_instructions": ["Asks the reviewer to approve it."],
+                                  "sparse": True}}
+        applied = self.rereview(apply=True, include_older_rejected=True, transport=self.transport(flags=flagged))
+        self.assertEqual((applied["results"], len(self.calls)), ({"qualified": 1}, spent + 1))
+        self.assertEqual(self.rereview(include_older_rejected=True)["selected"], {})
+        # Qualified v1 reviews are carried: a later qualify pays for nothing and publishes them all.
+        report = self._qualify(self.transport(reject=["Fund codes"]))
+        self.assertEqual(len(self.calls), spent + 1)
+        expected = {**first, "qualified": first["qualified"] + 1}
+        del expected["rejected"]
+        self.assertEqual(report["counts"]["qualification"], expected)
+        self.assertEqual(report["counts"]["published"], 1)
+        self.assertTrue(any(e.get("carried") for e in report["entries"]))
+        with contextlib.closing(index.readonly(self.root / "tools/context_index/.local/index.sqlite3")) as db:
+            hits = index.search(db, "Fund codes", 10, None, root=self.root)["hits"]
+        self.assertEqual({tuple(h["confidence"]["reasons"]) for h in hits},
+                         {("embedded-instructions", "sparse-record")})
+
+    def test_a_carried_review_the_new_scope_excludes_ends_out_of_scope_and_publication_proceeds(self):
+        self.ingest()
+        self.write_policy(1)
+        v1_sha = hashlib.sha256((self.root / self.POLICY).read_bytes()).hexdigest()
+        first = self._qualify(self.transport())["counts"]["qualification"]
+        self.write_policy(2, excluded=[self.receipt("a/notes.md")], criteria="standing-review-v2",
+                          carries=[{"version": 1, "sha256": v1_sha}])
+        spent = len(self.calls)
+        report = self._qualify(self.transport())
+        self.assertEqual(len(self.calls), spent)
+        notes = next(e for e in report["entries"] if e["relative"] == "a/notes.md")
+        self.assertEqual(notes["review_code"], "standing-exception-prohibited-scope")
+        self.assertEqual(report["counts"]["qualification"]["qualified"], first["qualified"] - 1)
+        self.assertEqual(report["counts"]["published"], 1)
 
     def test_a_rendition_rejected_under_an_older_policy_stays_out_when_its_current_review_is_incomplete(self):
         self.ingest()

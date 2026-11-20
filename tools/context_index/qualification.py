@@ -61,10 +61,12 @@ def _bound(selection, source, snapshot, engine, complete_scope, label):
             engine.fail(f"{label} review does not bind the exact complete rendition")
         reviewed_content.update(content)
         noted, deferral = confidence.review_notes(event["evidence"])
+        flags = confidence.review_flags(event["evidence"])
         reviewed_scope.append({"event_id": event_id, "content": sorted(content),
                                "unit": "file", "extent": "defined_scope",
                                **({"noted_issues": noted} if noted else {}),
-                               **({"deferral": deferral} if deferral is not None else {})})
+                               **({"deferral": deferral} if deferral is not None else {}),
+                               **({"flags": flags} if flags else {})})
     return reviewed_content, reviewed_scope
 
 

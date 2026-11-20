@@ -24,11 +24,22 @@ from . import standing_events
 from .contracts import IntakeError, pairs
 
 POLICY_SCHEMA = "standing-policy-v1"
+# v2 pins the review ``criteria`` (the reviewer prompt) and names earlier versions of the same
+# policy whose qualified reviews it ``carries`` forward; a v1 policy is the v1 criteria, carrying none.
+POLICY_SCHEMA_V2 = "standing-policy-v2"
+POLICY_SCHEMAS = (POLICY_SCHEMA, POLICY_SCHEMA_V2)
+CRITERIA = ("standing-review-v1", "standing-review-v2")
 # v2 adds the advisory, non-blocking `unverifiable_references` list; v1 findings
-# referenced by existing review events stay valid.
+# referenced by existing review events stay valid. v3 (written under the v2 criteria) adds the
+# reviewer's `embedded_instructions` and `sparse` flags.
 FINDINGS_SCHEMA = "standing-findings-v2"
+FINDINGS_SCHEMA_V3 = "standing-findings-v3"
 FINDINGS_SCHEMAS = {"standing-findings-v1": frozenset(),
-                    FINDINGS_SCHEMA: frozenset({"unverifiable_references"})}
+                    FINDINGS_SCHEMA: frozenset({"unverifiable_references"}),
+                    FINDINGS_SCHEMA_V3: frozenset({"unverifiable_references", "embedded_instructions",
+                                                   "sparse"})}
+# The findings schema each review criteria writes.
+CRITERIA_FINDINGS = {"standing-review-v1": FINDINGS_SCHEMA, "standing-review-v2": FINDINGS_SCHEMA_V3}
 OUTCOMES = ("qualified", "pending-review", "rejected", "deferred", "exception")
 LIMIT = 1024 * 1024
 # How a reviewer ``defer`` ends: ``hold`` (the default) keeps it a visible, unpublished ``deferred``
@@ -105,17 +116,37 @@ def _budget_valid(budget):
             and 0 < budget["max_findings_bytes"] <= LIMIT)
 
 
+POLICY_KEYS = frozenset({"schema", "policy_id", "version", "status", "reviewer", "scope", "budget",
+                         "selection"})
+
+
+def _carries_valid(carries, version):
+    return (isinstance(carries, list) and len(carries) <= 20
+            and all(isinstance(c, dict) and set(c) == {"version", "sha256"}
+                    and type(c["version"]) is int and 0 < c["version"] < version
+                    and isinstance(c["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", c["sha256"])
+                    for c in carries)
+            and len({c["sha256"] for c in carries}) == len(carries))
+
+
 def _policy_valid(value):
-    return (isinstance(value, dict) and set(value) == {
-        "schema", "policy_id", "version", "status", "reviewer", "scope", "budget", "selection"}
-        and value["schema"] == POLICY_SCHEMA and _identifier(value["policy_id"])
-        and type(value["version"]) is int and value["version"] > 0
-        and isinstance(value["status"], str) and value["status"] in {"active", "revoked"}
-        and isinstance(value["reviewer"], str)
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}", value["reviewer"]) is not None
-        and _scope_valid(value["scope"]) and _budget_valid(value["budget"])
-        and isinstance(value["selection"], dict) and set(value["selection"]) == {"context"}
-        and isinstance(value["selection"]["context"], list) and bool(value["selection"]["context"]))
+    if not isinstance(value, dict):
+        return False
+    if value.get("schema") == POLICY_SCHEMA_V2:
+        if (set(value) != POLICY_KEYS | {"criteria", "carries"} or value["criteria"] not in CRITERIA
+                or type(value.get("version")) is not int
+                or not _carries_valid(value["carries"], value["version"])):
+            return False
+    elif value.get("schema") != POLICY_SCHEMA or set(value) != POLICY_KEYS:
+        return False
+    return (_identifier(value["policy_id"])
+            and type(value["version"]) is int and value["version"] > 0
+            and isinstance(value["status"], str) and value["status"] in {"active", "revoked"}
+            and isinstance(value["reviewer"], str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}", value["reviewer"]) is not None
+            and _scope_valid(value["scope"]) and _budget_valid(value["budget"])
+            and isinstance(value["selection"], dict) and set(value["selection"]) == {"context"}
+            and isinstance(value["selection"]["context"], list) and bool(value["selection"]["context"]))
 
 
 def load_policy(root, name, expected_sha):
@@ -137,6 +168,17 @@ def load_policy(root, name, expected_sha):
     except index.IndexError_ as error:
         raise Refusal("blocked", "standing-policy-invalid") from error
     return value
+
+
+def criteria(standing):
+    """The review criteria a loaded policy pins (a v1 policy: the original criteria)."""
+    return standing.get("criteria", CRITERIA[0])
+
+
+def carried(standing):
+    """``(policy_id, version, sha256)`` of each earlier version whose qualified reviews this policy
+    carries forward: publication accepts their selections and ``qualify`` reuses them unreviewed."""
+    return [(standing["policy_id"], c["version"], c["sha256"]) for c in standing.get("carries", [])]
 
 
 RECEIPT = r"D0*[1-9][0-9]*"
@@ -187,6 +229,8 @@ def _findings_valid(value):
             | FINDINGS_SCHEMAS[value["schema"]]):
         return False
     return (_texts(value.get("unverifiable_references", []))
+            and _texts(value.get("embedded_instructions", []))
+            and type(value.get("sparse", False)) is bool
             and isinstance(value["policy"], dict) and set(value["policy"]) == {"policy_id", "version"}
             and isinstance(value["decision"], str) and value["decision"] in {"accept", "reject", "defer"}
             and _inspected_valid(value["inspected"])
@@ -368,7 +412,13 @@ def _read_findings(root, args, standing):
 
 
 def _findings_match(findings, standing, args):
-    return (findings["policy"] == {"policy_id": standing["policy_id"], "version": standing["version"]}
+    written = CRITERIA_FINDINGS[criteria(standing)]
+    # Findings record which criteria they were reviewed under: v3 only under the v2 criteria, and
+    # the v2 criteria only accept v3 (earlier findings never saw them).
+    schema_fits = (findings["schema"] == written if written == FINDINGS_SCHEMA_V3
+                   else findings["schema"] != FINDINGS_SCHEMA_V3)
+    return (schema_fits
+            and findings["policy"] == {"policy_id": standing["policy_id"], "version": standing["version"]}
             and findings["rendition"] == args["rendition"]
             and findings["rendition_sha256"] == args["rendition_sha256"]
             and findings["reviewer"] == standing["reviewer"])
@@ -478,6 +528,11 @@ def evaluate(root, args, snapshot=None):
     for key in ("contradictions", "missing_evidence"):
         if findings[key]:
             result[key] = list(findings[key])
+    # Reviewer flags (v2 criteria) travel the same way and mark the published text low confidence.
+    if findings.get("embedded_instructions"):
+        result["embedded_instructions"] = list(findings["embedded_instructions"])
+    if findings.get("sparse"):
+        result["sparse"] = True
     if not _findings_match(findings, standing, args):
         return outcome("exception", "findings-mismatch")
     engine = index.rendition_api(root)

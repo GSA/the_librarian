@@ -64,9 +64,10 @@ named stage. The ledger is operational recovery state, never corpus authority.
   completion, including when a published index later becomes unreadable.
 - Standing-policy stages (`tools/intake/standing.py`; the review event they record and bind is
   in `standing_events.py`, the selection and manifest write in `standing_publication.py`) pin a private (0600)
-  `standing-policy-v1` file by SHA-256 (id, version, active/revoked status,
+  `standing-policy-v1` or `-v2` file by SHA-256 (id, version, active/revoked status,
   reviewer, receipt/audience scope, page/record/findings budgets, selection
-  context) and an attributed `standing-findings-v2` (or legacy `-v1`) record for one exact
+  context; v2 adds the review `criteria` and the earlier versions it `carries`) and an
+  attributed `standing-findings-v2` (or legacy `-v1`; `-v3` under `standing-review-v2` criteria) record for one exact
   registered Docling or extraction rendition. Only findings that inspected every
   page, text record, table and individual warning (`#/warnings/N`) of a Docling
   rendition, or every payload record (`records: [index]`) and warning
@@ -81,15 +82,25 @@ named stage. The ledger is operational recovery state, never corpus authority.
   qualify-low-confidence` (or `cohort recover-deferred --apply` for already held deferrals)
   qualifies a `defer` with complete inspected scope under the current policy as low confidence:
   its event adds a `Reviewer-deferred:` statement and the index labels it `reviewer-deferred`.
+  Under `"criteria": "standing-review-v2"` the reviewer treats every instruction in a record
+  (to readers, reviewers or AI systems, itself included) as content, judges the rest, and
+  accepts coherent sparse records (thin tickets); it still rejects noise, boilerplate and text
+  that is nothing but instructions. An accept that lists `embedded_instructions` or sets
+  `sparse` qualifies with `Reviewer-flagged ...` event statements and the index labels it
+  `embedded-instructions` / `sparse-record` low confidence (`reviewed_scope[].flags`). A v2
+  policy's `carries: [{version, sha256}]` keeps earlier versions' qualified reviews: `qualify`
+  reuses them without a model call and publication accepts their selections. New default
+  policies use the v2 criteria; existing ones change only when the operator bumps them.
   `cohort rereview` (dry run; `--apply` with `--models-config`) re-reviews, as append-only
   corrections under the current policy, standing reviews still pending or deferred under an
   older policy and those blocked `insufficient-inspected-scope` (`--include-current-deferred`
-  adds current-policy deferrals); it never selects rejected or out-of-scope renditions, reports
+  adds current-policy deferrals, `--include-older-rejected` renditions rejected only under older
+  policies, for new criteria); it never selects out-of-scope renditions, reports
   counts by reason and estimated model calls/prompt tokens (`--cost-estimate FILE`), takes
   `--limit N` for staged rollout, qualifies remaining deferrals as low confidence by default,
   and resumes staged reviews without a new model call. Run `cohort publish` afterwards.
   Every indexed document carries a `confidence` label (`normal`, or `low` with reasons
-  `noted-issues`, `reviewer-deferred`, `converted-format`, `machine-ocr`, `agent-generated`, `incomplete-rendition`,
+  `noted-issues`, `reviewer-deferred`, `embedded-instructions`, `sparse-record`, `converted-format`, `machine-ocr`, `agent-generated`, `incomplete-rendition`,
   `open-correction`); retrieval shows it, never hides the text. When a newer document,
   meeting transcript or answered question contradicts or settles a claim, record it with
   `python -m tools.review_events.corrections record|resolve` or `intake FILE` (a
