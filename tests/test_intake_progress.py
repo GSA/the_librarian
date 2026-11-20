@@ -1,5 +1,6 @@
 """Read-only, body-free loopback progress view over the private intake stores."""
 from contextlib import closing
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -18,7 +19,7 @@ from tools.intake import adapters, cli, progress, progress_render, progress_serv
 SECRET = "SECRET-BODY-TEXT"
 
 
-def request(correlation, stages):
+def request(correlation, stages, correction_of=None):
     from tools.intake.contracts import OPERATIONS
     full = []
     for kind, operation, name in stages:
@@ -39,7 +40,7 @@ def request(correlation, stages):
             else:
                 args[key] = "dir/" + SECRET
         full.append({"id": name, "kind": kind, "operation": operation, "arguments": args})
-    return json.dumps({"version": 1, "correlation_id": correlation, "correction_of": None,
+    return json.dumps({"version": 1, "correlation_id": correlation, "correction_of": correction_of,
                        "policy": {"version": 1, "sha256": default_policy_hash()},
                        "retry": {"max_attempts": 2, "backoff_seconds": 0},
                        "stages": full}).encode()
@@ -270,6 +271,156 @@ class CorruptLedgerTests(ProgressCase):
                 self.assertEqual(cli.main(["--root", str(self.root), *argv]), 0)
             written = "".join(call.args[0] for call in out.write.call_args_list)
             self.assertIn("corrupt_store", written)
+
+
+RECEIPT = [("receipt", "catalog-submit", "receipt")]
+PREPARE = [("extraction", "extract-prepare", "prepare")]
+REGISTER = [("extraction", "extract-register", "register")]
+STANDING = [("review", "standing-review", "review"), ("publication", "standing-select", "select")]
+PUBLISH = [("publication", "standing-publish", "publish")]
+OLD, NEW = "869257cf", "143c7b29"  # standing policy hashes: OLD first attempted before NEW
+
+
+class DocumentTests(ProgressCase):
+    """Kata nbta: the headline counts documents, each once, and leaves superseded reviews out."""
+
+    def setUp(self):
+        super().setUp()
+        store.initialize(self.root)
+        self.db = self.root / ".local/intake/intake.sqlite3"
+
+    def put(self, correlation, stages, statuses, code=None, at=1000.0, correction_of=None):
+        """Insert one request with the given stage statuses, bypassing writers; failed stages get ``code``."""
+        from tools.intake.contracts import digest
+        raw = request(correlation, stages, correction_of)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO requests VALUES (?,?,?,?,?)",
+                      (correlation, correction_of, raw, digest(raw), str(self.root)))
+            for ordinal, ((_, _, name), status) in enumerate(zip(stages, statuses)):
+                done = status == "succeeded"
+                intent, evidence = json.dumps({"n": ordinal}), json.dumps({"ok": True})
+                c.execute("INSERT INTO stages VALUES (?,?,?,?,?,?,?,?,?)", (
+                    correlation, name, ordinal, status, 0, intent, digest(intent.encode()),
+                    evidence if done else None, digest(evidence.encode()) if done else None))
+                if status != "staged":
+                    c.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                        correlation, name, 0, 1, at + ordinal, at + ordinal + 0.5,
+                        "succeeded" if done else "failed", None if done else "permanent",
+                        None if done else code, None))
+
+    def document(self, n, extract="succeeded", register="succeeded", rendition=None, code=None):
+        """A cohort document: receipt, extraction and registration requests and its ``docs`` row."""
+        sid = "inbox-%024x" % n
+        self.put("upload-" + sid, RECEIPT, ["succeeded"])
+        if extract is not None:
+            self.put("extract-" + sid, PREPARE, [extract], code)
+        if register is not None:
+            self.put("register-" + sid, REGISTER, [register], code)
+        state = "extracted" if extract == register == "succeeded" else (
+            "received" if extract is None else extract if extract in {"blocked", "dead-letter"} else "extracting")
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO docs(system, path, format, submission_id, sha256, receipt_id, original, state, "
+                      "rendition, rendition_sha256, extract_head, register_head) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                      ("sys", f"p{n}", "pdf", sid, "0" * 64, f"R{n}", "o", state, "r" if rendition else None,
+                       rendition, None if extract is None else "extract-" + sid,
+                       None if register is None else "register-" + sid))
+        return sid
+
+    def review(self, sid, rendition, policy_hash, statuses, code=None, at=1000.0):
+        name = f"standing-{sid}-{rendition[:12]}-{policy_hash}"
+        self.put(name, STANDING, statuses, code, at)
+        return name
+
+    def build(self):
+        renditions = {n: hashlib.sha256(b"%d" % n).hexdigest() for n in range(10)}
+        # Rejected and out of scope under the old policy, then reviewed again under the new one.
+        a = self.document(1, rendition=renditions[1])
+        old_scope = self.review(a, renditions[1], OLD, ["blocked", "staged"], "standing-exception-prohibited-scope", 100)
+        self.review(a, renditions[1], NEW, ["succeeded", "staged"], at=200)
+        b = self.document(2, rendition=renditions[2])
+        old_rejected = self.review(b, renditions[2], OLD, ["blocked", "staged"],
+                                   "standing-rejected-reviewer-rejected", 110)
+        self.review(b, renditions[2], NEW, ["staged", "staged"])  # not attempted yet: still current
+        self.document(3, rendition=renditions[3])  # extracted, awaiting review
+        self.document(4, extract="blocked", register=None, code="needs-reader-docx")
+        e = "inbox-%024x" % 5
+        self.put("upload-" + e, RECEIPT, ["staged"])  # a manual upload: no docs row
+        # The document was extracted again: its earlier rendition's review no longer counts.
+        f = self.document(6, rendition=renditions[6])
+        stale = self.review(f, renditions[7], NEW, ["blocked", "staged"], "standing-rejected-reviewer-rejected", 210)
+        g = self.document(7, rendition=renditions[8])
+        self.review(g, renditions[8], NEW, ["succeeded", "succeeded"], at=300)
+        self.put("publish-" + "1" * 12 + "-x", PUBLISH, ["succeeded"], at=400)
+        h = self.document(8, rendition=renditions[9])
+        self.review(h, renditions[9], OLD, ["blocked", "staged"], "standing-pending-review-unresolved-evidence", 120)
+        return {"old_scope": old_scope, "old_rejected": old_rejected, "stale": stale}
+
+    def test_documents_are_counted_once_in_their_furthest_current_state(self):
+        names = self.build()
+        result = progress.snapshot(self.root, limit=100)
+        documents = result["documents"]
+        self.assertEqual((documents["source"], documents["documents"]), ("docs", 8))
+        self.assertEqual(sum(documents["funnel"].values()), 8)
+        self.assertEqual({k: v for k, v in documents["funnel"].items() if v},
+                         {"qualified": 1, "pending-review": 2, "extracted": 2, "needs-reader": 1,
+                          "staged": 1, "selected": 1})
+        self.assertEqual({(g["state"], g["funnel"], g["code"]): g["count"] for g in documents["attention_groups"]},
+                         {("blocked", "needs-reader", "needs-reader-docx"): 1,
+                          ("blocked", "pending-review", "standing-pending-review-unresolved-evidence"): 1})
+        self.assertEqual(result["publications"]["requests"], 1)
+        self.assertEqual(result["publications"]["last_published"], 400.5)
+        self.assertEqual(documents["requests"]["publication"], 1)
+        overall = result["overall"]
+        self.assertEqual(overall["superseded_by"], {"correction": 0, "policy": 2, "rendition": 1, "submission": 0})
+        self.assertEqual(overall["superseded"], 3)
+        self.assertEqual((overall["funnel"]["exception"], overall["funnel"]["rejected"]), (0, 0))
+        shown = {v["correlation_id"] for v in result["attention"] + result["recent"]}
+        self.assertFalse(shown & set(names.values()))
+        self.assertNotIn("standing-exception-prohibited-scope", {g["code"] for g in result["attention_groups"]})
+        text = progress_render.render_text(result)
+        self.assertIn("documents: 8 (from the docs table), 2 need attention;", text)
+        self.assertIn("  group: 1 x blocked needs-reader needs-reader-docx", text)
+        self.assertIn("policy=2, rendition=1", text)
+        self.assertIn("Documents: 8", progress_render.render_html(result))
+        self.assertNotIn(SECRET, json.dumps(result) + text + progress_render.render_html(result))
+        self.assertEqual(progress.snapshot(self.root, limit=100)["documents"], documents)  # cached pass agrees
+
+    def test_without_the_docs_table_documents_come_from_request_names(self):
+        self.build()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("DROP TABLE docs")
+        result = progress.snapshot(self.root, limit=100)
+        documents = result["documents"]
+        self.assertEqual((documents["source"], documents["documents"]), ("requests", 8))
+        self.assertEqual(sum(documents["funnel"].values()), 8)
+        # Without the docs table a rendition's staleness is unknown, so document 6 shows its review.
+        self.assertEqual({k: v for k, v in documents["funnel"].items() if v},
+                         {"qualified": 1, "pending-review": 2, "extracted": 1, "rejected": 1,
+                          "needs-reader": 1, "staged": 1, "selected": 1})
+        self.assertEqual(result["overall"]["superseded_by"]["policy"], 2)
+        self.assertIn("request names (no docs table)", progress_render.render_text(result))
+
+    def test_a_corrected_submission_is_superseded_with_its_requests(self):
+        old = self.document(1, rendition="d" * 64)
+        self.review(old, "d" * 64, NEW, ["succeeded", "staged"])
+        new = "inbox-%024x" % 2
+        self.put("upload-" + new, RECEIPT, ["succeeded"], correction_of="upload-" + old)
+        result = progress.snapshot(self.root)
+        self.assertEqual(result["documents"]["documents"], 1)
+        self.assertEqual({k: v for k, v in result["documents"]["funnel"].items() if v}, {"received": 1})
+        self.assertEqual(result["overall"]["superseded_by"],
+                         {"correction": 1, "policy": 0, "rendition": 0, "submission": 3})
+
+
+    def test_a_differently_named_correction_named_by_the_docs_row_decides(self):
+        sid = self.document(1, register="blocked", code="extract-failed")
+        self.put("repair-1", REGISTER, ["succeeded"], correction_of="register-" + sid)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("UPDATE docs SET state='extracted', rendition='r', rendition_sha256=?, register_head=? "
+                      "WHERE submission_id=?", ("e" * 64, "repair-1", sid))
+        documents = progress.snapshot(self.root)["documents"]
+        self.assertEqual({k: v for k, v in documents["funnel"].items() if v}, {"extracted": 1})
+        self.assertEqual(documents["requests"]["unattributed"], 0)
 
 
 class BindTests(unittest.TestCase):

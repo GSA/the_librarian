@@ -4,10 +4,10 @@ import base64
 import hashlib
 import html
 
-from .progress import FUNNEL, KINDS, STATUSES
+from .progress import DOC_FUNNEL, FUNNEL, KINDS, STATUSES
 
 EXCEPTIONAL = ("rejected", "deferred", "exception", "skipped-by-format", "needs-reader",
-               "blocked", "dead-letter")
+               "blocked", "dead-letter", "mismatch", "ambiguous")
 
 
 def when(value):
@@ -38,15 +38,35 @@ def source_line(name, value):
         f" ({value['detail']})" if value.get("detail") else "")
 
 
+def documents_source(documents):
+    return "the docs table" if documents["source"] == "docs" else "request names (no docs table)"
+
+
+def reasons(data):
+    found = ", ".join(f"{k}={v}" for k, v in data.get("superseded_by", {}).items() if v)
+    return f" ({found})" if found else ""
+
+
 def render_text(report):
     lines = [f"Intake progress at {report['generated_at']} (read-only, body-free)"]
     for name in ("ledger", "catalog", "review_events", "index"):
         lines.append("  " + source_line(name.replace("_", " "), report[name]))
+    documents = report["documents"]
+    if documents.get("available"):
+        counts = ", ".join(f"{k}={v}" for k, v in documents["funnel"].items() if v) or "none"
+        lines.append(f"documents: {documents['documents']} (from {documents_source(documents)}), "
+                     f"{documents['attention_total']} need attention; {counts}")
+        for group in documents["attention_groups"]:
+            lines.append(f"  group: {group['count']} x {group['state']} {group['funnel']} {group['code'] or '-'}")
+        publications = report["publications"]
+        counts = ", ".join(f"{k}={v}" for k, v in publications["funnel"].items() if v) or "none"
+        lines.append(f"publications: {publications['requests']} requests, last published "
+                     f"{when(publications['last_published'])}; {counts}")
     groups = [("overall", report["overall"])] + [("run " + k, v) for k, v in report["runs"].items()]
     for label, data in groups:
         counts = ", ".join(f"{k}={v}" for k, v in data["funnel"].items() if v) or "none"
         lines.append(f"{label}: {data['requests']} requests, {data['exceptions']} exceptions, "
-                     f"{data['retrying']} retrying, {data['superseded']} superseded; {counts}")
+                     f"{data['retrying']} retrying, {data['superseded']} superseded{reasons(data)}; {counts}")
     moving = report.get("rates")
     if moving:
         lines.append("finished attempts (last " + "/".join(f"{w // 60}" for w in moving["windows_seconds"])
@@ -60,7 +80,8 @@ def render_text(report):
                      f"selected documents={index['selected']['documents']} "
                      f"renditions={index['selected']['renditions']}")
     for group in report["attention_groups"]:
-        lines.append(f"  group: {group['count']} x {group['state']} {group['funnel']} {group['code'] or '-'}")
+        lines.append(f"  request group: {group['count']} x {group['state']} {group['funnel']} "
+                     f"{group['code'] or '-'}")
     for value in report["attention"]:
         attempt = value["last_attempt"] or {}
         lines.append(f"  ! {value['correlation_id']} {value['stage']} {value['state']} "
@@ -89,9 +110,9 @@ def esc(value):
     return html.escape("-" if value is None else str(value), quote=True)
 
 
-def cards(funnel):
+def cards(funnel, names=FUNNEL):
     out = []
-    for name in FUNNEL:
+    for name in names:
         tone = "bad" if name in EXCEPTIONAL and funnel[name] else "ok" if name == "published" else ""
         out.append(f'<div class="card {tone}"><b>{funnel[name]}</b>{esc(name)}</div>')
     return '<div class="cards">' + "".join(out) + "</div>"
@@ -136,8 +157,22 @@ def render_html(report, *, refresh=5):
                      f'<div class="card"><b>{index["selected"]["renditions"]}</b>selected renditions</div></div>')
         if index["reasons"]:
             parts.append("<p>Stale: " + esc("; ".join(index["reasons"])) + "</p>")
-    parts.append(f"<h2>Overall: {overall['requests']} requests, {overall['exceptions']} exceptions, "
-                 f"{overall['retrying']} retrying ({overall['superseded']} superseded originals not counted)</h2>" + cards(overall["funnel"]))
+    documents = report["documents"]
+    if documents.get("available"):
+        parts.append(f"<h2>Documents: {documents['documents']} (from {esc(documents_source(documents))}), "
+                     f"{documents['attention_total']} need attention</h2>" + cards(documents["funnel"], DOC_FUNNEL))
+        if documents["attention_groups"]:
+            parts.append("<h2>Documents needing attention by cause</h2>" + table(
+                ("count", "state", "funnel", "code"),
+                [(g["count"], g["state"], g["funnel"], g["code"]) for g in documents["attention_groups"]]))
+        publications = report["publications"]
+        parts.append(f"<h2>Publications: {publications['requests']} requests, last published "
+                     f"{time_tag(when(publications['last_published']))}</h2>" + table(
+                         tuple(publications["funnel"]) or ("requests",),
+                         [tuple(publications["funnel"].values()) or (0,)]))
+    parts.append(f"<h2>Requests: {overall['requests']} requests, {overall['exceptions']} exceptions, "
+                 f"{overall['retrying']} retrying ({overall['superseded']} superseded not counted"
+                 f"{esc(reasons(overall))})</h2>" + cards(overall["funnel"]))
     for name, data in report["runs"].items():
         parts.append(f"<h2>Run {esc(name)} ({esc(data['prefix'])}*): {data['requests']} requests, "
                      f"{data['exceptions']} exceptions ({data['superseded']} superseded not counted)</h2>"
@@ -164,10 +199,11 @@ def render_html(report, *, refresh=5):
             ("outcome", *(f"last {w // 60} min" for w in windows)),
             [(outcome, *(counts[str(w)] for w in windows)) for outcome, counts in moving["finished"].items()]))
     if report["attention_groups"]:
-        parts.append("<h2>Needs attention by cause</h2>" + table(
+        parts.append("<h2>Requests needing attention by cause</h2>" + table(
             ("count", "state", "funnel", "code"),
             [(g["count"], g["state"], g["funnel"], g["code"]) for g in report["attention_groups"]]))
-    parts.append(f"<h2>Needs attention (showing {len(report['attention'])} of {report['attention_total']})</h2>"
+    parts.append(f"<h2>Requests needing attention (showing {len(report['attention'])} of "
+                 f"{report['attention_total']})</h2>"
                  + table(headers, item_rows(report["attention"])))
     parts.append("<h2>Recent items</h2>" + table(headers, item_rows(report["recent"])))
     parts.append(f"<script>{LOCAL_TIME_SCRIPT}</script></body></html>")

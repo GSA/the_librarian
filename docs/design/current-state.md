@@ -1127,6 +1127,29 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   each run, and in the text and HTML output, so counts reconcile with the ledger
   (the ledger itself is unchanged). Test: `SupersededTests` in
   `tests/test_progress_scale.py` (a chain of three, one uncorrected block).
+- `progress` also leaves out standing reviews that a later review replaced, and counts its
+  headline funnel by document (Kata nbta). Before the page scan, `progress.ledger_index` reads
+  names only: the first attempt start of each standing policy (`standing-<submission>-<rendition
+  12>-<policy 8>`), the `upload-` receipt IDs and the derived `docs` rows. A standing review head is
+  superseded for `policy` when the same rendition has a head under a policy first attempted later
+  (policy arguments record its hash, not its version, so first use orders them; a never-attempted
+  policy is newest), for `rendition` when the `docs` row's current rendition differs, and for
+  `submission` when its submission's receipt was corrected; with `correction` these are
+  `superseded_by` in `overall` and each run, verified with their page but not counted. Each
+  receipt head is one document folded into exactly one state: its receipt until received, then
+  its extraction and registration heads (the `docs` heads, matched by exact ID whatever their
+  name, when the table exists; otherwise the newest by first attempt), then its review under the
+  newest policy, and `mismatch`/`ambiguous` `docs` rows stay so. A document's furthest state is
+  `selected`: publication requests do not name the documents they publish, so the publications
+  and index sections report publication. The funnel sums to `documents.documents`; document attention groups are formed from the
+  deciding request's code. Without the `docs` table the source is `requests` and rendition
+  staleness is not detected. Publication requests are reported in `publications`, not as
+  documents; request-level counts, rates, attention and `recent` are kept. At 77,000 documents
+  and 324,000 requests (60% with an older-policy head) a cold render took 10 s at about 250 MB
+  peak RSS against 9.3 s and 150 MB before; a cached render is unchanged. Tests: `DocumentTests`
+  in `tests/test_intake_progress.py` (older-policy and old-rendition heads superseded, one count
+  per document across extract and register requests, the cached pass agrees, the docs-absent
+  fallback, a corrected submission, and a differently named correction the `docs` row names).
 - `store.verify` keeps one memo of the previous successful pass keyed by exact
   request bytes and artifact text with the digest they were proven to have, capped
   at `store.MEMO_BYTES` (128 MiB of keys). A hit needs identical bytes and an

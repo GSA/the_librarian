@@ -10,14 +10,17 @@ from bisect import insort
 from collections import Counter
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+import math
 import os
+import re
 import sqlite3
 import stat
+import sys
 import time
 
 from tools import policy
 from tools.file_identity import file_identity
-from . import store
+from . import docs, store
 from .contracts import IntakeError, decode_request
 
 FUNNEL = ("staged", "received", "extracting", "extracted", "pending-review", "reviewed",
@@ -35,6 +38,20 @@ ACTIVE = {"receipt": "staged", "extraction": "extracting", "review": "pending-re
 STANDING_OUTCOMES = ("pending-review", "rejected", "deferred", "exception")
 FORMAT_CODES = {"unsupported-type", "type-mismatch", "unsupported-format", "skipped-by-format"}
 READER_PREFIX = "needs-reader"
+# One state per document (receipt), the furthest its current requests reached (see ``fold``).
+DOC_FUNNEL = ("staged", "received", "extracting", "extracted", "pending-review", "qualified",
+              "selected", "rejected", "deferred", "exception", "skipped-by-format",
+              "needs-reader", "blocked", "dead-letter", "mismatch", "ambiguous")
+# Why a counted request is left out: corrected by another request, a standing review under an older
+# policy than another review of the same rendition, a review of a rendition that is no longer the
+# document's current one, or any request of a submission whose receipt was corrected.
+SUPERSEDED = ("correction", "policy", "rendition", "submission")
+# ``standing-<submission>-<rendition sha256[:12]>-<policy sha256[:8]>`` and its ``-c<n>`` corrections.
+STANDING_NAME = re.compile(r"standing-(.+)-([0-9a-f]{12})-([0-9a-f]{8})(?:-c[0-9]+)?")
+ROLE_OPERATIONS = {"upload-": ("receipt", ("catalog-submit",)),
+                   "extract-": ("extract", ("extract-prepare",)),
+                   "register-": ("register", ("extract-register",))}
+SLOTS = {"receipt": 0, "extract": 1, "register": 2, "review": 3}
 
 
 def failure(error):
@@ -163,29 +180,182 @@ def newer(current, value):
 
 
 def request_state(correlation_id, stages, layout, attempts_of):
-    """Each stage's (status, last attempt code when coded) and the newest attempt time of one request."""
-    statuses, updated = [], None
+    """Each stage's (status, last attempt code when coded), and the oldest attempt start and newest
+    attempt time of one request."""
+    statuses, first, updated = [], None, None
     for saved, (stage_id, _, _) in zip(stages, layout):
         history = attempts_of.get((correlation_id, stage_id), [])
         for attempt in history:
             updated = newer(newer(updated, attempt["started"]), attempt["ended"])
+            first = attempt["started"] if first is None else min(first, attempt["started"])
         code = None
         if saved["status"] in CODED:
             current = [a for a in history if a["cycle"] == saved["cycle"]]
             code = current[-1]["code"] if current else None
         statuses.append((saved["status"], code))
-    return tuple(statuses), updated
+    return tuple(statuses), first, updated
 
 
-def scan(c, root, limit, runs, corrected):
-    """Verify every page and fold it into signature counts, newest times and the entries kept to show.
+# Documents -----------------------------------------------------------------
 
-    Requests in ``corrected`` are not chain heads: they are verified with their page but only
-    counted as superseded."""
+class LedgerIndex:
+    """What the page scan needs to know about the whole ledger before it starts, from names only.
+
+    ``uploads`` maps each receipt request's submission ID to True when it is a chain head (a
+    document). ``stale`` maps standing review heads that another review supersedes to the reason.
+    ``policy_rank`` orders standing policies by when they were first attempted (never attempted:
+    newest). ``docs`` is None without the derived ``docs`` table; otherwise it maps each row's
+    submission ID to the name tails of its extraction and registration heads (the part after
+    ``extract-<submission>`` / ``register-<submission>``) and its current rendition's 12-digit
+    prefix, and ``special`` holds the rows whose chain is not trusted (``mismatch``, ``ambiguous``).
+    Strings are interned so the per-document maps share one copy of each submission ID.
+    """
+
+    def __init__(self):
+        self.uploads, self.stale, self.first_use, self.ranks = {}, {}, {}, {}
+        self.docs, self.special, self.foreign = None, {}, {}
+
+    def policy_rank(self, p8):
+        rank = self.ranks.get(p8)
+        if rank is None:
+            rank = self.ranks[p8] = (self.first_use.get(p8, math.inf), sys.intern(p8))
+        return rank
+
+    def submission(self, rest):
+        """The longest known submission ID that ``rest`` starts with, ending at a ``-`` or at its end."""
+        at = len(rest)
+        while at > 0:
+            if rest[:at] in self.uploads:
+                return sys.intern(rest[:at])
+            at = rest.rfind("-", 0, at)
+        return None
+
+    def is_docs_head(self, role, sid, correlation_id):
+        tail = self.docs[sid][0 if role == "extract" else 1]
+        return tail is not None and (correlation_id == f"{role}-{sid}{tail}"
+                                     or self.foreign.get(correlation_id) == (role, sid))
+
+    def supersede(self, sid, r12, members):
+        """Mark the reviews of one rendition that a newer policy or a newer rendition supersedes."""
+        if self.docs is not None and sid in self.docs and self.docs[sid][2] != r12:
+            self.stale.update((correlation_id, "rendition") for _, correlation_id in members)
+            return
+        top = max(self.policy_rank(p8) for p8, _ in members)
+        self.stale.update((correlation_id, "policy") for p8, correlation_id in members
+                          if self.policy_rank(p8) < top)
+
+
+def prefixed(c, table, prefix, columns="correlation_id", tail=""):
+    """Rows of ``table`` whose correlation ID starts with ``prefix`` (a primary-key range, no LIKE)."""
+    return c.execute(f"SELECT {columns} FROM {table} WHERE correlation_id>=? AND correlation_id<?{tail}",
+                     (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)))
+
+
+def tail_of(prefix, sid, head):
+    if head is None:
+        return None
+    return sys.intern(head[len(prefix) + len(sid):]) if head.startswith(prefix + sid) else head
+
+
+def ledger_index(c, corrected):
+    """Read the names, first standing attempt times and ``docs`` rows the scan needs.
+
+    Each query is its own short read transaction; nothing is decoded and no document text is read.
+    Standing review names are read in key order, so the heads of one rendition arrive together.
+    """
+    index = LedgerIndex()
+    with ledger_errors():
+        c.execute("BEGIN")
+        for correlation_id, started in prefixed(c, "attempts", "standing-", "correlation_id, min(started)",
+                                                " GROUP BY correlation_id"):
+            name = STANDING_NAME.fullmatch(correlation_id)
+            if name is not None and started is not None:
+                index.first_use[name[3]] = min(started, index.first_use.get(name[3], started))
+        c.execute("COMMIT")
+        c.execute("BEGIN")
+        for (correlation_id,) in prefixed(c, "requests", "upload-"):
+            index.uploads[sys.intern(correlation_id[len("upload-"):])] = correlation_id not in corrected
+        if docs.present(c):
+            index.docs = {}
+            for sid, state, sha, extract_head, register_head in c.execute(
+                    "SELECT submission_id, state, rendition_sha256, extract_head, register_head FROM docs"):
+                sid = sys.intern(sid)
+                index.docs[sid] = (tail_of("extract-", sid, extract_head), tail_of("register-", sid, register_head),
+                                   sha[:12] if state == "extracted" and sha else None)
+                # A correction may carry any name; the row names the head explicitly.
+                for role, head in (("extract", extract_head), ("register", register_head)):
+                    if head is not None and not head.startswith(f"{role}-{sid}"):
+                        index.foreign[head] = (role, sid)
+                if state in {"mismatch", "ambiguous"}:
+                    index.special[sid] = state
+        c.execute("COMMIT")
+        c.execute("BEGIN")
+        group, members = None, []
+        for (correlation_id,) in prefixed(c, "requests", "standing-", tail=" ORDER BY correlation_id"):
+            name = STANDING_NAME.fullmatch(correlation_id)
+            if name is None or correlation_id in corrected:
+                continue
+            if (name[1], name[2]) != group:
+                if members:
+                    index.supersede(*group, members)
+                group, members = (name[1], name[2]), []
+            members.append((name[3], correlation_id))
+        if members:
+            index.supersede(*group, members)
+        c.execute("COMMIT")
+    return index
+
+
+def role_of(correlation_id, layout, index):
+    """``(role, submission ID)`` of one request: a document's receipt, extraction, registration or
+    standing review, a publication, or ``(None, None)`` for anything else."""
+    operations = tuple(operation for _, _, operation in layout)
+    foreign = index.foreign.get(correlation_id)
+    if foreign is not None and operations == ROLE_OPERATIONS[foreign[0] + "-"][1]:
+        return foreign
+    for prefix, (role, expected) in ROLE_OPERATIONS.items():
+        if correlation_id.startswith(prefix) and operations == expected:
+            rest = correlation_id[len(prefix):]
+            return role, sys.intern(rest) if role == "receipt" else index.submission(rest)
+    if operations == ("standing-review", "standing-select"):
+        name = STANDING_NAME.fullmatch(correlation_id)
+        if name is not None:
+            return "review", sys.intern(name[1])
+    if all(kind == "publication" for _, kind, _ in layout) and "standing-select" not in operations:
+        return "publication", None
+    return None, None
+
+
+def offer_document(documents, index, role, sid, correlation_id, found, first):
+    """Keep the request that decides one slot of a document: with a ``docs`` row its own heads,
+    otherwise the newest (standing reviews: newest policy first)."""
+    entry = documents[sid]
+    slot = SLOTS[role]
+    if role in {"extract", "register"} and index.docs is not None and sid in index.docs:
+        if index.is_docs_head(role, sid, correlation_id):
+            entry[slot] = (None, found)
+        return
+    started = math.inf if first is None else first
+    key = (*index.policy_rank(STANDING_NAME.fullmatch(correlation_id)[3]), started) \
+        if role == "review" else (started,)
+    if entry[slot] is None or entry[slot][0] is None or key >= entry[slot][0]:
+        entry[slot] = (key, found)
+
+
+def scan(c, root, limit, runs, corrected, index):
+    """Verify every page and fold it into signature counts, newest times, the entries kept to show
+    and one small entry per document.
+
+    Superseded requests (``corrected`` and ``index.stale``, and every request of a corrected
+    submission) are verified with their page but only counted as superseded."""
     counts, per_run = Counter(), {name: Counter() for name in runs}
-    superseded, superseded_runs = 0, Counter()
+    superseded, superseded_runs = Counter(), {name: Counter() for name in runs}
     latest = dict.fromkeys(per_run)
     newest, recent, groups, info, after = None, Best(limit), {}, {}, None
+    # One entry per document, allocated before the pages so the long-lived entries sit together.
+    documents = {sid: [None, None, None, None] for sid, head in index.uploads.items() if head}
+    publications, roles = Counter(), Counter()
+    published = None
     while True:
         with ledger_errors():
             c.execute("BEGIN")
@@ -197,23 +367,38 @@ def scan(c, root, limit, runs, corrected):
         layouts = store.verify_page(rows, root, _memo)
         for row, layout in zip(requests, layouts):
             correlation_id = row["correlation_id"]
-            if correlation_id in corrected:
-                superseded += 1
+            role, sid = role_of(correlation_id, layout, index)
+            reason = "correction" if correlation_id in corrected else None
+            if reason is None and role == "review":
+                reason = index.stale.get(correlation_id)
+            if reason is None and sid is not None and index.uploads.get(sid) is False:
+                reason = "submission"
+            if reason is not None:
+                superseded[reason] += 1
                 for name, prefix in runs.items():
-                    superseded_runs[name] += correlation_id.startswith(prefix)
+                    superseded_runs[name][reason] += correlation_id.startswith(prefix)
                 continue
-            statuses, updated = request_state(correlation_id, stages_of[correlation_id], layout,
-                                              attempts_of)
+            statuses, first, updated = request_state(correlation_id, stages_of[correlation_id], layout,
+                                                     attempts_of)
             signature = (layout, statuses)
             if signature not in info:
                 info[signature] = stage_signature(layout, statuses)
-            funnel, state, code = info[signature]
+            funnel, state, code = found = info[signature]
             counts[signature] += 1
             newest = newer(newest, updated)
             for name, prefix in runs.items():
                 if correlation_id.startswith(prefix):
                     per_run[name][signature] += 1
                     latest[name] = newer(latest[name], updated)
+            if role == "publication":
+                publications[funnel] += 1
+                if all(status == "succeeded" for status, _ in statuses):
+                    published = newer(published, updated)
+            elif role is not None and index.uploads.get(sid):
+                offer_document(documents, index, role, sid, correlation_id,
+                               (found, updated) if role == "review" else found, first)
+            roles["unattributed" if role not in {None, "publication"} and not index.uploads.get(sid)
+                  else role or "other"] += 1
             order = (-(updated or 0), correlation_id)
 
             def build(row=row, stages=stages_of[correlation_id], attempts_of=attempts_of):
@@ -224,15 +409,84 @@ def scan(c, root, limit, runs, corrected):
                 group[0] += 1
                 group[1].offer(order, build)
         after = requests[-1]["correlation_id"]
-    return counts, per_run, latest, newest, recent, groups, superseded, superseded_runs
+    return {"counts": counts, "per_run": per_run, "latest": latest, "newest": newest, "recent": recent,
+            "groups": groups, "superseded": superseded, "superseded_runs": superseded_runs,
+            "documents": documents, "publications": publications, "published": published, "roles": roles}
 
 
-def summarize(counts, per_run, latest, newest, recent, groups, superseded, superseded_runs, limit):
+# Each role's request funnel as a document state: a staged extraction is still extracting and a
+# staged standing review is still pending review.
+AS_DOCUMENT = {"extract": {"staged": "extracting"}, "register": {"staged": "extracting"},
+               "review": {"staged": "pending-review"}}
+
+
+def fold(entry, special):
+    """One document's ``(funnel state, deciding (funnel, status, code) or None)``.
+
+    The receipt decides until it succeeds, then the extraction and the registration, then the
+    current standing review. A selected document stays ``selected``: publication requests do not
+    name the documents they publish, so the publications and index sections report publication."""
+    receipt, extract, register, review = entry
+    if special is not None:
+        return special, None
+    if receipt is None:
+        return "staged", None
+    if receipt[1][0] != "received":
+        return receipt[1][0], receipt[1]
+    if extract is None:
+        return "received", None
+    for role, slot in (("extract", extract), ("register", register)):
+        if slot is None:
+            return "extracting", None
+        funnel = AS_DOCUMENT[role].get(slot[1][0], slot[1][0])
+        if funnel != "extracted":
+            return funnel, slot[1]
+    if review is None:
+        return "extracted", None
+    found = review[1][0]
+    return AS_DOCUMENT["review"].get(found[0], found[0]), found
+
+
+def summarize_documents(tally, index):
+    funnel, groups = dict.fromkeys(DOC_FUNNEL, 0), Counter()
+    documents = tally["documents"]
+    for sid, head in index.uploads.items():
+        if not head:
+            continue
+        state, found = fold(documents[sid], index.special.get(sid))
+        funnel[state] += 1
+        if found is None and state in {"mismatch", "ambiguous"}:
+            groups[(state, state, None)] += 1
+        elif found is not None and found[1] in CODED:
+            groups[(found[1], state, found[2])] += 1
+    roles = tally["roles"]
     return {
-        "overall": aggregate(counts, newest, superseded),
-        "runs": {name: aggregate(per_run[name], latest[name], superseded_runs[name])
-                 for name in per_run},
-        "recent": [public(make_item(entry)) for _, entry in recent.entries],
+        "available": True, "source": "requests" if index.docs is None else "docs",
+        "documents": sum(funnel.values()), "funnel": funnel,
+        "attention_groups": [{"state": state, "funnel": f, "code": code, "count": count}
+                             for (state, f, code), count in sorted(
+                                 groups.items(), key=lambda g: (-g[1], tuple(str(x) for x in g[0])))],
+        "attention_total": sum(groups.values()),
+        "requests": {"documents": sum(roles[r] for r in SLOTS), "unattributed": roles["unattributed"],
+                     "publication": roles["publication"], "other": roles["other"]},
+    }
+
+
+def summarize_publications(tally):
+    found = tally["publications"]
+    return {"requests": sum(found.values()), "funnel": {k: v for k, v in sorted(found.items())},
+            "last_published": tally["published"]}
+
+
+def summarize(tally, index, limit):
+    groups = tally["groups"]
+    return {
+        "overall": aggregate(tally["counts"], tally["newest"], tally["superseded"]),
+        "runs": {name: aggregate(tally["per_run"][name], tally["latest"][name], tally["superseded_runs"][name])
+                 for name in tally["per_run"]},
+        "documents": summarize_documents(tally, index),
+        "publications": summarize_publications(tally),
+        "recent": [public(make_item(entry)) for _, entry in tally["recent"].entries],
         "attention_groups": [
             {"state": state, "funnel": funnel, "code": code, "count": count}
             for (state, funnel, code), (count, _) in sorted(
@@ -246,8 +500,9 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
     """Verify the whole ledger a page at a time and reduce it to counts and the few items shown.
 
     Every page is read in its own short read transaction and verified after it ends (so, as
-    described under "Intake ledger" in docs/design/current-state.md, no read lock is held across digest or shape work). Nothing but counters and
-    the ``limit`` newest items per list is kept, so memory follows the page, not the ledger.
+    described under "Intake ledger" in docs/design/current-state.md, no read lock is held across
+    digest or shape work). Only counters, the ``limit`` newest items per list and a few hundred
+    bytes per document are kept, so memory follows the page and the document count, not the ledger.
     """
     started = time.perf_counter()
     runs = runs or {}
@@ -268,9 +523,10 @@ def read_ledger(root, timeout=2.0, limit=50, runs=None):
             corrected = {parent for (parent,) in c.execute(
                 "SELECT DISTINCT correction_of FROM requests WHERE correction_of IS NOT NULL")}
             c.execute("COMMIT")
-        tally = scan(c, root, limit, runs, corrected)
+        index = ledger_index(c, corrected)
+        tally = scan(c, root, limit, runs, corrected, index)
         after_identity, moving = last_identity(c, db, before)
-    summary = summarize(*tally, limit)
+    summary = summarize(tally, index, limit)
     # Stored only when the file was exactly the same before the first and after the last page: no
     # commit landed between pages, so the summary describes one verified file state.
     if before is not None and after_identity == before:
@@ -365,9 +621,10 @@ def item(correlation, correction_of, request, saved, attempts):
     }
 
 
-def aggregate(counts, last_activity, superseded=0):
+def aggregate(counts, last_activity, superseded=None):
     """Counts for a ``Counter`` of (layout, ((status, code), ...)) request signatures of chain heads;
-    ``superseded`` is the number of corrected originals left out of them."""
+    ``superseded`` counts the requests left out of them by reason (``SUPERSEDED``)."""
+    superseded = superseded or Counter()
     funnel = dict.fromkeys(FUNNEL, 0)
     matrix = {kind: dict.fromkeys(STATUSES, 0) for kind in KINDS}
     exceptions = retrying = 0
@@ -378,7 +635,8 @@ def aggregate(counts, last_activity, superseded=0):
         exceptions += number * any(status in {"blocked", "dead-letter"} for status, _ in statuses)
         retrying += number * any(status == "retryable" for status, _ in statuses)
     return {"requests": sum(counts.values()), "funnel": funnel, "stages": matrix,
-            "exceptions": exceptions, "retrying": retrying, "superseded": superseded,
+            "exceptions": exceptions, "retrying": retrying, "superseded": sum(superseded.values()),
+            "superseded_by": {reason: superseded[reason] for reason in SUPERSEDED},
             "last_activity": last_activity}
 
 
@@ -475,13 +733,17 @@ def snapshot(root, *, limit=50, runs=None, timeout=2.0):
     if view is None:
         empty = aggregate(Counter(), None)
         view = {"overall": empty, "runs": {name: aggregate(Counter(), None) for name in runs or {}},
+                "documents": {"available": False, "documents": 0, "funnel": dict.fromkeys(DOC_FUNNEL, 0),
+                              "attention_groups": [], "attention_total": 0},
+                "publications": {"requests": 0, "funnel": {}, "last_published": None},
                 "recent": [], "attention": [], "attention_groups": [], "attention_total": 0,
                 "rates": None, "cached": False, "seconds": None}
     index = read_index(root)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "body_free": True, "read_only": True,
-        "ledger": ledger_state, "overall": view["overall"],
+        "ledger": ledger_state, "documents": view["documents"], "publications": view["publications"],
+        "overall": view["overall"],
         "runs": {name: {"prefix": prefix, **view["runs"][name]}
                  for name, prefix in sorted((runs or {}).items())},
         "recent": view["recent"], "attention": view["attention"],

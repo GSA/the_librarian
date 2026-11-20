@@ -356,8 +356,29 @@ renders it as text or HTML and `progress_serve.py` serves it.
   running share its result, and a result younger than one second is served again, so any number
   of open tabs cost one render per second at most. Measure with
   `python3 tools/diagnostics/progress_benchmark.py` (synthetic fixtures only).
-- Each request maps to one funnel state from its ordered stage statuses and
-  last attempt: `staged`, `received` (receipt committed), `extracting`,
+- The headline is per document: each `upload-` receipt chain head is one
+  document in exactly one state, so the `documents` funnel sums to the
+  document count. The receipt decides until the document is `received`;
+  then its extraction and registration (`extracting` while either is
+  missing or staged, else their block or `extracted`), then the standing
+  review of its current rendition under the newest policy (`pending-review`,
+  `qualified`, `selected`, `rejected`, `deferred`, `exception` ...).
+  `selected` is the furthest document state: publication requests do not
+  name their documents, so publication is shown by `publications` and the
+  index panel. With the derived `docs` table its extraction and registration
+  heads (by exact ID, however a correction is named) and current rendition are used and `mismatch`/`ambiguous` rows keep
+  that state; without it the source is `requests` (the newest request by
+  first attempt) and rendition changes are not detected. Document attention
+  groups (`group:`) count documents by state, funnel and code. Publication
+  requests are not documents and are reported under `publications`.
+- Superseded requests are verified but not counted, and reported in
+  `superseded_by`: `correction` (named by another request's `correction_of`),
+  `policy` (a standing review of a rendition that also has a review under a
+  policy first attempted later), `rendition` (a standing review of a
+  rendition that is no longer the document's current one) and `submission`
+  (requests of a corrected receipt).
+- Each remaining request still maps to one funnel state from its ordered stage statuses and
+  last attempt (the request-level `overall` line and `request group:` lines): `staged`, `received` (receipt committed), `extracting`,
   `extracted`, `pending-review`, `reviewed`, `qualified`, `selected`,
   `published`, or the exceptions `rejected`, `deferred`, `exception`
   (blocked `standing-<outcome>-*` codes), `skipped-by-format`
