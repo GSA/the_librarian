@@ -126,7 +126,7 @@ def audit(root, *, workers=WORKERS, limit=1000):
     ``checked`` counts files hashed, ``mismatches`` all found, ``listed`` those in ``items``.
     """
     root = no_symlinks(Path(root))
-    with pins.snapshot(root) as snapshot:
+    with pins.snapshot(root, write=False) as snapshot:
         rows, state = snapshot.retained_files(), snapshot.state
     # The snapshot ends here: hashing gigabytes must not hold the catalog's read lock.
     base = str(root)
@@ -156,7 +156,7 @@ def read_verified(root, relative):
     present file at that path.
     """
     root = no_symlinks(Path(root))
-    with pins.snapshot(root) as snapshot:
+    with pins.snapshot(root, write=False) as snapshot:
         claims = [record["data"] for record in snapshot.artifacts_at(relative)
                   if record["data"].get("presence") == "present" and record["data"].get("sha256")]
     if not claims:

@@ -90,10 +90,17 @@ class Snapshot:
 
 
 @contextmanager
-def snapshot(root):
-    """One validated read transaction of the catalog at ``root`` as a ``Snapshot``."""
+def snapshot(root, *, write=True):
+    """One validated read transaction of the catalog at ``root`` as a ``Snapshot``.
+
+    With ``write`` false nothing is written to the instance, not even the catalog's read-validation
+    receipt (``catalog_store.observed_state``): a receipt that covers the file is still trusted, and
+    otherwise the history is validated in full for this call only. The audit and verified reads use it.
+    """
     home, db, _ = locations(root)
     require(home.is_dir() and stat.S_IMODE(home.stat().st_mode) == 0o700, "Catalog home missing or not private")
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
-        yield Snapshot(connection, store.validated_state(connection, home))
+        state = (store.validated_state(connection, home) if write
+                 else store.observed_state(connection, home, {}))
+        yield Snapshot(connection, state)

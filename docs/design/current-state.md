@@ -1076,8 +1076,9 @@ flags an unexpected change; it does not defend against one in real time, on ever
   reports each mismatch with its path, kind (`original`, `extraction`, `sidecar`, or the artifact
   role), problem (`hash-differs`, `size-differs`, `missing`, `symlink`, `not-a-file`, `unreadable`,
   `unsafe-path`), expected and found hash and record. It lists at most `--limit` (default 1,000) but
-  counts all. It is read-only (the catalog's read transaction ends before any file is hashed; the audit
-  writes nothing under the instance), never fails a read, and exits 0 clean, 1 with mismatches, 2 when it
+  counts all. It is read-only (the catalog's read transaction ends before any file is hashed; the catalog is
+  read through `observed_state`, so a missing or expired read-validation receipt is not rewritten; the
+  audit writes nothing under the instance), never fails a read, and exits 0 clean, 1 with mismatches, 2 when it
   could not run (for a scheduler to alert on). `check PATH...` verifies named files the same way.
   README.md ("Integrity audit") shows a cron and a systemd timer. Evidence: `tests/test_integrity.py`.
 - **Verified reads.** `integrity.read_verified(root, path)` opens one retained file, checks its SHA-256

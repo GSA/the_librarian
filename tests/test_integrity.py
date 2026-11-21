@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests import test_workspace
+from tools import policy
 from tests.support import WorkspaceCase
 from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index
@@ -44,6 +45,19 @@ class IntegrityTests(WorkspaceCase):
         self.assertEqual((report["mismatches"], report["items"]), (0, []))
         self.assertGreaterEqual(report["checked"], 2)
         self.assertEqual(tree(self.root), before)
+
+    def test_with_no_catalog_receipt_the_audit_validates_and_still_writes_nothing(self):
+        home = self.root / policy.validate_instance_roots(self.root)["catalog_home"]
+        receipt = home / ".local/read-validation.json"
+        self.assertTrue(receipt.exists())
+        receipt.unlink()
+        before = tree(self.root)
+        self.assertTrue(integrity.audit(self.root)["clean"])
+        self.assertEqual(integrity.read_verified(self.root, "sources/notes.txt"), self.original.read_bytes())
+        self.assertEqual(tree(self.root), before)
+        self.assertFalse(receipt.exists())
+        with patch.object(catalog, "_write_receipt", side_effect=AssertionError("wrote a receipt")):
+            self.assertTrue(integrity.audit(self.root)["clean"])
 
     def test_each_kind_of_change_is_reported_with_path_kind_expected_and_found(self):
         pinned = hashlib.sha256(self.original.read_bytes()).hexdigest()
