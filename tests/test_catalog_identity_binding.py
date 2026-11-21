@@ -1,4 +1,4 @@
-"""Catalog receipts bind to file identity with a daily full check (docs/design/current-state.md, "What a catalog write validates")."""
+"""Catalog receipts bind to file identity and never expire (Kata 91h5; docs/design/current-state.md, "What a catalog write validates")."""
 from contextlib import closing
 import datetime
 import json
@@ -66,43 +66,42 @@ class IdentityBinding(Case):
         self.refused()
 
     @needs_dbpage
-    def test_residual_identity_restoring_edit_is_served_until_the_next_utc_day(self):
-        """Documented class: an edit that restores size, mtime, ctime and counter is not seen by
-        the identity, only by the first full check of the next UTC day or an audit."""
+    def test_residual_identity_restoring_edit_is_served_until_an_audit_whatever_the_day(self):
+        """Documented class (Kata 91h5 removed the daily expiry): an edit that restores size, mtime,
+        ctime and counter is not seen by the identity on any day; the audit finds it."""
         self.raw_edit(restore_mtime=False)
         identity = self.saved()["binding"]["identity"]
         with patch.object(catalog, "file_identity", lambda path, connection: identity):
             self.assertEqual(catalog.status(self.root)["revision"], 3)
+            with self.day_after():
+                self.assertEqual(catalog.status(self.root)["revision"], 3)
             with self.assertRaises(CatalogError):
                 catalog.status(self.root, audit=True)
-            with self.day_after(), self.assertRaises(CatalogError):
-                catalog.status(self.root)
 
     @needs_dbpage
-    def test_new_utc_day_forces_one_full_validation_then_reuses(self):
+    def test_a_new_utc_day_replays_nothing(self):
         calls, patched = self.writes_inspect()
         with patched, self.day_after():
             catalog.status(self.root)
-            self.assertEqual(len(calls), 1)
             catalog.status(self.root)
-            catalog.status(self.root)
-            self.assertEqual(len(calls), 1)
+            self.write(30)
+        self.assertEqual(calls, [])
 
     @needs_dbpage
-    def test_delta_commit_does_not_advance_the_full_check_date(self):
-        stale = self.saved()
+    def test_a_delta_commit_carries_the_audit_date_forward(self):
         yesterday = (snapshots.utcnow() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         with closing(catalog.connect(self.db)) as connection:
             connection.execute("BEGIN")
             catalog._write_receipt(self.home, catalog._binding(connection), catalog._head_state(connection),
                                    validated_on=yesterday)
-        del stale
-        # Yesterday's receipt is a miss today: the write replays and starts today's clock.
-        self.write(20)
-        self.assertEqual(self.saved()["validated_on"], catalog._today())
-        before = self.saved()["validated_on"]
-        self.write(21)
-        self.assertEqual(self.saved()["validated_on"], before)
+        # The date records the last full replay for the audit report; it never makes the receipt a miss.
+        calls, patched = self.writes_inspect()
+        with patched:
+            self.write(20)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.saved()["validated_on"], yesterday)
+        catalog.status(self.root, audit=True)
+        self.assertEqual(self.saved()["validated_on"], catalog._today())  # a full replay (the audit) records its day
 
     def test_audit_always_replays(self):
         calls, patched = self.writes_inspect()
@@ -149,7 +148,7 @@ class ReviewRegressions(Case):
             self.write(n)
 
     @needs_dbpage
-    def test_idempotent_retry_on_a_new_utc_day_replays_once(self):
+    def test_idempotent_retry_on_a_new_utc_day_replays_nothing(self):
         later = snapshots.utcnow() + datetime.timedelta(days=1)
         records = catalog_records(1)
         calls, patched = self.writes_inspect()
@@ -158,7 +157,7 @@ class ReviewRegressions(Case):
                 again = catalog.submit(self.root, records, actor="a", request_id="r1", reason="test",
                                        expected_state="outdated")
                 self.assertTrue(again["idempotent"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls, [])
 
     def test_reader_opened_before_a_restore_never_binds_the_restored_file(self):
         snapshot = Path(catalog.backup(self.root)["snapshot"])

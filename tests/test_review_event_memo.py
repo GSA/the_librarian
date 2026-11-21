@@ -92,6 +92,16 @@ class MemoCase(unittest.TestCase):
         later = snapshots.utcnow() + timedelta(days=1)
         return patch.object(snapshots, "utcnow", lambda: later)
 
+    @property
+    def receipt(self):
+        return self.home / ".local" / event_history.RECEIPT
+
+    def new_process(self, keep_receipt=True):
+        """What a fresh process has: no memory, and the persisted receipt only if one was written."""
+        event_history.clear_memo()
+        if not keep_receipt and self.receipt.exists():
+            self.receipt.unlink()
+
     def raw_edit(self, restore_mtime):
         """Same-size in-place edit of the file, outside SQLite and the writer."""
         before = os.stat(self.db)
@@ -187,7 +197,7 @@ class MemoReuse(MemoCase):
         self.assertEqual(len(calls), 2)
 
     def test_a_connection_not_opened_by_the_store_is_never_memoized(self):
-        event_history.clear_memo()
+        self.new_process(keep_receipt=False)
         with closing(sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, isolation_level=None)) as raw:
             raw.row_factory = sqlite3.Row
             raw.execute("BEGIN")
@@ -285,9 +295,9 @@ class MemoTamper(MemoCase):
         with patch.object(event_history, "file_identity", lambda path, connection: identity):
             self.refused()
 
-    def test_residual_identity_restoring_edit_is_served_until_an_audit_or_the_next_utc_day(self):
+    def test_residual_identity_restoring_edit_is_served_until_an_audit(self):
         """Documented class: an edit that restores size, mtime, ctime and counter and leaves the
-        chain heads alone is seen only by the first full check of the next UTC day or an audit."""
+        chain heads alone is seen only by an audit (Kata 91h5: there is no daily full check)."""
         self.read()
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
@@ -299,16 +309,23 @@ class MemoTamper(MemoCase):
                 events.status(self.root, audit=True)
             self.refused("Event payload hash mismatch")  # the refusing audit evicted the memo
 
-    def test_residual_expires_on_the_next_utc_day(self):
+    def test_residual_does_not_expire_with_the_utc_day_but_a_new_process_and_an_audit_find_it(self):
+        """Kata 91h5 changes this guarantee: the next UTC day no longer replays. The edit is found by
+        the scheduled audit (``status --audit``), which also stops every later read trusting it."""
         self.read()
         with closing(events.connect(self.db)) as connection:
             connection.execute("BEGIN")
             identity = event_history.file_identity(self.db, connection)
         self.raw_edit(restore_mtime=False)
         with patch.object(event_history, "file_identity", lambda path, connection: identity):
-            self.assertEqual(self.read().state["events"], 3)
             with self.day_after():
-                self.refused("Event payload hash mismatch")
+                self.assertEqual(self.read().state["events"], 3)
+                self.new_process()
+                self.assertEqual(self.read().state["events"], 3)  # a new process trusts the receipt too
+            with self.assertRaisesRegex(contract.ReviewError, "Event payload hash mismatch"):
+                events.status(self.root, audit=True)
+            self.new_process()
+            self.refused("Event payload hash mismatch")
 
 
 @needs_dbpage
@@ -336,7 +353,7 @@ class MemoConcurrentWriter(MemoCase):
 
     def test_a_pass_that_overlaps_a_commit_is_not_remembered(self):
         """A commit between the identity taken before and after the pass stores nothing."""
-        event_history.clear_memo()
+        self.new_process(keep_receipt=False)
         real = event_history.file_identity
         seen = []
 
@@ -440,9 +457,9 @@ class DeltaVerification(MemoCase):
         os.pwrite(descriptor, (counter + 1).to_bytes(4, "big"), 24)
         os.close(descriptor)
 
-    def test_an_old_row_edit_disguised_as_a_commit_is_seen_by_an_audit_a_full_read_and_the_next_day(self):
+    def test_an_old_row_edit_disguised_as_a_commit_is_seen_by_an_audit_and_a_full_read(self):
         """The stated bound of the delta: rows before the remembered head are read again only at the
-        next full check (audit, publication, backup, new UTC day, other contract or file)."""
+        next full check (audit, publication, backup, other contract or file); not at a new UTC day."""
         self.read()
         self.raw_edit(restore_mtime=False)
         self.bump_counter()
@@ -451,7 +468,10 @@ class DeltaVerification(MemoCase):
             self.assertEqual(self.read().state["events"], 3)  # served by the delta: nothing past the head
             self.assertEqual(calls, [])
             with self.day_after():
-                self.refused("Event payload hash mismatch")
+                self.assertEqual(self.read().state["events"], 3)
+                self.assertEqual(calls, [])
+        with self.assertRaisesRegex(contract.ReviewError, "Event payload hash mismatch"):
+            event_reader.read_snapshot(self.root, full=True)
 
     def test_an_audit_refuses_the_disguised_edit(self):
         self.read()

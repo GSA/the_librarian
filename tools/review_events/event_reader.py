@@ -55,7 +55,8 @@ class Snapshot:
     def successors(self):
         if self._successors is None:
             count = self.state["events"]
-            self._successors = {target: successor for target, successor in self.history.successors.items()
+            # One atomic copy: another snapshot in this process may extend the shared history meanwhile.
+            self._successors = {target: successor for target, successor in list(self.history.successors.items())
                                 if self.history.by_id[successor] <= count}
         return self._successors
 
@@ -63,8 +64,7 @@ class Snapshot:
         """The ID of the event that corrects ``event_id`` in this snapshot, or None; constant time."""
         if self.history is None:
             return self.successors.get(event_id)
-        successor = self.history.successors.get(event_id)
-        return successor if successor is not None and self.history.event(successor, self.state["events"]) else None
+        return self.history.successor(event_id, self.state["events"])
 
     def event(self, event_id):
         """The event with this ID, or None; constant time on a memoized history."""
@@ -85,8 +85,7 @@ class Snapshot:
         """Events whose source locator is ``locator``, in store order; constant time to find."""
         if self.history is None:
             return [e for e in self.events if e["source"]["locator"] == locator]
-        count = self.state["events"]
-        return [self.history.events[n - 1] for n in self.history.by_locator.get(locator, ()) if n <= count]
+        return self.history.at(locator, self.state["events"])
 
     def query(self, *, receipt_id=None, source_id=None, outcome=None, content=None,
               unit=None, scope=None, origin=None, include_history=False, limit=10,

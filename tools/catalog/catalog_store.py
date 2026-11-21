@@ -199,9 +199,11 @@ def _today():
     return snapshots.utcnow().strftime("%Y-%m-%d")
 
 
-
 def _write_receipt(home, binding, state, validated_on=None):
-    """``validated_on`` is the UTC date of the last full validation this receipt descends from."""
+    """``validated_on`` is the UTC date of the last full replay this receipt descends from.
+
+    It is recorded for the audit report; it never limits how long the receipt is trusted.
+    """
     cache_home = safe_path(home / ".local")
     receipt = safe_path(cache_home / "read-validation.json")
     record = {"binding": binding, "state": state, "validated_on": validated_on or _today()}
@@ -224,8 +226,10 @@ def _write_receipt(home, binding, state, validated_on=None):
 def _trusted_state(connection, home, binding):
     """``(state, validated_on)`` a receipt vouches for when it covers exactly this file, else None.
 
-    An identity-bound receipt (0017) is trusted only on the UTC day of its last full validation,
-    so a change the identity cannot see is found by the first full check of the next day. A
+    A receipt is trusted for as long as it covers exactly this file (Kata 91h5): there is no daily
+    expiry. A change the identity cannot see (an edit that restores size, mtime, ctime and the
+    change counter, or silent media corruption) is found by the scheduled audit
+    (``python -m tools.store_audit``), ``status --audit``, backup verification or restore. A
     receipt from before 0017 carries no date and is a miss, never a refusal.
     """
     cache_home = safe_path(home / ".local")
@@ -244,8 +248,6 @@ def _trusted_state(connection, home, binding):
     signed = {key: saved[key] for key in saved if key != "checksum"}
     require(saved["checksum"] == fingerprint(signed), "Read-validation receipt checksum mismatch; run audit")
     if legacy or saved["binding"] != binding:
-        return None
-    if binding["version"] == 2 and saved["validated_on"] != _today():
         return None
     state = _head_state(connection)
     require(state == saved["state"], "Read-validation state mismatch; run audit")
@@ -299,9 +301,9 @@ def observed_state(connection, home, seen, *, inspect_limit=None):
 
     For callers such as ``tools/intake/progress.py`` that report on the catalog and must not change
     it. ``connection`` holds a read transaction. A read-validation receipt that covers exactly this
-    file vouches for a state a writer or reader already validated in full today. ``seen`` is a dict
+    file vouches for a state a writer or reader already validated in full. ``seen`` is a dict
     the caller keeps for the life of its process: an identity-bound file this process has already
-    inspected in full today, with the same head, reuses that state. Otherwise the whole history is
+    inspected in full, with the same head, reuses that state. Otherwise the whole history is
     inspected and, for an identity-bound file, remembered in ``seen``.
 
     Unlike ``validated_state``, a receipt or binding that cannot be read or checked (CatalogError,
@@ -322,7 +324,7 @@ def observed_state(connection, home, seen, *, inspect_limit=None):
         binding = _binding(connection, hash_bytes=not large)
         if binding is None:
             return None
-        marker = json.dumps([binding, _today()], sort_keys=True)
+        marker = json.dumps(binding, sort_keys=True)
         trusted = _trusted_state(connection, home, binding)
     except (CatalogError, OSError, ValueError):
         binding = marker = trusted = None
@@ -371,7 +373,7 @@ def _writer(root):
             trusted = _trusted_state(connection, home, binding)
         except (CatalogError, OSError):
             trusted = None  # an unusable receipt only costs the full replay; it never blocks a write
-        validated_on = None  # a full replay below (or the daily snapshot's) starts a new day
+        validated_on = None  # a full replay below starts the audit date afresh
         if trusted is None:
             state, current, _, _, _ = inspect(connection)
         else:
@@ -386,7 +388,10 @@ def _commit_revision(writer, incoming, *, request_id, actor, reason, input_hash,
     Returns ``(written state, committed_at, snapshot, retention)``.
     """
     connection, state = writer.connection, writer.state
-    taken, retention = _daily_snapshot(writer.root, connection, writer.backups, state, writer.trusted is None)
+    # The head is either replayed in full just above (no receipt) or vouched for by a receipt covering
+    # exactly these bytes, so the snapshot is the image of a validated transaction either way and never
+    # replays history under the writer lock (Kata 91h5); ``status --audit`` and the scheduled audit verify it.
+    taken, retention = _daily_snapshot(writer.root, connection, writer.backups, state, True)
     connection.execute("COMMIT")
     committed_flag = False
     revision = state["revision"] + 1
@@ -418,8 +423,7 @@ def _commit_revision(writer, incoming, *, request_id, actor, reason, input_hash,
                 f"Write committed at revision {revision}, but durability/backup failed; retry the same request"
             ) from error
         raise
-    # A snapshot verification replays everything, so only then does the full-check date advance.
-    _attest_commit(connection, writer.home, written, None if taken is not None else writer.validated_on)
+    _attest_commit(connection, writer.home, written, writer.validated_on)
     return written, batch["committed_at"], taken, retention
 
 

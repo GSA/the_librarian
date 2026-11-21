@@ -194,5 +194,8 @@
   "tools/evals/compare.py",
   "tools/evals/generate.py",
   "tools/evals/runner.py",
-  "tests/test_evals.py"
+  "tests/test_evals.py",
+  "tools/store_audit.py",
+  "tests/test_store_audit.py",
+  "tests/test_review_event_receipt.py"
 ]

@@ -315,6 +315,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.catalog.inventory` | List files under a configured root (`--root`, `--limit`, `directory`; metadata only) |
 | `python -m tools.extraction.extract` | Text, Gemini transcript, and ODT extraction (`prepare`, `verify`, `register`) |
 | `python -m tools.extraction.docling_extract` | Optional PDF and image extraction (`inspect`, `prepare`, `verify`, `register`) |
+| `python -m tools.store_audit` | Scheduled full verification of the catalog, review events, intake ledger and newest backups; JSON report, exit 1 if any store is flagged (cron/systemd timer; see the design doc) |
 | `python -m tools.review_events.event_store` | Review store: `init`, `status`, `audit`, `schema`, `get`, `append`, `backup`, `verify-backup`, `restore` |
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
 | `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore` |
@@ -370,6 +371,23 @@ WantedBy=timers.target
 
 A reported file is restored from backup or re-ingested; the audit repairs nothing. See
 [context/integrity.md](context/integrity.md).
+
+### Store audit
+
+Reads and writes trust the stores' read-validation receipts and never replay a store's whole history
+(there is no daily full check), so a store edited outside the application is found by the store audit,
+which replays the catalog, the review events and the intake ledger in full, verifies the newest backup of
+the catalog and of the review events, and prints a body-free JSON report (exit 0 all verified, 1 a store
+was flagged, 2 it could not run):
+
+```sh
+.venv/bin/python -m tools.store_audit --root "$PWD"
+```
+
+Schedule it with the file audit above, for example `23 3 * * *  cd /path/to/instance && .venv/bin/python
+-m tools.store_audit --root . > .local/store-audit.json || mail -s "Librarian store audit" owner@example.org
+< .local/store-audit.json`. Details and the tamper classes each check catches:
+[design](docs/design/current-state.md#store-validation-cadence-kata-91h5).
 
 ## MCP for consumer agents
 
