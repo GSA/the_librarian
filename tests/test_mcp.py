@@ -142,6 +142,23 @@ class MCP(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(Reader.stale_status(b"not json"))
         self.assertFalse(Reader.stale_status(b'{"fresh": true}'))
 
+    async def test_a_hung_reader_times_out_without_a_partial_result(self):
+        """Each call stays a bounded subprocess: a read that never returns is cut off at the timeout (Kata hep6)."""
+        import anyio
+        from unittest import mock
+        from mcp.server.mcpserver.exceptions import ToolError
+        from the_librarian_mcp.server import Reader
+
+        async def hang(*args, **kwargs):
+            await anyio.sleep(60)
+        reader = object.__new__(Reader)
+        reader.config = Config(root=ROOT, timeout_seconds=0.2)
+        with mock.patch("the_librarian_mcp.server.anyio.run_process", hang):
+            started = anyio.current_time()
+            with self.assertRaisesRegex(ToolError, "Reader timed out after 0.2 seconds; no partial result returned"):
+                await reader.execute("status", [], 100000)
+            self.assertLess(anyio.current_time() - started, 5)
+
     async def test_stale_status_still_obeys_the_output_budget(self):
         from types import SimpleNamespace
         from unittest import mock

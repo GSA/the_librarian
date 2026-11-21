@@ -13,7 +13,7 @@ from tools.context_index.context_index import (
     load_catalog, load_compaction, load_manifest, no_symlinks, publication_lock, readonly,
     search, validate_db_path,
 )
-from tools.context_index import corrections
+from tools.context_index import corrections, read_state
 from tools.context_index.packets import (
     compact_packet, packet, packet_many, render_result, validate_many_limits,
 )
@@ -98,6 +98,7 @@ def main(argv=None):
                 result = build(root, manifest, db, config, manifest_hash)
         else:
             connection = readonly(db)
+            before = read_state.capture(root, db)
             reasons = freshness(connection, root, manifest, db, config, manifest_hash, reuse=True)
             if reasons:
                 if args.command == "status":
@@ -117,8 +118,11 @@ def main(argv=None):
             elif args.command == "get-many":
                 result = packet_many(connection, config, args.locators, args.max_chars,
                                      format_=args.format, root=root)
-            # Refuse a result if the inputs changed while assembling it.
-            reasons = freshness(connection, root, manifest, db, config, manifest_hash, reuse=True)
+            # Refuse a result if the inputs changed while assembling it. A cheap state comparison stands in
+            # for the second full check only when it proves nothing moved; any doubt runs the full check.
+            reasons = [] if read_state.unchanged(before, connection, root, db, manifest, config,
+                                                 manifest_hash) else freshness(
+                connection, root, manifest, db, config, manifest_hash, reuse=True)
             if reasons:
                 fail("Index became stale during read; run build. " + "; ".join(reasons))
         sys.stdout.write(render_result(

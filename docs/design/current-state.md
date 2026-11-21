@@ -1143,6 +1143,51 @@ exceeded the reader's 30 s `--timeout-seconds`.
   - `::test_freshness_proof_with_racily_new_inputs_is_not_remembered`
   - `::test_freshness_proof_memo_signs_every_file_the_full_proof_opens` (an audit hook)
 
+### Reader per-call overhead (Kata hep6)
+
+A read (`status`, `search`, `get`, `get-many`) checked freshness before and after assembling its
+result, and the MCP server starts one `context_index` process per tool call. Measured on the 37,000-rendition
+instance (immutable read-only SQLite, nothing written, intake running, page cache warm):
+
+| Call (valid memo) | Before | After |
+| --- | --- | --- |
+| `status` / `search` / `get` wall | 3.1 / 3.0 / 3.0 s | 1.7 / 1.5 / 1.7 s |
+| each freshness check | 1.3 s and 1.2 s | 1.2 s once |
+| peak RSS | 319 MB | 303 MB |
+
+A call with no valid memo is unchanged at about 25 s (1.85 GB peak RSS), all in the first check; that
+cost is the [cold proof](#index-freshness-proof-memo-kata-t5df), owned by other work.
+
+- **Second check.** `tools/context_index/read_state.py` stands in for the second `freshness` call. Before the first
+  check the reader captures the identity (device, inode, mode, size, mtime, ctime) of the catalog and
+  review-event stores, any `-journal`/`-wal`/`-shm` beside them, and the freshness memo. After the read, the
+  second check is skipped only when all of that is unchanged *and* a few milliseconds of work re-derives
+  the rest of a verdict from disk: the manifest bytes against the pinned hash, the engine, policy,
+  corpus-root and instance-root metadata, and each indexed document's SHA-256. On any difference, any
+  doubt, or any of these, the reader runs the full second check exactly as before and reports its reasons:
+  a store whose ctime was within two seconds of the capture, a journal or write-ahead file, a
+  missing memo (the first check recomputed the whole proof and rewrote it), or an unreadable path.
+- **Detection that changed.** A selected extraction, original or submission sidecar edited outside the
+  application *while one read is in flight* is no longer refused by that read; it is refused by the next
+  read's first check (the memo's per-file signatures), and the application itself cannot change those
+  files without a catalog or review-event commit, which moves a store identity and gets the full second
+  check. The change follows the owner direction that a file edited outside the application after ingest is
+  detected and flagged, not defended against in real time. Manifest, policy, engine, indexed documents
+  and stores are still refused within the same read.
+- **Process per call, measured, kept.** A call's startup (interpreter and imports) is 0.05 s, and an MCP
+  `status` round trip on an empty instance is 61 ms against 59 ms for the bare subprocess. A persistent
+  reader's best case therefore saves about 0.05 s of a 1.7 s warm call. A cold-memo call in a process that
+  already ran one still takes 25 s: no in-process cache carries a proof across calls except the memo
+  file. The saving does not justify a long-lived worker that would need its own timeout, restart and
+  isolation story, so each call stays a subprocess under the server's `--timeout-seconds`; a hung read
+  still cannot block the server.
+- **Where the rest goes.** A warm call's remaining 1.2 s is the memo lookup (decoding the 25 MB memo
+  and one `lstat` for each of 300,000 signed files); parsing and validating the 50,000-selection manifest
+  is 0.26 s. Removing the lookup is the file-verification work's, not a reader change.
+- Evidence: `tests/test_read_state.py` (a warm read checks once; racily new stores, a journal, a
+  recomputed memo and a moved store get the second check; a manifest, indexed document or policy changed
+  during a read is refused with no output; a selected file edited during one read is found by the next).
+
 ### Concurrent writers
 
 - The catalog raises typed errors: `StaleState` (pin outdated), `WriterBusy`
