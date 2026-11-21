@@ -337,14 +337,21 @@ def validate_text_mapping(payload, source_raw, engine):
         engine.fail("Invalid text BOM declaration")
     if (payload["bom_bytes"] == 3) != source_raw.startswith(b"\xef\xbb\xbf"):
         engine.fail("Text BOM declaration does not match original bytes")
-    if any(not isinstance(record, dict) or not isinstance(record.get("text"), str)
-           or type(record.get("line")) is not int or type(record.get("terminator")) is not str
-           or type(record.get("byte_start")) is not int or type(record.get("byte_end")) is not int
-           for record in payload["lines"]):
-        engine.fail("Invalid text line field types")
+    lines = payload["lines"]
     # Exact equality with the canonical split proves field sets, numbering, terminators and that
-    # every byte after the BOM is covered by exactly one line slice.
-    if payload["lines"] != _canonical_lines(source_raw, payload["bom_bytes"]):
+    # every byte after the BOM is covered by exactly one line slice. Equality alone cannot tell
+    # ``1`` from ``True`` or ``1.0``, so the integer fields are also checked by type; a payload that
+    # differs is reported by the same checks, in the same order, as before.
+    if lines == _canonical_lines(source_raw, payload["bom_bytes"]):
+        if any(type(record["line"]) is not int or type(record["byte_start"]) is not int
+               or type(record["byte_end"]) is not int for record in lines):
+            engine.fail("Invalid text line field types")
+    else:
+        if any(not isinstance(record, dict) or not isinstance(record.get("text"), str)
+               or type(record.get("line")) is not int or type(record.get("terminator")) is not str
+               or type(record.get("byte_start")) is not int or type(record.get("byte_end")) is not int
+               for record in lines):
+            engine.fail("Invalid text line field types")
         engine.fail("Invalid text physical line mapping")
     expected_end = bool(payload["lines"] and payload["lines"][-1]["terminator"] != "none")
     if type(payload["ends_with_terminator"]) is not bool or payload["ends_with_terminator"] != expected_end:
@@ -352,12 +359,13 @@ def validate_text_mapping(payload, source_raw, engine):
 
 
 def _canonical_lines(source_raw, offset):
-    """Split decoded bytes after ``offset`` into numbered physical lines with exact byte ranges."""
+    """Split decoded bytes after ``offset`` into numbered physical lines with exact byte ranges.
+
+    A physical line ends at CRLF, CR or LF (``bytes.splitlines`` splits on exactly those and keeps
+    the terminator); the last line may have none.
+    """
     lines = []
-    for number, match in enumerate(re.finditer(b".*?(?:\\r\\n|\\r|\\n|\\Z)", source_raw[offset:]), 1):
-        raw_line = match.group()
-        if not raw_line:
-            continue
+    for number, raw_line in enumerate(source_raw[offset:].splitlines(True), 1):
         text = raw_line.decode("utf-8")
         terminator = ("crlf" if text.endswith("\r\n") else "lf" if text.endswith("\n")
                       else "cr" if text.endswith("\r") else "none")
