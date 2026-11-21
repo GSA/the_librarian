@@ -71,13 +71,13 @@ class StoreIdentity(unittest.TestCase):
                 root = Path(directory)
                 module.initialize(root)
                 database = module.locations(root)[1]
-                with sqlite3.connect(database) as connection:
+                with closing(sqlite3.connect(database)) as connection, connection:
                     connection.execute(f"PRAGMA application_id={old}")
                 with self.assertRaisesRegex(Exception, message + ".*migration or re-initialization"):
                     module.status(root)
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "index.sqlite3"
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute("PRAGMA application_id=0x46435458")
             with self.assertRaisesRegex(Exception, "Superseded FCTX.*migration or re-initialization"):
                 index.readonly(database)

@@ -705,7 +705,7 @@ class QualifyTests(QualifyCase):
         manifest = self.root / "config/selection.local.json"
         config, _ = index.load_manifest(manifest, self.root)
         self.assertEqual(len(config["renditions"]), 5)
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+        with contextlib.closing(index.readonly(self.root / cohort.DEFAULT_INDEX)) as db:
             hits = index.search(db, "Fund codes", 10, None, root=self.root)["hits"]
             self.assertEqual(len(hits), 1)
             got = packets.packet(db, config, hits[0]["locator"], 60000, root=self.root)
@@ -782,7 +782,7 @@ class QualifyTests(QualifyCase):
         self.assertIn(new_notes["receipt_id"], selected_receipts)
         self.assertNotIn(old_notes["receipt_id"], selected_receipts)
         self.assertEqual(len(selected), 7)
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+        with contextlib.closing(index.readonly(self.root / cohort.DEFAULT_INDEX)) as db:
             self.assertEqual(
                 len(index.search(db, "Updated cohort line", 10, None, root=self.root)["hits"]), 1)
             self.assertEqual(
@@ -1180,13 +1180,13 @@ class QualifyTests(QualifyCase):
         # A tampered ledger artifact or request is refused by the audit although its peers were memoised.
         db = self.root / ".local/intake/intake.sqlite3"
         store.list_requests(self.root)
-        with sqlite3.connect(db) as connection:
+        with contextlib.closing(sqlite3.connect(db)) as connection, connection:
             connection.execute("UPDATE stages SET evidence=evidence||' ' WHERE rowid="
                                "(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
         with self.assertRaises(IntakeError) as caught:
             store.audit(self.root)
         self.assertEqual(caught.exception.code, "corrupt_artifact")
-        with sqlite3.connect(db) as connection:
+        with contextlib.closing(sqlite3.connect(db)) as connection, connection:
             connection.execute("UPDATE stages SET evidence=substr(evidence,1,length(evidence)-1) "
                                "WHERE rowid=(SELECT max(rowid) FROM stages WHERE evidence IS NOT NULL)")
             connection.execute("UPDATE stages SET evidence=NULL, evidence_sha256=NULL "
@@ -1202,7 +1202,7 @@ class QualifyTests(QualifyCase):
         (self.root / cohort.DEFAULT_INDEX).unlink()
         report = self._qualify(transport)
         self.assertEqual(report["counts"]["published"], 1)
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+        with contextlib.closing(index.readonly(self.root / cohort.DEFAULT_INDEX)) as db:
             self.assertEqual(
                 len(index.search(db, "Fund codes", 10, None, root=self.root)["hits"]), 1)
 
@@ -1388,7 +1388,7 @@ class SharedManifestTests(QualifyCase):
 
     def search(self, text):
         from tools.context_index import context_index as index
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+        with contextlib.closing(index.readonly(self.root / cohort.DEFAULT_INDEX)) as db:
             return index.search(db, text, 10, None, root=self.root)["hits"]
 
     def test_a_b_a_b_keeps_every_cohorts_selections_and_publishes_them_all(self):
@@ -1990,7 +1990,7 @@ class PublishTests(QualifyCase):
 
     def hits(self, text):
         from tools.context_index import context_index as index
-        with index.readonly(self.root / cohort.DEFAULT_INDEX) as db:
+        with contextlib.closing(index.readonly(self.root / cohort.DEFAULT_INDEX)) as db:
             return index.search(db, text, 10, None, root=self.root)["hits"]
 
     def publish_requests(self):

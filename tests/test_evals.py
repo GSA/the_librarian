@@ -176,7 +176,7 @@ class GenerateTests(EvalWorkspace):
 
 class RunTests(EvalWorkspace):
     def test_scores_hits_ranks_misses_must_not_absence_and_confidence(self):
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db, db:
             db.execute("UPDATE document_confidence SET level='low', label=? WHERE path=?",
                        (json.dumps({"level": "low", "reasons": [
                            {"code": "reviewer-deferred", "details": []}]}), "documents/garden.md"))
@@ -219,7 +219,8 @@ class RunTests(EvalWorkspace):
         self.assertEqual(totals["confidence_match_rate"], 0.5)
         self.assertEqual(totals["expected_hit_confidence"], {"normal": 2, "low": 1})
         provenance = card["provenance"]
-        metadata = dict(sqlite3.connect(self.db).execute("SELECT key, value FROM metadata"))
+        with closing(sqlite3.connect(self.db)) as connection:
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
         for key in ("engine_fingerprint", "manifest_hash", "policy_hash", "rendition_identity"):
             self.assertEqual(provenance["index"][key], metadata[key])
         self.assertEqual(provenance["cases"]["count"], 10)

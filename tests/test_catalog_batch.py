@@ -35,6 +35,13 @@ class Case(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def nested(self):
+        """A second fixture whose temp dir and clock patch are released with this test (``doCleanups``, not ``tearDown``)."""
+        case = Case("run")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
     def pin(self):
         return catalog.status(self.root)["state_token"]
 
@@ -60,6 +67,17 @@ class Case(unittest.TestCase):
         return {m["marker"]: m["status"] for m in result["members"]}
 
 
+class NestedFixtures(unittest.TestCase):
+    def test_a_nested_case_releases_its_clock_patch_and_directory(self):
+        original, outer = catalog.now, Case("run")
+        outer.setUp()
+        nested = outer.nested()
+        self.assertIsNot(catalog.now, original)
+        outer.doCleanups()
+        self.assertIs(catalog.now, original)
+        self.assertFalse(Path(nested.temp.name).exists())
+
+
 class OneRevisionPerBatch(Case):
     def test_a_batch_commits_every_member_in_one_revision_with_an_unchanged_chain(self):
         result = self.batch(range(5))
@@ -75,9 +93,7 @@ class OneRevisionPerBatch(Case):
     def test_the_resulting_catalog_equals_committing_the_members_one_by_one(self):
         self.batch(range(6))
         batched = self.current()
-        other = Case("run")
-        other.setUp()
-        self.addCleanup(other.tearDown)
+        other = self.nested()
         for n in range(6):
             other.single(n)
         self.assertEqual(batched, other.current())
@@ -89,7 +105,8 @@ class OneRevisionPerBatch(Case):
         self.assertEqual(catalog.status(self.root, audit=True)["revision"], 2)
         snapshot = Path(catalog.backup(self.root)["snapshot"])
         self.assertEqual(catalog.verify_backup(snapshot)["revision"], 2)
-        self.assertEqual(catalog.lookup_shape(catalog.connect(self.db)), "indexed")
+        with closing(catalog.connect(self.db)) as connection:
+            self.assertEqual(catalog.lookup_shape(connection), "indexed")
 
     def test_a_batch_writes_one_daily_snapshot_and_one_receipt(self):
         for path in self.backups.iterdir():
@@ -363,10 +380,7 @@ class FailedMemberDoesNotBlockTheBatch(Case):
     def test_accepted_set_equals_committing_members_one_by_one_in_order(self):
         rng = random.Random(20261113)
         for round_ in range(12):
-            batch_case, sequential = Case("run"), Case("run")
-            for case in (batch_case, sequential):
-                case.setUp()
-                self.addCleanup(case.tearDown)
+            batch_case, sequential = self.nested(), self.nested()
             members = []
             for n in range(rng.randint(2, 7)):
                 m = member(n, None)

@@ -158,8 +158,10 @@ class LedgerCommits(unittest.TestCase):
         root_b, inbox_b = make_instance(self, 6)
         cohort.ingest(root_a, inbox_a, system="s", actor="a", batch_size=1)
         cohort.ingest(root_b, inbox_b, system="s", actor="a", batch_size=6)
-        raw = lambda root: dict(sqlite3.connect(store.locations(root)[2]).execute(
-            "SELECT correlation_id, raw FROM requests WHERE correlation_id LIKE 'upload-%'").fetchall())
+        def raw(root):
+            with closing(sqlite3.connect(store.locations(root)[2])) as connection:
+                return dict(connection.execute(
+                    "SELECT correlation_id, raw FROM requests WHERE correlation_id LIKE 'upload-%'").fetchall())
         # the retained records number their IDs across the chunk exactly as one-at-a-time staging does
         # (catalog state tokens differ between the two histories, so compare the records)
         ids = lambda root: {k: [r["id"] for r in json.loads(v)["stages"][0]["arguments"]["records"]]
