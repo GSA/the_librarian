@@ -11,7 +11,8 @@ document. Synthetic fixtures in temporary workspaces only; never point it at a r
 
     nice python3 tools/diagnostics/batch_ingest_benchmark.py --seed 2000 --files 100 --batch-sizes 1,25,50
 
-``--tree`` measures another checkout (for example an ``origin/main`` worktree) on the same seed.
+``--parse-workers 1,4,8`` repeats each batch size at those parse worker counts (Kata q868; wall, writer CPU
+and worker CPU per document). ``--tree`` measures another checkout (for example an ``origin/main`` worktree) on the same seed.
 ``--keep-seed DIR`` keeps the seeded instance for later runs of the same size.
 """
 import argparse
@@ -183,15 +184,22 @@ def measure(args):
         start, cpu = time.perf_counter(), time.process_time()
         parameters = inspect.signature(cohort.ingest).parameters
         kwargs = {"batch_size": args.batch_size} if "batch_size" in parameters else {}
+        if "parse_workers" in parameters:
+            kwargs["parse_workers"] = int(args.parse_workers)
+        times = os.times()
         report = cohort.ingest(root, inbox, system="bench", actor="bench", **kwargs)
         wall, cpu = time.perf_counter() - start, time.process_time() - cpu
+        after = os.times()
+        workers_cpu = after.children_user + after.children_system - times.children_user - times.children_system
         sync1 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
         io = dict(line.split(": ") for line in Path("/proc/self/io").read_text().splitlines())
         io0 = dict(line.split(": ") for line in before_io.splitlines())
         files = args.files
         result = {"tree": args.tree.name, "batch_size": args.batch_size if kwargs else 1, "seed": args.seed,
+                  "parse_workers": kwargs.get("parse_workers"),
                   "files": files, "outcome": {k: v for k, v in report["counts"]["outcome"].items() if v},
                   "ms_per_doc": round(wall / files * 1000, 1), "cpu_ms_per_doc": round(cpu / files * 1000, 1),
+                  "worker_cpu_ms_per_doc": round(workers_cpu / files * 1000, 1),
                   "fsync_per_doc": None if not shim else round((sync1[0] - sync0[0]) / files, 2),
                   "fdatasync_per_doc": None if not shim else round((sync1[1] - sync0[1]) / files, 2),
                   "catalog_revisions_per_doc": round((revisions() - before_revisions) / files, 3),
@@ -212,6 +220,8 @@ def main(argv=None):
     parser.add_argument("--keep-seed", type=Path, help="build or reuse the seeded instance under this directory")
     parser.add_argument("--work", type=Path, help="parent directory of the per-run copies")
     parser.add_argument("--seed-dir", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--parse-workers", default="1",
+                        help="comma separated parse worker counts to measure at each batch size (default 1)")
     parser.add_argument("--batch-size", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--shim", help=argparse.SUPPRESS)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
@@ -228,10 +238,10 @@ def main(argv=None):
             print(f"seeded {args.seed} documents in {build_seed(Path(__file__).resolve().parents[2], seed_dir, args.seed)} s",
                   file=sys.stderr)
         results = []
-        for size in (int(s) for s in args.batch_sizes.split(",")):
+        for size, workers in ((int(s), w) for s in args.batch_sizes.split(",") for w in args.parse_workers.split(",")):
             command = [sys.executable, str(Path(__file__).resolve()), "--child", "--tree", str(args.tree),
                        "--seed", str(args.seed), "--files", str(args.files), "--padding", str(args.padding),
-                       "--batch-size", str(size), "--seed-dir", str(seed_dir)]
+                       "--batch-size", str(size), "--parse-workers", workers, "--seed-dir", str(seed_dir)]
             if args.work:
                 command += ["--work", str(args.work)]
             environment = dict(os.environ, **({"LD_PRELOAD": str(shim)} if shim else {}))

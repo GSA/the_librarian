@@ -496,6 +496,20 @@ restated here.
   `ingest_benchmark.py --replay`: 11 to 5 ms per file, identical report digest.
   Evidence: `tests/test_intake_cohort.py::ReplayTests`,
   `tests/test_policy_isolation.py::StorageRootChecksAreCheapButNotWeaker`.
+- **Parse worker processes (Kata q868).** `ingest` reads, hashes and parses text-family files in
+  `--parse-workers` spawned processes (`tools/intake/parse_pool.py`) while the one writer commits; the
+  single-process path is `--parse-workers 1`. A worker is given bytes, a bare file name and the policy
+  settings (never a path to read, and no ledger, catalog or network handle) and returns a pure result:
+  `classify` judges each file (format, strict decoding, MIME and transcript parsing) from bytes this process
+  read and hashed, and each chunk's parse is remembered under the (format, source SHA-256, extractor SHA-256)
+  key the prepare stage and its guards already re-check against the source they re-read, so no stale or
+  foreign parse is used and no changed-input check moved. Results are delivered in submission order, so the
+  report, ledger and catalog are identical at any worker count. The queue is bounded by job count and bytes.
+  A worker that dies fails only its file (`unreadable/parse-worker-died` in `classify`, `failed
+  prepare/parse-worker-died` in a chunk's parse) and the run continues. Evidence:
+  `tests/test_intake_parse_workers.py` (`IngestEquivalence::test_one_and_many_workers_end_in_the_same_report_catalog_and_ledger`,
+  `::test_a_document_whose_worker_dies_fails_alone_and_a_rerun_completes_it`,
+  `::test_a_changed_source_is_never_served_a_worker_parse`, `ClassifyEquivalence`, `PipelineTests`).
 - **A derived `docs` table answers "what is left" and lets a replay skip stat-identical files
   (Kata e22r).** The intake ledger holds one `docs` row per cohort document (system and
   inbox-relative path; format, submission id, SHA-256, receipt, retained original, rendition and its

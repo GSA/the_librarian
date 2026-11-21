@@ -125,8 +125,8 @@ def fingerprint(root, format_name):
     return digest(code + policy.fingerprint(root).encode())
 
 
-def gemini(raw, root=None):
-    settings = policy.for_root(root)[0]
+def gemini(raw, root=None, settings=None):
+    settings = settings or policy.for_root(root)[0]
     text = raw.decode("utf-8")
     require("\x00" not in text, "NUL in UTF-8 transcript")
     lines = text.splitlines(keepends=True)
@@ -360,14 +360,31 @@ def keeping_parsed(count):
         _trim_parsed()
 
 
+def parse_payload(format_name, raw, root, settings=None):
+    """The payload of ``raw`` read as ``format_name``: a pure function of the bytes, the format and the
+    instance policy, so it may run in another process (``tools/intake/parse_pool.py``). A caller that
+    already holds the policy ``settings`` passes them, and the parse reads nothing from ``root``."""
+    return {"gemini-txt": lambda r: gemini(r, root, settings), "text": text, "mhtml": mime_html,
+            "odt": odt}[format_name](raw)
+
+
+def remember(key, payload, size):
+    """Keep a finished parse (``key`` as ``parse`` builds it, ``size`` the source bytes) for the next ``parse``."""
+    _PARSED[key] = (payload, size)
+    _PARSED.move_to_end(key)
+    _trim_parsed()
+
+
+def remembered(key):
+    return key in _PARSED
+
+
 def parse(format_name, raw, root, key):
     if key in _PARSED:
         _PARSED.move_to_end(key)
         return _PARSED[key][0]
-    payload = {"gemini-txt": lambda r: gemini(r, root), "text": text, "mhtml": mime_html,
-               "odt": odt}[format_name](raw)
-    _PARSED[key] = (payload, len(raw))
-    _trim_parsed()
+    payload = parse_payload(format_name, raw, root)
+    remember(key, payload, len(raw))
     return payload
 
 
