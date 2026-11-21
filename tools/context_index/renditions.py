@@ -6,6 +6,7 @@ import math
 import os
 import re
 import stat
+import threading
 from bisect import bisect_right
 from pathlib import Path, PurePosixPath
 
@@ -284,7 +285,9 @@ def _parallel_identity(work, selections, reads):
     import multiprocessing
     global _JOB
     workers = min(PARALLEL_WORKERS, os.cpu_count() or 1)
-    if workers < 2 or "fork" not in multiprocessing.get_all_start_methods():
+    # Only a single-threaded process forks safely: a child inherits whatever lock another thread held.
+    if (workers < 2 or threading.active_count() > 1
+            or "fork" not in multiprocessing.get_all_start_methods()):
         return None
     size = -(-len(selections) // (workers * 8))
     chunks = [(start, min(start + size, len(selections))) for start in range(0, len(selections), size)]

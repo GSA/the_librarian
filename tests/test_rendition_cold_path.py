@@ -2,6 +2,7 @@
 import copy
 import random
 import re
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -182,6 +183,16 @@ class ParallelIdentity(WorkspaceCase):
     def test_a_worker_that_reports_failure_discards_the_parallel_result(self):
         expected = self.identity(10 ** 9)
         with patch.object(renditions, "_identity_chunk", return_value=None):
+            self.assertEqual(self.identity(1), expected)
+
+    def test_a_threaded_process_never_forks(self):
+        expected = self.identity(10 ** 9)
+        release = threading.Event()
+        other = threading.Thread(target=release.wait)
+        other.start()
+        self.addCleanup(other.join)
+        self.addCleanup(release.set)
+        with patch("concurrent.futures.ProcessPoolExecutor", side_effect=AssertionError("forked")):
             self.assertEqual(self.identity(1), expected)
 
     def test_keeping_payloads_never_forks(self):
