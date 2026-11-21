@@ -1,7 +1,6 @@
 """Parallel parse workers for ingest (Kata q868): same output at any worker count, bounded, crash tolerant."""
 import os
 from pathlib import Path
-import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -75,10 +74,13 @@ class PipelineTests(unittest.TestCase):
         for limits, expected in (({"max_pending": 3}, 3), ({"max_bytes": 25}, 2)):
             with self.subTest(limits=limits):
                 submitted, peak = [], []
+
+                def delivered(result, error, submitted=submitted, peak=peak):
+                    peak.append(len(submitted) - len(peak))
                 with parse_pool.Workers(2, **limits) as pool:
                     for n in range(12):
                         submitted.append(n)
-                        pool.submit(slow_then, (n, 0.0), 10, lambda r, e: peak.append(len(submitted) - len(peak)))
+                        pool.submit(slow_then, (n, 0.0), 10, delivered)
                     pool.drain()
                 self.assertLessEqual(max(peak), expected + 1)
                 self.assertEqual(len(peak), 12)

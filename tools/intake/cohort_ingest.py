@@ -959,7 +959,9 @@ def _parse_ahead(root, inbox, chunk, pool, failed):
         except (IntakeError, OSError):
             continue  # the ledger stages report a missing or changed source as they always did
 
-        def remember(result, error, entry=entry, fmt=fmt, size=len(raw), fingerprint=identity[fmt]):
+        size, fingerprint = len(raw), identity[fmt]
+
+        def remember(result, error, entry=entry, fmt=fmt, size=size, fingerprint=fingerprint):
             if isinstance(error, parse_pool.WorkerDied):
                 failed[entry["relative"]] = {"outcome": "failed", "stage": "prepare", "code": "parse-worker-died"}
             elif error is None and result[0] == entry["sha256"]:
