@@ -506,8 +506,9 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
     try:
         selected, rendition_identity = renditions.inputs(
             root, config, rendition_api(root), review_snapshot=review_snapshot)
-    except IndexError_ as error:
-        refuse_changed_files(root, config, error)
+    except (IndexError_, ValueError, OSError):
+        # A missing or non-private extraction is a ValueError from the catalog's private-file check.
+        refuse_changed_files(root, config)
         raise
     expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
@@ -601,7 +602,7 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
             temporary.unlink()
 
 
-def refuse_changed_files(root, config, error):
+def refuse_changed_files(root, config):
     """Publication refuses changed retained files explicitly: when the full verification failed, name
     every selected file that no longer matches its pin (kind, path, problem, expected, found), not just
     the first one opened. The prior index stays published and readable, with its documents flagged by

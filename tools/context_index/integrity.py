@@ -205,7 +205,7 @@ def run_audit(args):
     if not db.is_file():
         raise IndexError_(f"Index missing: {db}; build it before recording an audit")
     before, started = flags.identity(db), datetime.now(timezone.utc).isoformat(timespec="seconds")
-    report = audit(root, workers=args.workers, limit=max(args.limit, flags.RECORD_LIMIT))
+    report = audit(root, workers=args.workers, limit=sys.maxsize)
     report["recorded"] = flags.record(db, report, started, before)
     report["items"] = report["items"][:args.limit]
     report["listed"] = len(report["items"])

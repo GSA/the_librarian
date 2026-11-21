@@ -1191,10 +1191,11 @@ flags an unexpected change; it does not defend against one in real time, on ever
   - **Where the flag comes from.** Reads still hash nothing. `integrity audit --record` (optionally
     `--db`) writes the audit result to a private (0600), checksummed report beside the index,
     `<index>.sqlite3.integrity.json` (ignored like the database), recording the index database's file
-    identity, the audit start time, files checked, mismatch count and up to 5,000 mismatches (path, kind,
-    problem, expected, found, receipt). It is the only thing `--record` writes, never inside the data
+    identity, the audit start time, files checked, the mismatch count and every flagged document with its
+    first three changed files (kind, path, problem, expected, found) and its changed-file count. Documents
+    are resolved at record time from the index, so no cap on mismatches can leave a document unflagged. It is the only thing `--record` writes, never inside the data
     roots; plain `audit` still writes nothing. A reader loads it once per call (one small file) and
-    ignores it unless it is private, owned by the user, within 8 MiB, checksum-valid and recorded for the
+    ignores it unless it is private, owned by the user, within 64 MiB, checksum-valid and recorded for the
     very database being read; a rebuild replaces the database, so its flags end with it, and an audit
     that started before the index was replaced records nothing. A missing, corrupt, forged or foreign
     report means no flags: this is detection, not access control, and a forger who can write the index's
@@ -1226,6 +1227,8 @@ flags an unexpected change; it does not defend against one in real time, on ever
   - Evidence (`tests/test_integrity_flags.py`):
     `::test_a_changed_file_flags_its_document_and_every_other_document_still_serves`,
     `::test_a_changed_original_flags_the_documents_extracted_from_it`,
+    `::test_a_changed_original_flags_only_its_own_renditions`,
+    `::test_every_flagged_document_is_recorded_however_many_files_changed`,
     `::test_low_confidence_exclude_and_last_treat_a_flagged_document_like_any_low_one`,
     `::test_a_clean_re_audit_clears_the_flag`, `::test_a_rebuilt_index_does_not_inherit_the_old_report`,
     `::test_a_forged_foreign_or_unsafe_report_means_no_flags`,
@@ -1234,7 +1237,8 @@ flags an unexpected change; it does not defend against one in real time, on ever
     `::test_flagged_documents_are_listed_up_to_a_cap_with_the_rest_counted`,
     `::test_get_many_labels_each_document_and_the_legend_explains_the_reason`,
     `::test_the_progress_panel_counts_and_lists_the_flagged_documents_with_the_resolution`,
-    and `PublicationTests::test_a_build_refuses_every_changed_selected_file_at_once_and_keeps_the_prior_index`.
+    and `PublicationTests::test_a_build_refuses_every_changed_selected_file_at_once_and_keeps_the_prior_index` and
+    `::test_a_missing_extraction_and_a_changed_original_are_both_named`.
 - **Verified reads.** `integrity.read_verified(root, path)` opens one retained file, checks its SHA-256
   against the catalog's current pin (one hash per file actually opened) and returns the bytes or raises
   `IntegrityMismatch` with the same report entry. Any retrieval that opens an original or retained

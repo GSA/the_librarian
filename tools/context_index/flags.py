@@ -15,14 +15,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
+from urllib.parse import quote
 import uuid
 
 from tools.context_index import confidence
 
 FORMAT = 1
-LIMIT = 8 * 1024 * 1024
-RECORD_LIMIT = 5000
+LIMIT = 64 * 1024 * 1024
+# Every flagged document is recorded; only the changed files kept per document are bounded.
+DOCUMENT_FILES = 3
 LISTED = 20
 DETAIL = 200
 _MISSES = (OSError, ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError)
@@ -78,18 +81,29 @@ def _write(path, record):
 
 
 def record(db, report, audited_at, before):
-    """Record ``report`` (an ``integrity.audit`` result) against index ``db``; True when written.
+    """Record ``report`` (an ``integrity.audit`` result listing every mismatch) against index ``db``.
 
-    ``before`` is ``identity(db)`` taken before the audit started: a report is not recorded for an
-    index that was replaced while the audit ran.
+    True when written. ``before`` is ``identity(db)`` taken before the audit started: a report is not
+    recorded for an index that was replaced while the audit ran. The documents each mismatch affects
+    are resolved here, from the index, so every flagged document is recorded however many files
+    changed; only the changed files listed per document are bounded.
     """
     if _identity(db) != before:
         return False
     items = [{key: item.get(key) for key in ("path", "kind", "problem", "expected", "found", "receipt")}
-             for item in report["items"][:RECORD_LIMIT]]
-    _write(location(db), {"format": FORMAT, "index": before, "audited_at": audited_at,
-                          "checked": report["checked"], "mismatches": report["mismatches"],
-                          "truncated": report["mismatches"] > len(items), "items": items})
+             for item in report["items"]]
+    connection = sqlite3.connect(f"file:{quote(str(db), safe='/')}?mode=ro", uri=True)
+    try:
+        documents = _documents(connection, items)
+    finally:
+        connection.close()
+    if _identity(db) != before:
+        return False
+    _write(location(db), {
+        "format": FORMAT, "index": before, "audited_at": audited_at, "checked": report["checked"],
+        "mismatches": report["mismatches"],
+        "documents": {path: found[:DOCUMENT_FILES] for path, found in documents.items()},
+        "document_files": {path: len(found) for path, found in documents.items()}})
     return True
 
 
@@ -100,11 +114,11 @@ def identity(db):
 class Flags:
     """The flagged documents of one index as of the recorded audit (empty without a matching report)."""
 
-    def __init__(self, recorded=False, audited_at=None, checked=0, mismatches=0, truncated=False,
-                 documents=None):
+    def __init__(self, recorded=False, audited_at=None, checked=0, mismatches=0, documents=None, files=None):
         self.recorded, self.audited_at, self.checked = recorded, audited_at, checked
-        self.mismatches, self.truncated = mismatches, truncated
+        self.mismatches = mismatches
         self.documents = documents or {}
+        self.files = files or {}
 
     def apply(self, path, current):
         """``current`` (a confidence label) with ``integrity-changed`` when ``path`` is flagged."""
@@ -136,15 +150,14 @@ class Flags:
         if self.mismatches:
             listed = []
             for path in sorted(self.documents)[:LISTED]:
-                listed.append({"path": _short(path), "files": [
+                listed.append({"path": _short(path), "changed_files": self.files.get(path, len(self.documents[path])),
+                               "files": [
                     {key: _short(item[key]) if isinstance(item[key], str) else item[key]
                      for key in ("kind", "path", "problem", "expected", "found")}
                     for item in self.documents[path]]})
             value["documents"] = listed
             if len(self.documents) > LISTED:
                 value["documents_not_listed"] = len(self.documents) - LISTED
-            if self.truncated:
-                value["truncated"] = True
             value["resolve"] = RESOLVE
         return value
 
@@ -168,13 +181,21 @@ def load(connection, root=None):
         saved = None if db is None else _read(location(db))
         if saved is None or saved.get("index") != _identity(db):
             return Flags()
-        items = [item for item in saved["items"] if isinstance(item, dict)
-                 and all(isinstance(item.get(key), str) for key in ("path", "kind", "problem"))]
-        for item in items:
-            item.setdefault("expected", None)
-            item.setdefault("found", None)
+        documents, files = {}, {}
+        indexed = {row[0] for row in connection.execute("SELECT path FROM documents")}
+        for path, found in saved["documents"].items():
+            if path not in indexed or not isinstance(found, list) or not found:
+                continue
+            items = [item for item in found if isinstance(item, dict)
+                     and all(isinstance(item.get(key), str) for key in ("path", "kind", "problem"))]
+            for item in items:
+                item.setdefault("expected", None)
+                item.setdefault("found", None)
+            if items:
+                documents[path] = items
+                files[path] = max(int(saved["document_files"].get(path, 0)), len(items))
         return Flags(True, str(saved["audited_at"]), int(saved["checked"]), int(saved["mismatches"]),
-                     bool(saved.get("truncated")), _documents(connection, items))
+                     documents, files)
     except _MISSES:
         return Flags()
 
@@ -198,6 +219,7 @@ def _documents(connection, items):
                 "SELECT path, json_extract(payload,'$.source.path'), json_extract(payload,'$.source.receipt_id') "
                 "FROM rendition_documents"):
             for item in (*by_original.get(source, ()), *by_receipt.get(receipt, ())):
-                if item not in flagged.setdefault(path, []):
-                    flagged[path].append(item)
+                # An entry exists only for a document some changed file affects.
+                if item not in flagged.get(path, ()):
+                    flagged.setdefault(path, []).append(item)
     return flagged

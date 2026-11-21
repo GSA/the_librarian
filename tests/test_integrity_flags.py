@@ -167,11 +167,11 @@ class FlagTests(WorkspaceCase):
     def test_flagged_documents_are_listed_up_to_a_cap_with_the_rest_counted(self):
         items = [{"path": f"extractions/r{n}/a.json", "kind": "extraction", "problem": "missing",
                   "expected": "0" * 64, "found": None} for n in range(flags.LISTED + 5)]
-        value = flags.Flags(True, "then", 100, len(items), False, {i["path"]: [i] for i in items}).summary()
+        value = flags.Flags(True, "then", 100, len(items), {i["path"]: [i] for i in items}).summary()
         self.assertEqual((len(value["documents"]), value["documents_not_listed"]), (flags.LISTED, 5))
-        long = flags.Flags(True, "then", 1, 1, False, {"p": [{"path": "x" * 1000, "kind": "original",
-                                                          "problem": "missing", "expected": None,
-                                                          "found": None}]})
+        long = flags.Flags(True, "then", 1, 1, {"p": [{"path": "x" * 1000, "kind": "original",
+                                                      "problem": "missing", "expected": None,
+                                                      "found": None}]})
         self.assertLess(len(long.summary()["documents"][0]["files"][0]["path"]), 1000)
 
     def test_get_many_labels_each_document_and_the_legend_explains_the_reason(self):
@@ -201,6 +201,46 @@ class FlagTests(WorkspaceCase):
             flags.Flags().summary())[0])
         del report
 
+    def test_a_changed_original_flags_only_its_own_renditions(self):
+        """A changed file nothing selected relies on flags no document; a relied-on one flags only its own."""
+        other = flags._documents(self.connection(), [
+            {"path": "sources/unrelated.txt", "kind": "original", "problem": "missing"},
+            {"path": "documents/other/submission.json", "kind": "sidecar", "problem": "missing",
+             "receipt": "D-other"}])
+        self.assertEqual(other, {})
+        self.original.write_bytes(b"changed original")
+        self.audit()
+        status = json.loads(self.run_cli("status")[1])["integrity"]
+        self.assertEqual(status["flagged_documents"], 1)
+        self.assertTrue(all(d["files"] for d in status["documents"]))
+        with closing(index.readonly(self.db)) as db:
+            kept = index.search(db, "first", 10, None, root=self.root, low_confidence="exclude")
+        self.assertTrue(kept["hits"], "unflagged documents still answer an excluding search")
+        self.assertNotIn(self.rendition, [h["path"] for h in kept["hits"]])
+
+    def connection(self):
+        connection = index.readonly(self.db)
+        self.addCleanup(connection.close)
+        return connection
+
+    def test_every_flagged_document_is_recorded_however_many_files_changed(self):
+        """More mismatches than any detail cap still flag every affected document."""
+        report = {"checked": 10, "mismatches": 3, "items": [
+            {"path": self.rendition, "kind": "extraction", "problem": "missing", "expected": "a", "found": None}]
+            + [{"path": f"sources/other{n}.txt", "kind": "original", "problem": "missing", "expected": "a",
+                "found": None} for n in range(2)]}
+        before = flags.identity(self.db)
+        self.assertTrue(flags.record(self.db, report, "now", before))
+        flagged = flags.load(self.connection())
+        self.assertEqual(sorted(flagged.documents), [self.rendition])
+        many = {"checked": 10, "mismatches": 9000, "items": [
+            {"path": self.rendition, "kind": "extraction", "problem": "hash-differs", "expected": "a",
+             "found": "b", "receipt": "D1"}] * 1}
+        self.assertTrue(flags.record(self.db, many, "now", before))
+        self.assertEqual(flags.load(self.connection()).mismatches, 9000)
+        saved = json.loads(flags.location(self.db).read_text())
+        self.assertNotIn("items", saved, "the report keeps documents, not one entry per changed file")
+
 
 class PublicationTests(WorkspaceCase):
     selected_text = test_workspace.WorkspaceTests.selected_text
@@ -222,6 +262,17 @@ class PublicationTests(WorkspaceCase):
         with closing(index.readonly(self.db)) as db:
             self.assertEqual(index.search(db, "first", 5, None, root=self.root)["hits"][0]["path"],
                              prepared["rendition"])
+
+    def test_a_missing_extraction_and_a_changed_original_are_both_named(self):
+        prepared = self.selected_text()
+        (self.root / prepared["rendition"]).unlink()
+        (self.root / "sources/notes.txt").write_bytes(b"changed original")
+        with self.assertRaises((index.IndexError_, ValueError)) as refused:
+            self.build()
+        message = str(refused.exception)
+        self.assertIn("Publication refused: 2 selected file(s)", message)
+        self.assertIn("extraction " + prepared["rendition"] + ": missing", message)
+        self.assertIn("original sources/notes.txt: hash-differs", message)
 
     def test_other_publication_failures_keep_their_own_message(self):
         self.selected_text()
