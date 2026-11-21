@@ -894,7 +894,7 @@ supersedes the daily full check kept by Kata qwtp (D2).
   store is reported and the others still run; exit status 0 when everything verified, 1 when any
   store was flagged, 2 for a usage error. It takes no writer lock and changes nothing except the
   baseline receipts described above. It does not check the files under the instance's data roots
-  (extractions, originals, sidecars): that is the integrity audit of Kata xv0n. Run it from cron or
+  (extractions, originals, sidecars): that is the integrity audit of Kata xv0n (`tools.context_index.integrity`). Run it from cron or
   a systemd timer, for example `17 3 * * * cd /path/to/instance && .venv/bin/python -m
   tools.store_audit --root . >> .local/store-audit.log 2>&1`, outside an intake run when the host is
   small (it holds a read transaction while it replays, as `status --audit` does). The daily verified
@@ -909,14 +909,14 @@ supersedes the daily full check kept by Kata qwtp (D2).
   | catalog `status` in a new process, first read of a UTC day | 18.4 s, 595 MB | 0.02 s, 27 MB |
   | catalog writer ready (replay) before the first write of a UTC day, under the writer lock | 21.8 s, 2.6 GB | 0.02 s, 27 MB |
   | whole first write of a day under the lock before the commit (writer ready plus daily snapshot) | 23.8 s, 4.2 GB | 2.0 s, 1.7 GB |
-  | cold index `status` with the freshness path on `read_snapshot(root)` (not `full=True`), memo removed | 25.1 s, 1.90 GB | 19.1 s, 1.46 GB |
+  | cold index `status`, freshness memo removed (with Kata xv0n's pin-based freshness, which reads `read_snapshot(root)`) | 10.8 s, 727 MB | 3.6 s, 223 MB |
 
   The first read after installing this code pays the old cost once, because receipts are bound to
-  the validator code. The index status row is the cold path of Kata 17b0 with its review-event
-  replay removed; the freshness path itself, the rest of that cold cost and the `full=True` call
-  belong to Kata xv0n, whose memo (`proof_cache.py`) still carries a UTC date in its key.
-- **Not done here.** The ledger `progress` summary and the index freshness memo keep their own
-  UTC-date keys (the freshness memo is Kata xv0n's; `progress` is a view, not a store gate).
+  the validator code. The last row is the whole cold index read on main (xv0n) against this change
+  on top of it: what remains is the review-event and catalog work of the freshness proof, not a
+  replay of either store.
+- **Not done here.** The ledger `progress` summary keeps its UTC-date key (it is a view, not a
+  store gate). The index freshness memo has no daily expiry since Kata xv0n.
   Document-update ingestion does not exist; a re-pinned hash is the app writing a new catalog
   revision, which every receipt already follows as a delta.
 

@@ -372,6 +372,23 @@ WantedBy=timers.target
 A reported file is restored from backup or re-ingested; the audit repairs nothing. See
 [context/integrity.md](context/integrity.md).
 
+### Store audit
+
+Reads and writes trust the stores' read-validation receipts and never replay a store's whole history
+(there is no daily full check), so a store edited outside the application is found by the store audit,
+which replays the catalog, the review events and the intake ledger in full, verifies the newest backup of
+the catalog and of the review events, and prints a body-free JSON report (exit 0 all verified, 1 a store
+was flagged, 2 it could not run):
+
+```sh
+.venv/bin/python -m tools.store_audit --root "$PWD"
+```
+
+Schedule it with the file audit above, for example `23 3 * * *  cd /path/to/instance && .venv/bin/python
+-m tools.store_audit --root . > .local/store-audit.json || mail -s "Librarian store audit" owner@example.org
+< .local/store-audit.json`. Details and the tamper classes each check catches:
+[design](docs/design/current-state.md#store-validation-cadence-kata-91h5).
+
 ## MCP for consumer agents
 
 `librarian-mcp` is a read-only stdio MCP server. `--root` must be an absolute
