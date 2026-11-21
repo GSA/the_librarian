@@ -1,5 +1,6 @@
 """Native review-event contracts; data is supplied explicitly, never seeded."""
 from datetime import date, datetime
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -65,12 +66,151 @@ def timestamp(value):
 
 # Events already proven schema-valid, per item schema. Re-reading a store
 # revalidates the same immutable history on every read; only unseen events
-# need the (expensive) schema walk.
+# need the (expensive) schema walk. Keys are SHA-256 digests, not event structure: 32 bytes per
+# event instead of a frozen copy of it (about 300 MB at 40k events).
 _SCHEMA_VALID = {}
 _SCHEMA_VALID_LIMIT = 200_000
 _BUNDLE_KEYWORDS = {"$schema", "$id", "title", "description", "type", "additionalProperties",
                     "required", "properties", "$defs"}
 _EVENTS_KEYWORDS = {"type", "minItems", "maxItems", "items"}
+# The fast path compiles the item schema to one Python predicate. It supports only the keywords
+# below; any other keyword, an unresolvable, cyclic or external reference, or an unusual value
+# (non-string unique items, non-scalar const/enum) disables it, never the validation.
+_COMPILED = {}
+_TYPES = {"string": lambda v: type(v) is str, "integer": lambda v: type(v) is int,
+          "null": lambda v: v is None, "array": lambda v: type(v) is list,
+          "object": lambda v: type(v) is dict, "boolean": lambda v: type(v) is bool}
+_IGNORED = {"title", "description"}
+
+
+class _NotCompilable(Exception):
+    pass
+
+
+def _exact(value):
+    """A scalar compared by Python type and value (``False`` is not ``0``, ``1.0`` is not ``1``)."""
+    if type(value) not in (str, int, bool, type(None)):
+        raise _NotCompilable
+    return type(value), value
+
+
+def _compile(node, defs, trail, format_checker):
+    """A predicate that is True only for instances the schema ``node`` accepts.
+
+    A False answer means "not proven valid", never "invalid": the caller then runs the full walk.
+    """
+    if node is True:
+        return lambda value: True
+    if not isinstance(node, dict):
+        raise _NotCompilable
+    tests = []
+    props = {}
+    for keyword, rule in node.items():
+        if keyword in _IGNORED:
+            continue
+        if keyword == "$ref":
+            name = rule[len("#/$defs/"):] if isinstance(rule, str) and rule.startswith("#/$defs/") else None
+            if name is None or name in trail or not isinstance(defs.get(name), dict):
+                raise _NotCompilable
+            tests.append(_compile(defs[name], defs, trail + (name,), format_checker))
+        elif keyword == "type":
+            kinds = rule if isinstance(rule, list) else [rule]
+            checks = [_TYPES.get(kind) for kind in kinds]
+            if not kinds or None in checks:
+                raise _NotCompilable
+            tests.append((lambda c: lambda v: c(v))(checks[0]) if len(checks) == 1
+                         else (lambda cs: lambda v: any(c(v) for c in cs))(checks))
+        elif keyword == "enum":
+            if not isinstance(rule, list):
+                raise _NotCompilable
+            allowed = {_exact(item) for item in rule}
+            tests.append(lambda v, allowed=allowed: type(v) in (str, int, bool, type(None)) and (type(v), v) in allowed)
+        elif keyword == "const":
+            wanted = _exact(rule)
+            tests.append(lambda v, wanted=wanted: type(v) in (str, int, bool, type(None)) and (type(v), v) == wanted)
+        elif keyword == "required":
+            names = tuple(rule)
+            tests.append(lambda v, names=names: type(v) is not dict or all(n in v for n in names))
+        elif keyword == "properties":
+            props = {name: _compile(sub, defs, trail, format_checker) for name, sub in rule.items()}
+        elif keyword == "additionalProperties":
+            if rule is not False and not isinstance(rule, dict):
+                raise _NotCompilable
+        elif keyword == "items":
+            item = _compile(rule, defs, trail, format_checker)
+            tests.append(lambda v, item=item: type(v) is not list or all(item(x) for x in v))
+        elif keyword == "oneOf":
+            branches = [_compile(sub, defs, trail, format_checker) for sub in rule]
+            tests.append(lambda v, branches=branches: sum(1 for b in branches if b(v)) == 1)
+        elif keyword == "minItems":
+            tests.append(lambda v, n=rule: type(v) is not list or len(v) >= n)
+        elif keyword == "maxItems":
+            tests.append(lambda v, n=rule: type(v) is not list or len(v) <= n)
+        elif keyword == "uniqueItems":
+            if rule is not True:
+                raise _NotCompilable
+            # Only strings are proven unique here; any other item makes the full walk decide.
+            tests.append(lambda v: type(v) is not list or (all(type(x) is str for x in v) and len(set(v)) == len(v)))
+        elif keyword == "minLength":
+            tests.append(lambda v, n=rule: type(v) is not str or len(v) >= n)
+        elif keyword == "maxLength":
+            tests.append(lambda v, n=rule: type(v) is not str or len(v) <= n)
+        elif keyword == "minimum":
+            tests.append(lambda v, n=rule: type(v) is not int or v >= n)
+        elif keyword == "pattern":
+            matcher = re.compile(rule).search
+            tests.append(lambda v, matcher=matcher: type(v) is not str or matcher(v) is not None)
+        elif keyword == "format":
+            if format_checker is None:
+                raise _NotCompilable
+            tests.append(lambda v, name=rule: format_checker.conforms(v, name))
+        else:
+            raise _NotCompilable
+    if "properties" in node or node.get("additionalProperties") is False:
+        closed = node.get("additionalProperties") is False
+        extra = node.get("additionalProperties")
+        extra = _compile(extra, defs, trail, format_checker) if isinstance(extra, dict) else None
+
+        def members(value):
+            if type(value) is not dict:
+                return True
+            for key, member in value.items():
+                test = props.get(key)
+                if test is None:
+                    if closed or (extra is not None and not extra(member)):
+                        return False
+                elif not test(member):
+                    return False
+            return True
+        tests.append(members)
+    if len(tests) == 1:
+        return tests[0]
+    return lambda value: all(test(value) for test in tests)
+
+
+def _fast_item_validator(schema, format_checker=None):
+    """A predicate for one event with the item schema compiled, or ``None`` when it cannot be.
+
+    jsonschema walks the reference-heavy item schema at about 1 ms per event; the compiled predicate
+    does the same checks in about 1/20 of that. Callers treat only True as an answer; every other
+    case is decided by the full validation, which also reports the exact error.
+    """
+    try:
+        defs = schema.get("$defs", {})
+        item = schema["properties"]["events"]["items"]
+        key = (hashlib.sha256(json.dumps([item, defs], sort_keys=True, allow_nan=False).encode()).digest(),
+               id(format_checker))
+        compiled = _COMPILED.get(key)
+        if compiled is None:
+            compiled = _compile(item, defs, (), format_checker)
+            if len(_COMPILED) >= 64:
+                _COMPILED.clear()
+            _COMPILED[key] = (compiled, format_checker)
+        else:
+            compiled = compiled[0]
+    except (_NotCompilable, KeyError, TypeError, ValueError, AttributeError, re.error):
+        return None
+    return compiled
 
 
 def _frozen(value):
@@ -82,7 +222,12 @@ def _frozen(value):
     return type(value), value
 
 
-def _valid_by_event(validator, schema, bundle):
+def _digest(value):
+    """Exact identity of a decoded JSON value: Python's repr separates ``1``, ``1.0``, ``True`` and ``"1"``."""
+    return hashlib.sha256(repr(value).encode("utf-8")).digest()
+
+
+def _valid_by_event(validator, schema, bundle, format_checker=None):
     """True only when every event and the envelope are known valid; False means "do the full walk".
 
     Applies only when the schema validates ``events`` purely per item (type, item
@@ -99,20 +244,29 @@ def _valid_by_event(validator, schema, bundle):
             or not (rule.get("minItems", 0) <= len(events) <= rule.get("maxItems", len(events)))):
         return False
     try:
-        item_schema = _frozen({**schema, "properties": {
-            **properties, "events": {k: v for k, v in rule.items() if k not in {"minItems", "maxItems"}}}})
-        keys = [_frozen(event) for event in events]
+        item_schema = hashlib.sha256(json.dumps({**schema, "properties": {
+            **properties, "events": {k: v for k, v in rule.items() if k not in {"minItems", "maxItems"}}}},
+            sort_keys=True, allow_nan=False).encode()).digest()
+        keys = [_digest(event) for event in events]
         known = _SCHEMA_VALID.get(item_schema, set())
-        unseen = [(key, event) for key, event in zip(keys, events) if key not in known]
-    except TypeError:
+        unseen = {key: event for key, event in zip(keys, events) if key not in known}
+    except (TypeError, ValueError, UnicodeError):
         return False
-    # The envelope is always checked, alongside one event when all are known.
-    for key, event in unseen or [(keys[0], events[0])]:
-        if next(validator.iter_errors({**bundle, "events": [event]}), None) is not None:
-            return False
-    if sum(len(v) for v in _SCHEMA_VALID.values()) + len(unseen) > _SCHEMA_VALID_LIMIT:
+    # The envelope is always checked, with the first event, by the full walk.
+    if next(validator.iter_errors({**bundle, "events": [events[0]]}), None) is not None:
+        return False
+    unseen.pop(keys[0], None)
+    if unseen:
+        fast = _fast_item_validator(schema, format_checker)
+        for event in unseen.values():
+            # Without the inlined validator, or when it does not accept the event, the full walk decides.
+            if fast is None or not fast(event):
+                if next(validator.iter_errors({**bundle, "events": [event]}), None) is not None:
+                    return False
+    proven = set(unseen) | {keys[0]}
+    if sum(len(v) for v in _SCHEMA_VALID.values()) + len(proven) > _SCHEMA_VALID_LIMIT:
         _SCHEMA_VALID.clear()
-    _SCHEMA_VALID.setdefault(item_schema, set()).update(key for key, _ in unseen)
+    _SCHEMA_VALID.setdefault(item_schema, set()).update(proven)
     return True
 
 
@@ -153,7 +307,7 @@ def schema_validate(bundle, schema=None, *, root=None):
         return not isinstance(value, str) or bool(timestamp(value))
     validator = Draft202012Validator(schema, format_checker=checker,
                                     registry=Registry(retrieve=offline))
-    error = None if _valid_by_event(validator, schema, bundle) else next(validator.iter_errors(bundle), None)
+    error = None if _valid_by_event(validator, schema, bundle, checker) else next(validator.iter_errors(bundle), None)
     if error is not None:
         location = "/" + "/".join(str(p) for p in error.absolute_path)
         raise ReviewError(f"Schema violation at {location} ({error.validator}); input value omitted")
