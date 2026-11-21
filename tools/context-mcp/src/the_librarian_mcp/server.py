@@ -216,7 +216,7 @@ def create_server(config: Config) -> MCPServer:
 
     @server.tool(annotations=READ_ONLY, structured_output=False)
     async def status() -> TextContent:
-        """Check selected document-index freshness, document counts by confidence level and claim-correction counts; not catalog/event-store health."""
+        """Check selected document-index freshness, document counts by confidence level and claim-correction counts and the recorded integrity audit (documents whose retained files changed since ingest); not catalog/event-store health."""
         return await reader.read("status", [], config.max_output_chars)
 
     @server.tool(annotations=READ_ONLY, structured_output=False)
@@ -230,6 +230,8 @@ def create_server(config: Config) -> MCPServer:
         and the response's confidence.reasons explains each reason and how to correct it. A hit
         whose text carries a recorded claim correction lists it under corrections (open ones make
         the hit low confidence: open-correction); read it with get for the statement and source. A hit
+        in a document the recorded integrity audit found changed is low confidence: integrity-changed
+        (its text is the text verified at ingest; do not cite its source locations as verified). A hit
         written by an AI agent also carries origin "agent-generated (...)" naming the generator,
         date and source commit: it is not a primary source.
         low_confidence: include (default, rank order), last (after normal hits) or exclude (counted

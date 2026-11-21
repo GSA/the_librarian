@@ -16,6 +16,7 @@ changes what both check without a code change here.
 """
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -24,8 +25,8 @@ import stat
 import sys
 
 from tools.catalog import pins
-from tools.context_index import forked
-from tools.context_index.context_index import IndexError_, no_symlinks
+from tools.context_index import flags, forked
+from tools.context_index.context_index import IndexError_, no_symlinks, validate_db_path
 
 WORKERS = 4
 PARALLEL_MIN = 2000
@@ -148,6 +149,22 @@ def _chunk_sequential(root, rows):
     return [mismatch for mismatch in (_compare(root, row) for row in rows) if mismatch is not None]
 
 
+def selection_mismatches(root, config, *, limit=1000):
+    """The mismatches among the files the selected renditions rely on (extraction, original, sidecar).
+
+    The publication check names every one of them at once, instead of the first it happens to open.
+    """
+    root = no_symlinks(Path(root))
+    selections = config.get("renditions", [])
+    paths = {item["path"] for item in selections}
+    receipts = {item["receipt_id"] for item in selections}
+    with pins.snapshot(root, write=False) as snapshot:
+        rows = [row for row in snapshot.retained_files()
+                if row[1] in paths or (row[4] in ("original", "preserved-metadata") and row[5] in receipts)]
+    found = _chunk_sequential(str(root), rows)
+    return found[:limit], len(found)
+
+
 def read_verified(root, relative):
     """The bytes of the retained file ``relative``, after checking its SHA-256 against the catalog pin.
 
@@ -178,6 +195,24 @@ def read_verified(root, relative):
                              "found": found})
 
 
+def run_audit(args):
+    """``audit``, and with ``--record`` the result recorded for the index it was started against."""
+    if not args.record:
+        return audit(args.root, workers=args.workers, limit=args.limit)
+    from tools import policy
+    root = no_symlinks(Path(args.root))
+    db = validate_db_path(root, args.db or root / policy.validate_instance_roots(root)["context_index_db"])
+    if not db.is_file():
+        raise IndexError_(f"Index missing: {db}; build it before recording an audit")
+    before, started = flags.identity(db), datetime.now(timezone.utc).isoformat(timespec="seconds")
+    report = audit(root, workers=args.workers, limit=sys.maxsize)
+    report["recorded"] = flags.record(db, report, started, before)
+    report["items"] = report["items"][:args.limit]
+    report["listed"] = len(report["items"])
+    report["recorded_in"] = str(flags.location(db)) if report["recorded"] else None
+    return report
+
+
 def parser():
     value = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     value.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
@@ -185,6 +220,10 @@ def parser():
     full = commands.add_parser("audit", help="Re-hash every retained file against its recorded hash")
     full.add_argument("--workers", type=int, default=WORKERS)
     full.add_argument("--limit", type=int, default=1000, help="Most mismatches to list (all are counted)")
+    full.add_argument("--record", action="store_true",
+                      help="Record the result beside the index (<index>.integrity.json) so reads flag the "
+                           "affected documents; the only thing written, and never inside the data roots")
+    full.add_argument("--db", type=Path, help="Index database to record against (default: the instance's)")
     check = commands.add_parser("check", help="Verify named retained files against their catalog pins")
     check.add_argument("paths", nargs="+")
     return value
@@ -196,7 +235,7 @@ def main(argv=None):
         if args.command == "audit":
             if args.workers < 1 or args.limit < 0:
                 raise IndexError_("--workers must be at least 1 and --limit not negative")
-            report = audit(args.root, workers=args.workers, limit=args.limit)
+            report = run_audit(args)
         else:
             items = []
             for relative in args.paths:

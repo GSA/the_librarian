@@ -25,7 +25,7 @@ TOOLKIT_FILES = frozenset({
     "tools/context_index/renditions.py", "tools/context_index/qualification.py",
     "tools/context_index/packets.py", "tools/context_index/confidence.py",
     "tools/context_index/corrections.py", "tools/context_index/proof_cache.py",
-    "tools/context_index/forked.py",
+    "tools/context_index/flags.py", "tools/context_index/forked.py",
     "tools/review_events/__init__.py", "tools/review_events/corrections.py", "tools/review_events/event_history.py",
     "tools/review_events/event_reader.py",
     "tools/review_events/event_store.py", "tools/review_events/review_events.py",

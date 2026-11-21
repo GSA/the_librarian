@@ -9,7 +9,9 @@ to correct it. Every reason has a stable code; the seams that add one are:
 - ``review_reasons``: reviewer-noted issues, reviewer deferrals and reviewer flags (embedded
   instructions, sparse records) recorded on review events;
 - ``origin_reasons``: an origin a submission declares (``agent_generated`` in its sidecar);
-- ``with_reason``: adds a reason to an existing label at read time (``open-correction``).
+- ``with_reason``: adds a reason to an existing label at read time (``open-correction``; and
+  ``integrity-changed``, a document-level reason from the recorded integrity audit, ``flags.py``,
+  that the index never stores).
 """
 
 import hashlib
@@ -56,6 +58,13 @@ REASONS = {
         "and its failure code.",
         "Check the missing pages in the original file, or confirm via a newer document, meeting "
         "transcript or answered question."),
+    "integrity-changed": (
+        "The last integrity audit found a retained file behind this document (its extraction, original or "
+        "submission sidecar) different from the hash recorded at ingest. The indexed text is the text "
+        "verified at ingest, but its source locations and any origin label may no longer match the file; "
+        "the details name the file, the problem and when the audit found it.",
+        "Do not cite its source locations as verified. Restore the file from backup or re-ingest the "
+        "document through intake, then rebuild the index and re-run the audit (never edit files by hand)."),
     "open-correction": (
         "An open claim correction disputes or amends this text; the piece's corrections list the "
         "quoted claim, any corrected statement and the cited source.",

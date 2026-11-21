@@ -47,6 +47,23 @@ def reasons(data):
     return f" ({found})" if found else ""
 
 
+def integrity_lines(integrity):
+    """Text lines for the recorded integrity audit: nothing without one, else the flagged documents."""
+    if not integrity:
+        return []
+    if integrity["audit"] != "recorded":
+        return ["  integrity: no audit recorded for this index (no document can be flagged)"]
+    lines = [f"  integrity: {integrity['flagged_documents']} flagged documents, {integrity['mismatches']} "
+             f"changed files of {integrity['checked']} checked (audit {integrity['audited_at']})"]
+    lines += [f"    ! {document['path']}: " + "; ".join(
+        f"{file['kind']} {file['problem']}" for file in document["files"]) for document in integrity.get("documents", [])]
+    if integrity.get("documents_not_listed"):
+        lines.append(f"    ... and {integrity['documents_not_listed']} more documents")
+    if integrity.get("resolve"):
+        lines.append("    resolve: " + integrity["resolve"])
+    return lines
+
+
 def render_text(report):
     lines = [f"Intake progress at {report['generated_at']} (read-only, body-free)"]
     for name in ("ledger", "catalog", "review_events", "index"):
@@ -79,6 +96,7 @@ def render_text(report):
                      f"{index['indexed']['documents']} sections={index['indexed']['sections']}; "
                      f"selected documents={index['selected']['documents']} "
                      f"renditions={index['selected']['renditions']}")
+        lines.extend(integrity_lines(index.get("integrity")))
     for group in report["attention_groups"]:
         lines.append(f"  request group: {group['count']} x {group['state']} {group['funnel']} "
                      f"{group['code'] or '-'}")
@@ -156,6 +174,16 @@ def render_html(report):
                      f'<div class="card"><b>{index["selected"]["renditions"]}</b>selected renditions</div></div>')
         if index["reasons"]:
             parts.append("<p>Stale: " + esc("; ".join(index["reasons"])) + "</p>")
+        integrity = index.get("integrity")
+        if integrity and integrity["audit"] == "recorded" and integrity["mismatches"]:
+            parts.append(f'<h2>Integrity: {integrity["flagged_documents"]} flagged documents</h2>'
+                         f'<p>{integrity["mismatches"]} changed files of {integrity["checked"]} checked by the audit of '
+                         f'{esc(integrity["audited_at"])}. {esc(integrity["resolve"])}</p>' + table(
+                             ("document", "changed files"),
+                             [(d["path"], "; ".join(f["kind"] + " " + f["problem"] + " " + f["path"]
+                                                   for f in d["files"])) for d in integrity["documents"]]))
+        elif integrity and integrity["audit"] != "recorded":
+            parts.append("<p class=\"muted\">No integrity audit is recorded for this index.</p>")
     documents = report["documents"]
     if documents.get("available"):
         parts.append(f"<h2>Documents: {documents['documents']} (from {esc(documents_source(documents))}), "

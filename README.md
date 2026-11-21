@@ -343,13 +343,20 @@ difference (path, kind, expected and found hash) without changing anything or fa
 ```sh
 .venv/bin/python -m tools.context_index.integrity --root "$PWD" audit            # all files (JSON report)
 .venv/bin/python -m tools.context_index.integrity --root "$PWD" check sources/memo.pdf   # named files
+.venv/bin/python -m tools.context_index.integrity --root "$PWD" audit --record   # also flag affected documents
 ```
+
+With `--record` the audit also writes its result beside the index, so reads keep serving but mark each
+document whose retained file changed (`integrity-changed`, low confidence), and `status` and the progress
+page list them with how to resolve. Schedule `audit --record` rather than plain `audit`; a rebuild clears
+the flags until the next audit. A build refuses to publish while a selected file differs from its recorded
+hash, and names every such file.
 
 Exit status: 0 clean, 1 mismatches found, 2 the audit could not run. **Run the audit on a schedule**, for
 example nightly, and alert on a non-zero status. With cron (`crontab -e`):
 
 ```cron
-17 3 * * *  cd /path/to/instance && .venv/bin/python -m tools.context_index.integrity --root . audit > .local/integrity-audit.json || mail -s "Librarian integrity audit: $?" owner@example.org < .local/integrity-audit.json
+17 3 * * *  cd /path/to/instance && .venv/bin/python -m tools.context_index.integrity --root . audit --record > .local/integrity-audit.json || mail -s "Librarian integrity audit: $?" owner@example.org < .local/integrity-audit.json
 ```
 
 With a systemd user timer (`~/.config/systemd/user/librarian-audit.{service,timer}`, then
@@ -360,7 +367,7 @@ With a systemd user timer (`~/.config/systemd/user/librarian-audit.{service,time
 [Service]
 Type=oneshot
 WorkingDirectory=/path/to/instance
-ExecStart=/path/to/instance/.venv/bin/python -m tools.context_index.integrity --root . audit
+ExecStart=/path/to/instance/.venv/bin/python -m tools.context_index.integrity --root . audit --record
 # librarian-audit.timer
 [Timer]
 OnCalendar=*-*-* 03:17:00
