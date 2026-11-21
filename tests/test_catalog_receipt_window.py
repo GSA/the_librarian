@@ -5,7 +5,6 @@ meets the new file with a receipt for the old one is in that window: it ends its
 waits boundedly for the writer to finish, and trusts the receipt only if it then covers exactly the
 file. Anything else (no writer, a writer that never attests, an edited file) still gets the full replay.
 """
-from contextlib import closing
 import threading
 import time
 from unittest.mock import patch
@@ -15,6 +14,7 @@ from tools.catalog import storage
 from tools.catalog.contracts import CatalogError
 from tests.test_catalog_delta_commit import Case
 from tests.test_file_identity_locks import needs_dbpage
+from tools.diagnostics.catalog_lock_benchmark import registration as catalog_records
 
 
 class ReceiptWindow(Case):
@@ -119,5 +119,3 @@ class ReceiptWindow(Case):
         saved["checksum"] = catalog.fingerprint(saved)
         self.receipt.write_text(catalog.canonical(saved) + "\n")
 
-
-from tools.diagnostics.catalog_lock_benchmark import registration as catalog_records  # noqa: E402
