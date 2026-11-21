@@ -319,7 +319,7 @@ renders it as text or HTML and `progress_serve.py` serves it.
 
 ```sh
 .venv/bin/python -m tools.intake.cli --root . progress [--format text] [--run bulk=upload-bulk-]
-.venv/bin/python -m tools.intake.cli --root . progress-serve [--port 8765] [--refresh 5]
+.venv/bin/python -m tools.intake.cli --root . progress-serve [--port 8765]
 ```
 
 - The ledger is opened `mode=ro` without the writer lock and walked in keyset pages of 5,000
@@ -387,7 +387,7 @@ renders it as text or HTML and `progress_serve.py` serves it.
   operation, status, funnel state and last attempt outcome/category/code and
   times only; request arguments, intents, evidence and document text are never
   read into the report. `--run NAME=PREFIX` groups correlation IDs by prefix.
-- `progress-serve` serves `/` (HTML, `meta refresh`, no external assets, and
+- `progress-serve` serves `/` (HTML that re-renders only when reloaded, no external assets, and
   one inline script that shows times in local time) and `/progress.json`,
   GET/HEAD only, with `Cache-Control: no-store` and a `default-src 'none'` CSP
   that allows only that script by its SHA-256 hash. It binds `127.0.0.1` by default, rejects non-loopback

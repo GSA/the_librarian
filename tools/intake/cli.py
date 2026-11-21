@@ -70,7 +70,6 @@ def arguments(argv):
         else:
             view.add_argument("--host", default="127.0.0.1")
             view.add_argument("--port", type=int, default=8765)
-            view.add_argument("--refresh", type=int, default=5, help="Page refresh seconds")
             view.add_argument("--allow-non-loopback", action="store_true",
                               help="Explicit approval to expose the view beyond this machine")
     recover = commands.add_parser(
@@ -119,11 +118,10 @@ def main(argv=None):
                              else json.dumps(report, sort_keys=True) + "\n")
             return 0
         if args.command == "progress-serve":
-            require(1 <= args.limit <= 1000 and 1 <= args.refresh <= 3600
-                    and 0 <= args.port <= 65535, "invalid_option")
+            require(1 <= args.limit <= 1000 and 0 <= args.port <= 65535, "invalid_option")
             progress_serve.check_bind(args.host, args.allow_non_loopback)
             result = progress_serve.serve(args.root, host=args.host, port=args.port,
-                                          refresh=args.refresh, limit=args.limit, runs=runs(args.run),
+                                          limit=args.limit, runs=runs(args.run),
                                           allow_non_loopback=args.allow_non_loopback)
         elif args.command == "initialize":
             result = store.initialize(args.root)

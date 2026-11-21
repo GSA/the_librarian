@@ -131,14 +131,13 @@ def item_rows(values):
              (v["last_attempt"] or {}).get("code"), Raw(time_tag(when(v["updated"])))) for v in values]
 
 
-def render_html(report, *, refresh=5):
+def render_html(report):
     overall = report["overall"]
     parts = [f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-             f'<meta http-equiv="refresh" content="{int(refresh)}">'
              f"<title>Intake progress</title><style>{STYLE}</style></head><body>",
              "<h1>Intake progress</h1>",
              f'<p class="muted">Read-only and body-free. Updated {time_tag(report["generated_at"])}; '
-             f"refreshes every {int(refresh)} s. Ledger read {report['render']['ledger_seconds']} s"
+             f"reload the page to update. Ledger read {report['render']['ledger_seconds']} s"
              f"{' (unchanged since last read)' if report['render']['ledger_cached'] else ''}. Last ledger activity {time_tag(when(overall['last_activity']))}.</p>"]
     sources = []
     for name in ("ledger", "catalog", "review_events", "index"):

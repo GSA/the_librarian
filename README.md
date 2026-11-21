@@ -243,7 +243,7 @@ label of its own, and keep the origin file unchanged once ingested (see
 ### Watching a run
 
 To watch a run, use the read-only, body-free progress view (CLI or a
-loopback-only page that refreshes itself; see
+loopback-only page that updates when reloaded; see
 [context/intake.md](context/intake.md#progress-view)):
 
 ```sh

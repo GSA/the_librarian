@@ -69,7 +69,7 @@ class Latest:
         return result
 
 
-def make_server(root, *, host="127.0.0.1", port=8765, refresh=5, limit=50, runs=None,
+def make_server(root, *, host="127.0.0.1", port=8765, limit=50, runs=None,
                 allow_non_loopback=False, reuse=1.0):
     address = check_bind(host, allow_non_loopback)
     latest = Latest(lambda: progress.snapshot(root, limit=limit, runs=runs), reuse)
@@ -107,7 +107,7 @@ def make_server(root, *, host="127.0.0.1", port=8765, refresh=5, limit=50, runs=
                 return self.send(404, "text/plain; charset=utf-8", "Not found\n")
             report = latest.get()
             if path == "/":
-                return self.send(200, "text/html; charset=utf-8", render_html(report, refresh=refresh))
+                return self.send(200, "text/html; charset=utf-8", render_html(report))
             return self.send(200, "application/json", json.dumps(report, sort_keys=True))
 
         do_HEAD = do_GET
