@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import sys
+import time
 import unicodedata
 import uuid
 
@@ -23,7 +24,7 @@ from tools.catalog.contracts import (
 from tools.catalog.storage import (
     AUTHORITY, BUSY_TIMEOUT_SECONDS, LOOKUP_REFUSAL, REFERENCE_FIELDS, VERSION, connect, create_lookup, decode,
     drop_lookup, fsync_directory, inspect, locations, lookup_shape, make_state, private_directory, private_file,
-    reserve, safe_path, schema_sql, seal, writer_lock, _head_state, _lookup_expression,
+    reserve, safe_path, schema_sql, seal, writer_lock, _head_state, _lookup_expression, _writer_active,
 )
 # Kept reachable here because callers use this module as the catalog's API.
 from tools.catalog.backups import backup, backup_inventory, prune  # noqa: F401
@@ -251,10 +252,41 @@ def _trusted_state(connection, home, binding):
     return state, saved["validated_on"]
 
 
+# A writer commits, then attests the new bytes, all under the writer lock. A reader that meets the new
+# file before the attestation would replay the whole history (17-38 s on a 37k-rendition instance)
+# for a receipt that lands moments later; it waits at most this long for the writer to finish first.
+ATTESTATION_WAIT_SECONDS = 5.0
+
+
+def _await_attestation(connection, home):
+    """Wait boundedly while another process holds the writer lock; True when there was a writer to wait for.
+
+    The read transaction ends first and a new one begins after: holding SQLite's read lock through the
+    wait would block that writer's next commit (it needs the lock exclusively) while this reader waits
+    for it, each waiting on the other until the bound.
+    """
+    if not _writer_active(home):
+        return False
+    connection.execute("COMMIT")
+    deadline = time.monotonic() + ATTESTATION_WAIT_SECONDS
+    while _writer_active(home) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    connection.execute("BEGIN")
+    return True
+
+
 def validated_state(connection, home, *, audit=False):
-    """Reuse full inspection only for the identical database file and validator bytes."""
+    """Reuse full inspection only for the identical database file and validator bytes.
+
+    A miss while a writer holds the writer lock (it is between its commit and its attestation, or
+    mid-write) waits for that writer and asks again against the file as it then is: a receipt is
+    trusted only when it covers exactly the file this connection reads, as ever.
+    """
     binding = _binding(connection)
     trusted = None if audit else _trusted_state(connection, home, binding)
+    if trusted is None and not audit and _await_attestation(connection, home):
+        binding = _binding(connection)
+        trusted = _trusted_state(connection, home, binding)
     if trusted is not None:
         return trusted[0]
     state = inspect(connection, detail=False)[0]
