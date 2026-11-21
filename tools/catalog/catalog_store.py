@@ -1055,6 +1055,19 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
     Each value equals ``read_records(root, receipt=id, limit=limit, expected_state=...)``, but the
     catalog is validated once and every scope is resolved with set-based joins, not per receipt.
     """
+    return _receipt_read(root, receipt_ids, limit=limit, expected_state=expected_state)[1]
+
+
+def receipt_snapshot(root, receipt_ids, *, limit=25):
+    """``(receipt_metadata(...), read_records_by_receipt(...))`` read from ONE validated snapshot.
+
+    Two calls can straddle a commit (the second then refuses the first's state as stale) and pay the
+    validation, the current-record copy and its indexes twice; this pays them once and cannot straddle.
+    """
+    return _receipt_read(root, receipt_ids, limit=limit, registrations=True)
+
+
+def _receipt_read(root, receipt_ids, *, limit, expected_state=None, registrations=False):
     require(type(limit) is int and limit > 0, "limit must be a positive integer")
     for receipt_id in receipt_ids:
         identifier(receipt_id, "receipt")
@@ -1106,7 +1119,9 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
                 "records": [current_record(connection, record_id, "current_rows") for record_id in page],
                 "count": len(page), "total_matching": len(members),
                 "next_after": page[-1] if len(members) > limit else None}
-        return result
+        if registrations:
+            return _registrations(connection, state, receipt_ids, "current_rows"), result
+        return None, result
 
 
 def current_record(connection, record_id, table="catalog_current"):
@@ -1115,6 +1130,19 @@ def current_record(connection, record_id, table="catalog_current"):
         raise MissingRecord("Record missing from authoritative catalog: " + record_id)
     return decode(row["payload"])
 
+
+
+def _registrations(connection, state, receipt_ids, table):
+    selected = {}
+    for receipt_id in receipt_ids:
+        receipt = current_record(connection, receipt_id, table)
+        if receipt["kind"] != "receipt":
+            raise MissingRecord("Receipt missing from authoritative catalog: " + receipt_id)
+        selected[receipt_id] = {
+            "receipt": receipt, "artifact": current_record(connection, receipt["data"]["artifact_id"], table),
+            "sources": [current_record(connection, sid, table) for sid in receipt["data"]["source_ids"]],
+        }
+    return {"state": state, "registrations": selected}
 
 
 def receipt_metadata(root, receipt_ids):
@@ -1127,16 +1155,7 @@ def receipt_metadata(root, receipt_ids):
         connection.execute("BEGIN")
         state = validated_state(connection, home)
         current_view(connection)
-        selected = {}
-        for receipt_id in receipt_ids:
-            receipt = current_record(connection, receipt_id)
-            if receipt["kind"] != "receipt":
-                raise MissingRecord("Receipt missing from authoritative catalog: " + receipt_id)
-            selected[receipt_id] = {
-                "receipt": receipt, "artifact": current_record(connection, receipt["data"]["artifact_id"]),
-                "sources": [current_record(connection, sid) for sid in receipt["data"]["source_ids"]],
-            }
-        return {"state": state, "registrations": selected}
+        return _registrations(connection, state, receipt_ids, "catalog_current")
 
 
 def restore(root, snapshot, expected_state=None):

@@ -182,11 +182,9 @@ def inputs(root, config, engine, review_snapshot=None, *, reads=None, keep=True)
     if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
             and review_snapshot is None):
         review_snapshot = engine.load_event_reader().read_snapshot(root, full=True)
-    snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
-    state = snapshot["state"]["state_token"]
-    # One validated catalog snapshot for every selected receipt, not one per rendition.
-    receipt_records = catalog.read_records_by_receipt(
-        root, [item["receipt_id"] for item in selections], limit=100, expected_state=state)
+    # One validated snapshot for every selected receipt, not one per rendition and not two.
+    snapshot, receipt_records = catalog.receipt_snapshot(
+        root, [item["receipt_id"] for item in selections], limit=100)
     result, identities = [], []
     for item in selections:
         registration = snapshot["registrations"][item["receipt_id"]]
