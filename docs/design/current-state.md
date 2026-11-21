@@ -177,7 +177,10 @@ restated here.
   conversions share nothing
   (`tests/test_docling.py::AdapterProcess::test_conversion_reads_a_private_copy_that_later_swaps_cannot_change`,
   `::test_concurrent_conversions_get_distinct_private_copies`). The worker still hashes the
-  copy against the pins and fails on any change to it.
+  copy against the pins and fails on any change to it. The PDF/image conversion children
+  that make the copy set their file-size limit to admit the largest pinned asset (203 MB),
+  not only their own output
+  (`tests/test_pdf_image.py::HardeningTests::test_conversion_children_can_write_the_largest_pinned_model_asset`).
   Its direct dependencies are exact pins in `tools/extraction/requirements-docling.in`;
   `requirements-docling.txt` is the full Python 3.14 Linux CPU lock the worker
   enforces at runtime, and every direct pin must appear in it unchanged
@@ -295,9 +298,13 @@ restated here.
   blocked as `changed-extraction-identity` (the extractor code changed after the
   stage pinned it, and replay keeps the pin) is repaired by
   `cohort recover-identity`, which stages validated corrections with a fresh
-  pin; the identity, source-hash and catalog-pin checks are not relaxed.
+  pin; the identity, source-hash and catalog-pin checks are not relaxed. An
+  `extract-prepare` blocked with a code a toolkit fix has since removed is
+  restaged by `cohort recover-blocked-extractions --code CODE` as an unrun
+  correction that the next ingest converts and registers.
   Evidence: `tests/test_intake_cohort.py::CorrectionChainTests`,
-  `::RecoverIdentityTests`, `::QualifyRepairedTests`.
+  `::RecoverIdentityTests`, `::QualifyRepairedTests`,
+  `::IngestTests::test_extractions_blocked_by_a_fixed_toolkit_are_restaged_for_the_next_ingest`.
 - **Standing review.** A model reply is recorded as findings exactly as
   reported; the standing policy, not the model, decides qualification. Missing
   inspection and out-of-scope receipts block; references to material outside the

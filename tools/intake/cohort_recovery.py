@@ -7,8 +7,8 @@ from . import adapters, cohort_review, contracts, runner, standing, store
 from .contracts import IntakeError
 
 
-def _identity_blocked(root):
-    """Chain heads that are blocked ``extract-register`` stages refused as a changed identity."""
+def _blocked_heads(root, operation, code):
+    """Chain heads whose ``operation`` stage is blocked and whose last attempt failed with ``code``."""
     found = []
     with store.locked(root) as c:
         rows = c.execute("SELECT s.correlation_id, s.ordinal, r.raw FROM stages s "
@@ -16,16 +16,21 @@ def _identity_blocked(root):
                          "ORDER BY s.correlation_id").fetchall()
         for row in rows:
             stage = contracts.decode_request(row["raw"])["stages"][row["ordinal"]]
-            if stage["operation"] != "extract-register":
+            if stage["operation"] != operation:
                 continue
             if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
                 continue  # not the head: a correction follows it
             last = c.execute("SELECT code FROM attempts WHERE correlation_id=? AND stage_id=? "
                              "ORDER BY cycle DESC, ordinal DESC LIMIT 1",
                              (row["correlation_id"], stage["id"])).fetchone()
-            if last is not None and last[0] == "changed-extraction-identity":
+            if last is not None and last[0] == code:
                 found.append((row["correlation_id"], stage))
     return found
+
+
+def _identity_blocked(root):
+    """Chain heads that are blocked ``extract-register`` stages refused as a changed identity."""
+    return _blocked_heads(root, "extract-register", "changed-extraction-identity")
 
 
 def _root_of(root, corr):
@@ -118,6 +123,33 @@ def recover_identity(root, *, apply=False):
     for corr, prepare, reuse in work:
         try:
             results[_repair(root, corr, prepare, reuse)] += 1
+        except IntakeError as error:
+            results[error.code] += 1
+    report["results"] = dict(results)
+    return report
+
+
+def recover_blocked_extractions(root, code, *, apply=False):
+    """Report, and with ``apply`` restage, extractions blocked with ``code`` by a since-fixed toolkit.
+
+    A blocked ``extract-prepare`` pins the extractor identity it first prepared under, so after the
+    toolkit fix that changes the identity, a replay can only block again. For each chain head that
+    is a blocked ``extract-prepare`` whose last attempt failed with ``code``, ``apply`` stages a
+    correction repeating its operation and arguments and does not run it: the next ``ingest``
+    follows ``correction_of`` to it and converts it like any other open extraction (PDFs and images
+    concurrently), then registers it. The correction pins today's extractor when it first prepares,
+    so a source or toolkit that still fails blocks it again. Repaired chains are not candidates again.
+    """
+    root = Path(root).resolve()
+    work = [corr for corr, _ in _blocked_heads(root, "extract-prepare", code)]
+    report = {"apply": apply, "code": code, "candidates": len(work)}
+    if not apply:
+        return report
+    results = Counter()
+    for corr in work:
+        try:
+            _correct(root, {"correlation_id": corr})
+            results["staged"] += 1
         except IntakeError as error:
             results[error.code] += 1
     report["results"] = dict(results)

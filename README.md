@@ -162,7 +162,9 @@ them. If a registration reports `register/changed-extraction-identity` (the
 extractor changed after it was first prepared), `python -m tools.intake.cohort
 recover-identity --root .` lists the recoverable ones and `--apply` repairs
 them through validated correction requests
-([context/intake.md](context/intake.md#read-only-cohort-intake)). An accepted review
+([context/intake.md](context/intake.md#read-only-cohort-intake)). Extractions blocked by a
+toolkit defect that has since been fixed (for example `extract-mutation`) are restaged for the next
+`ingest` with `recover-blocked-extractions --root . --code CODE` (`--apply`). An accepted review
 that reports contradictions or missing evidence now qualifies with those issues attached;
 `recover-unresolved-evidence --root .` (`--apply`) qualifies earlier reviews blocked as
 `unresolved-evidence` from their saved findings without a model call.
@@ -318,7 +320,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore` |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `audit`, `progress`, `progress-serve` |
-| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `recover-deferred`, `rereview`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
+| `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-blocked-extractions`, `recover-unresolved-evidence`, `recover-deferred`, `rereview`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
 | `python -m tools.evals` | Retrieval-quality evaluation: `generate` seeded cases, `run` them against a fresh index into a body-free scorecard, `compare BASE NEW` (exit 1 on a regression) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |

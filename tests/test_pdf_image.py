@@ -198,6 +198,29 @@ class HardeningTests(unittest.TestCase):
             pdf_image.convert(b"%PDF-1.4\n", "a.pdf", "pdf", RUNTIME, self.work)
         self.assertEqual(caught.exception.code, "extract-output-limit")
 
+    def test_conversion_children_can_write_the_largest_pinned_model_asset(self):
+        # Docling's adapter copies every pinned asset inside these children (some exceed 64 MiB);
+        # a sparse write at the last byte meets the file-size limit without writing the bytes.
+        write = ("def write(home, *_):\n"
+                 "    with open(Path(home) / 'asset', 'wb') as stream:\n"
+                 "        stream.seek(pdf_image.LARGEST_ASSET - 1)\n"
+                 "        stream.write(b'\\0')\n"
+                 "    return {'method': {}}\n")
+        entries = {"child": "pdf_image.extract_file = write\nsys.exit(pdf_image.child(sys.argv[1]))",
+                   "unit": "pdf_pages.read_unit = write\nsys.exit(pdf_pages.unit(sys.argv[1]))"}
+        self.assertGreater(pdf_image.LARGEST_ASSET, pdf_image.MAX_RESULT * 2)
+        for entry, call in entries.items():
+            with self.subTest(entry), tempfile.TemporaryDirectory(dir=self.work) as home:
+                (Path(home) / "source").write_bytes(b"x")
+                (Path(home) / "job.json").write_text(json.dumps({
+                    "name": "a.png", "format": "image", "python": "", "artifacts": "",
+                    "address_space_bytes": 4 * 1024**3, "cpu_seconds": 60, "wall_seconds": 60}))
+                code = ("import sys\nfrom pathlib import Path\n"
+                        "from tools.extraction import pdf_image, pdf_pages\n" + write + call)
+                subprocess.run([sys.executable, "-c", code, home], cwd=pdf_image.TOOLKIT, check=False)
+                result = json.loads((Path(home) / "result.json").read_text())
+                self.assertTrue(result["ok"], result)
+
     def test_deterministic_refusals_are_not_retried(self):
         calls = []
 

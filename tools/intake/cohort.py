@@ -25,7 +25,8 @@ from . import (agent_origin, cli, cohort_archives, cohort_rereview, cohort_revie
                selection_manifest, standing, store, throttle, upload, usage_log)
 from . import cohort_runtime, contracts, parse_pool
 from .cohort_ingest import BATCH_SIZE, classify, ingest
-from .cohort_recovery import recover_deferred, recover_identity, recover_unresolved_evidence
+from .cohort_recovery import (recover_blocked_extractions, recover_deferred, recover_identity,
+                              recover_unresolved_evidence)
 from .contracts import IntakeError
 
 DEFAULT_INDEX = "tools/context_index/.local/index.sqlite3"
@@ -530,6 +531,13 @@ def _parser():
         help="Report (or with --apply correct) registrations blocked as changed-extraction-identity")
     recover.add_argument("--root", required=True, type=Path)
     recover.add_argument("--apply", action="store_true")
+    blocked = commands.add_parser(
+        "recover-blocked-extractions", allow_abbrev=False,
+        help="Report (or with --apply restage for the next ingest) extractions blocked with --code "
+             "by a since-fixed toolkit")
+    blocked.add_argument("--root", required=True, type=Path)
+    blocked.add_argument("--code", required=True, help="the blocked attempt's code, e.g. extract-mutation")
+    blocked.add_argument("--apply", action="store_true")
     unresolved = commands.add_parser(
         "recover-unresolved-evidence", allow_abbrev=False,
         help="Report (or with --apply qualify) accepted reviews blocked as unresolved-evidence, "
@@ -669,6 +677,8 @@ def _maintenance(args):
     """The report of a ledger maintenance command (identity recovery or the docs table)."""
     if args.command == "recover-identity":
         return recover_identity(args.root, apply=args.apply)
+    if args.command == "recover-blocked-extractions":
+        return recover_blocked_extractions(args.root, args.code, apply=args.apply)
     if args.command == "recover-unresolved-evidence":
         return recover_unresolved_evidence(args.root, apply=args.apply)
     if args.command == "recover-deferred":
@@ -728,7 +738,7 @@ def _archive_command(args):
 def main(argv=None):
     args = _parser().parse_args(argv)
     try:
-        if args.command in {"recover-identity", "recover-unresolved-evidence", "recover-deferred", "backfill-docs", "audit-docs", "docs-status"}:
+        if args.command in {"recover-identity", "recover-blocked-extractions", "recover-unresolved-evidence", "recover-deferred", "backfill-docs", "audit-docs", "docs-status"}:
             print(json.dumps(_maintenance(args), sort_keys=True))
             return 0
         if args.command in {"expand-archives", "delete-archive-original"}:
