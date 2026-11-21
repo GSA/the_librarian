@@ -1,4 +1,4 @@
-"""The first write of a UTC day replays the history once, not four times (Kata yxc2), at full strength."""
+"""The first write of a UTC day replays nothing under the writer lock when a receipt covers the file, and at most once without one (Kata yxc2, 91h5)."""
 from contextlib import closing, contextmanager
 import os
 from pathlib import Path
@@ -54,12 +54,12 @@ class Case(unittest.TestCase):
 
 
 class OneReplay(Case):
-    def test_first_write_of_the_day_replays_the_history_once_with_a_receipt(self):
+    def test_first_write_of_the_day_replays_nothing_with_a_receipt(self):
         self.new_day()
         calls, patched = self.counting()
         with patched:
             result = self.write(10)
-        self.assertEqual(len(calls), 1)  # the live head; no copy, fresh-verify or retention replay
+        self.assertEqual(calls, [])  # a receipt covers the file; the snapshot is that validated image
         self.assertIsNotNone(result["backup"])
         self.assertEqual(result["retention"]["refused"], None)
 
@@ -100,7 +100,7 @@ class SnapshotStrength(Case):
         read = lambda s: sorted(__import__("json").loads(Path(s["receipt"]).read_text()))
         self.assertEqual(read(daily), read(manual))
 
-    def test_forged_receipt_over_a_tampered_catalog_still_refuses_the_first_write_of_the_day(self):
+    def test_forged_receipt_over_a_tampered_catalog_is_found_by_the_audit_not_the_first_write(self):
         with closing(sqlite3.connect(self.db, isolation_level=None)) as connection:
             for table in ("metadata", "revisions", "versions"):
                 for action in ("update", "delete"):
@@ -112,6 +112,10 @@ class SnapshotStrength(Case):
             binding, state = catalog._binding(connection), catalog._head_state(connection)
         catalog._write_receipt(self.home, binding, state)
         self.new_day()
+        with self.assertRaises(CatalogError):
+            catalog.status(self.root, audit=True)
+        # Without the receipt the writer replays and refuses, as it always did.
+        (self.home / ".local" / "read-validation.json").unlink()
         with self.assertRaises(CatalogError):
             self.write(10)
         self.assertEqual(self.snapshots(), [])  # nothing published for a corrupt head

@@ -290,16 +290,22 @@ class TamperDetection(Case):
             state = catalog._head_state(connection)
         catalog._write_receipt(self.home, binding, state)
 
-    def test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt(self):
+    def test_first_write_of_each_day_no_longer_replays_so_a_forged_receipt_is_found_by_the_audit(self):
+        """Kata 91h5 changes this guarantee: the first write of a day trusts a receipt that covers
+        exactly the file (as every later write always did); the audit finds the tampering."""
         self.mutate("UPDATE versions SET payload=replace(payload,'Synthetic.','Edited.') WHERE record_id='S1'"
                     " OR record_id LIKE 'A-upload-1-%'")
         self.forge_receipt_for_current_bytes()
         for path in self.backups.iterdir():
-            path.unlink()  # a new UTC day: the write must take a verified snapshot, which replays history
+            path.unlink()  # a new UTC day: the write takes a snapshot without replaying history
+        calls, patched = self.writes_inspect()
+        with patched:
+            self.assertEqual(self.write(12)["committed_revision"], 4)
+        self.assertEqual(calls, [])
         with self.assertRaises(CatalogError):
-            self.write(12)
+            catalog.status(self.root, audit=True)
 
-    def test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot(self):
+    def test_documented_residual_forged_receipt_is_trusted_until_an_audit(self):
         self.mutate("UPDATE versions SET payload=replace(payload,'Synthetic.','Edited.') WHERE record_id='S1'"
                     " OR record_id LIKE 'A-upload-1-%'")
         self.forge_receipt_for_current_bytes()

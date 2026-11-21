@@ -79,6 +79,8 @@ class WriterContention(unittest.TestCase):
 
         def read():
             event_history.clear_memo()
+            # A cold read is one with no receipt either (a new process after a commit by older code).
+            (events.locations(self.root)[0] / ".local" / event_history.RECEIPT).unlink(missing_ok=True)
             self.assertTrue(progress.read_review_events(self.root)["available"])
         committed, failures = self.writer_during(read)
         self.assertEqual(failures, [])

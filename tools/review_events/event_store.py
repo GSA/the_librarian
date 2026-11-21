@@ -343,9 +343,11 @@ def status(root, event_id=None, audit=False):
     _, db, _ = locations(root)
     with closing(connect(db)) as connection:
         connection.execute("BEGIN")
+        # An audit replays everything, then re-baselines what a new process may trust (the receipt); a
+        # refusing audit forgets both, so every later read replays and refuses too.
         if audit:
             event_history.forget(str(db))
-        state, events, successors, history = event_history.view(connection, root, reuse=not audit,
+        state, events, successors, history = event_history.view(connection, root, reuse=True, full=audit,
                                                                 materialize=False)
         if event_id is None:
             return {"command": "status", **state}

@@ -23,23 +23,26 @@ named stage. The ledger is operational recovery state, never corpus authority.
   the pinned identity to the native lifecycle as `expected_identity`, so a
   source or runtime change refuses before any rendition or registration is
   published and each attempt converts once.
-- Review-event reads (`qualify`, standing review, progress, `event_store status`) reuse a
-  full validation held in process memory while the events database file identity (device,
-  inode, size, mtime, ctime, SQLite change counter), the contract hash and the UTC date are
-  unchanged and the chain heads re-read from the file still match. Any commit, swap or edit,
-  a restart or a new UTC day validates everything again; `event_store.py audit` always does.
-  An edit that restores identity and leaves the chain heads alone is seen only then (the
-  catalog receipt's residual). Usage and evidence:
+- Review-event reads (`qualify`, standing review, progress, `event_store status`) trust a
+  validation while the events database file identity (device, inode, size, mtime, ctime, SQLite
+  change counter), the contract hash and the validator code are unchanged and the chain heads
+  re-read from the file still match. The validation is held in process memory and persisted as
+  `<review events home>/.local/read-validation.json`, so a new process (every MCP call) replays
+  nothing, and after a commit verifies only the events past the remembered head. There is no daily
+  expiry; `event_store.py audit` and `python -m tools.store_audit` replay everything. An edit that
+  restores identity and leaves the chain heads alone is seen only then (the catalog receipt's
+  residual). Usage and evidence:
   [design](../docs/design/current-state.md#review-event-validation).
 - Concurrent intake agents may share one instance ([design](../docs/design/current-state.md#concurrent-writers)).
   The catalog writer lock waits up to 10s across processes. A catalog write
   validates only its delta when the database file identity (device, inode, size,
-  mtime, ctime, SQLite change counter) matches a prior full validation made the
-  same UTC day ([design](../docs/design/current-state.md#what-a-catalog-write-validates)), and replays all history otherwise,
-  on the first read or write of each UTC day and under `status --audit`; that
-  first write replays the history once, holding the writer lock about as long as one `inspect`
-  plus writing the snapshot (about 3 s at 25k registrations, 11 s at 100k;
-  [design](../docs/design/current-state.md#what-a-catalog-write-validates)). A lost race is a
+  mtime, ctime, SQLite change counter) matches a prior full validation
+  ([design](../docs/design/current-state.md#what-a-catalog-write-validates)), and replays all history otherwise
+  and under `status --audit`. There is no daily expiry (Kata 91h5): the first write of a UTC day
+  holds the writer lock for the daily snapshot only (about 2 s at 132k revisions), not for a
+  replay. The full replay is the scheduled `python -m tools.store_audit --root ROOT` (catalog,
+  review events, intake ledger, newest backups; JSON report, exit 1 when any store is flagged;
+  [design](../docs/design/current-state.md#store-validation-cadence-kata-91h5)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
   `catalog-busy` (lock wait exceeded) attempt, never `native-input`. Such an attempt wrote
   nothing, so it does not spend `max_attempts` ([design](../docs/design/current-state.md#concurrent-writers)):

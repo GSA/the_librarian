@@ -785,9 +785,10 @@ is what matters; the chain of how it got here is in git history and the Katas
    ctime_ns, SQLite change counter) plus the validator-file hash (`VALIDATOR_FILES`:
    `catalog_store.py`, `storage.py`, `backups.py` and `contracts.py`) and runtime
    versions; otherwise (journal or WAL present, or no `sqlite_dbpage`) the SHA-256
-   of the exact database bytes. An identity-bound receipt is trusted only on the
-   UTC date of the full validation it descends from (`validated_on`); the first
-   validated read or write of the next UTC day replays all history and rewrites it.
+   of the exact database bytes. A receipt is trusted for as long as it covers exactly
+   the file (Kata 91h5): there is no daily expiry. `validated_on` only records the UTC
+   date of the last full replay for the audit report. What replaces the daily check is
+   the scheduled audit ("Store validation cadence" below).
 2. **Trusted head.** When the binding matches, the writer takes the state from the
    receipt (it must equal the state re-derived from the database head); otherwise
    it runs a full `inspect`. An unreadable receipt only costs a replay; it never
@@ -802,12 +803,15 @@ is what matters; the chain of how it got here is in git history and the Katas
    the new bytes (best effort). A crash after COMMIT leaves a receipt that no
    longer matches, so the next reader or writer validates in full and the retry is
    idempotent.
-6. **First write of a UTC day** replays the history once (`inspect` with
-   `detail=False`, state only) inside the writer lock, then writes the snapshot.
-   `inspect` decodes and encodes each payload once, falls back to the original
-   step-by-step checks on any irregularity, and streams revisions and versions.
-   `status --audit`, `verify_backup`, restore and the daily snapshot always replay
-   in full.
+6. **First write of a UTC day** replays nothing when a receipt covers the file (Kata 91h5):
+   the daily snapshot is the serialized image of the validated transaction, written, fsynced
+   and re-hashed against that image, so the work under the writer lock is the snapshot copy
+   itself. Without a receipt (a new catalog, a changed file or validator code) the writer
+   replays once (`inspect` with `detail=False`, state only), as any writer does, and the
+   snapshot is that replay's image. `inspect` decodes and encodes each payload once, falls
+   back to the original step-by-step checks on any irregularity, and streams revisions and
+   versions. `status --audit`, `verify_backup`, restore, `migrate-indexes` and
+   `python -m tools.store_audit` always replay in full.
 
 Measured when written, on synthetic catalogs of four records per registration
 (shared host; compare shapes, rerun the benchmarks before relying on a figure):
@@ -833,6 +837,89 @@ rebase, daily snapshot on the fast path), `tests/test_catalog_identity_binding.p
 valid history and about 100 tamperings: same result or same refusal message),
 `tests/test_validation_cost.py`.
 
+### Store validation cadence (Kata 91h5)
+
+Reads and writes do not replay a store's history once per UTC day or once per process. The owner
+is the only provider of documents and nobody edits the instance's files by hand (later automated
+ingestion is the only other writer, and it is controlled), so a recorded hash is the reference
+and an unexpected change is *detected and flagged*, not defended against in real time. This
+supersedes the daily full check kept by Kata qwtp (D2).
+
+- **Review-event receipt.** `<review events home>/.local/read-validation.json` (0700 directory,
+  0600 file, canonical JSON with a checksum) holds the validated state and its binding: the
+  file identity (device, inode, size, mtime_ns, ctime_ns, SQLite change counter), the contract
+  hash, the SHA-256 of `event_history.py`, `review_events.py` and the item schema, and the
+  Python, SQLite, `jsonschema` and `referencing` versions. It is rewritten after every full
+  replay and every delta, best effort. A new process that finds a receipt for this code and
+  contract trusts it exactly as the in-process memo is trusted: when the file's identity equals
+  the receipt's, and the chain heads and correction count re-read from the file equal its state,
+  it replays nothing; when only SQLite's own commits moved the identity (same file, larger, a
+  new change counter) it verifies just the rows past the remembered head (`_extend`). The
+  events themselves are not loaded: `StoredHistory` answers `event`, `superseded_by` and `at`
+  from the store's unique keys on a read-only connection bounded by the snapshot's event count (an event
+  appended later is never seen) and loads every row once, lazily, only for `events`,
+  `successors` and `query`. A missing, oversized, malformed, group-readable, symlinked or
+  wrongly checksummed receipt, one for other code, contract or runtime, or one whose store
+  identity or contract differs, is a miss that costs one full replay and never a refusal. A
+  full replay that refuses when asked for (an audit or publication, `full=True`) deletes the receipt,
+  so no later process trusts that file; a refusing ordinary read leaves it, its identity already misses.
+- **No daily expiry** in the catalog receipt, the review-event memo or the receipt above.
+- **Where each tamper class is now detected**
+
+  | Change to a store file | Detected |
+  | --- | --- |
+  | SQLite edit, raw edit or truncation that moves size, mtime, ctime or the change counter; a file swapped or restored; changed validator code, contract or runtime | at the next read or write (identity or binding differs), with the unchanged refusal |
+  | Edit that restores size, mtime, ctime and change counter, or silent media corruption | by `status --audit` of the store, `python -m tools.store_audit`, backup verification or restore; not by reads or writes (before Kata 91h5: also by the first read or write of the next UTC day) |
+  | Old review-event rows edited while the head, counts and change counter are made to look like a commit | the same audits (and publication, which reads with `full=True`) |
+  | An actor who rewrites the file and its unkeyed receipt so they agree | the same audits; not a defense against that actor |
+
+  Evidence: `tests/test_catalog_identity_binding.py` (`test_a_new_utc_day_replays_nothing`,
+  `test_residual_identity_restoring_edit_is_served_until_an_audit_whatever_the_day`),
+  `tests/test_catalog_delta_commit.py`
+  (`test_first_write_of_each_day_no_longer_replays_so_a_forged_receipt_is_found_by_the_audit`),
+  `tests/test_review_event_memo.py` (`test_residual_does_not_expire_with_the_utc_day_but_a_new_process_and_an_audit_find_it`),
+  `tests/test_review_event_receipt.py` (a new process replays nothing and verifies only the delta,
+  stored lookups equal replayed ones, every receipt defect is a miss, an audit re-baselines and a
+  failing one removes the receipt), `tests/test_store_audit.py`.
+- **First write of a day.** The writer's replay under the lock is gone when a receipt covers the
+  file; what remains under the lock is the daily snapshot itself (serialize, write, fsync, hash,
+  retention). The snapshot is the image of a validated transaction, so it is not replayed; whether
+  its bytes are a valid store is checked by `verify-backup`, restore and the audit of the newest
+  backup, as for every snapshot older than the one just written.
+- **Scheduled audit.** `python -m tools.store_audit --root ROOT` replays the catalog
+  (`status --audit`), the review events (`status --audit`, which also re-baselines the receipt) and
+  the intake ledger (`intake audit`), verifies the newest backup of the catalog and of the review
+  events against its receipt (`--no-backups` skips that), and prints one body-free JSON object:
+  `ok`, and per store `ok`, the state it verified or the refusal, and the seconds taken. A failing
+  store is reported and the others still run; exit status 0 when everything verified, 1 when any
+  store was flagged, 2 for a usage error. It takes no writer lock and changes nothing except the
+  baseline receipts described above. It does not check the files under the instance's data roots
+  (extractions, originals, sidecars): that is the integrity audit of Kata xv0n. Run it from cron or
+  a systemd timer, for example `17 3 * * * cd /path/to/instance && .venv/bin/python -m
+  tools.store_audit --root . >> .local/store-audit.log 2>&1`, outside an intake run when the host is
+  small (it holds a read transaction while it replays, as `status --audit` does). The daily verified
+  backup stays.
+- **Measured** (one production-sized instance, read only through a throwaway overlay, nothing
+  written to it; 51.5k review events, 132k-revision 865 MB catalog; wall time, peak RSS of the
+  process):
+
+  | | before | after |
+  | --- | --- | --- |
+  | review-event `read_snapshot` in a new process | 5.8 s, 665 MB | 0.01 s (0.05 s with start-up), 28 MB |
+  | catalog `status` in a new process, first read of a UTC day | 18.4 s, 595 MB | 0.02 s, 27 MB |
+  | catalog writer ready (replay) before the first write of a UTC day, under the writer lock | 21.8 s, 2.6 GB | 0.02 s, 27 MB |
+  | whole first write of a day under the lock before the commit (writer ready plus daily snapshot) | 23.8 s, 4.2 GB | 2.0 s, 1.7 GB |
+  | cold index `status` with the freshness path on `read_snapshot(root)` (not `full=True`), memo removed | 25.1 s, 1.90 GB | 19.1 s, 1.46 GB |
+
+  The first read after installing this code pays the old cost once, because receipts are bound to
+  the validator code. The index status row is the cold path of Kata 17b0 with its review-event
+  replay removed; the freshness path itself, the rest of that cold cost and the `full=True` call
+  belong to Kata xv0n, whose memo (`proof_cache.py`) still carries a UTC date in its key.
+- **Not done here.** The ledger `progress` summary and the index freshness memo keep their own
+  UTC-date keys (the freshness memo is Kata xv0n's; `progress` is a view, not a store gate).
+  Document-update ingestion does not exist; a re-pinned hash is the app writing a new catalog
+  revision, which every receipt already follows as a delta.
+
 ### Lookup indexes and the `refs` table
 
 A write needs two lookups into the committed state: the current records that reference a
@@ -856,7 +943,7 @@ synthetic documents the two scans were about half of the time per document).
   rows the replayed payloads imply). Anything between, a changed definition or a missing,
   extra, altered or moved `refs` row is refused ("Catalog lookup structures are incomplete or
   differ ..."). `PRAGMA integrity_check` already covers the index pages. A forged receipt cannot hide this
-  past the daily replay or `audit`, like any other edit.
+  past `audit`, like any other edit.
 - **Schema version unchanged.** The authority data, the hash chain, every state token and the
   `contract_version` metadata are the same, so `VERSION` stays 1. Bumping it would refuse every existing
   catalog and invalidate every backup receipt (`backup_version == VERSION`) for a change that
@@ -900,9 +987,9 @@ synthetic documents the two scans were about half of the time per document).
 - The catalog receipt is **unkeyed**. For the **catalog**, an actor who rewrites the
   database *and* the receipt so that they
   agree, or who rewrites the file while restoring size, mtime, ctime and the change
-  counter, can get one write or read accepted without a replay; the next UTC day's
-  full check, `status --audit` and backup verification replay all history and
-  refuse. For the **intake ledger** nothing is trusted on the strength of a stored
+  counter, can get a write or read accepted without a replay; `status --audit`, the scheduled
+  audit and backup verification replay all history and refuse (no longer the next UTC day's
+  read or write: Kata 91h5). For the **intake ledger** nothing is trusted on the strength of a stored
   marker any more (Kata qwtp): a writer checks structure only, so an edit that keeps SQLite
   sound (a changed digest or status) is served to writers until `intake.cli audit` or a
   `progress` read verifies it, with no daily bound. Catalog audit and
@@ -911,17 +998,17 @@ synthetic documents the two scans were about half of the time per document).
   (`test_the_documented_residual_a_digest_edit_is_served_to_writers_until_audit`).
 - What the byte-hash binding saw and the identity binding does not: silent media
   corruption with no write through the OS, and an identity-restoring edit. Both
-  are now caught at the next daily full check or audit, a window of at most one UTC
-  day. Everything else refuses at the next read or write: SQLite edits, raw
+  are caught by the next audit (`status --audit`, `tools.store_audit`); there is no daily full
+  check any more (Kata 91h5), so the window is the audit interval the owner schedules. Everything else refuses at the next read or write: SQLite edits, raw
   same-size `pwrite`s (even with mtime restored, because `utime` moves ctime), a
   replaced file, a restored older file.
 - Evidence: `tests/test_catalog_identity_binding.py` (`test_raw_same_size_edit_is_refused`,
   `test_raw_edit_with_restored_mtime_is_refused_because_utime_moves_ctime`,
-  `test_residual_identity_restoring_edit_is_served_until_the_next_utc_day`,
+  `test_residual_identity_restoring_edit_is_served_until_an_audit_whatever_the_day`,
   `test_audit_always_replays`), `tests/test_catalog_delta_commit.py`
   (`test_forged_receipt_for_other_bytes_does_not_vouch_for_tampered_bytes`,
-  `test_first_write_of_each_day_replays_in_full_even_with_a_matching_forged_receipt`,
-  `test_documented_residual_forged_receipt_is_trusted_until_the_next_daily_snapshot`).
+  `test_first_write_of_each_day_no_longer_replays_so_a_forged_receipt_is_found_by_the_audit`,
+  `test_documented_residual_forged_receipt_is_trusted_until_an_audit`).
   The ledger has no receipt to forge: writers check structure only (see "Intake ledger"), and that
   residual is pinned by `CadenceTests` as above (Kata yy1k, qwtp).
 - **Never close a descriptor on a database file while a connection to it is open
@@ -994,10 +1081,10 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   maintain. Tests: `tests/test_store_busy.py` (a writer can take EXCLUSIVE while batch reads
   page their results; bounded retry; settle retry), `tests/test_progress_scale.py`
   (`CatalogTests`: a large catalog is never inspected or hashed).
-- **Invalidation.** Any commit (by this or another process), restore, swapped file,
-  same-size edit (even with a restored mtime, because `utime` moves ctime), changed
-  contract or new UTC day misses and revalidates everything with the unchanged
-  refusals. `event_store.py audit` (and `status(audit=True)`) always replays
+- **Invalidation.** Any commit (by this or another process) is verified as a delta; a restore,
+  swapped file, same-size edit (even with a restored mtime, because `utime` moves ctime) or
+  changed contract, validator code or runtime misses and revalidates everything with the
+  unchanged refusals. A new UTC day no longer does (Kata 91h5). `event_store.py audit` (and `status(audit=True)`) always replays
   and first forgets the file, so a refusing audit leaves nothing to serve.
 - **Cost.** Synthetic, zero-latency stub, concurrency 1, `nice`d on a shared host
   (`qualify` per-entry serial ms, first decile to last decile): 400 documents 89 to 432
@@ -1017,8 +1104,8 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   against that index. Any failure of the delta falls back to the full pass, which refuses with
   its exact message. **Rows before the remembered head are not read again until the next full
   check**: `audit`, a backup, publication (`read_snapshot(root, full=True)`, used by
-  `standing_publication.authorize_publication` and by index build and freshness, so publication still re-validates
-  everything it serves), the first check of a new UTC day, a different contract, a swapped file,
+  `standing_publication.authorize_publication` and by index build, so publication still re-validates
+  everything it serves), a different contract, a swapped file,
   or any identity change SQLite did not make (an out-of-band write leaves the counter alone and
   is refused at once, as before). The residual below widens by one case: an edit to an old
   row that also bumps the change counter and leaves the heads alone is served until that next
@@ -1029,9 +1116,10 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   existing refusal still refuses), `tests/test_standing.py`.
 - **Residual** (the catalog receipt's, 0017). The memo is unkeyed. An edit that restores
   size, mtime, ctime and the change counter *and* leaves the last event and batch hashes
-  and the correction count unchanged is served from the memo until this process's first
-  validation of the next UTC day, a restart of the process, or an audit, which replay
-  everything and refuse. It is not a defense against an actor who can write the file.
+  and the correction count unchanged is served, by this process's memo and by the persisted
+  receipt in any new process, until an audit (`status --audit`, `tools.store_audit`), which
+  replays everything and refuses; a refusing audit also deletes the receipt, so no later reader
+  trusts the file. It is not a defense against an actor who can write the file.
   Evidence: `tests/test_review_event_memo.py` (reuse, same-size edit with and without
   restored mtime, swapped and swapped-tampered file, a connection opened before a swap,
   a concurrent writer process's commit, an overlapping commit, the stated residual and its
