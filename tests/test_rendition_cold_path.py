@@ -3,7 +3,10 @@ import copy
 import random
 import re
 import unittest
+from unittest.mock import patch
 
+from tests.support import WorkspaceCase
+from tests import test_workspace
 from tools.context_index import context_index as index
 from tools.context_index import renditions
 
@@ -128,3 +131,61 @@ class TextMapping(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParallelIdentity(WorkspaceCase):
+    """The forked identity check yields the sequential identity, or defers to the sequential check's error."""
+    selected_text = test_workspace.WorkspaceTests.selected_text
+
+    def setUp(self):
+        super().setUp()
+        self.prepared = self.selected_text()
+        self.config["renditions"] = [self.config["renditions"][0]]
+        self.config, self.checksum = index.load_manifest(self.manifest, self.root)
+
+    def identity(self, minimum):
+        with patch.object(renditions, "PARALLEL_MIN", minimum), patch.object(renditions, "PARALLEL_WORKERS", 2):
+            reads = set()
+            digest = renditions.inputs(self.root, self.config, index.rendition_api(self.root),
+                                       review_snapshot=None, reads=reads, keep=False)[1]
+        return digest, reads
+
+    def test_parallel_identity_and_reads_equal_the_sequential_ones(self):
+        sequential = self.identity(10 ** 9)
+        answers = []
+        real = renditions._parallel_identity
+
+        def recording(*args):
+            answers.append(real(*args))
+            return answers[-1]
+        with patch.object(renditions, "_parallel_identity", recording):
+            forked = self.identity(1)
+        self.assertEqual(len(answers), 1)
+        self.assertIsNotNone(answers[0], "the workers did the check")
+        self.assertEqual(forked, sequential)
+        self.assertTrue(sequential[1])
+
+    def test_a_failing_check_reports_the_sequential_error(self):
+        extraction = self.root / self.prepared["rendition"]
+        extraction.write_bytes(extraction.read_bytes() + b" ")
+        with self.assertRaises(index.IndexError_) as sequential:
+            self.identity(10 ** 9)
+        with self.assertRaises(index.IndexError_) as forked:
+            self.identity(1)
+        self.assertEqual(str(forked.exception), str(sequential.exception))
+
+    def test_a_broken_pool_falls_back_to_the_sequential_check(self):
+        expected = self.identity(10 ** 9)
+        with patch("concurrent.futures.ProcessPoolExecutor", side_effect=OSError("no processes")):
+            self.assertEqual(self.identity(1), expected)
+
+    def test_a_worker_that_reports_failure_discards_the_parallel_result(self):
+        expected = self.identity(10 ** 9)
+        with patch.object(renditions, "_identity_chunk", return_value=None):
+            self.assertEqual(self.identity(1), expected)
+
+    def test_keeping_payloads_never_forks(self):
+        with patch.object(renditions, "PARALLEL_MIN", 1), \
+                patch.object(renditions, "_parallel_identity", side_effect=AssertionError("forked")):
+            selected, digest = renditions.inputs(self.root, self.config, index.rendition_api(self.root))
+        self.assertEqual(len(selected), 1)
