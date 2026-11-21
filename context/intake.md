@@ -791,7 +791,7 @@ can only block again. Run
 
 The dry run counts `candidates`: chain heads that are a blocked `extract-prepare` whose last attempt
 failed with `CODE`. `--apply` stages a correction `<root>-c<n>` repeating each one's operation and
-arguments and runs nothing; the next `ingest` (or `qualify`) follows `correction_of` to it, converts it
+arguments and runs nothing (a multi-stage request is counted in `skipped`); the next `ingest` (or `qualify`) follows `correction_of` to it, converts it
 with the other open extractions (`--extract-concurrency`), registers it, and it is then reviewed and
 selected like any other rendition. A source or toolkit that still fails blocks the correction again.
 Repaired chains are not candidates again. Run it while no ingest is writing.

@@ -8,14 +8,16 @@ from .contracts import IntakeError
 
 
 def _blocked_heads(root, operation, code):
-    """Chain heads whose ``operation`` stage is blocked and whose last attempt failed with ``code``."""
+    """``(correlation ID, stage, stage count)`` of the chain heads whose ``operation`` stage is blocked
+    and whose last attempt failed with ``code``."""
     found = []
     with store.locked(root) as c:
         rows = c.execute("SELECT s.correlation_id, s.ordinal, r.raw FROM stages s "
                          "JOIN requests r USING(correlation_id) WHERE s.status='blocked' "
                          "ORDER BY s.correlation_id").fetchall()
         for row in rows:
-            stage = contracts.decode_request(row["raw"])["stages"][row["ordinal"]]
+            stages = contracts.decode_request(row["raw"])["stages"]
+            stage = stages[row["ordinal"]]
             if stage["operation"] != operation:
                 continue
             if c.execute("SELECT 1 FROM requests WHERE correction_of=?", (row["correlation_id"],)).fetchone():
@@ -24,13 +26,14 @@ def _blocked_heads(root, operation, code):
                              "ORDER BY cycle DESC, ordinal DESC LIMIT 1",
                              (row["correlation_id"], stage["id"])).fetchone()
             if last is not None and last[0] == code:
-                found.append((row["correlation_id"], stage))
+                found.append((row["correlation_id"], stage, len(stages)))
     return found
 
 
 def _identity_blocked(root):
     """Chain heads that are blocked ``extract-register`` stages refused as a changed identity."""
-    return _blocked_heads(root, "extract-register", "changed-extraction-identity")
+    return [(corr, stage) for corr, stage, _ in
+            _blocked_heads(root, "extract-register", "changed-extraction-identity")]
 
 
 def _root_of(root, corr):
@@ -139,10 +142,17 @@ def recover_blocked_extractions(root, code, *, apply=False):
     follows ``correction_of`` to it and converts it like any other open extraction (PDFs and images
     concurrently), then registers it. The correction pins today's extractor when it first prepares,
     so a source or toolkit that still fails blocks it again. Repaired chains are not candidates again.
+    Only the single-stage requests that cohort ingest stages are corrected; a multi-stage request
+    is counted in ``skipped`` and untouched.
     """
     root = Path(root).resolve()
-    work = [corr for corr, _ in _blocked_heads(root, "extract-prepare", code)]
-    report = {"apply": apply, "code": code, "candidates": len(work)}
+    work, skipped = [], Counter()
+    for corr, _, count in _blocked_heads(root, "extract-prepare", code):
+        if count == 1:
+            work.append(corr)
+        else:
+            skipped["multi-stage"] += 1
+    report = {"apply": apply, "code": code, "candidates": len(work), "skipped": dict(skipped)}
     if not apply:
         return report
     results = Counter()

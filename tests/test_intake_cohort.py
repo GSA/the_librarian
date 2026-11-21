@@ -244,9 +244,18 @@ class IngestTests(CohortCase):
             return real(root, stage)
         with unittest.mock.patch.object(adapters, "prepare", side_effect=mutation):
             cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+            (blocked,) = [s for s in store.list_requests(self.root) if s["stages"][0]["status"] == "blocked"]
+            (prepare,) = store.request(self.root, blocked["correlation_id"])["stages"]
+            register = {"id": "register", "kind": "extraction", "operation": "extract-register",
+                        "arguments": {**prepare["arguments"], "actor": "operator",
+                                      "expected_state": catalog.status(self.root)["state_token"]}}
+            store.stage_request(self.root, "multi", [prepare, register])
+            calls.clear()
+            runner.settle(self.root, "multi", "prepare")
         self.assertEqual(cohort.recover_blocked_extractions(self.root, "native-input")["candidates"], 0)
         self.assertEqual(cohort.recover_blocked_extractions(self.root, "extract-mutation"),
-                         {"apply": False, "code": "extract-mutation", "candidates": 1})
+                         {"apply": False, "code": "extract-mutation", "candidates": 1,
+                          "skipped": {"multi-stage": 1}})
         applied = cohort.recover_blocked_extractions(self.root, "extract-mutation", apply=True)
         self.assertEqual(applied["results"], {"staged": 1})
         report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
