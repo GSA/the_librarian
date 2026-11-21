@@ -29,8 +29,21 @@ through intake, which records its SHA-256 and size in the catalog. Those recorde
   re-extraction) reads it with `integrity.read_verified(root, path)`, which checks that one file's SHA-256
   against the catalog's current pin and raises `IntegrityMismatch` instead of returning changed bytes.
 
+## What readers show after an audit
+
+`audit --record` also writes the result beside the index (`<index>.sqlite3.integrity.json`, private,
+checksummed, tied to that index file). Readers then mark each affected document (the extraction itself,
+and every rendition made from a changed original or whose submission sidecar changed) with the
+low-confidence reason `integrity-changed` instead of failing: the text is what was verified at ingest, but
+do not cite its source locations as verified, and say so when you cite it. `search --low-confidence
+exclude` leaves flagged documents out. `status` and the progress page give the count, the list and the
+command to resolve it; `integrity: audit none-for-this-index` means no audit has been recorded, not that
+the files are clean. A rebuild clears the flags (it verified every selected file); re-run the audit.
+`build` refuses to publish while a selected file differs from its pin, names all of them and leaves the
+current index in place.
+
 ## When the audit reports a mismatch
 
 Do not repair in place. Restore the file from backup, or re-ingest the document through intake so the
-catalog re-pins it, then rebuild the index. Treat the file's text as untrusted either way. Report an
+catalog re-pins it, then rebuild the index and re-run `audit --record`. Treat the file's text as untrusted either way. Report an
 unexplained mismatch to the owner: nobody is meant to edit these files.

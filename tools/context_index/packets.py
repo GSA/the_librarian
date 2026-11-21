@@ -6,7 +6,7 @@ import posixpath
 import re
 from urllib.parse import unquote, urlsplit
 
-from tools.context_index import confidence, corrections
+from tools.context_index import confidence, corrections, flags as integrity_flags
 from tools.context_index.context_index import (
     REFERENCE, canonical_locator, envelope, fail, get_section, visible_lines,
 )
@@ -53,8 +53,10 @@ def packet(connection, config, locator, max_chars, *, fail_fast=False, root=None
         fail("--max-chars must be a positive integer")
     requested = canonical_locator(locator, root)
     selected = get_section(connection, requested, root)
-    docs = {row["path"]: row for row in connection.execute(
-        "SELECT d.*,c.label AS confidence FROM documents d JOIN document_confidence c USING(path)")}
+    flagged = integrity_flags.load(connection)
+    docs = {row["path"]: {**row, "confidence": flagged.label_text(row["path"], row["confidence"])}
+            for row in connection.execute(
+                "SELECT d.*,c.label AS confidence FROM documents d JOIN document_confidence c USING(path)")}
     rendition_metadata = dict(connection.execute("SELECT path,payload FROM rendition_documents"))
     pieces = {}
     assembled_chars = 0

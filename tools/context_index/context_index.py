@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote
 import uuid
 
 from tools import policy
-from tools.context_index import confidence, proof_cache, renditions
+from tools.context_index import confidence, flags as integrity_flags, proof_cache, renditions
 
 
 SCHEMA = 1
@@ -503,8 +503,12 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
     computation = proof_cache.Computation(root, config)
-    selected, rendition_identity = renditions.inputs(
-        root, config, rendition_api(root), review_snapshot=review_snapshot)
+    try:
+        selected, rendition_identity = renditions.inputs(
+            root, config, rendition_api(root), review_snapshot=review_snapshot)
+    except IndexError_ as error:
+        refuse_changed_files(root, config, error)
+        raise
     expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
         existing = readonly(db)
@@ -595,6 +599,25 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
             connection.close()
         if temporary.exists():
             temporary.unlink()
+
+
+def refuse_changed_files(root, config, error):
+    """Publication refuses changed retained files explicitly: when the full verification failed, name
+    every selected file that no longer matches its pin (kind, path, problem, expected, found), not just
+    the first one opened. The prior index stays published and readable, with its documents flagged by
+    the recorded audit. Returns when no file differs, so the original refusal stands."""
+    from tools.context_index import integrity
+    try:
+        found, total = integrity.selection_mismatches(root, config, limit=20)
+    except (IndexError_, OSError, ValueError, sqlite3.Error):
+        return
+    if not total:
+        return
+    lines = [f"{item['kind']} {item['path']}: {item['problem']} (expected {item['expected']}, "
+             f"found {item['found']})" for item in found]
+    fail(f"Publication refused: {total} selected file(s) differ from the hashes recorded at ingest; "
+         "the prior index is preserved. " + "; ".join(lines) + (f"; and {total - len(found)} more" if total > len(found) else "")
+         + ". Restore them from backup or re-ingest the documents through intake, then build again.")
 
 
 def count_index(connection):
@@ -732,13 +755,17 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
     from tools.context_index import corrections
     placed = corrections.sections(connection, corrections.place(connection, corrections.load(root)))
     corrected = json.dumps(sorted(key for key, found in placed.items() if any(p["open"] for p in found)))
-    low = "(c.level='low' OR s.id IN (SELECT value FROM json_each(?)))"
+    # Documents the recorded integrity audit flagged are low confidence too (``integrity-changed``).
+    flagged = integrity_flags.load(connection)
+    changed = json.dumps(sorted(flagged.documents))
+    low = ("(c.level='low' OR s.id IN (SELECT value FROM json_each(?)) "
+           "OR s.path IN (SELECT value FROM json_each(?)))")
     order = " ORDER BY " + (low + "," if low_confidence == "last" else "")
     rows = connection.execute(
         "SELECT s.*,d.role,c.label AS confidence,snippet(search_fts,1,'','',' … ',36) AS excerpt "
         + matching + (" AND NOT " + low if low_confidence == "exclude" else "")
         + order + "bm25(search_fts),s.path,s.line_start LIMIT ?",
-        [*parameters, *([corrected] if low_confidence != "include" else []), limit],
+        [*parameters, *([corrected, changed] if low_confidence != "include" else []), limit],
     ).fetchall()
     hits, labels = [], []
     for row in rows:
@@ -747,7 +774,7 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
             "role": row["role"], "line_start": row["line_start"], "line_end": row["line_end"],
             "excerpt": row["excerpt"][:600], "caveat": DISCOVERY,
         }
-        label = json.loads(row["confidence"])
+        label = flagged.apply(row["path"], json.loads(row["confidence"]))
         labels.append(corrections.flag_hit(hit, label, placed.get(row["id"])))
         origin = confidence.origin_label(label)
         if origin is not None:
@@ -771,7 +798,7 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
                       confidence=confidence.summary(labels))
     if low_confidence == "exclude":
         result["low_confidence_excluded"] = connection.execute(
-            "SELECT count(*) " + matching + " AND " + low, [*parameters, corrected]).fetchone()[0]
+            "SELECT count(*) " + matching + " AND " + low, [*parameters, corrected, changed]).fetchone()[0]
     if not hits and result.get("low_confidence_excluded"):
         result["filtered"] = {
             "classification": "low-confidence-excluded",

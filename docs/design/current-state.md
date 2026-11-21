@@ -358,7 +358,9 @@ restated here.
   version-2 descriptor declares `origin.agent_generated: {generator, generated_on,
   source_commit}`; the hash-pinned `submission.json` sidecar is read at build and a missing,
   changed or malformed one fails the build) and `open-correction` (added at read time by
-  `with_reason` for an open claim correction, below; never stored in the index). Markdown documents are `normal`. `search` hits carry `{level, reasons:
+  `with_reason` for an open claim correction, below; never stored in the index) and
+  `integrity-changed` (read-time, document-level, from the recorded integrity audit; see the
+  [integrity audit](#index-freshness-from-ingest-pins-and-the-integrity-audit-kata-xv0n-earlier-t5df-17b0)). Markdown documents are `normal`. `search` hits carry `{level, reasons:
   [codes]}` and `--low-confidence include|last|exclude` (default `include`, rank order) ranks
   low hits after normal ones or leaves them out while counting them in
   `low_confidence_excluded` (an empty result caused only by that filter reports
@@ -1176,6 +1178,63 @@ flags an unexpected change; it does not defend against one in real time, on ever
   audit writes nothing under the instance), never fails a read, and exits 0 clean, 1 with mismatches, 2 when it
   could not run (for a scheduler to alert on). `check PATH...` verifies named files the same way.
   README.md ("Integrity audit") shows a cron and a systemd timer. Evidence: `tests/test_integrity.py`.
+- **Flagging a changed file per document** (Kata ejm8; `tools/context_index/flags.py`). A changed file
+  does not fail the index; the document it belongs to is served **marked**, not withheld. Decision: the
+  served text, locators and labels come from the index database, which was built from files verified
+  at ingest, so a changed extraction, original or sidecar does not make that text wrong; what it
+  undermines is the citation target (`source_location` into the original or extraction) and an
+  `agent-generated` origin read from a sidecar. The document therefore gets the low-confidence reason
+  `integrity-changed` (`confidence.REASONS`; details name the kind, path, problem and when the audit found
+  it), its correction is "restore from backup or re-ingest through intake, rebuild, re-audit", and every
+  other document is untouched. Withholding was rejected: it would hide verified ingest-time text and make
+  one bad file an availability failure, against the owner's detect-and-flag direction.
+  - **Where the flag comes from.** Reads still hash nothing. `integrity audit --record` (optionally
+    `--db`) writes the audit result to a private (0600), checksummed report beside the index,
+    `<index>.sqlite3.integrity.json` (ignored like the database), recording the index database's file
+    identity, the audit start time, files checked, mismatch count and up to 5,000 mismatches (path, kind,
+    problem, expected, found, receipt). It is the only thing `--record` writes, never inside the data
+    roots; plain `audit` still writes nothing. A reader loads it once per call (one small file) and
+    ignores it unless it is private, owned by the user, within 8 MiB, checksum-valid and recorded for the
+    very database being read; a rebuild replaces the database, so its flags end with it, and an audit
+    that started before the index was replaced records nothing. A missing, corrupt, forged or foreign
+    report means no flags: this is detection, not access control, and a forger who can write the index's
+    `.local` directory has the same trust as the index database itself. A later clean audit clears a flag.
+  - **Which documents.** A mismatch flags the indexed document at the same path (an extraction), and every
+    selected rendition whose `source.path` is a changed original or whose receipt's sidecar changed (one
+    `rendition_documents` pass over the index, no file read).
+  - **Where it shows.** `search` hits and `get`/`get-many` pieces and documents carry the reason and the
+    top-level legend explains it; `--low-confidence last|exclude` treat flagged documents like other low
+    ones (counted in `low_confidence_excluded`). `status` adds `integrity: {audit, audited_at, checked,
+    mismatches, flagged_documents, documents (at most 20, with the changed files), documents_not_listed,
+    resolve}`; with no matching report it says `audit: none-for-this-index` and how to record one rather
+    than implying a clean index. The progress text and page show the same count, list and command, and the
+    paths and hashes in them are untrusted text (escaped, truncated to 200 characters). The stored label is
+    unchanged, so an index is not stale for the reason and needs no rebuild beyond the one this code
+    change causes (engine fingerprint).
+  - **Publication.** Build and the publication guards still verify every selected file in full. When that
+    fails, `build` now names every selected file that differs from its pin (kind, path, problem, expected,
+    found; the first 20 and a count), refuses to publish, and leaves the prior index in place, still
+    readable and flagged. Partial publication that excludes mismatched selections was not built: it would
+    change the manifest/index relationship and the intake publication evidence; re-ingest and select the
+    repaired document instead. A failure that is not a changed file keeps its own message.
+  - **Changed guarantee.** Until now a changed retained file, once detected, took no part in reads; xv0n
+    made it a non-failure and left detection to a report nobody read at read time. Now a read surfaces the
+    last recorded audit's finding on the affected document only. The guarantee that a mismatched file is
+    never *published* is unchanged (build refuses). Freshness still does not read files, so a change
+    made after the last recorded audit is not flagged until the next one (the audit schedule bounds it;
+    `read_verified` still refuses one file at a time).
+  - Evidence (`tests/test_integrity_flags.py`):
+    `::test_a_changed_file_flags_its_document_and_every_other_document_still_serves`,
+    `::test_a_changed_original_flags_the_documents_extracted_from_it`,
+    `::test_low_confidence_exclude_and_last_treat_a_flagged_document_like_any_low_one`,
+    `::test_a_clean_re_audit_clears_the_flag`, `::test_a_rebuilt_index_does_not_inherit_the_old_report`,
+    `::test_a_forged_foreign_or_unsafe_report_means_no_flags`,
+    `::test_the_audit_does_not_record_for_an_index_replaced_while_it_ran`,
+    `::test_without_a_recorded_audit_status_says_so_instead_of_implying_clean`,
+    `::test_flagged_documents_are_listed_up_to_a_cap_with_the_rest_counted`,
+    `::test_get_many_labels_each_document_and_the_legend_explains_the_reason`,
+    `::test_the_progress_panel_counts_and_lists_the_flagged_documents_with_the_resolution`,
+    and `PublicationTests::test_a_build_refuses_every_changed_selected_file_at_once_and_keeps_the_prior_index`.
 - **Verified reads.** `integrity.read_verified(root, path)` opens one retained file, checks its SHA-256
   against the catalog's current pin (one hash per file actually opened) and returns the bytes or raises
   `IntegrityMismatch` with the same report entry. Any retrieval that opens an original or retained

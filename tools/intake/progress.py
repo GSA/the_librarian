@@ -715,10 +715,12 @@ def read_index(root):
         with closing(index.readonly(db)) as connection:
             reasons = index.freshness(connection, root, manifest, db, config, checksum, reuse=True)
             counts = index.count_index(connection)
+            integrity = index.integrity_flags.load(connection).summary()
     except (index.IndexError_, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         return {**failure(error), "fresh": False}
     return {"available": True, "fresh": not reasons, "reasons": reasons[:10],
-            "stale_reasons": len(reasons), "selected": selected, "indexed": counts}
+            "stale_reasons": len(reasons), "selected": selected, "indexed": counts,
+            "integrity": integrity}
 
 
 # Snapshot ------------------------------------------------------------------
