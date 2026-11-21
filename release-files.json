@@ -180,6 +180,7 @@
   "tests/test_review_event_memo.py",
   "tests/test_review_event_schema_fastpath.py",
   "tests/test_rendition_cold_path.py",
+  "tests/test_read_state.py",
   "tests/test_selection_manifest.py",
   "tools/diagnostics/ledger_verify_benchmark.py",
   "tools/diagnostics/publish_benchmark.py",
