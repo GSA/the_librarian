@@ -218,16 +218,25 @@ def origin_label(current):
     return None if found is None else "agent-generated (" + "; ".join(found["details"]) + ")"
 
 
+def is_submission_sidecar(record, original_id):
+    """Whether ``record`` is the upload submission sidecar of the original ``original_id``."""
+    return (record["kind"] == "artifact" and record["data"].get("role") == "preserved-metadata"
+            and record["data"].get("parent_id") == original_id
+            and str(record["data"].get("path", "")).endswith("/submission.json"))
+
+
+def sidecar_records(records, original_id):
+    """The submission sidecar records among ``records`` for the original ``original_id``."""
+    return [record for record in records if is_submission_sidecar(record, original_id)]
+
+
 def declared_origin(root, records, original, read, engine):
     """The ``origin`` a receipt's upload submission sidecar declares, or ``None`` without one.
 
     The sidecar is the ``preserved-metadata`` child of the original whose SHA-256 the catalog pins;
     one that is present in the catalog but missing, changed or malformed fails the build.
     """
-    meta = [record for record in records
-            if record["kind"] == "artifact" and record["data"].get("role") == "preserved-metadata"
-            and record["data"].get("parent_id") == original["id"]
-            and str(record["data"].get("path", "")).endswith("/submission.json")]
+    meta = sidecar_records(records, original["id"])
     if not meta:
         return None
     if len(meta) != 1:

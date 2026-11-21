@@ -6,11 +6,10 @@ import math
 import os
 import re
 import stat
-import threading
 from bisect import bisect_right
 from pathlib import Path, PurePosixPath
 
-from tools.context_index import confidence, qualification
+from tools.context_index import confidence, forked, qualification
 
 
 # One instance publishes a reviewed cohort (tens of thousands of files), not a hand-picked handful.
@@ -162,42 +161,133 @@ PAYLOAD_METADATA = ("precedence", "xml_sha256", "unrendered_features", "bom_byte
                     "method", "parts", "source_format", "conversion", "page_count", "unread_pages")
 
 
-def inputs(root, config, engine, review_snapshot=None, *, reads=None, keep=True):
-    """Pin selected catalog records, original bytes and retained extraction bytes.
+def inputs(root, config, engine, review_snapshot=None, *, keep=True):
+    """Verify every selected extraction, original and sidecar in full; return ``(kept, identity)``.
 
-    ``reads``, a set, receives every selected extraction, original and sidecar path read (the stores
-    are the caller's to name). Without ``keep`` only the identity is returned, so a freshness check
-    holds one extraction at a time instead of every payload.
+    This is the publication check: it opens and re-hashes each file. Without ``keep`` only the
+    identity is returned, so one extraction is held at a time instead of every payload. The identity
+    is a function of what the catalog pinned (``pin_identity``), the same value ``pinned_identity``
+    computes without opening any file.
     """
     selections = config.get("renditions", [])
     if not selections:
         return [], ""
-    checked = _checker(root, engine)
-
-    def no_symlinks(path):
-        path = checked(path)
-        if reads is not None:
-            reads.add(path)
-        return path
+    no_symlinks = _checker(root, engine)
     catalog = engine.load_catalog()
-    if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
-            and review_snapshot is None):
+    reviewed = any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
+    if reviewed and review_snapshot is None:
         review_snapshot = engine.load_event_reader().read_snapshot(root, full=True)
     # One validated snapshot for every selected receipt, not one per rendition and not two.
     snapshot, receipt_records = catalog.receipt_snapshot(
         root, [item["receipt_id"] for item in selections], limit=100)
     work = _Work(root, engine, catalog, snapshot, receipt_records, review_snapshot, no_symlinks)
+    review_state = review_snapshot.state["state_token"] if reviewed else None
     if not keep and len(selections) >= PARALLEL_MIN:
-        found = _parallel_identity(work, selections, reads)
+        found = _parallel_identity(work, selections)
         if found is not None:
-            return [], found
-    result, identities = [], []
+            return [], engine.digest(_combine(found, review_state).encode("utf-8"))
+    result, pieces = [], []
     for item in selections:
-        identity, kept = _check_selection(work, item)
+        piece, kept = _check_selection(work, item)
         if keep:
             result.append(kept)
-        identities.append(identity)
-    return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
+        pieces.append(piece)
+    return result, engine.digest(_combine(pieces, review_state).encode("utf-8"))
+
+
+def _combine(pieces, review_state):
+    """The text a selection identity is hashed from: each selection's identity JSON, in order."""
+    return "[" + json.dumps(review_state) + ", [" + ", ".join(pieces) + "]]"
+
+
+def pinned_identity(root, config, engine, review_snapshot=None):
+    """The selection identity from what the stores pin, opening no selected file (Kata xv0n).
+
+    The catalog records each selection's original, rendition, relationship and submission sidecar
+    with the SHA-256 and size taken at ingest; review events bind the reviewed selections. Equal pins
+    give the identity ``inputs`` computed after its full verification, so an index built from files
+    that verified then is fresh while those pins and the review state are unchanged. A changed file is
+    ``integrity.audit``'s to report, not this check's to refuse. Reading only the stores, it returns
+    in seconds regardless of how many bytes the selected files hold.
+    """
+    selections = config.get("renditions", [])
+    if not selections:
+        return ""
+    from tools.catalog import pins
+    reviewed = any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
+    if reviewed and review_snapshot is None:
+        review_snapshot = engine.load_event_reader().read_snapshot(root)
+    review_state = review_snapshot.state["state_token"] if reviewed else None
+    pieces = []
+    with pins.snapshot(root) as snapshot:
+        for start in range(0, len(selections), pins.CHUNK):
+            part = selections[start:start + pins.CHUNK]
+            receipts = snapshot.texts(item["receipt_id"] for item in part)
+            heads = {receipt_id: json.loads(text) for receipt_id, text in receipts.items()}
+            originals = snapshot.texts(head["data"]["artifact_id"] for head in heads.values())
+            sidecars = snapshot.sidecars(originals)
+            related = snapshot.texts(
+                name for item in part for name in _rendition_ids(item))
+            for item in part:
+                pieces.append(_pinned_piece(item, receipts, heads, originals, sidecars, related, engine))
+    return engine.digest(_combine(pieces, review_state).encode("utf-8"))
+
+
+def _rendition_ids(item):
+    run = PurePosixPath(item["path"]).parts[-2]
+    prefix = "docling" if item["format"] == "docling" else "extract"
+    return "A-" + prefix + "-" + run, "R-" + prefix + "-" + run
+
+
+def _pinned_piece(item, receipts, heads, originals, sidecars, related, engine):
+    """One selection's identity JSON from the stored record texts; refuses what the pins contradict."""
+    try:
+        receipt = heads[item["receipt_id"]]
+        original_id = receipt["data"]["artifact_id"]
+        original_text = originals[original_id]
+        child_id, relation_id = _rendition_ids(item)
+        child_text, relation_text = related[child_id], related[relation_id]
+    except KeyError:
+        engine.fail("Rendition/source registration mismatch: " + item["path"])
+    if receipt["kind"] != "receipt":
+        engine.fail("Rendition/source registration mismatch: " + item["path"])
+    submission = [text for text in sidecars.get(original_id, ())
+                  if confidence.is_submission_sidecar(json.loads(text), original_id)
+                  and json.loads(text)["data"]["receipt_id"] == item["receipt_id"]]
+    _check_pins(item, json.loads(original_text), json.loads(child_text), json.loads(relation_text),
+                submission, engine)
+    return _piece(item, [receipts[item["receipt_id"]], original_text, child_text, relation_text,
+                         *sorted(submission)])
+
+
+def _piece(item, texts):
+    """The identity JSON of one selection: its manifest fields and the SHA-256 of each stored pin text."""
+    selection = {key: item[key] for key in ("path", "sha256", "receipt_id", "format")}
+    if "review_event_ids" in item:
+        selection["review_event_ids"] = item["review_event_ids"]
+    return json.dumps({"selection": selection,
+                       "pins": [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts]},
+                      sort_keys=True)
+
+
+def _check_pins(item, original, child, relation, submission, engine):
+    """What the catalog records alone must say for ``item`` to be a registered rendition of its original."""
+    data, child_data = original["data"], child["data"]
+    relation_data = relation["data"]
+    expected_child = {
+        "path": item["path"], "sha256": item["sha256"], "parent_id": original["id"],
+        "role": "generated-rendition", "presence": "present", "coverage": "indexed",
+        "handling_refs": data["handling_refs"], "audience": data["audience"],
+    }
+    expected_relation = {"from_id": child["id"], "to_id": original["id"], "relation": "rendition-of"}
+    if (data["role"] != "original" or data["presence"] != "present" or data["coverage"] == "excluded"
+            or any(child_data.get(key) != expected for key, expected in expected_child.items())
+            or any(relation_data.get(key) != expected for key, expected in expected_relation.items())):
+        engine.fail("Rendition/source registration mismatch: " + item["path"])
+    if not engine.original_allowed(data["path"]):
+        engine.fail("Original source excluded by current policy")
+    if len(submission) > 1:
+        engine.fail("Ambiguous submission records for " + original["id"])
 
 
 class _Work:
@@ -210,7 +300,7 @@ class _Work:
 
 
 def _check_selection(work, item):
-    """Check one selection in full; ``(its identity, (item, raw, value, metadata, label))``."""
+    """Check one selection in full; ``(its identity JSON, (item, raw, value, metadata, label))``."""
     root, engine, catalog = work.root, work.engine, work.catalog
     registration = work.snapshot["registrations"][item["receipt_id"]]
     original = registration["artifact"]
@@ -221,8 +311,9 @@ def _check_selection(work, item):
         engine.fail("Selected rendition hash changed: " + item["path"])
     value = _load_extraction(item, raw, engine)
     run = PurePosixPath(item["path"]).parts[-2]
-    child, relation = _registered_rendition(
-        item, value, raw, registration, work.receipt_records[item["receipt_id"]], run, engine)
+    records = work.receipt_records[item["receipt_id"]]
+    child, relation = _registered_rendition(item, value, raw, registration, records, run, engine)
+    submission = confidence.sidecar_records(records["records"], original["id"])
     source = value["source"]
     original_raw = _read_original(root, source, work.no_symlinks, engine)
     if item["format"] == "text":
@@ -237,82 +328,39 @@ def _check_selection(work, item):
         validate_docling_conversion(value, engine)
     elif "review_event_ids" in item:
         review = qualification.extract(item, value, identity, work.review_snapshot, engine)
-    if review is not None:
-        identity["qualification"] = review
     origin = confidence.declared_origin(
-        root, work.receipt_records[item["receipt_id"]]["records"], original,
+        root, records["records"], original,
         lambda path: catalog.private_file(work.no_symlinks(path)), engine)
     label = confidence.for_rendition(value, review, origin)
-    identity["confidence"] = label
-    return identity, (item, raw, value, _metadata(item, value, run, review), label)
+    texts = [catalog.canonical(registration["receipt"]), catalog.canonical(original),
+             catalog.canonical(child), catalog.canonical(relation),
+             *sorted(catalog.canonical(record) for record in submission)]
+    return _piece(item, texts), (item, raw, value, _metadata(item, value, run, review), label)
 
 
 # Checking selections is independent per selection and CPU-bound, so an identity-only check of many
-# selections (a freshness proof; ``keep`` false) runs them in forked workers that share the validated
+# selections (``keep`` false) runs them in forked workers that share the validated
 # catalog and review state copy-on-write. This is an accept-only fast path: a worker that reports
 # anything but success, or any pool failure, discards the parallel result and the caller runs the same
 # checks sequentially, which fails with the exact original error.
 PARALLEL_MIN = 2000
 PARALLEL_WORKERS = 4
-_JOB = None
 
 
 def _identity_chunk(bounds):
-    """``(identity JSON, paths read)`` for selections ``bounds[0]:bounds[1]``, or None on any failure."""
-    work, selections, track = _JOB
-    reads = set()
-    work.no_symlinks = _tracked(work.no_symlinks, reads) if track else work.no_symlinks
+    """The identity JSON of selections ``bounds[0]:bounds[1]``, or None on any failure."""
+    work, selections = forked.JOB
     try:
-        pieces = [json.dumps(_check_selection(work, item)[0], sort_keys=True)
-                  for item in selections[bounds[0]:bounds[1]]]
+        return ", ".join(_check_selection(work, item)[0] for item in selections[bounds[0]:bounds[1]])
     except Exception:  # whatever it was, the sequential run reproduces and reports it
         return None
-    return ", ".join(pieces), [str(path) for path in reads]
 
 
-def _tracked(check, reads):
-    def tracked(path):
-        path = check(path)
-        reads.add(path)
-        return path
-    return tracked
-
-
-def _parallel_identity(work, selections, reads):
-    """The identity digest of ``selections`` computed in forked workers, or None to run sequentially."""
-    import concurrent.futures
-    import gc
-    import multiprocessing
-    global _JOB
-    workers = min(PARALLEL_WORKERS, os.cpu_count() or 1)
-    # Only a single-threaded process forks safely: a child inherits whatever lock another thread held.
-    if (workers < 2 or threading.active_count() > 1
-            or "fork" not in multiprocessing.get_all_start_methods()):
-        return None
-    size = -(-len(selections) // (workers * 8))
-    chunks = [(start, min(start + size, len(selections))) for start in range(0, len(selections), size)]
-    # Tracking happens in the worker; the parent's own tracker (if any) is not shared across the fork.
-    parent_tracker = work.no_symlinks
-    _JOB = (work, selections, reads is not None)
-    gc.collect()
-    gc.freeze()  # keep the collector from touching, and so copying, the shared heap in every worker
-    try:
-        with concurrent.futures.ProcessPoolExecutor(
-                max_workers=workers, mp_context=multiprocessing.get_context("fork")) as pool:
-            futures = [pool.submit(_identity_chunk, chunk) for chunk in chunks]
-            outcomes = [future.result() for future in futures]
-    except Exception:
-        return None
-    finally:
-        _JOB = None
-        work.no_symlinks = parent_tracker
-        gc.unfreeze()
-    if any(outcome is None for outcome in outcomes):
-        return None
-    if reads is not None:
-        for _, paths in outcomes:
-            reads.update(Path(path) for path in paths)
-    return work.engine.digest(("[" + ", ".join(piece for piece, _ in outcomes) + "]").encode("utf-8"))
+def _parallel_identity(work, selections):
+    """Each worker's identity JSON of ``selections``, in order, or None to run sequentially."""
+    outcomes = forked.run((work, selections), _identity_chunk, len(selections),
+                          min(PARALLEL_WORKERS, os.cpu_count() or 1))
+    return None if outcomes is None or any(outcome is None for outcome in outcomes) else outcomes
 
 
 def _load_extraction(item, raw, engine):

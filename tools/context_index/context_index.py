@@ -394,8 +394,14 @@ def readonly(path):
 
 
 def metadata_expected(root, manifest_hash, config=None, rendition_identity=None, review_snapshot=None,
-                      cache_db=None):
-    """With ``cache_db`` (an index path) a proven identity is reused while its inputs are unchanged."""
+                      *, pinned=False, cache_db=None):
+    """The metadata a fresh index carries.
+
+    The rendition identity is by default verified in full (every selected file opened and re-hashed:
+    publication). With ``pinned`` it comes from the catalog and review-event pins alone, opening no
+    selected file (a reader's freshness check; ``renditions.pinned_identity``); with ``cache_db`` (an
+    index path) a pinned identity is reused while the stores it was read from are unchanged.
+    """
     try:
         corpus_root = policy.logical_corpus_root(root)
         settings = policy.for_root(root)[0]
@@ -403,11 +409,15 @@ def metadata_expected(root, manifest_hash, config=None, rendition_identity=None,
     except ValueError as error:
         fail(str(error))
     if rendition_identity is None:
-        def compute(reads):
-            return renditions.inputs(root, config or {}, rendition_api(root), review_snapshot=review_snapshot,
-                                     reads=reads, keep=False)[1]
-        rendition_identity = (compute(None) if cache_db is None
-                              else proof_cache.identity(root, config or {}, cache_db, compute))
+        if pinned:
+            def compute():
+                return renditions.pinned_identity(root, config or {}, rendition_api(root),
+                                                  review_snapshot=review_snapshot)
+            rendition_identity = (compute() if cache_db is None
+                                  else proof_cache.identity(root, config or {}, cache_db, compute))
+        else:
+            rendition_identity = renditions.inputs(
+                root, config or {}, rendition_api(root), review_snapshot=review_snapshot, keep=False)[1]
     return {
         "schema_version": str(SCHEMA), "engine_fingerprint": engine_fingerprint(),
         "manifest_hash": manifest_hash, "corpus_root": corpus_root,
@@ -489,12 +499,12 @@ def publication_lock(db):
 
 
 def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
-    proof = proof_cache.Proof(root, config)
     review_snapshot = (load_event_reader().read_snapshot(root, full=True)
                        if any(item["format"] == "docling" for item in config.get("renditions", []))
                        else None)
+    computation = proof_cache.Computation(root, config)
     selected, rendition_identity = renditions.inputs(
-        root, config, rendition_api(root), review_snapshot=review_snapshot, reads=proof.reads)
+        root, config, rendition_api(root), review_snapshot=review_snapshot)
     expected = metadata_expected(root, manifest_hash, config, rendition_identity, review_snapshot)
     if db.exists():
         existing = readonly(db)
@@ -577,8 +587,8 @@ def build(root, manifest, db, config, manifest_hash, *, publication_guard=None):
         if publication_guard is not None:
             publication_guard()
         os.replace(temporary, db)
-        # Readers may reuse this full proof while its inputs keep their identity.
-        proof.store(db, rendition_identity)
+        # Readers reuse this identity while the stores it was read from keep their file identity.
+        computation.store(db, rendition_identity)
         return envelope(command="build", fresh=True, database=str(db), root=root, **counts)
     finally:
         if connection is not None:
@@ -609,13 +619,14 @@ def has_table(connection, name):
 def freshness(connection, root, manifest, db, config, manifest_hash, expected=None, *, reuse=False):
     """Reasons the index is stale; ``expected`` is a ``metadata_expected`` the caller just computed.
 
-    ``reuse`` (readers only, never publication) lets the rendition identity come from the proof memo
-    (``proof_cache``) while every input it was proven from is unchanged.
+    ``reuse`` (readers only, never publication) takes the rendition identity from what the catalog and
+    review events pin, without opening any selected file; ``integrity.audit`` reports a file that no
+    longer matches its pin. Publication verifies every file in full.
     """
     no_symlinks(db)
     actual = dict(connection.execute("SELECT key,value FROM metadata"))
     if expected is None:
-        expected = metadata_expected(root, manifest_hash, config, cache_db=db if reuse else None)
+        expected = metadata_expected(root, manifest_hash, config, pinned=reuse, cache_db=db if reuse else None)
     reasons = [f"metadata changed: {key}" for key in expected if actual.get(key) != expected[key]]
     if not has_table(connection, "rendition_documents"):
         return [*reasons, "rendition schema missing; run build"]

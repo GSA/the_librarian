@@ -1025,11 +1025,9 @@ class StandingExtractTests(WorkspaceCase):
                 return index.search(db, "Extract phrase", 10, None, root=self.root)["hits"][0]["confidence"]
         self.assertEqual(label(), {"level": "normal", "reasons": []})
         # The seam a converter or OCR kind uses: one RENDITION_REASONS entry, then a rebuild.
+        # A real edit of confidence.py makes readers refuse the old index through the engine
+        # fingerprint (test_workspace's engine-fingerprint test); the patch here only models the seam.
         with patch.dict(confidence.RENDITION_REASONS, {"text": "converted-format"}):
-            with closing(index.readonly(self.root / DB)) as db:
-                self.assertEqual(index.freshness(db, self.root, self.manifest, self.db,
-                                                 *index.load_manifest(self.manifest, self.root)),
-                                 ["metadata changed: rendition_identity"])
             self.build()
             self.assertEqual(label(), {"level": "low", "reasons": ["converted-format"]})
 
