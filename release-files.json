@@ -176,6 +176,7 @@
   "tests/test_publish_scale.py",
   "tests/test_review_event_contract.py",
   "tests/test_review_event_memo.py",
+  "tests/test_review_event_schema_fastpath.py",
   "tests/test_selection_manifest.py",
   "tools/diagnostics/ledger_verify_benchmark.py",
   "tools/diagnostics/publish_benchmark.py",
