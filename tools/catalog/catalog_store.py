@@ -1063,11 +1063,14 @@ def receipt_snapshot(root, receipt_ids, *, limit=25):
 
     Two calls can straddle a commit (the second then refuses the first's state as stale) and pay the
     validation, the current-record copy and its indexes twice; this pays them once and cannot straddle.
+    Each receipt's ``records`` is a sequence that decodes its records when iterated, so a caller that
+    visits one receipt at a time never holds every receipt's decoded records (about 1 GB for 40,000
+    receipts) at once; the decoded values equal those of ``read_records_by_receipt``.
     """
-    return _receipt_read(root, receipt_ids, limit=limit, registrations=True)
+    return _receipt_read(root, receipt_ids, limit=limit, registrations=True, lazy=True)
 
 
-def _receipt_read(root, receipt_ids, *, limit, expected_state=None, registrations=False):
+def _receipt_read(root, receipt_ids, *, limit, expected_state=None, registrations=False, lazy=False):
     require(type(limit) is int and limit > 0, "limit must be a positive integer")
     for receipt_id in receipt_ids:
         identifier(receipt_id, "receipt")
@@ -1116,12 +1119,42 @@ def _receipt_read(root, receipt_ids, *, limit, expected_state=None, registration
             page = members[:limit]
             result[receipt_id] = {
                 "authority": AUTHORITY, "state": state,
-                "records": [current_record(connection, record_id, "current_rows") for record_id in page],
+                "records": (_EncodedRecords(_payloads(connection, page)) if lazy else
+                            [current_record(connection, record_id, "current_rows") for record_id in page]),
                 "count": len(page), "total_matching": len(members),
                 "next_after": page[-1] if len(members) > limit else None}
         if registrations:
             return _registrations(connection, state, receipt_ids, "current_rows"), result
         return None, result
+
+
+def _payloads(connection, record_ids):
+    payloads = []
+    for record_id in record_ids:
+        row = connection.execute("SELECT payload FROM current_rows WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise MissingRecord("Record missing from authoritative catalog: " + record_id)
+        payloads.append(row["payload"])
+    return payloads
+
+
+class _EncodedRecords:
+    """A read-only sequence of records kept as their stored JSON text and decoded on each iteration."""
+
+    def __init__(self, payloads):
+        self._payloads = payloads
+
+    def __len__(self):
+        return len(self._payloads)
+
+    def __iter__(self):
+        return (decode(payload) for payload in self._payloads)
+
+    def __getitem__(self, index):
+        return decode(self._payloads[index])
+
+    def __eq__(self, other):
+        return list(self) == list(other)
 
 
 def current_record(connection, record_id, table="catalog_current"):
