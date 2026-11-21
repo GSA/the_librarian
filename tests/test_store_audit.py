@@ -14,6 +14,7 @@ from tools.catalog import catalog_store as catalog
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
 from tools.review_events import event_history, event_store as events
+from tools.review_events import review_events as contract
 from tests.test_file_identity_locks import needs_dbpage
 from tests.test_review_event_memo import add
 
@@ -106,7 +107,7 @@ class Audit(AuditCase):
         self.assertEqual(code, 1)
         self.assertFalse(flagged["review-events"]["ok"])
         event_history.clear_memo()
-        with self.assertRaises(Exception):
+        with self.assertRaises(contract.ReviewError):
             events.status(self.root)  # a new process, whose only memory is the receipt, still refuses
 
     def test_a_corrupt_newest_backup_is_flagged(self):

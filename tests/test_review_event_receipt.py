@@ -211,8 +211,8 @@ class ReceiptIsAMissNeverATrust(MemoCase):
                 self.receipt.write_bytes(self.good)
 
     def test_a_receipt_for_other_code_runtime_or_contract_is_a_miss(self):
-        for target, value in ((event_history, "_validator_sha256"), (event_history, "_runtime")):
-            with self.subTest(value), patch.object(target, value, lambda: "changed" if value == "_validator_sha256" else ["x"]):
+        for name, changed in (("_validator_sha256", lambda: "changed"), ("_runtime", lambda: ["x"])):
+            with self.subTest(name), patch.object(event_history, name, changed):
                 self.new_process()
                 calls, patched = self.full_passes()
                 with patched:

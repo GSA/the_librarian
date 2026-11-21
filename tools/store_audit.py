@@ -14,7 +14,6 @@ body-free JSON object. Run it on a schedule while no intake run holds the catalo
     17 3 * * *  cd /path/to/instance && .venv/bin/python -m tools.store_audit --root . >> .local/store-audit.log 2>&1
 """
 import argparse
-from contextlib import closing
 from datetime import datetime, timezone
 import json
 from pathlib import Path
