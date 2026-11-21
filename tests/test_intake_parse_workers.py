@@ -192,6 +192,28 @@ class IngestEquivalence(unittest.TestCase):
         self.assertEqual(outcomes[victim.relative_to(inbox).as_posix()], "changed-since-intake")
         self.assertEqual(sum(o == "extracted" for o in outcomes.values()), 5)
 
+    def test_a_parse_is_remembered_under_the_policy_it_was_submitted_with(self):
+        root, inbox = make_instance(self, 2)
+        entries = [e for e in cohort_ingest.classify(root, inbox) if e["format"] in cohort_ingest.BATCH_PREPARE]
+        self.assertTrue(entries)
+        jobs = []
+
+        class Recording:
+            def submit(self, fn, args, size, done):
+                jobs.append((fn, args, done))
+                return len(jobs)
+        before = {e["format"]: extract.fingerprint(root, e["format"]) for e in entries}
+        cohort_ingest._parse_ahead(root, inbox, entries, Recording(), {})
+        remembered = []
+        # The instance policy changes while the parses run: delivery must not relabel them with the new identity.
+        with patch.object(extract, "fingerprint", return_value="new-policy"), \
+                patch.object(extract, "remember", lambda key, payload, size: remembered.append(key)):
+            for fn, args, done in jobs:
+                done(fn(*args), None)
+        self.assertEqual(len(remembered), len(jobs))
+        for fmt, _sha, fingerprint in remembered:
+            self.assertEqual(fingerprint, before[fmt])
+
     def test_an_invalid_worker_count_is_refused_before_anything_runs(self):
         root, inbox = make_instance(self, 2)
         for bad in (0, "2"):

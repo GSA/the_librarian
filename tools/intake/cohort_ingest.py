@@ -935,7 +935,7 @@ def preparse(format_name, raw, settings):
     return hashlib.sha256(raw).hexdigest(), extract.parse_payload(format_name, raw, None, settings)
 
 
-def _parse_ahead(root, inbox, chunk, pool, failed, fingerprints):
+def _parse_ahead(root, inbox, chunk, pool, failed):
     """Queue the parse of a chunk's text-family documents in ``pool``; return the last job's sequence number.
 
     A finished parse is remembered (``extract.remember``, keyed by format, source hash and extractor
@@ -946,6 +946,7 @@ def _parse_ahead(root, inbox, chunk, pool, failed, fingerprints):
     and fails alone, and a later run reads it afresh.
     """
     last, settings = None, None
+    identity = {}  # format -> extractor fingerprint of the policy captured at submission, not at delivery
     for entry in chunk:
         fmt = entry["format"]
         if fmt not in BATCH_PREPARE:
@@ -953,16 +954,16 @@ def _parse_ahead(root, inbox, chunk, pool, failed, fingerprints):
         try:
             raw = upload.read_file(source_path(inbox, entry), upload.FORMATS[fmt][1])
             settings = settings or policy.for_root(root)[0]
+            if fmt not in identity:
+                identity[fmt] = extract.fingerprint(root, fmt)
         except (IntakeError, OSError):
             continue  # the ledger stages report a missing or changed source as they always did
 
-        def remember(result, error, entry=entry, fmt=fmt, size=len(raw)):
+        def remember(result, error, entry=entry, fmt=fmt, size=len(raw), fingerprint=identity[fmt]):
             if isinstance(error, parse_pool.WorkerDied):
                 failed[entry["relative"]] = {"outcome": "failed", "stage": "prepare", "code": "parse-worker-died"}
             elif error is None and result[0] == entry["sha256"]:
-                if fmt not in fingerprints:
-                    fingerprints[fmt] = extract.fingerprint(root, fmt)
-                extract.remember((fmt, result[0], fingerprints[fmt]), result[1], size)
+                extract.remember((fmt, result[0], fingerprint), result[1], size)
         sequence = pool.submit(preparse, (fmt, raw, settings), len(raw), remember)
         last = sequence if sequence is not None else last
     return last
@@ -975,20 +976,20 @@ def _process_all(root, inbox, todo, system, actor, batch_size, stats, concurrenc
     """
     # One correction-chain index serves every entry, so following chains never rescans the ledger.
     heads = store.Heads()
-    pending, failed, fingerprints = [], {}, {}
+    pending, failed = [], {}
     chunks = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
     pool = pool or parse_pool.Workers(1)
     ahead = None  # last job of the chunk queued ahead
     # Room for this chunk's parses and the next chunk's (still bounded by ``extract._KEEP_BYTES`` of source).
     with extract.keeping_parsed(2 * batch_size):
         if pool.parallel and chunks:
-            ahead = _parse_ahead(root, inbox, chunks[0], pool, failed, fingerprints)
+            ahead = _parse_ahead(root, inbox, chunks[0], pool, failed)
         for number, chunk in enumerate(chunks):
             if pool.parallel:
                 pool.deliver_through(ahead)
             results = {e["relative"]: failed.pop(e["relative"]) for e in chunk if e["relative"] in failed}
             if pool.parallel and number + 1 < len(chunks):
-                ahead = _parse_ahead(root, inbox, chunks[number + 1], pool, failed, fingerprints)
+                ahead = _parse_ahead(root, inbox, chunks[number + 1], pool, failed)
             todo_now = [e for e in chunk if e["relative"] not in results]
             if todo_now and batch_size == 1:
                 results.update({todo_now[0]["relative"]: _settled(root, inbox, todo_now[0], system, actor, heads)})
