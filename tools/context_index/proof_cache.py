@@ -1,15 +1,16 @@
-"""Ignored local memo of the expensive half of the index freshness proof (Kata t5df).
+"""Ignored local memo of the index freshness identity (Kata t5df; simplified by Kata xv0n).
 
-``renditions.inputs`` replays the whole review-event history, validates the catalog and re-reads
-and re-validates every selected extraction, original and submission sidecar to compute an index's
-``rendition_identity``. A reader (``status``, ``search``, ``get``, ``get-many``, claim corrections and
-the progress page) reuses an identity proven earlier only while the toolkit code, runtime, policy,
-instance roots, selections and UTC date are unchanged and every file and directory the proof read
-keeps its exact identity. Any other state, or any doubt, recomputes it in full. Publication (build and
-the publication guards) never reuses one; build only leaves one behind.
+``renditions.pinned_identity`` reads the catalog's pins for every selection and the review-event
+state: seconds on a 40,000-selection instance, no selected file opened. A reader (``status``,
+``search``, ``get``, ``get-many``, claim corrections, the progress page) reuses an identity computed
+earlier while the toolkit code, runtime, policy, instance roots and selections are unchanged and
+the catalog and review-event stores keep the exact file identity they had. Any other state, or any
+doubt, recomputes it. Publication never reuses one; build leaves its identity behind.
+
+The memo signs only the two stores. It no longer signs selected files (they are not inputs of the
+identity) and has no daily expiry (a change to a retained file is ``integrity.audit``'s to report).
 """
 
-from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
 import json
@@ -25,11 +26,12 @@ import uuid
 from tools import policy
 
 
-FORMAT = 1
-# A proof whose inputs changed this close to its start is not remembered: a later change could keep
-# the same coarse timestamp (git's "racily clean" rule). Every write moves ctime, which utime cannot set.
+FORMAT = 2
+# A store changed this close to the start of a computation is not remembered: a later change could
+# keep the same coarse timestamp (git's "racily clean" rule). Every write moves ctime, which utime
+# cannot set.
 RACY_NS = 2_000_000_000
-LIMIT = 256 * 1024 * 1024
+LIMIT = 1024 * 1024
 TOOLKIT = Path(__file__).resolve().parents[1]
 CODE_SUFFIXES = (".py", ".json", ".sql")
 RUNTIME_DISTRIBUTIONS = ("jsonschema", "referencing")
@@ -46,13 +48,13 @@ def location(db):
 
 
 def needs_review(config):
-    """Whether ``renditions.inputs`` reads the review-event history for this selection."""
+    """Whether the identity reads the review-event state for this selection."""
     return any(item["format"] == "docling" or "review_event_ids" in item
                for item in config.get("renditions", []))
 
 
 def _code():
-    """Every toolkit source and schema file, so any code a proof may run is part of its key."""
+    """Every toolkit source and schema file, so any code a computation may run is part of its key."""
     result = hashlib.sha256()
     for directory, names, files in os.walk(TOOLKIT):
         names[:] = sorted(name for name in names if not name.startswith(".") and name != "__pycache__")
@@ -78,7 +80,7 @@ def _runtime():
 def _key(root, config):
     root = Path(root)
     return hashlib.sha256(json.dumps({
-        "format": FORMAT, "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "root": str(root),
+        "format": FORMAT, "root": str(root),
         "renditions": json.dumps(config.get("renditions", []), sort_keys=True),
         "policy": policy.fingerprint(root), "roots": policy.validate_instance_roots(root),
         "code": _code(), "runtime": _runtime(),
@@ -97,25 +99,11 @@ def _sidecar_free(stores):
     return not any(os.path.lexists(str(store) + suffix) for store in stores for suffix in STORE_SIDECARS)
 
 
-def _file(path):
+def _signature(path):
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError("not a regular file")
     return [info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
-
-
-def _directory(path):
-    info = os.lstat(path)
-    if not stat.S_ISDIR(info.st_mode):
-        raise ValueError("not a directory")
-    return [info.st_dev, info.st_ino, info.st_mode]
-
-
-def _relative(root, path):
-    name = os.path.relpath(os.path.abspath(path), root)
-    if name == os.curdir or name == os.pardir or name.startswith(os.pardir + os.sep) or os.path.isabs(name):
-        raise ValueError("outside the instance root")
-    return name
 
 
 def _checksum(record):
@@ -155,68 +143,62 @@ def _write(path, record):
 
 
 def lookup(root, config, db):
-    """The remembered identity when every recorded input is exactly as proven, else None."""
+    """The remembered identity when both stores are exactly as it was computed from, else None."""
     root = str(root)
     try:
         saved = _read(location(db))
         if saved is None or saved.get("key") != _key(root, config) or not isinstance(saved.get("identity"), str):
             return None
-        if not _sidecar_free(_stores(root, config)):
+        stores = _stores(root, config)
+        if not _sidecar_free(stores):
             return None
-        for name, signature in saved["directories"].items():
-            if _directory(os.path.join(root, name) if name != os.curdir else root) != signature:
+        for name, signature in saved["stores"].items():
+            if _signature(os.path.join(root, name)) != signature:
                 return None
-        for name, signature in saved["files"].items():
-            if _file(os.path.join(root, name)) != signature:
-                return None
+        if set(saved["stores"]) != {os.path.relpath(store, root) for store in stores}:
+            return None
         return saved["identity"]
     except _MISSES:
         return None
 
 
-class Proof:
-    """One full computation: ``reads`` collects every file it reads; ``store`` remembers its result."""
+class Computation:
+    """One computation of an identity; ``store`` remembers its result only if nothing changed under it."""
 
     def __init__(self, root, config):
-        self.root, self.config, self.reads = str(root), config, set()
+        self.root, self.config = str(root), config
         self.started = _now_ns()
         try:
             self.key = _key(self.root, config) if config.get("renditions") else None
+            self.stores = {name: _signature(os.path.join(self.root, name)) for name in (
+                os.path.relpath(store, self.root) for store in _stores(self.root, config))}
         except _MISSES:
             self.key = None
 
     def store(self, db, identity):
-        """Remember ``identity`` (best effort); True when written. Nothing changed during the proof."""
+        """Remember ``identity`` (best effort); True when written."""
         if self.key is None or not isinstance(identity, str) or not identity:
             return False
         try:
             stores = _stores(self.root, self.config)
-            files, directories = {}, {os.curdir: _directory(self.root)}
-            for path in {*self.reads, *stores}:
-                name = _relative(self.root, path)
-                files[name] = _file(path)
-                parent = os.path.dirname(name)
-                while parent and parent not in directories:
-                    directories[parent] = _directory(os.path.join(self.root, parent))
-                    parent = os.path.dirname(parent)
-            if (any(signature[5] >= self.started - RACY_NS for signature in files.values())
+            now = {name: _signature(os.path.join(self.root, name)) for name in self.stores}
+            if (now != self.stores or any(signature[5] >= self.started - RACY_NS for signature in now.values())
                     or not _sidecar_free(stores) or _key(self.root, self.config) != self.key):
                 return False
-            _write(location(db), {"format": FORMAT, "key": self.key, "identity": identity,
-                                  "files": files, "directories": directories})
+            _write(location(db), {"format": FORMAT, "key": self.key, "identity": identity, "stores": now})
             return True
         except _MISSES:
             return False
 
 
 def identity(root, config, db, compute):
-    """``compute(reads)`` returns the identity and adds each file it reads to the set ``reads``."""
+    """The remembered identity, else ``compute()`` (remembered when the stores did not change meanwhile)."""
     if not config.get("renditions"):
-        return compute(set())
+        return compute()
     found = lookup(root, config, db)
     if found is not None:
         return found
-    proof = Proof(root, config)
-    value = compute(proof.reads)
-    proof.store(db, value)
+    computation = Computation(root, config)
+    value = compute()
+    computation.store(db, value)
     return value

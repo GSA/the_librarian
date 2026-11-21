@@ -317,6 +317,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
 | `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore` |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
+| `python -m tools.context_index.integrity` | Read-only integrity audit of registered files against their ingest hashes: `audit`, `check PATH...` (exit 1 on a mismatch) |
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `audit`, `progress`, `progress-serve` |
 | `python -m tools.intake.cohort` | Read-only inbox intake: `classify`, `ingest`, `qualify`, `publish`, `recover-identity`, `recover-unresolved-evidence`, `recover-deferred`, `rereview`, `backfill-docs`, `audit-docs`, `docs-status`, `expand-archives`, `delete-archive-original` |
 | `python -m tools.diagnostics.retrieval_log` | Opt-in body-free retrieval diagnostics (`report [--since-days N]`, `prune --keep N`) |
@@ -326,6 +327,47 @@ Run these from the clone root. Each supports `--help`.
 | `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index |
 | `librarian-mcp` | Read-only stdio MCP server |
 | `librarian-audit` | Body-free `report` of the opt-in MCP audit log |
+
+## Integrity audit and the no-hand-edit rule
+
+Files in an instance's data and source roots (`sources/`, the extractions home and everything else the
+catalog registers) are written only by intake. **Never edit, replace, move or delete them by hand**; to
+change a document, submit it through intake. Readers prove the index fresh from the hashes the catalog
+recorded at ingest and do not reopen those files, so a hand edit is not noticed by a read. It is found by
+the read-only audit, which re-hashes every registered file against its recorded hash and reports each
+difference (path, kind, expected and found hash) without changing anything or failing any read:
+
+```sh
+.venv/bin/python -m tools.context_index.integrity --root "$PWD" audit            # all files (JSON report)
+.venv/bin/python -m tools.context_index.integrity --root "$PWD" check sources/memo.pdf   # named files
+```
+
+Exit status: 0 clean, 1 mismatches found, 2 the audit could not run. **Run the audit on a schedule**, for
+example nightly, and alert on a non-zero status. With cron (`crontab -e`):
+
+```cron
+17 3 * * *  cd /path/to/instance && .venv/bin/python -m tools.context_index.integrity --root . audit > .local/integrity-audit.json || mail -s "Librarian integrity audit: $?" owner@example.org < .local/integrity-audit.json
+```
+
+With a systemd user timer (`~/.config/systemd/user/librarian-audit.{service,timer}`, then
+`systemctl --user enable --now librarian-audit.timer`):
+
+```ini
+# librarian-audit.service
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/instance
+ExecStart=/path/to/instance/.venv/bin/python -m tools.context_index.integrity --root . audit
+# librarian-audit.timer
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+A reported file is restored from backup or re-ingested; the audit repairs nothing. See
+[context/integrity.md](context/integrity.md).
 
 ## MCP for consumer agents
 

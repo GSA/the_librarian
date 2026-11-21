@@ -146,12 +146,10 @@ class ParallelIdentity(WorkspaceCase):
 
     def identity(self, minimum):
         with patch.object(renditions, "PARALLEL_MIN", minimum), patch.object(renditions, "PARALLEL_WORKERS", 2):
-            reads = set()
-            digest = renditions.inputs(self.root, self.config, index.rendition_api(self.root),
-                                       review_snapshot=None, reads=reads, keep=False)[1]
-        return digest, reads
+            return renditions.inputs(self.root, self.config, index.rendition_api(self.root),
+                                     review_snapshot=None, keep=False)[1]
 
-    def test_parallel_identity_and_reads_equal_the_sequential_ones(self):
+    def test_parallel_identity_equals_the_sequential_one(self):
         sequential = self.identity(10 ** 9)
         answers = []
         real = renditions._parallel_identity
@@ -164,7 +162,6 @@ class ParallelIdentity(WorkspaceCase):
         self.assertEqual(len(answers), 1)
         self.assertIsNotNone(answers[0], "the workers did the check")
         self.assertEqual(forked, sequential)
-        self.assertTrue(sequential[1])
 
     def test_a_failing_check_reports_the_sequential_error(self):
         extraction = self.root / self.prepared["rendition"]

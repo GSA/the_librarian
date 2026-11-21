@@ -948,8 +948,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   validation is never stored. Callers receive fresh state and event-list containers (the
   event dictionaries are shared and read-only by contract).
 - **Read locks and busy waits (Kata xeb8).** Review-event connections used SQLite's busy
-  timeout 0, and a full replay (a cold `progress` render, a publication or the index
-  freshness check's `read_snapshot(full=True)`) held its read transaction, and so its
+  timeout 0, and a full replay (a cold `progress` render, or a publication's `read_snapshot(full=True)`) held its read transaction, and so its
   SHARED lock, for the whole O(history) validation (6.5 s at 13,000 events). A running
   `progress-serve` therefore made concurrent review-event appends fail at once with
   `sqlite3.OperationalError`, which intake records as retryable `sqlite-operational`.
@@ -970,7 +969,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   (`policy._probe_store_id`) among them, fails meanwhile. The long readers were the index
   freshness check (`renditions.inputs` → `read_records_by_receipt`, about 6 s at 458,000
   current records, on every `progress-serve` render and twice per MCP call; since Kata t5df
-  only on a miss of the [freshness proof memo](#index-freshness-proof-memo-kata-t5df)) and the
+  only on a miss of the [freshness memo](#index-freshness-from-ingest-pins-and-the-integrity-audit-kata-xv0n-earlier-t5df-17b0)) and the
   `progress` catalog panel's full inspection (about 21 s) when no receipt vouched.
   `read_records_by_receipt` now copies the validated snapshot's current records into a
   temporary table and commits before its joins and lookups, which read only that copy. The
@@ -1031,117 +1030,97 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   a concurrent writer process's commit, an overlapping commit, the stated residual and its
   expiry, contract change, audit).
 
-### Index freshness proof memo (Kata t5df)
+### Index freshness from ingest pins, and the integrity audit (Kata xv0n; earlier t5df, 17b0)
 
-Every index read (`status`, `search`, `get`, `get-many`, claim corrections and the
-`progress` index panel) checks freshness before and after it reads. The expensive part of that
-check is the expected `rendition_identity`. To compute it, `renditions.inputs` replays the
-review-event history in full, validates the catalog by receipt, and re-reads and re-validates
-every selected extraction, original and submission sidecar. On an instance with 35,671 documents
-(35,670 renditions and a 10 GB index) one `status` took 82.6 s and 5.84 GB RSS, so an MCP call
-exceeded the reader's 30 s `--timeout-seconds`.
+Every index read (`status`, `search`, `get`, `get-many`, claim corrections and the `progress` index
+panel) checks freshness before and after it reads. The check compares the index's stored
+`rendition_identity` with the current one. Hashes recorded at ingest are the reference: the owner is
+the only provider of documents, nobody edits files under the instance's data and source roots by
+hand, and the only other writer will be controlled automated ingestion. So the system detects and
+flags an unexpected change; it does not defend against one in real time, on every read.
 
-- **What is remembered.** `tools/context_index/proof_cache.py` remembers only the identity. It
-  lives in the ignored file `<index>.sqlite3.freshness.json`, beside the index. Every other part
-  of the expected metadata is recomputed on each check, and Markdown document hashes are re-read
-  each time: the policy hash, engine fingerprint, manifest hash, corpus root and audience.
-  Freshness still compares the database's stored metadata with the expected metadata, so a
-  rebuilt, replaced or stale index is judged exactly as before.
-- **Key.** The memo key is a SHA-256 over these inputs:
-  - the memo format and the UTC date (daily expiry, like the catalog receipt and the review-event
-    memo);
-  - the instance root;
-  - the selected `renditions` configuration;
-  - `policy.fingerprint` and the validated instance roots;
-  - the hash of every toolkit `.py`, `.json` and `.sql` file;
-  - the runtime: Python, SQLite and Unicode data versions, `jsonschema` and `referencing`.
-- **Signed files.** The memo records an `lstat` signature (device, inode, mode, size, mtime_ns,
-  ctime_ns) for every file the computation opened. That covers each extraction, original and
-  sidecar `renditions.inputs` passes through its symlink-safe checker, plus `catalog.sqlite3`.
-  It also covers `events.sqlite3` whenever a selection names review events or is a `docling`
-  rendition. Each ancestor directory up to the root, the root included, is recorded with its
-  device, inode and mode, which catches a directory swapped for a symlink or a changed mode.
-  The proof lists no directory, so entries added to a directory are not inputs.
-- **Hit.** A lookup is a hit only when all of these hold:
-  - the memo is a regular, non-symlink file owned by this user, with no group or other bits and
-    at most 256 MiB;
-  - it parses, and its checksum and format match;
-  - its key equals the current key;
-  - every recorded signature is identical;
-  - no `-journal`, `-wal` or `-shm` file exists beside a signed store, so the full path keeps
-    its refusals.
-
-  Anything else, including any error, is a miss, and a miss computes the identity in full with
-  the unchanged refusals.
-- **Store.** A full computation remembers its identity, whether or not the index is fresh. That
-  is sound because the identity is a pure function of the signed inputs. It is stored only when
-  every signed file's ctime is more than 2 s before the computation started, when no store
-  sidecar is present, and when the key is unchanged afterwards. This is git's "racily clean"
-  rule. Every write moves ctime, and `utime` cannot set it, so an old ctime proves the bytes
-  read match the signature. The memo is written with mode 0600 to an `O_EXCL|O_NOFOLLOW`
-  temporary file and then renamed into place. Publication never reuses the memo: the
-  `adapters` index-build guards and build's own post-check always compute in full. `build`
-  leaves its identity behind for readers.
-- **Invalidation.** Any of these makes the next read compute in full:
-  - an edited, replaced, removed or re-moded selected file or sidecar;
-  - any catalog or review-event commit (during intake, the first read after each commit);
-  - a manifest selection, policy, instance roots, toolkit code or runtime change;
-  - a new UTC day.
-- **Cheaper full check.** `freshness` no longer pre-reads the review-event snapshot (inputs
-  reads it once when a selection needs it). `inputs(keep=False)` no longer builds the per-file
-  result list that metadata only hashed.
-- **Cost** (same instance, read-only, toolkit run against its data): a cold `status` (one full
-  check) takes 51 s and 2.1 GB, down from 82.6 s and 5.84 GB. A warm `status` takes 1.5 s and
-  231 MB. A warm freshness, `search`, `get` and freshness sequence takes 2.1 s in total, with
-  0.9 s and 0.8 s for the two checks and 280 MB. The memo is 24 MB, signing about 107,000 files
-  and 107,000 directories. The first read of a UTC day, or the first after a store commit, still
-  pays the cold cost, which can exceed the MCP timeout; any `status` warms it.
-- **Cold-path costs** (Kata 17b0; read-only, same instance, 39.7k selected renditions, 39.9k
-  review events, 822 MB catalog; every check and refusal is unchanged):
-  - *Review events* (PR #99): the item schema is compiled to an accept-only predicate (anything
-    else falls back to the full `jsonschema` walk, which reports the exact error) and the
-    in-process validated-event memo is keyed by SHA-256. Replay 72 s to 6 s.
-  - *Catalog receipt window.* A writer commits, then writes the receipt for the new bytes, holding
-    the writer lock throughout. A reader that opened the file in between saw a receipt for the old
-    bytes and replayed the whole history (17-38 s here; 4 of 1,163 reads in a 4-minute sample of
-    an active intake). `validated_state` now ends its read transaction and waits, for at most
-    `ATTESTATION_WAIT_SECONDS` (5 s), while another process holds the writer lock, then asks
-    again: the receipt is trusted only if it then covers exactly the file, so no check is
-    weakened, and a writer that never attests (or an edited file) still gets the full replay.
-    Evidence: `tests/test_catalog_receipt_window.py`.
-  - *One snapshot.* `catalog.receipt_snapshot` returns the selected registrations and their
-    records from one validated snapshot (it used to be two, which also let a commit between them
-    refuse the first state as stale) and holds each receipt's records as stored JSON until that
-    selection is checked (about 0.6 GB less).
-  - *Text mapping.* `_canonical_lines` splits with `bytes.splitlines` (the same CR, LF and CRLF
-    boundaries) and a payload that equals the canonical split is accepted after a type check of
-    its integer fields; one that differs gets the old checks and messages. Evidence:
-    `tests/test_rendition_cold_path.py` (reference-split equivalence, mutation verdicts).
-  - *Forked identity check.* When only the identity is wanted (`keep` false, 2,000 or more
-    selections) selections are checked in up to four forked workers that share the validated
-    catalog and review state copy-on-write, from a single-threaded process only. A worker that
-    reports anything but success, or any pool failure, discards the parallel result and the same
-    checks run sequentially, so the error is the original one; the identity bytes are the
-    sequential bytes. A subprocess's peak counts its shared pages: report summed PSS for the true
-    cost.
-  - *Measured cold `status`* (immutable read-only sqlite URIs, nothing written to the instance,
-    concurrent intake running): 36.5 s and 2.1 GB peak RSS before, 20.3 s and 1.6 GB peak
-    RSS (2.3 GB summed PSS with the workers) after. Remaining: catalog snapshot 5.8 s, review
-    events 4.9 s, selection checks 8.6 s wall.
-  - *Not done.* Reusing per-selection results across a catalog or event commit (a delta proof)
-    changes what the memo vouches for; it is an owner decision, recorded on the Kata.
-- **Residual** (the catalog receipt's, 0017). The memo is unkeyed: an actor who can write the
-  index's `.local` directory can forge it, the same trust as the index database itself. An edit
-  that restores an input's size, mtime_ns and ctime_ns (root, or a clock change) is served until
-  the next UTC day.
-- Evidence (`tests/test_workspace.py`):
-  - `::test_build_leaves_a_private_freshness_proof_that_readers_reuse_without_the_full_proof`
-  - `::test_freshness_proof_memo_misses_on_every_input_change` (same-size original, extraction
-    bytes and mode, a directory swapped for a symlink, a catalog commit, manifest, policy)
-  - `::test_freshness_proof_memo_binds_the_review_event_store_when_selections_are_reviewed`
-  - `::test_corrupt_forged_or_unsafe_freshness_proof_memo_is_ignored`
-  - `::test_freshness_proof_with_racily_new_inputs_is_not_remembered`
-  - `::test_freshness_proof_memo_signs_every_file_the_full_proof_opens` (an audit hook)
+- **Identity from pins.** `renditions.pinned_identity` computes the identity from the stores alone:
+  for each selection, the stored text of its receipt, original, rendition and `rendition-of` records
+  and of the original's `preserved-metadata` submission sidecar (each record carries the SHA-256,
+  size and path taken at ingest), the selection's own fields, and, when any selection is
+  `docling` or lists `review_event_ids`, the review-event `state_token`. It opens no selected file.
+  `tools/catalog/pins.py` reads those records with keyed lookups in one validated snapshot, with no
+  copy of the current-record table. The checks that need only the catalog's records still refuse
+  (rendition registered under the original, same path and hash, `indexed` coverage, policy allows the
+  original, one sidecar). Freshness reads the review events with `read_snapshot(root)`, not
+  `full=True`: the review-event store's own validation decides what that costs.
+- **Build verifies in full.** `renditions.inputs` (publication: build, the `adapters` guards and
+  build's post-check) still opens and re-validates every selected extraction, original and submission
+  sidecar and the review qualification, and hashes the same pin texts into the same identity
+  (`tests/test_workspace.py::test_identity_read_from_the_pins_equals_the_fully_verified_one`). An index
+  built from files that verified at publication is fresh while the catalog's pins and the review state
+  are unchanged. A catalog commit that re-pins a file (the form a future document-update ingestion will
+  take) changes the identity and so makes the index stale, as it should.
+- **Changed guarantee.** A selected extraction, original or sidecar modified, replaced or removed after
+  ingest is **no longer a freshness failure**; readers no longer reopen those files. It is detected by
+  the audit (below), by a verified read of that file, and by the next build (which refuses it).
+  The old tamper tests that expected a reader to refuse are replaced, not removed:
+  `tests/test_workspace.py::test_a_changed_retained_file_is_no_freshness_failure_but_the_audit_and_verified_reads_report_it`
+  (same-size original, extraction bytes, a removed extraction and a symlink-swapped one: freshness
+  passes; the audit reports path, kind and problem; `read_verified` refuses; build refuses),
+  `::test_identity_read_from_the_pins_equals_the_fully_verified_one` and
+  `::test_freshness_identity_opens_no_selected_file_and_the_memo_signs_the_stores` (an audit hook shows
+  no selected file is opened). Unchanged: path-traversal, symlink and permission checks on every file a
+  reader or the build opens, the catalog and review-event hash chains, treating document text as
+  untrusted, and backups.
+- **Integrity audit** (`python -m tools.context_index.integrity audit --root ROOT`; `tools/context_index/integrity.py`).
+  It reads the catalog's present artifacts that carry a path and a hash (originals, retained
+  extractions, submission sidecars, anything else registered), re-hashes each in up to four forked
+  workers (the pool shared with the identity check, `tools/context_index/forked.py`, from a
+  single-threaded process only; any doubt falls back to the sequential loop with the same result) and
+  reports each mismatch with its path, kind (`original`, `extraction`, `sidecar`, or the artifact
+  role), problem (`hash-differs`, `size-differs`, `missing`, `symlink`, `not-a-file`, `unreadable`,
+  `unsafe-path`), expected and found hash and record. It lists at most `--limit` (default 1,000) but
+  counts all. It is read-only (the catalog's read transaction ends before any file is hashed; the catalog is
+  read through `observed_state`, so a missing or expired read-validation receipt is not rewritten; the
+  audit writes nothing under the instance), never fails a read, and exits 0 clean, 1 with mismatches, 2 when it
+  could not run (for a scheduler to alert on). `check PATH...` verifies named files the same way.
+  README.md ("Integrity audit") shows a cron and a systemd timer. Evidence: `tests/test_integrity.py`.
+- **Verified reads.** `integrity.read_verified(root, path)` opens one retained file, checks its SHA-256
+  against the catalog's current pin (one hash per file actually opened) and returns the bytes or raises
+  `IntegrityMismatch` with the same report entry. Any retrieval that opens an original or retained
+  extraction beyond the index (for example a deeper search) must read through it. The retrieval paths
+  today (`search`, `get`, `get-many`) answer from the index and open no original, so none calls it
+  yet. Evidence: `tests/test_integrity.py::test_a_verified_read_returns_the_pinned_bytes_and_refuses_unpinned_paths`
+  and `::test_a_changed_file_does_not_stop_reads_but_a_verified_read_refuses_it`.
+- **Document updates.** Not built. The reference is the catalog's *current* record for a path, so an
+  ingestion that re-pins a path through the catalog changes what freshness, the audit and verified reads
+  expect without a code change (`tests/test_integrity.py::test_the_audit_follows_the_catalog_when_a_path_is_re_pinned`).
+- **Memo** (`tools/context_index/proof_cache.py`, simplified). It remembers only the identity, in the
+  ignored file `<index>.sqlite3.freshness.json`, so the pin reads are skipped while the catalog (and the
+  review-event store, when selections need it) keep their exact file identity. The key is a SHA-256 of
+  the memo format, instance root, `renditions` configuration, `policy.fingerprint`, validated roots, the
+  hash of every toolkit `.py`, `.json` and `.sql` file and the runtime (Python, SQLite, Unicode data,
+  `jsonschema`, `referencing`). It signs an `lstat` identity (device, inode, mode, size, mtime_ns,
+  ctime_ns) of the stores only, no selected file or directory, and **has no UTC-date key**. A hit also
+  needs a private (0600), non-symlink, owned memo of at most 1 MiB with a valid checksum, and no
+  `-journal`, `-wal` or `-shm` beside a signed store. It is written only when the stores did not change
+  during the computation and are older than 2 s (git's "racily clean" rule), through an
+  `O_EXCL|O_NOFOLLOW` temporary file. Any other state is a miss. Publication never reuses it; `build`
+  leaves its identity behind. Evidence (`tests/test_workspace.py`):
+  `::test_build_leaves_a_private_freshness_proof_that_readers_reuse_without_the_full_proof`,
+  `::test_freshness_proof_memo_misses_on_store_and_configuration_changes`,
+  `::test_freshness_proof_memo_binds_the_review_event_store_when_selections_are_reviewed`,
+  `::test_corrupt_forged_or_unsafe_freshness_proof_memo_is_ignored`,
+  `::test_freshness_proof_with_racily_new_inputs_is_not_remembered`.
+- **Cost** (read-only on an instance with 50,000 selected renditions, 40,000 review events and an
+  865 MB catalog; immutable SQLite URIs, nothing written to the instance, intake running; the tables of
+  the sibling Kata on store validation apply on top): cold `status` (the catalog and review-event stores
+  already attested by their receipts) took 25.9 s wall and 1.85 GB peak RSS (the two checks of one
+  `status`: 24.2 s cold, 1.2 s warm), and with this change 9.4 s wall and 0.71 GB (8.5 s cold:
+  5.7 s the review-event replay and 2.4 s the pin reads and digest), a warm memo hit 0.35 s and 0.19 GB.
+  Selection identity alone: 2.4-2.6 s here against 15.4 s for the full verification, with the same
+  digest. The review-event replay is the sibling Kata's (store validation); the audit's cost is the
+  retained files' bytes (about 1.7 GB read; the first run is cold-cache bound).
+- **Residual.** The memo is unkeyed: an actor who can write the index's `.local` directory can forge it,
+  the same trust as the index database itself. A file changed out of band is reported by the next audit,
+  not by the read that opens it unless that read uses `read_verified`; an out-of-band edit of the catalog
+  or review-event store is caught by those stores' own validation, unchanged here.
 
 ### Concurrent writers
 
