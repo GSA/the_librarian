@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import sys
+import time
 import unicodedata
 import uuid
 
@@ -23,7 +24,7 @@ from tools.catalog.contracts import (
 from tools.catalog.storage import (
     AUTHORITY, BUSY_TIMEOUT_SECONDS, LOOKUP_REFUSAL, REFERENCE_FIELDS, VERSION, connect, create_lookup, decode,
     drop_lookup, fsync_directory, inspect, locations, lookup_shape, make_state, private_directory, private_file,
-    reserve, safe_path, schema_sql, seal, writer_lock, _head_state, _lookup_expression,
+    reserve, safe_path, schema_sql, seal, writer_lock, _head_state, _lookup_expression, _writer_active,
 )
 # Kept reachable here because callers use this module as the catalog's API.
 from tools.catalog.backups import backup, backup_inventory, prune  # noqa: F401
@@ -251,10 +252,41 @@ def _trusted_state(connection, home, binding):
     return state, saved["validated_on"]
 
 
+# A writer commits, then attests the new bytes, all under the writer lock. A reader that meets the new
+# file before the attestation would replay the whole history (17-38 s on a 37k-rendition instance)
+# for a receipt that lands moments later; it waits at most this long for the writer to finish first.
+ATTESTATION_WAIT_SECONDS = 5.0
+
+
+def _await_attestation(connection, home):
+    """Wait boundedly while another process holds the writer lock; True when there was a writer to wait for.
+
+    The read transaction ends first and a new one begins after: holding SQLite's read lock through the
+    wait would block that writer's next commit (it needs the lock exclusively) while this reader waits
+    for it, each waiting on the other until the bound.
+    """
+    if not _writer_active(home):
+        return False
+    connection.execute("COMMIT")
+    deadline = time.monotonic() + ATTESTATION_WAIT_SECONDS
+    while _writer_active(home) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    connection.execute("BEGIN")
+    return True
+
+
 def validated_state(connection, home, *, audit=False):
-    """Reuse full inspection only for the identical database file and validator bytes."""
+    """Reuse full inspection only for the identical database file and validator bytes.
+
+    A miss while a writer holds the writer lock (it is between its commit and its attestation, or
+    mid-write) waits for that writer and asks again against the file as it then is: a receipt is
+    trusted only when it covers exactly the file this connection reads, as ever.
+    """
     binding = _binding(connection)
     trusted = None if audit else _trusted_state(connection, home, binding)
+    if trusted is None and not audit and _await_attestation(connection, home):
+        binding = _binding(connection)
+        trusted = _trusted_state(connection, home, binding)
     if trusted is not None:
         return trusted[0]
     state = inspect(connection, detail=False)[0]
@@ -1023,6 +1055,22 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
     Each value equals ``read_records(root, receipt=id, limit=limit, expected_state=...)``, but the
     catalog is validated once and every scope is resolved with set-based joins, not per receipt.
     """
+    return _receipt_read(root, receipt_ids, limit=limit, expected_state=expected_state)[1]
+
+
+def receipt_snapshot(root, receipt_ids, *, limit=25):
+    """``(receipt_metadata(...), read_records_by_receipt(...))`` read from ONE validated snapshot.
+
+    Two calls can straddle a commit (the second then refuses the first's state as stale) and pay the
+    validation, the current-record copy and its indexes twice; this pays them once and cannot straddle.
+    Each receipt's ``records`` is a sequence that decodes its records when iterated, so a caller that
+    visits one receipt at a time never holds every receipt's decoded records (about 1 GB for 40,000
+    receipts) at once; the decoded values equal those of ``read_records_by_receipt``.
+    """
+    return _receipt_read(root, receipt_ids, limit=limit, registrations=True, lazy=True)
+
+
+def _receipt_read(root, receipt_ids, *, limit, expected_state=None, registrations=False, lazy=False):
     require(type(limit) is int and limit > 0, "limit must be a positive integer")
     for receipt_id in receipt_ids:
         identifier(receipt_id, "receipt")
@@ -1071,10 +1119,42 @@ def read_records_by_receipt(root, receipt_ids, *, limit=25, expected_state=None)
             page = members[:limit]
             result[receipt_id] = {
                 "authority": AUTHORITY, "state": state,
-                "records": [current_record(connection, record_id, "current_rows") for record_id in page],
+                "records": (_EncodedRecords(_payloads(connection, page)) if lazy else
+                            [current_record(connection, record_id, "current_rows") for record_id in page]),
                 "count": len(page), "total_matching": len(members),
                 "next_after": page[-1] if len(members) > limit else None}
-        return result
+        if registrations:
+            return _registrations(connection, state, receipt_ids, "current_rows"), result
+        return None, result
+
+
+def _payloads(connection, record_ids):
+    payloads = []
+    for record_id in record_ids:
+        row = connection.execute("SELECT payload FROM current_rows WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise MissingRecord("Record missing from authoritative catalog: " + record_id)
+        payloads.append(row["payload"])
+    return payloads
+
+
+class _EncodedRecords:
+    """A read-only sequence of records kept as their stored JSON text and decoded on each iteration."""
+
+    def __init__(self, payloads):
+        self._payloads = payloads
+
+    def __len__(self):
+        return len(self._payloads)
+
+    def __iter__(self):
+        return (decode(payload) for payload in self._payloads)
+
+    def __getitem__(self, index):
+        return decode(self._payloads[index])
+
+    def __eq__(self, other):
+        return list(self) == list(other)
 
 
 def current_record(connection, record_id, table="catalog_current"):
@@ -1083,6 +1163,19 @@ def current_record(connection, record_id, table="catalog_current"):
         raise MissingRecord("Record missing from authoritative catalog: " + record_id)
     return decode(row["payload"])
 
+
+
+def _registrations(connection, state, receipt_ids, table):
+    selected = {}
+    for receipt_id in receipt_ids:
+        receipt = current_record(connection, receipt_id, table)
+        if receipt["kind"] != "receipt":
+            raise MissingRecord("Receipt missing from authoritative catalog: " + receipt_id)
+        selected[receipt_id] = {
+            "receipt": receipt, "artifact": current_record(connection, receipt["data"]["artifact_id"], table),
+            "sources": [current_record(connection, sid, table) for sid in receipt["data"]["source_ids"]],
+        }
+    return {"state": state, "registrations": selected}
 
 
 def receipt_metadata(root, receipt_ids):
@@ -1095,16 +1188,7 @@ def receipt_metadata(root, receipt_ids):
         connection.execute("BEGIN")
         state = validated_state(connection, home)
         current_view(connection)
-        selected = {}
-        for receipt_id in receipt_ids:
-            receipt = current_record(connection, receipt_id)
-            if receipt["kind"] != "receipt":
-                raise MissingRecord("Receipt missing from authoritative catalog: " + receipt_id)
-            selected[receipt_id] = {
-                "receipt": receipt, "artifact": current_record(connection, receipt["data"]["artifact_id"]),
-                "sources": [current_record(connection, sid) for sid in receipt["data"]["source_ids"]],
-            }
-        return {"state": state, "registrations": selected}
+        return _registrations(connection, state, receipt_ids, "catalog_current")
 
 
 def restore(root, snapshot, expected_state=None):

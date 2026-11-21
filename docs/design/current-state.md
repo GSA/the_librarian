@@ -1096,6 +1096,40 @@ exceeded the reader's 30 s `--timeout-seconds`.
   0.9 s and 0.8 s for the two checks and 280 MB. The memo is 24 MB, signing about 107,000 files
   and 107,000 directories. The first read of a UTC day, or the first after a store commit, still
   pays the cold cost, which can exceed the MCP timeout; any `status` warms it.
+- **Cold-path costs** (Kata 17b0; read-only, same instance, 39.7k selected renditions, 39.9k
+  review events, 822 MB catalog; every check and refusal is unchanged):
+  - *Review events* (PR #99): the item schema is compiled to an accept-only predicate (anything
+    else falls back to the full `jsonschema` walk, which reports the exact error) and the
+    in-process validated-event memo is keyed by SHA-256. Replay 72 s to 6 s.
+  - *Catalog receipt window.* A writer commits, then writes the receipt for the new bytes, holding
+    the writer lock throughout. A reader that opened the file in between saw a receipt for the old
+    bytes and replayed the whole history (17-38 s here; 4 of 1,163 reads in a 4-minute sample of
+    an active intake). `validated_state` now ends its read transaction and waits, for at most
+    `ATTESTATION_WAIT_SECONDS` (5 s), while another process holds the writer lock, then asks
+    again: the receipt is trusted only if it then covers exactly the file, so no check is
+    weakened, and a writer that never attests (or an edited file) still gets the full replay.
+    Evidence: `tests/test_catalog_receipt_window.py`.
+  - *One snapshot.* `catalog.receipt_snapshot` returns the selected registrations and their
+    records from one validated snapshot (it used to be two, which also let a commit between them
+    refuse the first state as stale) and holds each receipt's records as stored JSON until that
+    selection is checked (about 0.6 GB less).
+  - *Text mapping.* `_canonical_lines` splits with `bytes.splitlines` (the same CR, LF and CRLF
+    boundaries) and a payload that equals the canonical split is accepted after a type check of
+    its integer fields; one that differs gets the old checks and messages. Evidence:
+    `tests/test_rendition_cold_path.py` (reference-split equivalence, mutation verdicts).
+  - *Forked identity check.* When only the identity is wanted (`keep` false, 2,000 or more
+    selections) selections are checked in up to four forked workers that share the validated
+    catalog and review state copy-on-write, from a single-threaded process only. A worker that
+    reports anything but success, or any pool failure, discards the parallel result and the same
+    checks run sequentially, so the error is the original one; the identity bytes are the
+    sequential bytes. A subprocess's peak counts its shared pages: report summed PSS for the true
+    cost.
+  - *Measured cold `status`* (immutable read-only sqlite URIs, nothing written to the instance,
+    concurrent intake running): 36.5 s and 2.1 GB peak RSS before, 20.3 s and 1.6 GB peak
+    RSS (2.3 GB summed PSS with the workers) after. Remaining: catalog snapshot 5.8 s, review
+    events 4.9 s, selection checks 8.6 s wall.
+  - *Not done.* Reusing per-selection results across a catalog or event commit (a delta proof)
+    changes what the memo vouches for; it is an owner decision, recorded on the Kata.
 - **Residual** (the catalog receipt's, 0017). The memo is unkeyed: an actor who can write the
   index's `.local` directory can forge it, the same trust as the index database itself. An edit
   that restores an input's size, mtime_ns and ctime_ns (root, or a clock change) is served until

@@ -6,6 +6,7 @@ import math
 import os
 import re
 import stat
+import threading
 from bisect import bisect_right
 from pathlib import Path, PurePosixPath
 
@@ -182,49 +183,136 @@ def inputs(root, config, engine, review_snapshot=None, *, reads=None, keep=True)
     if (any(item["format"] == "docling" or "review_event_ids" in item for item in selections)
             and review_snapshot is None):
         review_snapshot = engine.load_event_reader().read_snapshot(root, full=True)
-    snapshot = catalog.receipt_metadata(root, [item["receipt_id"] for item in selections])
-    state = snapshot["state"]["state_token"]
-    # One validated catalog snapshot for every selected receipt, not one per rendition.
-    receipt_records = catalog.read_records_by_receipt(
-        root, [item["receipt_id"] for item in selections], limit=100, expected_state=state)
+    # One validated snapshot for every selected receipt, not one per rendition and not two.
+    snapshot, receipt_records = catalog.receipt_snapshot(
+        root, [item["receipt_id"] for item in selections], limit=100)
+    work = _Work(root, engine, catalog, snapshot, receipt_records, review_snapshot, no_symlinks)
+    if not keep and len(selections) >= PARALLEL_MIN:
+        found = _parallel_identity(work, selections, reads)
+        if found is not None:
+            return [], found
     result, identities = [], []
     for item in selections:
-        registration = snapshot["registrations"][item["receipt_id"]]
-        original = registration["artifact"]
-        if not engine.original_allowed(original["data"]["path"]):
-            engine.fail("Original source excluded by current policy")
-        raw = catalog.private_file(no_symlinks(root / item["path"])).read_bytes()
-        if hashlib.sha256(raw).hexdigest() != item["sha256"]:
-            engine.fail("Selected rendition hash changed: " + item["path"])
-        value = _load_extraction(item, raw, engine)
-        run = PurePosixPath(item["path"]).parts[-2]
-        child, relation = _registered_rendition(
-            item, value, raw, registration, receipt_records[item["receipt_id"]], run, engine)
-        source = value["source"]
-        original_raw = _read_original(root, source, no_symlinks, engine)
-        if item["format"] == "text":
-            validate_text_mapping(value["payload"], original_raw, engine)
-        elif item["format"] == "mhtml":
-            validate_mhtml(value["payload"], original_raw, engine)
-        identity = {"original": original, "rendition": child, "relationship": relation,
-                    "source": source, "rendition_sha256": item["sha256"]}
-        review = None
-        if item["format"] == "docling":
-            review = qualification.docling(item, value, identity, review_snapshot, engine)
-            validate_docling_conversion(value, engine)
-        elif "review_event_ids" in item:
-            review = qualification.extract(item, value, identity, review_snapshot, engine)
-        if review is not None:
-            identity["qualification"] = review
-        origin = confidence.declared_origin(
-            root, receipt_records[item["receipt_id"]]["records"], original,
-            lambda path: catalog.private_file(no_symlinks(path)), engine)
-        label = confidence.for_rendition(value, review, origin)
-        identity["confidence"] = label
+        identity, kept = _check_selection(work, item)
         if keep:
-            result.append((item, raw, value, _metadata(item, value, run, review), label))
+            result.append(kept)
         identities.append(identity)
     return result, engine.digest(json.dumps(identities, sort_keys=True).encode("utf-8"))
+
+
+class _Work:
+    """What checking one selection needs besides the selection: the validated catalog and review state."""
+
+    def __init__(self, root, engine, catalog, snapshot, receipt_records, review_snapshot, no_symlinks):
+        self.root, self.engine, self.catalog = root, engine, catalog
+        self.snapshot, self.receipt_records, self.review_snapshot = snapshot, receipt_records, review_snapshot
+        self.no_symlinks = no_symlinks
+
+
+def _check_selection(work, item):
+    """Check one selection in full; ``(its identity, (item, raw, value, metadata, label))``."""
+    root, engine, catalog = work.root, work.engine, work.catalog
+    registration = work.snapshot["registrations"][item["receipt_id"]]
+    original = registration["artifact"]
+    if not engine.original_allowed(original["data"]["path"]):
+        engine.fail("Original source excluded by current policy")
+    raw = catalog.private_file(work.no_symlinks(root / item["path"])).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != item["sha256"]:
+        engine.fail("Selected rendition hash changed: " + item["path"])
+    value = _load_extraction(item, raw, engine)
+    run = PurePosixPath(item["path"]).parts[-2]
+    child, relation = _registered_rendition(
+        item, value, raw, registration, work.receipt_records[item["receipt_id"]], run, engine)
+    source = value["source"]
+    original_raw = _read_original(root, source, work.no_symlinks, engine)
+    if item["format"] == "text":
+        validate_text_mapping(value["payload"], original_raw, engine)
+    elif item["format"] == "mhtml":
+        validate_mhtml(value["payload"], original_raw, engine)
+    identity = {"original": original, "rendition": child, "relationship": relation,
+                "source": source, "rendition_sha256": item["sha256"]}
+    review = None
+    if item["format"] == "docling":
+        review = qualification.docling(item, value, identity, work.review_snapshot, engine)
+        validate_docling_conversion(value, engine)
+    elif "review_event_ids" in item:
+        review = qualification.extract(item, value, identity, work.review_snapshot, engine)
+    if review is not None:
+        identity["qualification"] = review
+    origin = confidence.declared_origin(
+        root, work.receipt_records[item["receipt_id"]]["records"], original,
+        lambda path: catalog.private_file(work.no_symlinks(path)), engine)
+    label = confidence.for_rendition(value, review, origin)
+    identity["confidence"] = label
+    return identity, (item, raw, value, _metadata(item, value, run, review), label)
+
+
+# Checking selections is independent per selection and CPU-bound, so an identity-only check of many
+# selections (a freshness proof; ``keep`` false) runs them in forked workers that share the validated
+# catalog and review state copy-on-write. This is an accept-only fast path: a worker that reports
+# anything but success, or any pool failure, discards the parallel result and the caller runs the same
+# checks sequentially, which fails with the exact original error.
+PARALLEL_MIN = 2000
+PARALLEL_WORKERS = 4
+_JOB = None
+
+
+def _identity_chunk(bounds):
+    """``(identity JSON, paths read)`` for selections ``bounds[0]:bounds[1]``, or None on any failure."""
+    work, selections, track = _JOB
+    reads = set()
+    work.no_symlinks = _tracked(work.no_symlinks, reads) if track else work.no_symlinks
+    try:
+        pieces = [json.dumps(_check_selection(work, item)[0], sort_keys=True)
+                  for item in selections[bounds[0]:bounds[1]]]
+    except Exception:  # whatever it was, the sequential run reproduces and reports it
+        return None
+    return ", ".join(pieces), [str(path) for path in reads]
+
+
+def _tracked(check, reads):
+    def tracked(path):
+        path = check(path)
+        reads.add(path)
+        return path
+    return tracked
+
+
+def _parallel_identity(work, selections, reads):
+    """The identity digest of ``selections`` computed in forked workers, or None to run sequentially."""
+    import concurrent.futures
+    import gc
+    import multiprocessing
+    global _JOB
+    workers = min(PARALLEL_WORKERS, os.cpu_count() or 1)
+    # Only a single-threaded process forks safely: a child inherits whatever lock another thread held.
+    if (workers < 2 or threading.active_count() > 1
+            or "fork" not in multiprocessing.get_all_start_methods()):
+        return None
+    size = -(-len(selections) // (workers * 8))
+    chunks = [(start, min(start + size, len(selections))) for start in range(0, len(selections), size)]
+    # Tracking happens in the worker; the parent's own tracker (if any) is not shared across the fork.
+    parent_tracker = work.no_symlinks
+    _JOB = (work, selections, reads is not None)
+    gc.collect()
+    gc.freeze()  # keep the collector from touching, and so copying, the shared heap in every worker
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("fork")) as pool:
+            futures = [pool.submit(_identity_chunk, chunk) for chunk in chunks]
+            outcomes = [future.result() for future in futures]
+    except Exception:
+        return None
+    finally:
+        _JOB = None
+        work.no_symlinks = parent_tracker
+        gc.unfreeze()
+    if any(outcome is None for outcome in outcomes):
+        return None
+    if reads is not None:
+        for _, paths in outcomes:
+            reads.update(Path(path) for path in paths)
+    return work.engine.digest(("[" + ", ".join(piece for piece, _ in outcomes) + "]").encode("utf-8"))
 
 
 def _load_extraction(item, raw, engine):
@@ -339,14 +427,21 @@ def validate_text_mapping(payload, source_raw, engine):
         engine.fail("Invalid text BOM declaration")
     if (payload["bom_bytes"] == 3) != source_raw.startswith(b"\xef\xbb\xbf"):
         engine.fail("Text BOM declaration does not match original bytes")
-    if any(not isinstance(record, dict) or not isinstance(record.get("text"), str)
-           or type(record.get("line")) is not int or type(record.get("terminator")) is not str
-           or type(record.get("byte_start")) is not int or type(record.get("byte_end")) is not int
-           for record in payload["lines"]):
-        engine.fail("Invalid text line field types")
+    lines = payload["lines"]
     # Exact equality with the canonical split proves field sets, numbering, terminators and that
-    # every byte after the BOM is covered by exactly one line slice.
-    if payload["lines"] != _canonical_lines(source_raw, payload["bom_bytes"]):
+    # every byte after the BOM is covered by exactly one line slice. Equality alone cannot tell
+    # ``1`` from ``True`` or ``1.0``, so the integer fields are also checked by type; a payload that
+    # differs is reported by the same checks, in the same order, as before.
+    if lines == _canonical_lines(source_raw, payload["bom_bytes"]):
+        if any(type(record["line"]) is not int or type(record["byte_start"]) is not int
+               or type(record["byte_end"]) is not int for record in lines):
+            engine.fail("Invalid text line field types")
+    else:
+        if any(not isinstance(record, dict) or not isinstance(record.get("text"), str)
+               or type(record.get("line")) is not int or type(record.get("terminator")) is not str
+               or type(record.get("byte_start")) is not int or type(record.get("byte_end")) is not int
+               for record in lines):
+            engine.fail("Invalid text line field types")
         engine.fail("Invalid text physical line mapping")
     expected_end = bool(payload["lines"] and payload["lines"][-1]["terminator"] != "none")
     if type(payload["ends_with_terminator"]) is not bool or payload["ends_with_terminator"] != expected_end:
@@ -354,12 +449,13 @@ def validate_text_mapping(payload, source_raw, engine):
 
 
 def _canonical_lines(source_raw, offset):
-    """Split decoded bytes after ``offset`` into numbered physical lines with exact byte ranges."""
+    """Split decoded bytes after ``offset`` into numbered physical lines with exact byte ranges.
+
+    A physical line ends at CRLF, CR or LF (``bytes.splitlines`` splits on exactly those and keeps
+    the terminator); the last line may have none.
+    """
     lines = []
-    for number, match in enumerate(re.finditer(b".*?(?:\\r\\n|\\r|\\n|\\Z)", source_raw[offset:]), 1):
-        raw_line = match.group()
-        if not raw_line:
-            continue
+    for number, raw_line in enumerate(source_raw[offset:].splitlines(True), 1):
         text = raw_line.decode("utf-8")
         terminator = ("crlf" if text.endswith("\r\n") else "lf" if text.endswith("\n")
                       else "cr" if text.endswith("\r") else "none")

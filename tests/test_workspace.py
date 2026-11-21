@@ -201,6 +201,13 @@ class WorkspaceTests(WorkspaceCase):
         self.assertEqual(catalog.read_records_by_receipt(self.root, ["D9"])["D9"]["records"], [])
         with self.assertRaises(catalog.CatalogError):
             catalog.read_records_by_receipt(self.root, ["D1"], expected_state="outdated")
+        # One snapshot yields exactly what the two separate reads yield, with a single state.
+        metadata, records = catalog.receipt_snapshot(self.root, ["D1", "D2"], limit=100)
+        self.assertEqual(metadata, catalog.receipt_metadata(self.root, ["D1", "D2"]))
+        self.assertEqual(records, catalog.read_records_by_receipt(self.root, ["D1", "D2"], limit=100))
+        self.assertEqual(metadata["state"], records["D1"]["state"])
+        with self.assertRaises(catalog.MissingRecord):
+            catalog.receipt_snapshot(self.root, ["D9"])
 
     def test_native_review_correction_retry_and_restore(self):
         self.registration()
