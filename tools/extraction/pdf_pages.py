@@ -272,7 +272,7 @@ def unit(home):
         job = json.loads((home / "job.json").read_text())
         pdf_image._limit(resource.RLIMIT_AS, job["address_space_bytes"])
         pdf_image._limit(resource.RLIMIT_CPU, job["cpu_seconds"], job["cpu_seconds"] + 10)
-        pdf_image._limit(resource.RLIMIT_FSIZE, pdf_image.MAX_RESULT * 2)
+        pdf_image._limit(resource.RLIMIT_FSIZE, pdf_image.file_ceiling(pdf_image.MAX_RESULT * 2))
         signal.signal(signal.SIGALRM, _alarm)
         signal.signal(signal.SIGXCPU, _cpu)
         signal.alarm(job["wall_seconds"])

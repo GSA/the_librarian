@@ -781,6 +781,21 @@ registration and reports the entry `extracted` with no new extraction work; it i
 selected like any other rendition. Repaired chains are not candidates again. Run it while no ingest is
 writing, as with `recover-conflicts`.
 
+**Recovering extractions blocked by a since-fixed toolkit.** A PDF/image (or other) extraction that
+a toolkit defect blocked, for example `extract-mutation` when the conversion child's file-size limit
+refused the private model-asset copy, keeps its pinned extractor identity, so after the fix a `replay`
+can only block again. Run
+
+    python -m tools.intake.cohort recover-blocked-extractions --root ROOT --code CODE           # dry run
+    python -m tools.intake.cohort recover-blocked-extractions --root ROOT --code CODE --apply
+
+The dry run counts `candidates`: chain heads that are a blocked `extract-prepare` whose last attempt
+failed with `CODE`. `--apply` stages a correction `<root>-c<n>` repeating each one's operation and
+arguments and runs nothing (a multi-stage request is counted in `skipped`); the next `ingest` (or `qualify`) follows `correction_of` to it, converts it
+with the other open extractions (`--extract-concurrency`), registers it, and it is then reviewed and
+selected like any other rendition. A source or toolkit that still fails blocks the correction again.
+Repaired chains are not candidates again. Run it while no ingest is writing.
+
 **Recovering reviews blocked as `unresolved-evidence`.** Before accepted reviews with reported
 contradictions or missing evidence qualified, they ended `standing-pending-review-unresolved-evidence`.
 Run

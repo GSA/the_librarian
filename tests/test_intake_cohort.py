@@ -234,6 +234,34 @@ class IngestTests(CohortCase):
         failed = [e for e in report["entries"] if e.get("outcome") == "failed"]
         self.assertEqual([e["code"] for e in failed], ["native-input"])
 
+    def test_extractions_blocked_by_a_fixed_toolkit_are_restaged_for_the_next_ingest(self):
+        real, calls = adapters.prepare, []
+
+        def mutation(root, stage):
+            if stage["operation"] == "extract-prepare" and not calls:
+                calls.append(stage)
+                raise adapters.StageFailure("blocked", "extract-mutation")
+            return real(root, stage)
+        with unittest.mock.patch.object(adapters, "prepare", side_effect=mutation):
+            cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+            (blocked,) = [s for s in store.list_requests(self.root) if s["stages"][0]["status"] == "blocked"]
+            (prepare,) = store.request(self.root, blocked["correlation_id"])["stages"]
+            register = {"id": "register", "kind": "extraction", "operation": "extract-register",
+                        "arguments": {**prepare["arguments"], "actor": "operator",
+                                      "expected_state": catalog.status(self.root)["state_token"]}}
+            store.stage_request(self.root, "multi", [prepare, register])
+            calls.clear()
+            runner.settle(self.root, "multi", "prepare")
+        self.assertEqual(cohort.recover_blocked_extractions(self.root, "native-input")["candidates"], 0)
+        self.assertEqual(cohort.recover_blocked_extractions(self.root, "extract-mutation"),
+                         {"apply": False, "code": "extract-mutation", "candidates": 1,
+                          "skipped": {"multi-stage": 1}})
+        applied = cohort.recover_blocked_extractions(self.root, "extract-mutation", apply=True)
+        self.assertEqual(applied["results"], {"staged": 1})
+        report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        self.assertEqual((report["counts"]["outcome"]["extracted"], report["counts"]["outcome"]["failed"]), (6, 0))
+        self.assertEqual(cohort.recover_blocked_extractions(self.root, "extract-mutation")["candidates"], 0)
+
 
 class BlockedCase(CohortCase):
     """Registrations blocked as a changed extraction identity, as in Kata ap0b."""

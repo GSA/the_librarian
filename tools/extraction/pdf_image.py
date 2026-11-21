@@ -47,6 +47,9 @@ LOCK = HERE / "requirements-docling.txt"
 DOCLING_FILES = (HERE / "docling_adapter.py", HERE / "docling_bridge.py", HERE / "docling_worker.py")
 MAX_SOURCE = bridge.MAX_SOURCE
 MAX_RESULT = 64 * 1024 * 1024
+# A conversion child copies each pinned model asset into its private directory before Docling
+# runs, so its per-file size ceiling must admit the largest pin as well as its own output.
+LARGEST_ASSET = max(size for size, _ in docling_worker.ASSET_PINS)
 MIB = 1024**2
 # A page's text layer is real text when it has at least ``min_page_chars`` letters or digits and they
 # are at least ``min_alnum_ratio`` of its non-space characters (garbled or missing-font layers fail the
@@ -423,6 +426,11 @@ def _limit(kind, soft, hard=None):
     resource.setrlimit(kind, (min(soft, hard), hard))
 
 
+def file_ceiling(output_bytes):
+    """The ``RLIMIT_FSIZE`` of a child that writes ``output_bytes`` and copies the model assets."""
+    return max(output_bytes, LARGEST_ASSET)
+
+
 def _alarm(_signal, _frame):
     raise ConversionFailed("timeout", "conversion wall timeout exceeded")
 
@@ -528,7 +536,7 @@ def child(home):
         _limit(resource.RLIMIT_AS, job["address_space_bytes"])
         # The soft CPU limit sends SIGXCPU; the hard limit kills a process that ignores it.
         _limit(resource.RLIMIT_CPU, job["cpu_seconds"], job["cpu_seconds"] + 10)
-        _limit(resource.RLIMIT_FSIZE, MAX_RESULT)
+        _limit(resource.RLIMIT_FSIZE, file_ceiling(MAX_RESULT))
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(job["wall_seconds"])
         raw = (home / "source").read_bytes()
