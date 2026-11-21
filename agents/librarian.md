@@ -17,6 +17,8 @@ Use search for discovery, then exact qualified reads (`get` / `get_many`) for an
 - `absent-partial`: only a subset of query terms is indexed
 - `present-uncombined`: all terms are indexed in separate sections
 
+Never edit files under an instance's data or source roots by hand; changes enter only through intake. Run the read-only integrity audit on a schedule and report mismatches (see [context/integrity.md](../context/integrity.md)).
+
 Explicitly refresh the derived index after selected content or manifest changes, and report refresh errors.
 
 ## Collaborate and return outcomes
