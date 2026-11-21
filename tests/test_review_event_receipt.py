@@ -97,6 +97,43 @@ class PersistedReceipt(MemoCase):
         self.assertEqual(stored.at("sources/memo-1.txt"), replayed.at("sources/memo-1.txt"))
         self.assertEqual((stored.events, stored.successors), (replayed.events, replayed.successors))
 
+    def test_a_correction_committed_while_a_snapshot_resolves_its_successors_does_not_break_it(self):
+        """roborev 874: materializing ``successors`` resolves each one's sequence; a commit from another
+        process in between must neither resize what is being iterated nor leak into this snapshot."""
+        import datetime
+        def correction(n, target):
+            return event(self.root, n, event_id=f"rev-memo-fix-{n}", supersedes=[target],
+                         correction_reason="Synthetic correction.",
+                         recorded_at=(datetime.datetime.now(datetime.timezone.utc)
+                                      + datetime.timedelta(seconds=5)).isoformat())
+
+        def append_one(item):
+            state = events.status(self.root)
+            events.append(self.root, event_history.bundle([item]), "memo-tester", "req-" + item["event_id"],
+                          state["revision"], state["state_token"])
+        append_one(correction(0, "rev-memo-0"))
+        self.new_process()
+        snapshot = self.read()
+        self.assertIsInstance(snapshot.history, event_history.StoredHistory)
+        real = snapshot.history.by_id
+        committed = []
+
+        class Racing(dict):
+            def __getitem__(inner, key):
+                if not committed:
+                    committed.append(1)
+                    append_one(correction(1, "rev-memo-1"))  # another writer, mid-materialization
+                return real[key]
+        history = snapshot.history
+        history._full.by_id = Racing(real)
+        try:
+            found = snapshot.successors
+        finally:
+            history._full.by_id = real
+        self.assertEqual(found, {"rev-memo-0": "rev-memo-fix-0"})
+        self.new_process()
+        self.assertEqual(self.read().successors, {"rev-memo-0": "rev-memo-fix-0", "rev-memo-1": "rev-memo-fix-1"})
+
     def test_a_stored_history_never_shows_an_event_appended_after_its_state(self):
         self.new_process()
         before = self.read()

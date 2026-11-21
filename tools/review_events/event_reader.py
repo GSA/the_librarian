@@ -55,7 +55,8 @@ class Snapshot:
     def successors(self):
         if self._successors is None:
             count = self.state["events"]
-            self._successors = {target: successor for target, successor in self.history.successors.items()
+            # One atomic copy: another snapshot in this process may extend the shared history meanwhile.
+            self._successors = {target: successor for target, successor in list(self.history.successors.items())
                                 if self.history.by_id[successor] <= count}
         return self._successors
 

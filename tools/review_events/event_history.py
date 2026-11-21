@@ -155,7 +155,7 @@ class StoredHistory:
         self.path, self._opened = path, opened
         self._lock = threading.RLock()
         self._connection, self._pid = None, None
-        self._full = History()
+        self._full, self._loaded_all = History(), False
         self._db()
 
     def _db(self):
@@ -182,7 +182,12 @@ class StoredHistory:
             self._connection = None
 
     def add(self, event):
-        """Nothing to remember: rows past the validated state are read from the file when needed."""
+        """Called when a delta was verified past the remembered head. Before the rows are loaded there
+        is nothing to keep (they are read from the file when needed); after, the event joins them,
+        unless the load already read it."""
+        with self._lock:
+            if self._loaded_all and event["event_id"] not in self._full.by_id:
+                self._full.add(event)
 
     def event(self, event_id, upto=None):
         with self._lock:
@@ -210,13 +215,15 @@ class StoredHistory:
             pass
 
     def _loaded(self):
+        """Every row, loaded once; afterwards only ``add`` grows it, so an iteration in progress over
+        one of its indexes is never resized by another property access."""
         with self._lock:
-            have = len(self._full.events)
-            rows = self._db().execute("SELECT sequence,payload FROM events WHERE sequence>? ORDER BY sequence",
-                                      (have,)).fetchall()
-            for offset, (sequence, payload) in enumerate(rows, have + 1):
-                require(sequence == offset, "Broken event sequence")
-                self._full.add(json.loads(payload, object_pairs_hook=contract.pairs))
+            if not self._loaded_all:
+                rows = self._db().execute("SELECT sequence,payload FROM events ORDER BY sequence").fetchall()
+                for offset, (sequence, payload) in enumerate(rows, 1):
+                    require(sequence == offset, "Broken event sequence")
+                    self._full.add(json.loads(payload, object_pairs_hook=contract.pairs))
+                self._loaded_all = True
             return self._full
 
     events = property(lambda self: self._loaded().events)
