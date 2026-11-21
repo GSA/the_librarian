@@ -105,11 +105,11 @@ class EmptyInstanceTests(ProgressCase):
         self.assertEqual(result["recent"], [])
         self.assertTrue(result["catalog"]["available"])
         self.assertEqual(result["catalog"]["artifacts"], 0)
-        page = progress_render.render_html(result, refresh=5)
-        self.assertIn('http-equiv="refresh" content="5"', page)
+        page = progress_render.render_html(result)
+        self.assertNotIn('http-equiv="refresh"', page)
         self.assertEqual(page.lower().count("<script"), 1)
         self.assertIn("<time datetime=", page)
-        self.assertNotIn("http://", page.replace('http-equiv', ''))
+        self.assertNotIn("http://", page)
 
 
 class MixedStateTests(ProgressCase):
@@ -444,7 +444,7 @@ class BindTests(unittest.TestCase):
 class ServerTests(ProgressCase):
     def test_serves_html_and_json_on_loopback_get_only(self):
         store.initialize(self.root)
-        server = progress_serve.make_server(self.root, port=0, refresh=7)
+        server = progress_serve.make_server(self.root, port=0)
         self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -457,7 +457,7 @@ class ServerTests(ProgressCase):
             self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
             self.assertIn(progress_render.SCRIPT_SRC, response.headers["Content-Security-Policy"])
             self.assertEqual(response.headers["Cache-Control"], "no-store")
-        self.assertIn('content="7"', page)
+        self.assertNotIn('http-equiv="refresh"', page)
         with urllib.request.urlopen(base + "/progress.json") as response:
             self.assertTrue(json.loads(response.read())["ledger"]["available"])
         with self.assertRaises(urllib.error.HTTPError) as caught:

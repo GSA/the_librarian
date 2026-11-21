@@ -969,7 +969,7 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   PENDING while readers finish, and every new reader, the 5 s instance-identity probe
   (`policy._probe_store_id`) among them, fails meanwhile. The long readers were the index
   freshness check (`renditions.inputs` → `read_records_by_receipt`, about 6 s at 458,000
-  current records, on every `progress-serve` refresh and twice per MCP call; since Kata t5df
+  current records, on every `progress-serve` render and twice per MCP call; since Kata t5df
   only on a miss of the [freshness proof memo](#index-freshness-proof-memo-kata-t5df)) and the
   `progress` catalog panel's full inspection (about 21 s) when no receipt vouched.
   `read_records_by_receipt` now copies the validated snapshot's current records into a
