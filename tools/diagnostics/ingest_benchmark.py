@@ -143,7 +143,55 @@ def totals(root):
         digest.update(json.dumps(record, sort_keys=True).encode())
     db = root / ".local/catalog/catalog.sqlite3"
     return {"records": records["total_matching"], "records_sha256": digest.hexdigest(),
-            "catalog_bytes": db.stat().st_size}
+            "catalog_bytes": db.stat().st_size, **renditions(root)}
+
+
+def renditions(root):
+    """File count, bytes and one digest of the rendition files under the extraction home.
+
+    The digest covers ``extraction.json`` only (path and content): ``registration.json`` and ``completion.json``
+    carry commit times and chain hashes that differ between runs.
+    """
+    home, files, size = root / "data/extractions", 0, 0
+    digest = hashlib.sha256()
+    for path in sorted(p for p in home.rglob("*.json") if p.is_file()):
+        raw = path.read_bytes()
+        files, size = files + 1, size + len(raw)
+        if path.name == "extraction.json":
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0" + hashlib.sha256(raw).digest())
+    return {"rendition_files": files, "rendition_bytes": size, "renditions_sha256": digest.hexdigest()}
+
+
+@contextlib.contextmanager
+def counting_syncs(counts):
+    """Count ``os.fsync`` calls (file and directory descriptors apart) and the time they take in ``counts``."""
+    import os
+    import stat
+    real = os.fsync
+    counts.update(file_fsyncs=0, directory_fsyncs=0, fsync_s=0.0)
+
+    def fsync(descriptor):
+        kind = "directory_fsyncs" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file_fsyncs"
+        start = time.perf_counter()
+        try:
+            return real(descriptor)
+        finally:
+            counts[kind] += 1
+            counts["fsync_s"] += time.perf_counter() - start
+    os.fsync = fsync
+    try:
+        yield counts
+    finally:
+        os.fsync = real
+
+
+def written_bytes():
+    """Bytes this process sent to storage (``/proc/self/io`` ``write_bytes``), or None off Linux."""
+    try:
+        with open("/proc/self/io", encoding="ascii") as stream:
+            return int(dict(line.split(": ") for line in stream.read().splitlines())["write_bytes"])
+    except (OSError, KeyError, ValueError):
+        return None
 
 
 def phase(cohort, root, inbox, limit, timers):
@@ -158,12 +206,15 @@ def phase(cohort, root, inbox, limit, timers):
             latencies.append(time.perf_counter() - start)
     cohort._process = process
     timers.clear()
+    syncs, before = {}, written_bytes()
     start, cpu = time.perf_counter(), time.process_time()
     try:
-        report = cohort.ingest(root, inbox, system="bench", actor="bench", limit=limit)
+        with counting_syncs(syncs):
+            report = cohort.ingest(root, inbox, system="bench", actor="bench", limit=limit)
     finally:
         cohort._process = original
     wall, cpu = time.perf_counter() - start, time.process_time() - cpu
+    after = written_bytes()
     outcome = report["counts"]["outcome"]
     processed = len(latencies)
     return {
@@ -176,6 +227,12 @@ def phase(cohort, root, inbox, limit, timers):
                        "last_decile_mean": round(sum(latencies[-max(1, processed // 10):])
                                                  / max(1, processed // 10) * 1000, 1)},
         "outcome": {k: v for k, v in outcome.items() if v},
+        "report_sha256": hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest(),
+        "fsyncs": {"file": syncs["file_fsyncs"], "directory": syncs["directory_fsyncs"],
+                   "per_document": round((syncs["file_fsyncs"] + syncs["directory_fsyncs"])
+                                 / max(1, outcome.get("extracted", 0)), 2),
+                   "wall_s": round(syncs["fsync_s"], 3)},
+        "bytes_written": None if before is None or after is None else after - before,
         "stages": {name: {"calls": c, "wall_s": round(w, 3), "cpu_s": round(p, 3)}
                    for name, (c, w, p) in sorted(timers.items(), key=lambda kv: -kv[1][1])},
     }

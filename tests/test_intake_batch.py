@@ -1,14 +1,17 @@
 """Batched ingest (Kata herq): outcomes equal the one-at-a-time path; crashes and refusals are safe."""
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from tools import durable
 from tools.catalog import catalog_store as catalog
 from tools.diagnostics.ingest_benchmark import fixture
 from tools.intake import adapters, cohort, cohort_ingest, runner, store, upload
@@ -486,6 +489,7 @@ CRASH = """
 import os, sys
 from pathlib import Path
 sys.path.insert(0, {repo!r})
+from tools import durable
 from tools.catalog import catalog_store as catalog
 from tools.extraction import extract
 from tools.intake import adapters, cohort, runner, upload, store
@@ -542,6 +546,18 @@ elif point == "between-completion-files": # after some documents' completion.jso
     wrap(extract, "finish_registration", after=hit)
 elif point == "between-prepare-guards":   # after some documents' extraction was prepared
     wrap(extract, "run", after=hit)
+elif point in ("before-directory-flush", "after-directory-flush"):
+    # the chunk's files are written; their directory entries are synced once, before the commit that names them
+    real_flush = durable.DirectorySyncs.flush
+    def flush(self):
+        if not self.pending:
+            return real_flush(self)
+        if point == "before-directory-flush":
+            hit()
+        real_flush(self)
+        if point == "after-directory-flush":
+            hit()
+    durable.DirectorySyncs.flush = flush
 cohort.ingest(root, inbox, system="s", actor="a", batch_size={size})
 """
 
@@ -554,6 +570,8 @@ POINTS = [
     ("before-native-work", 1), ("before-native-work", 2), ("before-native-work", 3),
     ("between-ledger-members", 3), ("between-ledger-members", 7),
     ("between-retained-copies", 3), ("between-completion-files", 2), ("between-prepare-guards", 4),
+    # a chunk syncs directories at four points (retained copies, renditions, registrations, completions)
+    *[(point, nth) for point in ("before-directory-flush", "after-directory-flush") for nth in (1, 2, 3, 4)],
 ]
 
 
@@ -631,6 +649,82 @@ class CrashInjection(unittest.TestCase):
                     for s in r["stages"] if s["id"] == "receipt"]
         self.assertEqual(set(receipts), {1})
         self.assertEqual(len(revisions(root)), before + 1)  # only the registration batch was missing
+
+
+class DirectorySyncOrder(unittest.TestCase):
+    """Entries are durable before the commit that names them (Kata 5n0q): a directory entry made by a link,
+    unlink or mkdir stays "dirty" until that directory is fsynced, and no ledger or catalog commit that
+    refers to renditions and retained copies, and no recorded evidence, happens while one is dirty."""
+
+    def run_chunk(self, files, batch_size, flush=None):
+        root, inbox = make_instance(self, files)
+        dirty, violations, syncs = set(), [], []
+        watched = (root / "sources").as_posix(), (root / "data").as_posix()
+        mark = lambda path: dirty.add(Path(path).parent.as_posix()) if str(path).startswith(watched) else None
+        real = {name: getattr(os, name) for name in ("link", "unlink", "mkdir", "rename", "fsync")}
+
+        def link(source, destination, *args, **kwargs):
+            result = real["link"](source, destination, *args, **kwargs)
+            mark(destination)
+            return result
+
+        def unlink(path, *args, **kwargs):
+            result = real["unlink"](path, *args, **kwargs)
+            mark(path)
+            return result
+
+        def mkdir(path, *args, **kwargs):
+            result = real["mkdir"](path, *args, **kwargs)
+            mark(path)
+            return result
+
+        def fsync(descriptor):
+            real["fsync"](descriptor)
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                path = os.readlink(f"/proc/self/fd/{descriptor}")
+                dirty.discard(path)
+                syncs.append(path)
+
+        def check(name):
+            if dirty:
+                violations.append((name, sorted(dirty)))
+
+        def guarded(owner, name, after=False):
+            original = getattr(owner, name)
+
+            def wrapped(*args, **kwargs):
+                if not after:
+                    check(name)
+                result = original(*args, **kwargs)
+                if after:
+                    check(name)
+                return result
+            return patch.object(owner, name, wrapped)
+
+        with patch.object(os, "link", link), patch.object(os, "unlink", unlink), patch.object(os, "mkdir", mkdir), \
+                patch.object(os, "fsync", fsync), guarded(store, "stage_many"), guarded(catalog, "submit_batch"), \
+                guarded(adapters, "execute_batch", after=True), \
+                (patch.object(durable.DirectorySyncs, "flush", flush) if flush else patch.object(os, "getpid", os.getpid)):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=batch_size, parse_workers=1)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], files)
+        return violations, syncs
+
+    def test_nothing_is_committed_or_recorded_while_a_directory_entry_is_unsynced(self):
+        violations, _ = self.run_chunk(6, 3)
+        self.assertEqual(violations, [])
+
+    def test_the_check_notices_a_chunk_that_never_syncs_its_directories(self):
+        violations, _ = self.run_chunk(4, 4, flush=lambda self: self.pending.clear())
+        self.assertTrue(violations)
+
+    def test_a_chunk_syncs_each_directory_once_per_stage_not_once_per_file(self):
+        _, one = self.run_chunk(1, 1)
+        _, many = self.run_chunk(12, 12)
+        # A document's own directories (its retained-copy directory, its rendition directory three times, its
+        # rendition's parent) are synced once per stage; the shared parents once per chunk. One document alone
+        # syncs ten, and the same documents in one chunk sync about six each (it was ten each before 5n0q).
+        self.assertLess(len(many), 12 * len(one))
+        self.assertLessEqual(len(many) / 12, 7)
 
 
 class Contention(unittest.TestCase):

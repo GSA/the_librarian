@@ -91,7 +91,10 @@ def private_directory(path):
     require(path.is_dir() and stat.S_IMODE(path.stat().st_mode) == 0o700,
             "Catalog directories must have mode 0700")
     for created in reversed(missing):
-        fsync_directory(created.parent)
+        durable.fsync_directory_later(created.parent, fsync_directory)
+    if not missing and durable.batching():
+        # An interrupted run may have created this directory and died before its parent was synced.
+        durable.fsync_directory_later(path.parent, fsync_directory)
     return path
 
 

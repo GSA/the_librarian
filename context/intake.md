@@ -248,7 +248,9 @@ A MIME HTML file costs about 8 ms more in its parser during `classify`; that is 
 **Batched catalog registration.** `ingest` processes admitted files in chunks (`--batch-size`, default 50; `1` is the
 old path of two catalog revisions per document). A chunk's receipts commit as ONE catalog revision and its extraction
 registrations as ONE more, so a document costs about 2/N revisions instead of 2, and the writer lock, fsyncs
-and per-commit validation are paid once per chunk. What stays per document: the retained copy, the ledger
+and per-commit validation are paid once per chunk, as are the directory syncs of the retained copies and rendition files
+(each file is fsynced when written; its directory entry is synced once per directory and stage, before the commit
+that names the file). What stays per document: the retained copy, the ledger
 request, stage, attempt, intent and evidence of every receipt and extraction stage, and every changed-input check.
 Each document is judged on its own inside the chunk:
 

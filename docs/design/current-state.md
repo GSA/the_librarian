@@ -1350,6 +1350,22 @@ the receipt stage and again for the extraction-registration stage (`extract.regi
   `running`, and the re-run finds each marker present and records its evidence; a kill between ledger members leaves
   an unfinished attempt that is reused. Retained copies, `registration.json` and `completion.json` are written
   without replacement and checked by content, so they too are completed, never duplicated.
+- **Directory syncs per chunk (Kata 5n0q).** Each of those files is still written to a private partial file,
+  fsynced and linked into place without replacement, but the directory entry is no longer synced after every
+  link. `durable.batched_directory_syncs` defers the syncs of a stage to one `flush` that fsyncs each touched
+  directory once (deepest first), and a stage flushes before anything that names the files: the chunk's retained
+  copies before `store.stage_many` stages their requests, the chunk's renditions before `run_batch` records the
+  prepare evidence, every `registration.json` before `catalog.submit_batch` commits the registrations, and the
+  `completion.json` files after the commit before the ledger records the register evidence. A file found
+  already present (an earlier run died after linking it) queues its directory again, so a rerun makes durable
+  what the killed run may not have, and a directory created by a killed run has its parent synced too. Nothing
+  else changes: the same files, names and bytes, no check weakened, and a failure inside a stage flushes nothing
+  because nothing has committed yet. Outside a batch scope (`run` for one document, PDF, image and converted
+  renditions, `upload.submit`) every sync happens at once as before. A text-family document goes from about
+  15 fsyncs to about 8 in a 50-document chunk (10 to 5 directory syncs); the three files per document are kept.
+  Evidence: `tests/test_intake_batch.py` (`DirectorySyncOrder`: no ledger or catalog commit and no recorded
+  evidence while a directory entry made by a link, unlink or mkdir is unsynced, shown to fail when the flush is
+  dropped; syncs per chunk; a kill before and after each flush completed by a re-run) and `tests/test_durable.py`.
 - **Snapshots and receipts.** A chunk is one commit: one first-write-of-the-UTC-day replay and snapshot, one
   validation receipt, one lock hold. The lock is held for the chunk's validation and write (about the cost of one
   `submit` plus per-record encoding), not for the model-free extraction.

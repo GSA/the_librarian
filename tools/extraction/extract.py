@@ -18,7 +18,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-from tools import policy
+from tools import durable, policy
 from tools.catalog import catalog_store as catalog
 from tools.extraction import mhtml
 
@@ -415,6 +415,8 @@ def publish(path, raw):
     if path.exists():
         require(catalog.private_file(path).read_bytes() == raw,
                 "Existing extraction/registration differs; preserve it and investigate")
+        # An earlier run may have linked the file and died before syncing its directory.
+        durable.fsync_directory_later(path.parent, catalog.fsync_directory)
         return False
     temporary = path.with_name(uuid.uuid4().hex + ".partial")
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -424,7 +426,7 @@ def publish(path, raw):
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, path, follow_symlinks=False)
-        catalog.fsync_directory(path.parent)
+        durable.fsync_directory_later(path.parent, catalog.fsync_directory)
     finally:
         temporary.unlink()
     return True
@@ -544,32 +546,35 @@ def register_batch(root, items, *, rebase=True):
     outcomes = [None] * len(items)
     with catalog.writer_lock(root / HOME):
         ready = []  # (index, item, path, value, recipe, result)
-        for index, item in enumerate(items):
-            try:
-                receipt, format_name = item["receipt"], item["format_name"]
-                state, original, path, value = item["prepared"]
-                require(value["source"]["receipt_id"] == receipt and value["payload"]["format"] == format_name
-                        and path.is_relative_to(root), "Prepared bundle is for a different receipt, format or root")
-                raw = encoded(value)
-                require(len(raw) <= MAX_EXPANDED, "Complete rendition exceeds output limit")
-                require(item["actor"] is not None and item["expected_state"] is not None,
-                        "Registration requires actor and explicit expected catalog state")
-                require(path.exists(), "Prepared rendition missing; run prepare for this source/extractor version")
-                require(catalog.private_file(path).read_bytes() == raw,
-                        "Rendition differs from repeat extraction; preserve it and investigate")
-                unchanged(root, value)
-                result = {"command": "register", "receipt_id": receipt, "run_id": value["run_id"],
-                          "rendition": path.relative_to(root).as_posix(), "created": False,
-                          "source_sha256": value["source"]["sha256"], "rendition_sha256": digest(raw),
-                          "catalog_state": state, "boundary": BOUNDARY, "warnings": value["payload"]["warnings"]}
-                marker = registration_marker(value)
-                recipe = registration_recipe(root, original, path, value, state, item["actor"],
-                                             registered=lambda marker=marker: catalog.marker_present(root, marker))
-                unchanged(root, value)
-            except REGISTER_ERRORS as error:
-                outcomes[index] = error
-                continue
-            ready.append((index, item, path, value, recipe, result))
+        # registration.json of every document is written first and its directories synced once, before any commit
+        with durable.batched_directory_syncs() as syncs:
+            for index, item in enumerate(items):
+                try:
+                    receipt, format_name = item["receipt"], item["format_name"]
+                    state, original, path, value = item["prepared"]
+                    require(value["source"]["receipt_id"] == receipt and value["payload"]["format"] == format_name
+                            and path.is_relative_to(root), "Prepared bundle is for a different receipt, format or root")
+                    raw = encoded(value)
+                    require(len(raw) <= MAX_EXPANDED, "Complete rendition exceeds output limit")
+                    require(item["actor"] is not None and item["expected_state"] is not None,
+                            "Registration requires actor and explicit expected catalog state")
+                    require(path.exists(), "Prepared rendition missing; run prepare for this source/extractor version")
+                    require(catalog.private_file(path).read_bytes() == raw,
+                            "Rendition differs from repeat extraction; preserve it and investigate")
+                    unchanged(root, value)
+                    result = {"command": "register", "receipt_id": receipt, "run_id": value["run_id"],
+                              "rendition": path.relative_to(root).as_posix(), "created": False,
+                              "source_sha256": value["source"]["sha256"], "rendition_sha256": digest(raw),
+                              "catalog_state": state, "boundary": BOUNDARY, "warnings": value["payload"]["warnings"]}
+                    marker = registration_marker(value)
+                    recipe = registration_recipe(root, original, path, value, state, item["actor"],
+                                                 registered=lambda marker=marker: catalog.marker_present(root, marker))
+                    unchanged(root, value)
+                except REGISTER_ERRORS as error:
+                    outcomes[index] = error
+                    continue
+                ready.append((index, item, path, value, recipe, result))
+            syncs.flush()
         groups = {}
         for entry in ready:  # one revision per (actor, reason): the revision records exactly one of each
             groups.setdefault((entry[4]["actor"], entry[4]["reason"]), []).append(entry)
@@ -582,22 +587,25 @@ def register_batch(root, items, *, rebase=True):
                 for entry in entries:
                     outcomes[entry[0]] = error
                 continue
-            for (index, item, path, value, recipe, result), member in zip(entries, submitted["members"]):
-                if member["status"] == "refused":
-                    outcomes[index] = member["error"]
-                    continue
-                outcome = {"command": "submit", "idempotent": member["status"] == "present",
-                           **member["committed_state"], "state": member["committed_state"],
-                           "request_id": recipe["request_id"], "committed_revision": member["committed_revision"],
-                           "committed_state": member["committed_state"], "backup": None, "retention": None}
-                try:
-                    finish_registration(root, path, value, recipe, outcome)
-                except REGISTER_ERRORS as error:
-                    outcomes[index] = error
-                    continue
-                result.update(catalog_state=outcome["state"], registered=True, idempotent=outcome["idempotent"],
-                              request_id=recipe["request_id"], committed_revision=member["committed_revision"])
-                outcomes[index] = result
+            # completion.json files follow the commit; their directories are synced once for the group
+            with durable.batched_directory_syncs() as syncs:
+                for (index, item, path, value, recipe, result), member in zip(entries, submitted["members"]):
+                    if member["status"] == "refused":
+                        outcomes[index] = member["error"]
+                        continue
+                    outcome = {"command": "submit", "idempotent": member["status"] == "present",
+                               **member["committed_state"], "state": member["committed_state"],
+                               "request_id": recipe["request_id"], "committed_revision": member["committed_revision"],
+                               "committed_state": member["committed_state"], "backup": None, "retention": None}
+                    try:
+                        finish_registration(root, path, value, recipe, outcome)
+                    except REGISTER_ERRORS as error:
+                        outcomes[index] = error
+                        continue
+                    result.update(catalog_state=outcome["state"], registered=True, idempotent=outcome["idempotent"],
+                                  request_id=recipe["request_id"], committed_revision=member["committed_revision"])
+                    outcomes[index] = result
+                syncs.flush()
     return outcomes
 
 
