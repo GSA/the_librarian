@@ -345,11 +345,17 @@ def main(argv=None):
                         help="with --replay: replay with ingest(trust_stat=True) (Kata e22r; default hashes every file)")
     parser.add_argument("--reuse", type=Path,
                         help="with --replay, keep and reuse the instance and inbox under this directory")
+    parser.add_argument("--pin-extractor", action="store_true",
+                        help="give every format a fixed extractor identity, so trees whose extractor source differs "
+                             "(its hash is part of every run ID and rendition path) produce comparable digests")
     parser.add_argument("--label", default="")
     parser.add_argument("--keep", type=Path, help="parent directory for fixtures (default: temporary)")
     args = parser.parse_args(argv)
     from _harness import use_tree
     use_tree(args.tree)
+    if args.pin_extractor:
+        from tools.extraction import extract
+        extract.fingerprint = lambda root, format_name: hashlib.sha256(b"pinned extractor").hexdigest()
     results = []
     for size in (int(s) for s in args.sizes.split(",")):
         if args.replay:
