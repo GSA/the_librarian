@@ -23,7 +23,10 @@ def bounded(output, max_chars):
     contract.require(type(max_chars) is int and 1 <= max_chars <= 1000000,
                      "max_chars must be an integer from 1 to 1000000")
     contract.require(len(output) <= max_chars,
-                     "Complete output exceeds max_chars; no fields were truncated")
+                     f"Complete output exceeds max_chars: requires {len(output)} characters, "
+                     f"limit is {max_chars}; no fields were truncated. Select fewer records "
+                     "or explicitly increase max_chars within the supported ceiling. "
+                     "An outer client/tool response limit may still apply.")
     return output
 
 
