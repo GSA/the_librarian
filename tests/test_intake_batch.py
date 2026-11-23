@@ -760,7 +760,7 @@ class DirectorySyncOrder(unittest.TestCase):
                     dirty, violations, syncs, seen = set(), [], [], [0]
                     real_flush = durable.DirectorySyncs.flush
 
-                    def flush(self, before=before, nth=nth):
+                    def flush(self, before=before, nth=nth, seen=seen, real_flush=real_flush):
                         if not self.pending:
                             return real_flush(self)
                         seen[0] += 1
