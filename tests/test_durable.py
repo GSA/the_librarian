@@ -45,5 +45,45 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(durable.sha256_file(self.target / "file"), hashlib.sha256(b"data").hexdigest())
 
 
+    def test_batched_directory_syncs_defer_each_directory_to_one_flush(self):
+        other = self.root / "other"
+        other.mkdir()
+        synced = []
+        sync = synced.append
+        durable.fsync_directory_later(self.target, sync)
+        self.assertEqual(synced, [self.target])  # outside a scope: at once
+        synced.clear()
+        with durable.batched_directory_syncs() as syncs:
+            self.assertTrue(durable.batching())
+            for path in (self.target, other, self.target, other / "deeper"):
+                durable.fsync_directory_later(path, sync)
+            self.assertEqual(synced, [])
+            syncs.flush()
+            self.assertEqual(sorted(synced), sorted([self.target, other, other / "deeper"]))
+            self.assertEqual(synced[0], other / "deeper")  # deepest first
+            synced.clear()
+            syncs.flush()
+            self.assertEqual(synced, [])  # a flushed queue is empty
+            durable.fsync_directory_later(self.target, sync)
+        self.assertEqual(synced, [self.target])  # the scope flushes what is left on a normal exit
+        self.assertFalse(durable.batching())
+
+    def test_a_failed_scope_flushes_nothing_and_leaves_no_scope_behind(self):
+        synced = []
+        with self.assertRaises(RuntimeError), durable.batched_directory_syncs():
+            durable.fsync_directory_later(self.target, synced.append)
+            raise RuntimeError
+        self.assertEqual(synced, [])
+        self.assertFalse(durable.batching())
+
+    def test_nested_scopes_share_the_outer_queue(self):
+        synced = []
+        with durable.batched_directory_syncs():
+            with durable.batched_directory_syncs():
+                durable.fsync_directory_later(self.target, synced.append)
+            self.assertEqual(synced, [])
+        self.assertEqual(synced, [self.target])
+
+
 if __name__ == "__main__":
     unittest.main()

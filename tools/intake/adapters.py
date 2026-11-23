@@ -9,6 +9,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile
 
+from tools import durable
 from tools.catalog import catalog_store as catalog
 from tools.review_events import event_reader
 from tools.review_events import event_history, event_store as events
@@ -424,8 +425,18 @@ def execute_batch(root, entries):
     if operation == "extract-prepare":
         # Publishes each rendition under its own run directory; nothing is shared, so each stage runs alone
         # (the parse memo of ``batch_scope`` serves the guards and the registration that follow).
-        for index in range(len(entries)):
-            single(index)
+        # Their directory entries are synced once, before the ledger records the stages as prepared.
+        with durable.batched_directory_syncs() as syncs:
+            for index in range(len(entries)):
+                single(index)
+            try:
+                syncs.flush()
+            except OSError as error:
+                # Files whose entries cannot be made durable are not prepared: each stage that would have
+                # succeeded fails (retryably, as the same error from its own sync always did) and the rest stand.
+                for index, outcome in enumerate(outcomes):
+                    if not isinstance(outcome, Exception):
+                        outcomes[index] = error
         return outcomes
     if operation == "catalog-submit":
         groups = {}

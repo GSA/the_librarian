@@ -22,7 +22,7 @@ import zipfile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from tools.durable import fsync_directory
+from tools.durable import batched_directory_syncs, batching, fsync_directory, fsync_directory_later
 from tools.extraction import convert, mhtml
 from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store
@@ -212,7 +212,10 @@ def private_directory(root, relative, owned):
         require(not cursor.is_symlink(), "unsafe_path")
         if not cursor.exists():
             cursor.mkdir(mode=0o700)
-            fsync_directory(cursor.parent)
+            fsync_directory_later(cursor.parent)
+        elif batching():
+            # An interrupted run may have created this directory and died before its parent was synced.
+            fsync_directory_later(cursor.parent)
         require(cursor.is_dir(), "unsafe_path")
         if index >= len(parts) - owned:
             require(stat.S_IMODE(cursor.stat(follow_symlinks=False).st_mode) == 0o700, "not_private")
@@ -223,8 +226,14 @@ def write_all(stream, raw):
     stream.write(raw)
 
 
-def publish(directory, name, raw):
-    """Atomically publish bytes at directory/name; equal bytes are idempotent, others conflict."""
+def publish(directory, name, raw, sync_existing=False):
+    """Atomically publish bytes at directory/name; equal bytes are idempotent, others conflict.
+
+    The directory is synced before returning, or at the flush of the active ``batched_directory_syncs``
+    scope (the caller flushes before anything refers to the file). ``sync_existing`` also syncs the
+    directory when equal bytes are already there: an earlier, interrupted run may have linked the file
+    and not yet synced its entry.
+    """
     final = directory / name
     for stale in directory.glob(f".{name}.*.partial"):
         if stale.is_file() and not stale.is_symlink():
@@ -237,6 +246,8 @@ def publish(directory, name, raw):
         except IntakeError as error:
             raise IntakeError("destination_conflict") from error
         require(digest(existing) == digest(raw), "destination_conflict")
+        if sync_existing:
+            fsync_directory_later(directory)
         return False
     partial = directory / f".{name}.{uuid.uuid4().hex}.partial"
     fd = os.open(partial, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -249,10 +260,10 @@ def publish(directory, name, raw):
             os.link(partial, final)
         except FileExistsError as error:
             raise IntakeError("destination_conflict") from error
-        fsync_directory(directory)
     finally:
         partial.unlink(missing_ok=True)
-        fsync_directory(directory)
+        # One sync covers the link and the partial's unlink, now or at the batch's flush.
+        fsync_directory_later(directory)
     return True
 
 
@@ -671,12 +682,13 @@ def _receipt_request(root, value, correlation_id, records, state):
                                   "reason": "Manual upload: " + value["reason"][:400]}}]}).encode()
 
 
-def _publish_copies(root, directory, value, raw, sidecar):
+def _publish_copies(root, directory, value, raw, sidecar, sync_existing=False):
     # Retained bytes are durable before the receipt stage exists, so no
-    # run/resume can commit a present artifact whose file is missing.
+    # run/resume can commit a present artifact whose file is missing. Inside a
+    # ``batched_directory_syncs`` scope the caller flushes before staging.
     target = private_directory(root, directory, 2)
-    publish(target, value["name"], raw)
-    publish(target, SIDECAR, sidecar)
+    publish(target, value["name"], raw, sync_existing)
+    publish(target, SIDECAR, sidecar, sync_existing)
 
 
 def _stage_locked(root, path, value, known):
@@ -692,7 +704,9 @@ def _stage_locked(root, path, value, known):
     else:
         state, records = records_for(root, value, raw, original_path, sidecar_path, sidecar)
         request = _receipt_request(root, value, correlation_id, records, state)
-    _publish_copies(root, directory, value, raw, sidecar)
+    with batched_directory_syncs() as syncs:
+        _publish_copies(root, directory, value, raw, sidecar, sync_existing=not existing)
+        syncs.flush()  # entries durable before the request that names them
     if not existing:
         store.stage(root, request)
     return correlation_id, existing
@@ -738,27 +752,29 @@ def stage_submissions(root, items, known=None):
             taken |= reserved_ids(root, probe)
             view = (state, taken)
         requests = {}
-        for index, value in values.items():
-            path = items[index][0]
-            try:
-                _, raw, correlation_id, directory, original_path, sidecar_path, sidecar = _read_submission(root, path, value)
-                prior = saved.get(correlation_id)
-                if prior is not None:
-                    _same_submission(prior, raw, original_path, sidecar_path, sidecar)
-                    records = None
-                else:
-                    records = records_for(root, value, raw, original_path, sidecar_path, sidecar, view)[1]
-                _publish_copies(root, directory, value, raw, sidecar)
-            except IntakeError as error:
-                results[index] = error
-                continue
-            if records is None:
-                results[index] = (correlation_id, True)
-                continue
-            for prefix in PREFIXES:
-                view[1].highest[prefix] = max(view[1].highest[prefix],
-                                              highest_number((r["id"] for r in records), prefix))
-            requests[index] = (correlation_id, _receipt_request(root, value, correlation_id, records, view[0]))
+        with batched_directory_syncs() as syncs:
+            for index, value in values.items():
+                path = items[index][0]
+                try:
+                    _, raw, correlation_id, directory, original_path, sidecar_path, sidecar = _read_submission(root, path, value)
+                    prior = saved.get(correlation_id)
+                    if prior is not None:
+                        _same_submission(prior, raw, original_path, sidecar_path, sidecar)
+                        records = None
+                    else:
+                        records = records_for(root, value, raw, original_path, sidecar_path, sidecar, view)[1]
+                    _publish_copies(root, directory, value, raw, sidecar, sync_existing=records is not None)
+                except IntakeError as error:
+                    results[index] = error
+                    continue
+                if records is None:
+                    results[index] = (correlation_id, True)
+                    continue
+                for prefix in PREFIXES:
+                    view[1].highest[prefix] = max(view[1].highest[prefix],
+                                                  highest_number((r["id"] for r in records), prefix))
+                requests[index] = (correlation_id, _receipt_request(root, value, correlation_id, records, view[0]))
+            syncs.flush()  # every retained entry durable before the requests that name them
         order = list(requests)
         for index, outcome in zip(order, store.stage_many(root, [requests[i][1] for i in order])):
             results[index] = outcome if isinstance(outcome, IntakeError) else (requests[index][0], False)

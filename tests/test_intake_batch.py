@@ -1,14 +1,18 @@
 """Batched ingest (Kata herq): outcomes equal the one-at-a-time path; crashes and refusals are safe."""
+import contextlib
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from tools import durable
 from tools.catalog import catalog_store as catalog
 from tools.diagnostics.ingest_benchmark import fixture
 from tools.intake import adapters, cohort, cohort_ingest, runner, store, upload
@@ -488,6 +492,7 @@ CRASH = """
 import os, sys
 from pathlib import Path
 sys.path.insert(0, {repo!r})
+from tools import durable
 from tools.catalog import catalog_store as catalog
 from tools.extraction import extract
 from tools.intake import adapters, cohort, runner, upload, store
@@ -544,6 +549,18 @@ elif point == "between-completion-files": # after some documents' completion.jso
     wrap(extract, "finish_registration", after=hit)
 elif point == "between-prepare-guards":   # after some documents' extraction was prepared
     wrap(extract, "run", after=hit)
+elif point in ("before-directory-flush", "after-directory-flush"):
+    # the chunk's files are written; their directory entries are synced once, before the commit that names them
+    real_flush = durable.DirectorySyncs.flush
+    def flush(self):
+        if not self.pending:
+            return real_flush(self)
+        if point == "before-directory-flush":
+            hit()
+        real_flush(self)
+        if point == "after-directory-flush":
+            hit()
+    durable.DirectorySyncs.flush = flush
 cohort.ingest(root, inbox, system="s", actor="a", batch_size={size})
 """
 
@@ -556,6 +573,8 @@ POINTS = [
     ("before-native-work", 1), ("before-native-work", 2), ("before-native-work", 3),
     ("between-ledger-members", 3), ("between-ledger-members", 7),
     ("between-retained-copies", 3), ("between-completion-files", 2), ("between-prepare-guards", 4),
+    # a chunk syncs directories at four points (retained copies, renditions, registrations, completions)
+    *[(point, nth) for point in ("before-directory-flush", "after-directory-flush") for nth in (1, 2, 3, 4)],
 ]
 
 
@@ -633,6 +652,154 @@ class CrashInjection(unittest.TestCase):
                     for s in r["stages"] if s["id"] == "receipt"]
         self.assertEqual(set(receipts), {1})
         self.assertEqual(len(revisions(root)), before + 1)  # only the registration batch was missing
+
+
+class Interrupted(BaseException):
+    """Stands for a kill: nothing in the ingest catches it."""
+
+
+class DirectorySyncOrder(unittest.TestCase):
+    """Entries are durable before the commit that names them (Kata 5n0q): a directory entry made by a link,
+    unlink or mkdir stays "dirty" until that directory is fsynced, and no ledger or catalog commit that
+    refers to renditions and retained copies, and no recorded evidence, happens while one is dirty."""
+
+    def tracking(self, root, dirty, violations, syncs, flush=None):
+        """Patches that model which directory entries have not reached storage yet.
+
+        ``dirty`` outlives a run, so a run that is killed with entries unsynced leaves them unsynced for the
+        run that completes it.
+        """
+        watched = (root / "sources").as_posix(), (root / "data").as_posix()
+        mark = lambda path: dirty.add(Path(path).parent.as_posix()) if str(path).startswith(watched) else None
+        real = {name: getattr(os, name) for name in ("link", "unlink", "mkdir", "fsync")}
+
+        def link(source, destination, *args, **kwargs):
+            result = real["link"](source, destination, *args, **kwargs)
+            mark(destination)
+            return result
+
+        def unlink(path, *args, **kwargs):
+            result = real["unlink"](path, *args, **kwargs)
+            mark(path)
+            return result
+
+        def mkdir(path, *args, **kwargs):
+            result = real["mkdir"](path, *args, **kwargs)
+            mark(path)
+            return result
+
+        def fsync(descriptor):
+            real["fsync"](descriptor)
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                path = os.readlink(f"/proc/self/fd/{descriptor}")
+                dirty.discard(path)
+                syncs.append(path)
+
+        def guarded(owner, name, after=False, under=""):
+            """Record a violation when the call is made (or, ``after``, returns) with an unsynced entry under ``under``."""
+            original = getattr(owner, name)
+
+            def wrapped(*args, **kwargs):
+                if not after:
+                    check()
+                result = original(*args, **kwargs)
+                if after:
+                    check()
+                return result
+
+            def check():
+                names = sorted(d for d in dirty if (root / under).as_posix() in d)
+                if names:
+                    violations.append((name, names))
+            return patch.object(owner, name, wrapped)
+
+        stack = contextlib.ExitStack()
+        for patcher in (patch.object(os, "link", link), patch.object(os, "unlink", unlink),
+                        patch.object(os, "mkdir", mkdir), patch.object(os, "fsync", fsync),
+                        guarded(store, "stage_many", under="sources"), guarded(catalog, "submit_batch"),
+                        guarded(adapters, "execute_batch", after=True)):
+            stack.enter_context(patcher)
+        if flush:
+            stack.enter_context(patch.object(durable.DirectorySyncs, "flush", flush))
+        return stack
+
+    def run_chunk(self, files, batch_size, flush=None):
+        root, inbox = make_instance(self, files)
+        dirty, violations, syncs = set(), [], []
+        with self.tracking(root, dirty, violations, syncs, flush):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=batch_size, parse_workers=1)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], files)
+        return violations, syncs
+
+    def test_nothing_is_committed_or_recorded_while_a_directory_entry_is_unsynced(self):
+        violations, _ = self.run_chunk(6, 3)
+        self.assertEqual(violations, [])
+
+    def test_the_check_notices_a_chunk_that_never_syncs_its_directories(self):
+        violations, _ = self.run_chunk(4, 4, flush=lambda self: self.pending.clear())
+        self.assertTrue(violations)
+
+    def test_a_chunk_syncs_each_directory_once_per_stage_not_once_per_file(self):
+        _, one = self.run_chunk(1, 1)
+        _, many = self.run_chunk(12, 12)
+        # A document's own directories (its retained-copy directory, its rendition directory three times, its
+        # rendition's parent) are synced once per stage; the shared parents once per chunk. One document alone
+        # syncs ten, and the same documents in one chunk sync about six each (it was ten each before 5n0q).
+        self.assertLess(len(many), 12 * len(one))
+        self.assertLessEqual(len(many) / 12, 7)
+
+    def test_a_rerun_makes_durable_what_a_killed_run_left_unsynced_before_it_commits_anything_that_names_it(self):
+        # Kill the run at the Nth flush that has work, before and after it syncs; the entries the killed run
+        # linked but did not sync (retained copies, renditions, saved registrations, completions) stay dirty
+        # until the rerun, which finds the files present and must still sync them before its own commits.
+        # The state a kill leaves is the whole point, so the run before the kill and the rerun share ``dirty``.
+        for before in (True, False):
+            for nth in (1, 2, 3, 4):
+                with self.subTest(before=before, nth=nth):
+                    root, inbox = make_instance(self, 3)
+                    dirty, violations, syncs, seen = set(), [], [], [0]
+                    real_flush = durable.DirectorySyncs.flush
+
+                    def flush(self, before=before, nth=nth):
+                        if not self.pending:
+                            return real_flush(self)
+                        seen[0] += 1
+                        if before and seen[0] == nth:
+                            raise Interrupted
+                        real_flush(self)
+                        if not before and seen[0] == nth:
+                            raise Interrupted
+                    with self.tracking(root, dirty, violations, syncs, flush), self.assertRaises(Interrupted):
+                        cohort.ingest(root, inbox, system="s", actor="a", batch_size=3, parse_workers=1)
+                    if before:
+                        self.assertTrue(dirty)  # the kill left entries unsynced
+                    killed = list(violations)
+                    with self.tracking(root, dirty, violations, syncs):
+                        report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=3, parse_workers=1)
+                    self.assertEqual(report["counts"]["outcome"]["extracted"], 3)
+                    self.assertEqual(violations, killed)  # the rerun committed nothing over an unsynced entry
+                    self.assertEqual(dirty, set())
+
+    def test_a_failed_directory_sync_while_preparing_fails_those_stages_retryably_and_the_run_continues(self):
+        root, inbox = make_instance(self, 4)
+        real_flush, calls = durable.DirectorySyncs.flush, []
+
+        def flush(self):
+            if self.pending:
+                calls.append(1)
+                if len(calls) == 2:  # the retained copies flushed first; fail the prepare stage's flush
+                    self.pending.clear()
+                    raise OSError(5, "injected")
+            return real_flush(self)
+        with patch.object(durable.DirectorySyncs, "flush", flush):
+            report = cohort.ingest(root, inbox, system="s", actor="a", batch_size=4, parse_workers=1)
+        # every prepare stage that had written its rendition failed once (recorded, within its attempt budget)
+        # and the retry completed it; nothing was registered on the strength of an unsynced rendition
+        with closing(sqlite3.connect(store.locations(root)[2])) as c:
+            failed = c.execute("SELECT count(*) FROM attempts WHERE outcome='failed'").fetchone()[0]
+        self.assertEqual(failed, 4)
+        self.assertEqual(report["counts"]["outcome"]["extracted"], 4, report["counts"])
+        self.assertEqual(report["counts"]["outcome"]["failed"], 0)
 
 
 class Contention(unittest.TestCase):
