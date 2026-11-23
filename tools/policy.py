@@ -10,6 +10,8 @@ import re
 import shutil
 import uuid
 
+from tools import validation_scope
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "config/policy.json"
@@ -42,7 +44,7 @@ def _no_symlinks(path):
     if ".." in path.parts:
         raise ValueError("Policy path traversal is not permitted")
     path = path.absolute()
-    if any(part.is_symlink() for part in (path, *path.parents)):
+    if validation_scope.has_symlink(path):
         raise ValueError("Policy symlinks are not permitted")
     return path
 
@@ -120,7 +122,7 @@ def _check_storage_roots(raw_roots, markdown_roots, original_roots):
 
 
 def read(path):
-    if any(part.is_symlink() for part in (path, *path.parents)):
+    if validation_scope.has_symlink(path):
         raise ValueError("Policy symlinks are not permitted")
     with path.open("rb") as stream:
         raw = stream.read(65537)
@@ -213,6 +215,36 @@ def _has_instance_policy(root):
 
 
 def for_root(root=None):
+    """``_for_root``, reused inside an ingest validation scope (Kata ajmk) while nothing it read has changed.
+
+    A hit still checks the root and the policy directories for symlinks and compares the ``lstat``
+    identity (device, inode, size, mtime, ctime, mode) of every file the policy is read from, and the
+    in-process ``SETTINGS``; any difference, and any refusal, recomputes in full. The scope ends at each
+    chunk boundary, and nothing is shared across roots, threads or processes.
+    """
+    scope = validation_scope.current()
+    if scope is None or (root is not None and ".." in Path(root).parts):
+        return _for_root(root)
+    absolute = None if root is None else Path(root).absolute()
+    files = [BASE, LOCAL]
+    if absolute is not None:
+        files += [absolute / "config/policy.json", absolute / "config/policy.local.json"]
+    # The directories the files are read from (each check also lstat-s the instance root above them).
+    for directory in dict.fromkeys(path.parent for path in files):
+        if validation_scope.has_symlink(directory, probe=True):  # read only, never created here
+            raise ValueError("Policy symlinks are not permitted")
+    key = ("for_root", absolute, BASE, LOCAL)
+    before = tuple(validation_scope.identity(path) for path in files)
+    cached = scope.values.get(key)
+    if cached is not None and cached[0] == before and cached[1] == SETTINGS:
+        return deepcopy(cached[2]), cached[3]
+    settings, digest = _for_root(root)
+    if tuple(validation_scope.identity(path) for path in files) == before:
+        scope.values[key] = (before, deepcopy(SETTINGS), deepcopy(settings), digest)
+    return settings, digest
+
+
+def _for_root(root=None):
     """Policy for an instance root.
 
     A root with its own ``config/policy*.json`` loads exactly those files. ``root=None``
@@ -248,7 +280,9 @@ def _settings_hash(settings):
 
 def fingerprint(root=None):
     policy_hash = for_root(root)[1]
-    return hashlib.sha256(Path(__file__).read_bytes() + policy_hash.encode()).hexdigest()
+    return validation_scope.memo(
+        ("policy.fingerprint", policy_hash, validation_scope.identity(__file__)),
+        lambda: hashlib.sha256(Path(__file__).read_bytes() + policy_hash.encode()).hexdigest())
 
 
 def allowed(name, category, root=None):
@@ -404,19 +438,25 @@ def _stat_id(path):
 
 
 def _watched(instance_root, roots):
-    """Every path whose change can alter a successful validation: lock, policy, binding, root components, stores."""
+    """``(paths, file_count)``: every path whose change can alter a successful validation.
+
+    The first ``file_count`` are files (migration lock, policy files, instance binding, store files),
+    then come the storage-root directory components.
+    """
     watched = [BASE, LOCAL]
     watched += [instance_root / name for name in (MIGRATION_FILE, INSTANCE_FILE,
                                                   "config/policy.json", "config/policy.local.json")]
+    for key, name in (("catalog_home", "catalog.sqlite3"), ("review_events_home", "events.sqlite3"),
+                      ("intake_home", "intake.sqlite3")):
+        watched += [instance_root / roots[key] / name, instance_root / DEFAULT_STORAGE_ROOTS[key] / name]
+    files = tuple(dict.fromkeys(watched))
+    components = []
     for rel in (*roots.values(), *DEFAULT_STORAGE_ROOTS.values()):
         cursor = instance_root
         for part in PurePosixPath(rel).parts:
             cursor = cursor / part
-            watched.append(cursor)
-    for key, name in (("catalog_home", "catalog.sqlite3"), ("review_events_home", "events.sqlite3"),
-                      ("intake_home", "intake.sqlite3")):
-        watched += [instance_root / roots[key] / name, instance_root / DEFAULT_STORAGE_ROOTS[key] / name]
-    return tuple(dict.fromkeys(watched))
+            components.append(cursor)
+    return (*files, *(c for c in dict.fromkeys(components) if c not in files)), len(files)
 
 
 def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=False):
@@ -429,20 +469,30 @@ def validate_instance_roots(root, *, allow_missing=(), ignore_migration_lock=Fal
     instance_root = _no_symlinks(root)
     key = (instance_root, tuple(allow_missing), ignore_migration_lock, BASE, LOCAL)
     cached = _VALIDATED.get(key)
-    if (cached is not None and cached[0] == SETTINGS
-            and cached[2] == tuple(_stat_id(path) for path in cached[1])):
-        return dict(cached[3])
+    scope = validation_scope.current()
+    if cached is not None and cached[0] == SETTINGS:
+        # Inside an ingest chunk (Kata ajmk) a result confirmed in full earlier in the same chunk is
+        # reused after comparing only the watched files (migration lock, policy files, instance
+        # binding, store files); the storage-root directory components were compared when it was
+        # confirmed, and the next chunk boundary forgets the confirmation so they are compared again.
+        confirmed = scope is not None and scope.values.get(("validated", key)) is cached
+        count = cached[4] if confirmed else len(cached[1])
+        if cached[2][:count] == tuple(_stat_id(path) for path in cached[1][:count]) and (
+                confirmed or cached[2][count:] == tuple(_stat_id(path) for path in cached[1][count:])):
+            if scope is not None and not confirmed:
+                scope.values[("validated", key)] = cached
+            return dict(cached[3])
     # Snapshot before validating and cache only if nothing moved meanwhile, so a change that races the
     # validation is revalidated on the next call instead of becoming the accepted baseline.
     try:
-        before = _watched(instance_root, storage_roots(instance_root))
+        before, file_count = _watched(instance_root, storage_roots(instance_root))
         before_ids = tuple(_stat_id(path) for path in before)
     except ValueError:
         before = None
     roots = _validate_instance_roots(instance_root, allow_missing, ignore_migration_lock)
-    if before is not None and _watched(instance_root, roots) == before and before_ids == tuple(
+    if before is not None and _watched(instance_root, roots)[0] == before and before_ids == tuple(
             _stat_id(path) for path in before):
-        _VALIDATED[key] = (deepcopy(SETTINGS), before, before_ids, dict(roots))
+        _VALIDATED[key] = (deepcopy(SETTINGS), before, before_ids, dict(roots), file_count)
     return roots
 
 

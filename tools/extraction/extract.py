@@ -18,7 +18,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-from tools import durable, policy
+from tools import durable, policy, validation_scope
 from tools.catalog import catalog_store as catalog
 from tools.extraction import mhtml
 
@@ -119,10 +119,15 @@ def mime_html(raw):
 
 def fingerprint(root, format_name):
     """Extractor identity hash; the MIME reader's code is part of identity only for its format."""
-    code = Path(__file__).read_bytes()
-    if format_name == "mhtml":
-        code += Path(mhtml.__file__).read_bytes()
-    return digest(code + policy.fingerprint(root).encode())
+    policy_fingerprint = policy.fingerprint(root)
+    files = (__file__, mhtml.__file__) if format_name == "mhtml" else (__file__,)
+
+    def compute():
+        code = b"".join(Path(name).read_bytes() for name in files)
+        return digest(code + policy_fingerprint.encode())
+    return validation_scope.memo(
+        ("extract.fingerprint", policy_fingerprint, files, tuple(validation_scope.identity(n) for n in files)),
+        compute)
 
 
 def gemini(raw, root=None, settings=None):

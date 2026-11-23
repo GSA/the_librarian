@@ -113,6 +113,33 @@ restated here.
   `tests/test_instance_root_cache.py` (no store reopen on repeat calls; a
   migration lock, changed storage roots, substituted store and symlinked root
   each still refused after a cached success).
+- **Policy and path-safety checks are reused within an ingest chunk (Kata ajmk).**
+  `tools/validation_scope.py` opens a thread-local scope around the chunk loop of
+  `cohort_ingest._process_all` and `boundary()` empties it at the start of every
+  chunk; outside a scope nothing is cached and every check runs in full as before.
+  Inside one: (1) `safe_path`, `store.safe` and the policy symlink checks always
+  `lstat` the path and its parent, and stop walking up at an ancestor whose
+  `lstat` (device, inode, mode) equals the one recorded when it was found clean;
+  a path that does not exist yet (the target of a write that creates it) gets the
+  full walk, and only existence probes of SQLite sidecars and journals use the
+  cache; (2) `policy.for_root` returns a copy of the policy it loaded for that
+  root while the (device, inode, size, mtime_ns, ctime_ns, mode) identity of every
+  policy file, the policy directories' symlink checks and the in-process
+  `SETTINGS` are unchanged, and `policy.fingerprint` / `extract.fingerprint` are
+  remembered under those identities plus the source files' identity;
+  (3) `validate_instance_roots` reuses a result confirmed in full earlier in the
+  chunk after comparing the migration lock, policy files, instance binding and
+  store files, and skips the storage-root directory components until the next
+  boundary. Refusals are never cached, nothing is shared across roots, threads or
+  processes, and `O_NOFOLLOW` opens, permission checks and store probes are
+  unchanged. What a chunk can miss: a symlink swapped into an unchanged higher
+  ancestor, or a storage-root component, after it was confirmed within the same
+  chunk; it is refused at the next chunk boundary (at most `BATCH_SIZE` documents
+  later), before any further chunk writes. Evidence: `tests/test_validation_scope.py`
+  (symlinked or replaced ancestor, root swapped for a symlink between chunks, policy
+  edited between chunks and mid-scope, migration lock, substituted store, loosened
+  permissions, no sharing across roots, threads or processes, identical catalog and
+  report with and without the scope). Measurements: Kata ajmk and its PR.
 - **Topology.** One instance is one full clone: its own checkout, `.venv`,
   `config/*.local.json`, inbox and stores. Policy is resolved per `--root` on
   every operation; a root without its own policy files gets only the versioned

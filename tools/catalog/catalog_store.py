@@ -52,7 +52,7 @@ def initialize(root):
     with writer_lock(home):
         require(not db.exists(), "Catalog already exists; init never overwrites")
         for suffix in ("-journal", "-wal", "-shm"):
-            require(not safe_path(str(db) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+            require(not safe_path(str(db) + suffix, probe=True).exists(), "SQLite sidecar present; explicit recovery required")
         partial = home / ("init-" + uuid.uuid4().hex + ".partial")
         reserve(partial)
         published = False
@@ -89,8 +89,8 @@ def _recover_journal(db):
     (WAL, shared memory) is still refused. The caller verifies the recovered catalog in full.
     """
     for suffix in ("-wal", "-shm"):
-        require(not safe_path(str(db) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
-    journal = safe_path(str(db) + "-journal")
+        require(not safe_path(str(db) + suffix, probe=True).exists(), "SQLite sidecar present; explicit recovery required")
+    journal = safe_path(str(db) + "-journal", probe=True)
     if not journal.exists():
         return False
     require(journal.is_file() and stat.S_IMODE(journal.stat().st_mode) == 0o600,
@@ -127,7 +127,7 @@ def migrate_indexes(root, *, rebuild=False, check=False, recover=False):
     with writer_lock(home):
         if recover:
             _recover_journal(db)
-        elif safe_path(str(db) + "-journal").exists():
+        elif safe_path(str(db) + "-journal", probe=True).exists():
             raise CatalogError("SQLite sidecar present; explicit recovery required: "
                                "run migrate-indexes --recover after confirming no other process is migrating")
         return _migrate_locked(home, db, backups, rebuild)
@@ -1226,7 +1226,7 @@ def restore(root, snapshot, expected_state=None):
             require(verify_backup(source) == source_state, "Restore source changed")
             seal(partial)
             for suffix in ("-journal", "-wal", "-shm"):
-                require(not safe_path(str(db) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+                require(not safe_path(str(db) + suffix, probe=True).exists(), "SQLite sidecar present; explicit recovery required")
             if safety is None:
                 os.link(partial, db, follow_symlinks=False)
                 published = True

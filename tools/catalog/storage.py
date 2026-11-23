@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-from tools import durable, policy
+from tools import durable, policy, validation_scope
 from tools.file_identity import KeyedConnection, file_key
 from tools.catalog.contracts import (
     CatalogError, GraphValidator, WriterBusy, canonical, exact, fingerprint, require, text, validate_record,
@@ -71,12 +71,15 @@ REFS_FROM_VERSIONS = ("INSERT OR IGNORE INTO refs SELECT j.value,v.revision,v.or
 
 
 
-def safe_path(path):
+def safe_path(path, *, probe=False):
+    """``path`` made absolute and checked for traversal and symlinks. Inside an ingest validation scope
+    (``tools/validation_scope.py``) ancestors already checked are not walked again, but a path that does
+    not exist yet (a write that creates it follows) is walked in full, unless ``probe`` marks an existence
+    check of a path nothing will create (a SQLite sidecar or journal)."""
     path = Path(path)
     require(".." not in path.parts, "Filesystem traversal is forbidden")
     path = path.absolute()
-    for component in reversed((path, *path.parents)):
-        require(not component.is_symlink(), "Symlink paths are forbidden")
+    require(not validation_scope.has_symlink(path, probe=probe), "Symlink paths are forbidden")
     return path
 
 
@@ -209,7 +212,7 @@ def _journal_state(path):
     journal before releasing the lock, so neither is mistaken for abandoned.
     """
     import fcntl
-    journal = safe_path(str(path) + "-journal")
+    journal = safe_path(str(path) + "-journal", probe=True)
     home = path.parent
     if str(safe_path(home)) in getattr(_held, "homes", ()):
         return "abandoned" if journal.exists() else "none"
@@ -234,7 +237,7 @@ def connect(path, write=False):
     deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
     while True:
         for suffix in ("-wal", "-shm"):
-            require(not safe_path(str(path) + suffix).exists(), "SQLite sidecar present; explicit recovery required")
+            require(not safe_path(str(path) + suffix, probe=True).exists(), "SQLite sidecar present; explicit recovery required")
         state = _journal_state(path)
         if state == "none":
             break

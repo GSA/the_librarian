@@ -14,7 +14,7 @@ import time
 import unicodedata
 from urllib.parse import quote
 
-from tools import policy
+from tools import policy, validation_scope
 from tools.catalog import catalog_store as catalog
 from tools.extraction import convert, extract, mhtml
 from tools.durable import sha256_file
@@ -983,10 +983,11 @@ def _process_all(root, inbox, todo, system, actor, batch_size, stats, concurrenc
     pool = pool or parse_pool.Workers(1)
     ahead = None  # last job of the chunk queued ahead
     # Room for this chunk's parses and the next chunk's (still bounded by ``extract._KEEP_BYTES`` of source).
-    with extract.keeping_parsed(2 * batch_size):
+    with extract.keeping_parsed(2 * batch_size), validation_scope.scoped():
         if pool.parallel and chunks:
             ahead = _parse_ahead(root, inbox, chunks[0], pool, failed)
         for number, chunk in enumerate(chunks):
+            validation_scope.boundary()  # a policy edit or symlink swap between chunks is seen in full
             if pool.parallel:
                 pool.deliver_through(ahead)
             results = {e["relative"]: failed.pop(e["relative"]) for e in chunk if e["relative"] in failed}
