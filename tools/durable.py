@@ -69,6 +69,20 @@ def batching():
     return getattr(_scope, "syncs", None) is not None
 
 
+def fsync_chain_later(path, root, sync=fsync_directory):
+    """Queue ``path`` and every directory above it up to ``root`` for the active scope's flush (a no-op outside one).
+
+    A rerun that finds directories an interrupted run made cannot tell whether their entries ever reached
+    storage, so a batch that depends on them queues each one with its parents.
+    """
+    if getattr(_scope, "syncs", None) is None:
+        return
+    for directory in (path, *path.parents):
+        _scope.syncs.add(directory, sync)
+        if directory == root:
+            break
+
+
 def fsync_directory_later(path, sync=fsync_directory):
     """``sync(path)`` now, or once at the flush of the active ``batched_directory_syncs`` scope."""
     active = getattr(_scope, "syncs", None)

@@ -92,9 +92,6 @@ def private_directory(path):
             "Catalog directories must have mode 0700")
     for created in reversed(missing):
         durable.fsync_directory_later(created.parent, fsync_directory)
-    if not missing and durable.batching():
-        # An interrupted run may have created this directory and died before its parent was synced.
-        durable.fsync_directory_later(path.parent, fsync_directory)
     return path
 
 

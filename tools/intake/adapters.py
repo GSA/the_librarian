@@ -429,7 +429,14 @@ def execute_batch(root, entries):
         with durable.batched_directory_syncs() as syncs:
             for index in range(len(entries)):
                 single(index)
-            syncs.flush()
+            try:
+                syncs.flush()
+            except OSError as error:
+                # Files whose entries cannot be made durable are not prepared: each stage that would have
+                # succeeded fails (retryably, as the same error from its own sync always did) and the rest stand.
+                for index, outcome in enumerate(outcomes):
+                    if not isinstance(outcome, Exception):
+                        outcomes[index] = error
         return outcomes
     if operation == "catalog-submit":
         groups = {}

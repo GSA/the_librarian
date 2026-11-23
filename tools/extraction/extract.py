@@ -495,6 +495,8 @@ def registration_recipe(root, original, path, value, state, actor, registered=la
             saved[key] == recipe[key] for key in ("actor", "request_id", "reason")),
             "Saved registration differs in actor, request or reason")
         catalog.validate_records(saved["records"])
+        # An earlier run may have linked the file and died before syncing its directory.
+        durable.fsync_directory_later(saved_path.parent, catalog.fsync_directory)
         if saved != recipe:
             history = catalog.read_records(
                 root, kind="artifact", path=value["source"]["path"],
@@ -521,6 +523,8 @@ def finish_registration(root, path, value, recipe, outcome):
             require(saved["request_id"] == recipe["request_id"]
                     and saved["committed_state"] == outcome["committed_state"],
                     "Committed registration differs from saved completion")
+            # An earlier run may have linked the file and died before syncing its directory.
+            durable.fsync_directory_later(completion.parent, catalog.fsync_directory)
         unchanged(root, value)
     except (ExtractionError, catalog.CatalogError, OSError, ValueError, KeyError) as error:
         raise ExtractionError("Catalog registration committed, but completion/final check failed; "
@@ -631,6 +635,8 @@ def run(root, command, receipt, format_name, actor=None, expected_state=None, re
         if command == "prepare":
             catalog.private_directory(path.parent.parent)
             catalog.private_directory(path.parent)
+            # A rerun finds directories a killed run made; their entries are synced with this batch's.
+            durable.fsync_chain_later(path.parent, root, catalog.fsync_directory)
             unchanged(root, value)
             created = publish(path, raw)
         else:
