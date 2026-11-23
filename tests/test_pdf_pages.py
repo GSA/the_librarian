@@ -225,7 +225,8 @@ class HardeningTests(unittest.TestCase):
 
     def test_the_document_time_budget_marks_later_pages_without_running_them(self):
         pages = [text_page(1)] + [scan_page(n) for n in range(2, 6)]
-        payload, _, log = self.convert({str(n): "sleep:0.4" for n in range(2, 6)}, pages, document_seconds=0.5)
+        # One page fits the budget with 0.4s to spare for child startup on a slow runner; two never do.
+        payload, _, log = self.convert({str(n): "sleep:0.8" for n in range(2, 6)}, pages, document_seconds=1.2)
         self.assertEqual([(e["outcome"], e.get("code"), e.get("attempts")) for e in payload["pages"][3:]],
                          [("failed", "extract-time-budget", 0)] * 2)
         self.assertIn("[Page 5 not extracted: extract-time-budget]", [line["text"] for line in payload["lines"]])

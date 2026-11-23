@@ -25,4 +25,16 @@ jobs:
       - name: Schema snapshots
         run: .venv/bin/python -m tools.schemas.export_schemas --check
       - name: Tests
-        run: .venv/bin/python -m unittest discover -s tests
+        shell: bash
+        run: |
+          .venv/bin/python -W error::ResourceWarning -X dev -m unittest discover -s tests -v 2>&1 | tee test-output.log
+      - name: No ResourceWarning in test output
+        # Unraisable warnings (a finalizer's "unclosed database") print but do not fail the run, so check the log.
+        run: |
+          if grep -n ResourceWarning test-output.log; then
+            echo "::error::tests leaked resources; close connections and clean up temp directories"
+            exit 1
+          fi
+      - name: Skipped tests
+        if: always()
+        run: grep -E "\.\.\. skipped" test-output.log || true

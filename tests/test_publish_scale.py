@@ -4,6 +4,7 @@ Synthetic selections in temporary workspaces only. The diagnostic that builds th
 (``tools/diagnostics/publish_benchmark.py``) is the fixture, so the numbers it prints and these tests
 describe the same shape.
 """
+from contextlib import closing
 from pathlib import Path
 import tempfile
 import unittest
@@ -95,7 +96,7 @@ class PublishScaleTests(unittest.TestCase):
         report = cohort.publish(root, policy_path=bench.POLICY, manifest=bench.MANIFEST)
         self.assertEqual(report["counts"], {"published": 1, "selections": 12})
         self.assertEqual(report["publication"], {"status": "succeeded", "available": True})
-        with index.readonly(root / cohort.DEFAULT_INDEX) as db:
+        with closing(index.readonly(root / cohort.DEFAULT_INDEX)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM rendition_documents").fetchone()[0], 12)
 
 
