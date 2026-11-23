@@ -97,23 +97,26 @@ def has_symlink(path, probe=False):
     A path that does not exist yet is the target of a write that will create it, so it gets the full
     walk unless ``probe`` says the caller only tests whether it exists (a SQLite sidecar or journal).
     """
-    path = Path(path)
     scope = current()
     if scope is None:
-        return _full(path)
-    first = _dir_id(path)
+        return _full(Path(path))
+    name = os.fspath(path)
+    first = _dir_id(name)
     if first is None and not probe:
-        return _full(path)
-    clean, pending, seen = scope.clean, [], 0
-    for part in (path, *path.parents):
-        found = first if part is path or part == path else _dir_id(part)
-        if found is None:
-            continue  # absent, so it cannot be a link
-        if stat.S_ISLNK(found[2]):
-            return True
-        if seen >= 2 and clean.get(part) == found:
+        return _full(Path(path))
+    clean, pending, seen, found = scope.clean, [], 0, first
+    while True:
+        if found is not None:
+            if stat.S_ISLNK(found[2]):
+                return True
+            if seen >= 2 and clean.get(name) == found:
+                break
+            seen += 1
+            pending.append((name, found))
+        parent = os.path.dirname(name)
+        if parent == name:
             break
-        seen += 1
-        pending.append((part, found))
+        name = parent
+        found = _dir_id(name)
     clean.update(pending)
     return False
