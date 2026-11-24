@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "rules": [
+    {"id": "dependency-trees", "reason": "vendored dependencies", "globs": ["**/node_modules/**", "**/vendor/**"]},
+    {"id": "vcs-internals", "reason": "version-control metadata", "globs": ["**/.git/**", "**/.svn/**"]},
+    {"id": "build-tool-cache", "reason": "build-tool cache files", "extensions": [".lastUpdated", ".repositories", ".sha1"]}
+  ]
+}

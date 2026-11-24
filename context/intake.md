@@ -677,6 +677,55 @@ size, sha256, manifest sha256, actor, time) to `archives/deletions.jsonl`. It fs
 then unlinks the archive and fsyncs the directory. A rerun reports `already-deleted`. Exit status
 is 0 for `verified`, `deleted` and `already-deleted`, and 1 when blocked.
 
+## Excluding files and deselecting selections
+
+Low-value material (dependency trees such as `node_modules`, VCS internals such as `.git` or
+`.svn`, build-tool caches) should neither spend model calls nor take selections. Two supported
+mechanisms, neither of which rewrites the standing policy:
+
+**Exclusion rules** are private instance configuration, `config/intake-exclusions.local.json`
+(ignored by Git; template `config/intake-exclusions.example.json`), read automatically by
+`classify`, `ingest` and `qualify` when it exists, or named with `--exclusions FILE`. Version 1, at
+most 64 KiB: `{"version": 1, "rules": [{"id", "reason"?, "globs"?, "extensions"?}]}`. `id` is unique
+(lower-case letters, digits, hyphens). A glob is matched against the whole inbox-relative path
+(`ARCHIVE!/MEMBER` for an archive member): `*` and `?` stay within one segment, `**/` is any leading
+directories, `/**` anything below, no leading `/`, `..` or backslash. An extension (leading dot,
+case-insensitive) matches the end of the file name. The first matching rule wins. A malformed file
+is `invalid_exclusions`; a symlinked file is `unsafe_path`; naming `--exclusions` with
+`--agent-origin` is `exclusions_not_for_agent_origin` (that cohort has its own `exclude`, and the
+instance file is not applied to it).
+
+A matched file is classified as usual and then reported `disposition: excluded` with `rule` and
+`underlying` (the disposition it would have had). One whose `underlying` is `admit` is still
+submitted: it gets a receipt, its original is retained and registered (so a retirement manifest
+joins it), and its ledger `docs` row is `received`, with `outcome: receipt-only`; it is never
+extracted, sent to the model or selected, and `--limit` does not hold receipts back. An excluded
+archive is not looked into. `counts.excluded` is body-free: `rules`, rules-file `sha256`, `files`,
+`by_rule`, `underlying`, `bytes`, `receipt_expected` and, for `ingest`/`qualify`, `received` and
+`outcome`. `classify` is therefore the dry run. A rule added later never removes a selection by
+itself: the file keeps whatever selection it has until `deselect` removes it, even if its bytes changed (a new receipt) or it would no longer be admitted; `qualify` finds the entry from the inbox path its receipt's pinned submission sidecar names.
+
+**`deselect`** (`python -m tools.intake.cohort deselect --root R --manifest M ...`) removes manifest
+selections. It is a dry run unless `--apply` (which needs `--actor`; `--reason` is an optional
+note). Selectors: `--receipt D123` (repeatable), `--receipts-file` (one ID per line, or the
+`--report` of an earlier dry run), `--rule ID` / `--all-rules` (the selections whose inbox path, from
+the ledger's `docs` rows, a rule matches; `--system` limits them to one cohort label) and `--dedupe`.
+Duplicates: selections of different receipts whose originals have the same SHA-256 (from the `docs` row, else from the catalog, so the optional table is not needed) form a group;
+every group is reported (`counts.duplicates`, `groups` in `--report`: `keep`, `receipts`, `removed`),
+and `--dedupe` keeps the lowest receipt that no other selector removes and deselects the rest, so a
+group is never emptied. Output is body-free counts (`deselect`, `remaining`, `by_reason`, `by_rule`,
+`unmapped`, `unmatched_receipts`, `duplicates`); `--report FILE` (0600) lists receipts and paths.
+
+Apply holds the ledger writer lock and records the removal in three steps, so a crash at any point is
+finished by running the same command again (a rerun that finds nothing to remove changes nothing):
+a `begin` record in `<intake home>/deselections.jsonl` (append-only, fsynced; every removed receipt,
+selection hash and reason, the actor and counts); one review event per removed entry superseding its
+live review (`outcome: dispositioned`, id `rev-deselect-...`; this is what stops a later `qualify`
+from selecting it again, and publication refuses a manifest entry citing a superseded review); then
+the atomic, validated manifest rewrite and a `done` record. Receipts, originals, renditions and
+reviews are never deleted. Deselecting does not publish: run `publish` afterwards. A removed
+entry frees its manifest capacity.
+
 ## Agent-written context
 
 `classify`, `ingest` and `qualify` accept `--agent-origin FILE`: a private origin file

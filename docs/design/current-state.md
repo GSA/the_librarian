@@ -451,6 +451,50 @@ restated here.
   whole document) and `document-missing` (shown only in status).
   `status` reports `claim_corrections` counts including open drifted ones. No store means reads
   are unchanged; an invalid store refuses the read. Evidence: `tests/test_corrections.py`.
+- **Inbox exclusion rules and `deselect`** (Kata bvvc). `cohort classify|ingest|qualify` read an
+  optional private `config/intake-exclusions.local.json` (or `--exclusions FILE`;
+  `tools/intake/exclusions.py`, version 1, `rules[{id, reason?, globs?, extensions?}]`, first match
+  wins, globs over the whole inbox-relative path including `ARCHIVE!/MEMBER`). `classify` judges a
+  file as before and `exclusions.mark` then reports it `excluded` with `rule` and `underlying`
+  (never during `--agent-origin`, whose own `exclude` stays; naming both is
+  `exclusions_not_for_agent_origin`). A file that would have been `admit` still gets a receipt
+  (`cohort_ingest._receipt_only_batch`, the receipt half of `_process_batch` that ingest already
+  splits out as `_receive_batch`; outcome `receipt-only`, ledger `docs` state `received`); it gets no
+  prepare/register stage, so it is never extracted, reviewed or selected, `--limit` does not defer
+  its receipt, and `--trust-stat` cannot send it down the extraction fast path. The standing policy
+  is not read or rewritten by any of this. `qualify` keeps the existing selection of a file a rule
+  matches (`_reconcile_qualified(..., keep)`, by receipt or by the inbox path the receipt's
+  sidecar names, so a changed or no-longer-admittable file keeps it too): an exclusion never
+  removes anything by itself.
+  `tools/intake/deselect.py` removes selections: dry run by default; selectors are receipt IDs
+  (or a dry-run report), exclusion rules matched against the `docs` row's inbox path, and
+  `--dedupe` over groups of selections whose originals share a SHA-256 (from the `docs` row, else the
+  catalog's original, so the optional table is not needed; groups are always
+  reported; the lowest receipt left after the other selectors is kept, so no group is emptied).
+  `--apply` holds the ledger writer lock and recovers an interrupted manifest append, then writes
+  in this order: a fsynced `begin` record in `<intake home>/deselections.jsonl`, one superseding
+  `dispositioned` review event per removed entry's live review (`rev-deselect-<hash of the
+  superseded id>`, batched, idempotent by request ID), the atomic validated manifest rewrite
+  (`standing_publication._replace_validated`, not the constant-time append, which only adds) and a
+  `done` record. A `begin` without `done` is completed by the next `--apply` whatever selectors it
+  gets; a rerun with nothing left to remove writes nothing. Superseding the review is what keeps a
+  removed entry removed: `cohort_review._superseded` reports it `review-superseded` and
+  `qualify` does not restore it, and publication refuses a manifest entry that cites a
+  superseded review. Receipts, originals and renditions are not touched; `publish` is run
+  afterwards. Evidence: `tests/test_intake_exclusions.py`
+  (`test_excluded_files_are_never_sent_to_the_model_nor_selected_but_are_reported`,
+  `test_ingest_gives_excluded_files_receipts_and_never_extracts_them`,
+  `test_dry_run_is_the_default_writes_nothing_and_reports_by_rule`,
+  `test_apply_removes_only_the_matching_selections_and_keeps_every_receipt`,
+  `test_apply_is_idempotent_and_a_rerun_changes_nothing`,
+  `test_a_crash_after_the_log_but_before_the_events_is_finished_by_a_rerun`,
+  `test_a_crash_after_the_events_but_before_the_manifest_rewrite_is_finished_by_a_rerun`,
+  `test_a_deselected_entry_is_not_selected_again_by_a_rerun_or_a_policy_bump`,
+  `test_publish_after_deselect_serves_only_what_is_left`,
+  `test_byte_identical_selections_across_receipts_are_reported_as_groups_without_removing`,
+  `test_dedupe_never_removes_the_last_copy_when_a_rule_removes_the_others`,
+  `test_a_selection_survives_its_file_changing_or_becoming_unadmittable_while_excluded`,
+  `test_dedupe_finds_groups_from_the_catalog_without_the_docs_table`).
 - **Agent-written context is a cohort with a declared origin** (Kata 2ket). `cohort
   classify|ingest|qualify --agent-origin FILE` (`tools/intake/agent_origin.py`) reads a private
   version-1 origin file (`generator`, optional `source_repository`, `provenance` `git|none`,
