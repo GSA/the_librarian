@@ -374,7 +374,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.evals` | Retrieval-quality evaluation: `generate` seeded cases, `run` them against a fresh index into a body-free scorecard, `compare BASE NEW` (exit 1 on a regression) |
 | `python -m tools.schemas.export_schemas` | Generate or `--check` SQLite schema snapshots in `tools/schemas/` |
 | `python -m tools.package` | Package allowlisted toolkit files (`--output`) |
-| `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index |
+| `librarian-preflight` | Check prerequisites; `--refresh-index` rebuilds the index; `--verify-start` starts a fresh MCP server and calls `status` and `search` |
 | `librarian-mcp` | Read-only stdio MCP server |
 | `librarian-audit` | Body-free `report` of the opt-in MCP audit log |
 
@@ -508,6 +508,34 @@ python3 -m zipfile -e .local/the-librarian.zip ~/my-program-librarian
 
 Then run [Setup](#setup) inside the copy. The package includes only the files
 listed in `release-files.json`.
+
+### Upgrading an instance
+
+An upgrade is not done until a **fresh** MCP server has started from the upgraded
+instance. The store audits (`store_audit`, publish, integrity audit) never start
+the server, and servers already running keep the old code until restarted, so
+they hide a broken start until the next client or host restart. After copying the
+new toolkit files and reinstalling the adapter into the instance `.venv`
+(`.venv/bin/python -m pip install ./tools/context-mcp`), run from a directory outside the instance:
+
+```sh
+/abs/instance/.venv/bin/librarian-preflight \
+  --root /abs/instance --manifest /abs/instance/config/selection.local.json \
+  --verify-start --server-command /abs/instance/.venv/bin/librarian-mcp \
+  --client-timeout-seconds 60
+```
+
+`--verify-start` starts a new `librarian-mcp` process the way the client
+configuration does (no `PYTHONPATH` or inherited virtual environment, working
+directory outside the instance), calls `status` and one `search`, and exits
+non-zero with the server's stderr if any step fails or exceeds the client
+timeout. Use the same `--root`, `--manifest`, limits and timeout as the client
+binding (the example in [MCP for consumer agents](#mcp-for-consumer-agents)
+uses 60 s). Record the `initialize`, `status`, `search` and `total` timings in
+the upgrade notes. A process-fresh start is not a cold page cache: after a
+reindex or host restart, repeat the check on the cold cache and keep the slowest
+step under the client timeout. Then restart every long-running server (and
+client) so it runs the upgraded code.
 
 ## Rules
 
