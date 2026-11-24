@@ -22,7 +22,7 @@ original has it), ``receipt-by-content`` (the bytes are a catalog original under
 ``archive-not-expanded``, ``unreadable`` and ``changed-during-read``.
 """
 import argparse
-from collections import Counter, defaultdict
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
