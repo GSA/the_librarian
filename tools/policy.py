@@ -10,7 +10,13 @@ import re
 import shutil
 import uuid
 
-from tools import validation_scope
+try:
+    from tools import validation_scope
+except ModuleNotFoundError:  # loaded by file path (the MCP adapter), where the toolkit is not on sys.path
+    import importlib.util as _util
+    _spec = _util.spec_from_file_location("librarian_validation_scope", Path(__file__).with_name("validation_scope.py"))
+    validation_scope = _util.module_from_spec(_spec)
+    _spec.loader.exec_module(validation_scope)
 
 
 ROOT = Path(__file__).resolve().parents[1]
