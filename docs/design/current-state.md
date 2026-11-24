@@ -433,11 +433,14 @@ restated here.
   splits out as `_receive_batch`; outcome `receipt-only`, ledger `docs` state `received`); it gets no
   prepare/register stage, so it is never extracted, reviewed or selected, `--limit` does not defer
   its receipt, and `--trust-stat` cannot send it down the extraction fast path. The standing policy
-  is not read or rewritten by any of this. `qualify` keeps an excluded file's existing selection
-  (`_reconcile_qualified(..., retained)`): an exclusion never removes anything by itself.
+  is not read or rewritten by any of this. `qualify` keeps the existing selection of a file a rule
+  matches (`_reconcile_qualified(..., keep)`, by receipt or by the inbox path the receipt's
+  sidecar names, so a changed or no-longer-admittable file keeps it too): an exclusion never
+  removes anything by itself.
   `tools/intake/deselect.py` removes selections: dry run by default; selectors are receipt IDs
   (or a dry-run report), exclusion rules matched against the `docs` row's inbox path, and
-  `--dedupe` over groups of selections whose originals share a SHA-256 (groups are always
+  `--dedupe` over groups of selections whose originals share a SHA-256 (from the `docs` row, else the
+  catalog's original, so the optional table is not needed; groups are always
   reported; the lowest receipt left after the other selectors is kept, so no group is emptied).
   `--apply` holds the ledger writer lock and recovers an interrupted manifest append, then writes
   in this order: a fsynced `begin` record in `<intake home>/deselections.jsonl`, one superseding
@@ -460,7 +463,9 @@ restated here.
   `test_a_deselected_entry_is_not_selected_again_by_a_rerun_or_a_policy_bump`,
   `test_publish_after_deselect_serves_only_what_is_left`,
   `test_byte_identical_selections_across_receipts_are_reported_as_groups_without_removing`,
-  `test_dedupe_never_removes_the_last_copy_when_a_rule_removes_the_others`).
+  `test_dedupe_never_removes_the_last_copy_when_a_rule_removes_the_others`,
+  `test_a_selection_survives_its_file_changing_or_becoming_unadmittable_while_excluded`,
+  `test_dedupe_finds_groups_from_the_catalog_without_the_docs_table`).
 - **Agent-written context is a cohort with a declared origin** (Kata 2ket). `cohort
   classify|ingest|qualify --agent-origin FILE` (`tools/intake/agent_origin.py`) reads a private
   version-1 origin file (`generator`, optional `source_repository`, `provenance` `git|none`,

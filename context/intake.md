@@ -703,14 +703,14 @@ extracted, sent to the model or selected, and `--limit` does not hold receipts b
 archive is not looked into. `counts.excluded` is body-free: `rules`, rules-file `sha256`, `files`,
 `by_rule`, `underlying`, `bytes`, `receipt_expected` and, for `ingest`/`qualify`, `received` and
 `outcome`. `classify` is therefore the dry run. A rule added later never removes a selection by
-itself: the file keeps whatever selection it has (`qualify` retains it) until `deselect` removes it.
+itself: the file keeps whatever selection it has until `deselect` removes it, even if its bytes changed (a new receipt) or it would no longer be admitted; `qualify` finds the entry from the inbox path its receipt's pinned submission sidecar names.
 
 **`deselect`** (`python -m tools.intake.cohort deselect --root R --manifest M ...`) removes manifest
 selections. It is a dry run unless `--apply` (which needs `--actor`; `--reason` is an optional
 note). Selectors: `--receipt D123` (repeatable), `--receipts-file` (one ID per line, or the
 `--report` of an earlier dry run), `--rule ID` / `--all-rules` (the selections whose inbox path, from
 the ledger's `docs` rows, a rule matches; `--system` limits them to one cohort label) and `--dedupe`.
-Duplicates: selections of different receipts whose originals have the same SHA-256 form a group;
+Duplicates: selections of different receipts whose originals have the same SHA-256 (from the `docs` row, else from the catalog, so the optional table is not needed) form a group;
 every group is reported (`counts.duplicates`, `groups` in `--report`: `keep`, `receipts`, `removed`),
 and `--dedupe` keeps the lowest receipt that no other selector removes and deselects the rest, so a
 group is never emptied. Output is body-free counts (`deselect`, `remaining`, `by_reason`, `by_rule`,

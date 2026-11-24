@@ -217,6 +217,20 @@ class QualifyExclusionTests(ExcludedCase):
         self.assertEqual(len(self.selected()), 9, "an exclusion never removes a selection by itself")
         self.assertEqual(again["counts"]["excluded"]["files"], 3)
 
+    def test_a_selection_survives_its_file_changing_or_becoming_unadmittable_while_excluded(self):
+        self.rules_path.unlink()
+        self.qualify()
+        selected = {s["receipt_id"] for s in self.selected()}
+        self.rules_path.write_text(json.dumps(RULES))
+        self.writable()
+        (self.inbox / "cache/x.pom").write_bytes(b"<project>changed bytes</project>\n")  # a new receipt
+        (self.inbox / "web/node_modules/pkg/readme.md").write_bytes(b"")  # no longer admitted
+        calls = len(self.calls)
+        report = self.qualify()
+        self.assertEqual(len(self.calls), calls)
+        self.assertTrue(selected <= {s["receipt_id"] for s in self.selected()})
+        self.assertEqual(self.entry(report, "web/node_modules/pkg/readme.md")["underlying"], "empty")
+
     def test_an_explicit_exclusions_file_overrides_the_default_and_agent_origin_refuses_it(self):
         other = Path(self.temp.name) / "rules.json"
         other.write_text(json.dumps({"version": 1, "rules": [{"id": "txt", "extensions": [".txt"]}]}))
@@ -509,6 +523,30 @@ class DuplicateTests(DeselectCase):
         copies = [self.receipt(n) for n in ("copy-a.md", "docs/copy-b.md", "docs/deep/copy-c.md")]
         self.assertEqual(sum(c in kept for c in copies), 1)
         self.assertNotIn(copies[0], kept)
+
+
+class DuplicateWithoutDocsTests(DeselectCase):
+    """The same duplicate detection when the optional ``docs`` table is absent or lacks a row."""
+
+    def test_dedupe_finds_groups_from_the_catalog_without_the_docs_table(self):
+        with store.locked(self.root) as c:
+            c.execute("DROP TABLE docs")
+        copies = sorted((self.receipt(n) for n in ("copy-a.md", "docs/copy-b.md", "docs/deep/copy-c.md")),
+                        key=lambda r: int(r[1:]))
+        report = self.run_deselect(dedupe=True, actor="operator", apply=True)
+        left = {s["receipt_id"] for s in self.selected()}
+        self.assertIn(copies[0], left)
+        self.assertTrue(left.isdisjoint(copies[1:]))
+        self.assertEqual(report["counts"]["unmapped"], 2)
+
+    def test_a_selection_whose_row_moved_to_a_newer_receipt_is_still_grouped(self):
+        copies = sorted((self.receipt(n) for n in ("copy-a.md", "docs/copy-b.md", "docs/deep/copy-c.md")),
+                        key=lambda r: int(r[1:]))
+        with store.locked(self.root) as c:
+            c.execute("DELETE FROM docs WHERE receipt_id=?", (copies[1],))
+        report = self.run_deselect()
+        group = next(g for g in report["groups"] if copies[0] in g["receipts"])
+        self.assertEqual(group["receipts"], copies)
 
 
 class DeselectCliTests(DeselectCase):

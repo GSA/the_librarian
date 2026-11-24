@@ -37,6 +37,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+from tools.catalog import catalog_store as catalog
 from tools.context_index import context_index as index
 from tools.durable import fsync_directory
 from tools.review_events import event_history, event_reader
@@ -175,7 +176,29 @@ def _rows(c, receipts):
     return found
 
 
-def build_plan(c, selected, *, receipts=(), rules=None, rule_ids=(), system=None, dedupe=False):
+def _originals(root, rows, receipts):
+    """``{receipt ID: original SHA-256}``: from the current ``docs`` row when there is one, else from the catalog.
+
+    A receipt with no row (the optional ``docs`` table is absent, or a correction moved the row to a
+    newer receipt) still has its original's hash in the authoritative catalog, so duplicates are
+    found without the table. A receipt the catalog cannot show is left out.
+    """
+    found = {receipt: row[2] for receipt, row in rows.items() if row[2]}
+    missing = sorted(set(receipts) - found.keys())
+    for start in range(0, len(missing), 2000):
+        chunk = missing[start:start + 2000]
+        try:
+            held = catalog.receipt_metadata(root, chunk)["registrations"]
+        except (catalog.CatalogError, OSError, ValueError) as error:
+            raise IntakeError("deselect_catalog_unavailable") from error
+        for receipt, registration in held.items():
+            sha256 = registration["artifact"]["data"].get("sha256")
+            if sha256:
+                found[receipt] = sha256
+    return found
+
+
+def build_plan(root, c, selected, *, receipts=(), rules=None, rule_ids=(), system=None, dedupe=False):
     """What the selectors remove from the manifest entries ``selected``, and every duplicate group.
 
     Returns ``{"entries": [...], "groups": [...], "unmatched": [...], "docs": n}``; each removed entry
@@ -183,6 +206,7 @@ def build_plan(c, selected, *, receipts=(), rules=None, rule_ids=(), system=None
     ``None`` for a receipt the ledger has no row for).
     """
     rows = _rows(c, {e["receipt_id"] for e in selected})
+    originals = _originals(root, rows, {e["receipt_id"] for e in selected})
     wanted = set(receipts)
     removed = {}
     for entry in selected:
@@ -198,9 +222,8 @@ def build_plan(c, selected, *, receipts=(), rules=None, rule_ids=(), system=None
             removed[entry["path"]] = reason
     by_original = defaultdict(list)
     for entry in selected:
-        row = rows.get(entry["receipt_id"])
-        if row is not None and row[2]:
-            by_original[row[2]].append(entry)
+        if entry["receipt_id"] in originals:
+            by_original[originals[entry["receipt_id"]]].append(entry)
     groups = []
     for original, members in sorted(by_original.items()):
         if len({m["receipt_id"] for m in members}) < 2:
@@ -387,7 +410,7 @@ def deselect(root, manifest, *, actor=None, receipts=(), rules=None, rule_ids=()
         _, raw, digest = _manifest(root, manifest)
         selected = raw.get("renditions", [])
         with store.locked(root) as c:
-            plan = build_plan(c, selected, **selectors)
+            plan = build_plan(root, c, selected, **selectors)
         return _report(manifest, digest, plan, selected, False)
     with store.locked(root) as c:
         selection_manifest.recover(root, manifest)
@@ -395,7 +418,7 @@ def deselect(root, manifest, *, actor=None, receipts=(), rules=None, rule_ids=()
         selected = raw.get("renditions", [])
         log = _log_path(root)
         begun = _open_plans(_records(log), manifest)
-        plan = build_plan(c, selected, **selectors)
+        plan = build_plan(root, c, selected, **selectors)
         _finish(plan, begun, selected)
         report = _report(manifest, digest, plan, selected, True)
         removing = {e["path"] for e in plan["entries"]}

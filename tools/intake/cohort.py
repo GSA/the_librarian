@@ -15,6 +15,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+from urllib.parse import unquote
 
 from tools import policy
 from tools.review_events import event_reader
@@ -187,7 +188,12 @@ ATTRIBUTION_RECORDS = 1000
 
 
 def _submission_system(root, receipt):
-    """The cohort label a receipt was submitted under, from validated catalog evidence.
+    """The cohort label a receipt was submitted under (see ``_submission_origin``)."""
+    return (_submission_origin(root, receipt) or (None, None))[0]
+
+
+def _submission_origin(root, receipt):
+    """``(cohort label, inbox locator)`` a receipt was submitted under, from validated catalog evidence.
 
     ``receipt`` is one receipt's scoped catalog records. The label is the ``origin.system`` of
     the ``local-path`` submission sidecar whose SHA-256 the catalog pins on the receipt's
@@ -214,12 +220,13 @@ def _submission_system(root, receipt):
                 or sidecar["original"]["sha256"] != original["data"]["sha256"]):
             return None
         origin = sidecar["origin"]
-        return origin["system"] if origin["kind"] == "local-path" else None
+        return (origin["system"], origin["locator"]) if origin["kind"] == "local-path" else None
     except (KeyError, TypeError, ValueError, OSError, IntakeError):
         return None
 
 
 ABSENT = "\0absent"
+LOCATOR = "\0locator:"  # cache key prefix: the inbox path a receipt was submitted for
 
 
 def _attribute(root, cache, entries):
@@ -241,8 +248,10 @@ def _attribute(root, cache, entries):
             cache[receipt] = ABSENT
         else:
             # A receipt too large to show its sidecar record is unproven, so it is kept.
-            cache[receipt] = (None if scoped["next_after"] is not None
-                              else _submission_system(root, scoped))
+            origin = None if scoped["next_after"] is not None else _submission_origin(root, scoped)
+            cache[receipt] = origin and origin[0]
+            if origin is not None:
+                cache[LOCATOR + receipt] = unquote(origin[1])
 
 
 def _merge_cohort(listed, own, mine):
@@ -333,11 +342,11 @@ def _check_options(concurrency, initial_concurrency, inspected_form, deferred="h
         raise IntakeError("invalid_deferred_mode")
 
 
-def _reconcile_qualified(root, manifest, system, current, cohorts, extracted, retained=frozenset()):
+def _reconcile_qualified(root, manifest, system, current, cohorts, extracted, keep=lambda r: False):
     """Reconcile the cohort's manifest entries to exactly its qualified renditions.
 
     Selections come from validated review evidence, keeping an operator's explicit selection whose
-    saved review was superseded. ``retained`` receipts (those of excluded files) keep their entries:
+    saved review was superseded. Entries ``keep`` names (those of files an exclusion rule matches) stay:
     an exclusion never removes a selection, ``deselect`` does. Returns ``_reconcile``'s counts.
     """
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
@@ -346,8 +355,7 @@ def _reconcile_qualified(root, manifest, system, current, cohorts, extracted, re
 
     def reconciled(own, room):
         own = [r for r in own if not stale & set(r.get("review_event_ids") or [])]
-        chosen = [r for r in own if r["path"] in kept or r["receipt_id"] in retained
-                  ] + [e["selection"] for e in qualified]
+        chosen = [r for r in own if r["path"] in kept or keep(r)] + [e["selection"] for e in qualified]
         # A selection restored from saved evidence cannot exceed what the manifest can hold
         # next to other cohorts' entries; the surplus stays visibly pending, never invalid.
         surplus = {r["path"] for r in chosen[room:]}
@@ -417,12 +425,19 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     # Dropping the cohort's selections for renditions it no longer has comes before selecting
     # replacements, so replacing a rendition never needs spare manifest capacity.
     current = {e["rendition"] for e in extracted}
-    # A file an exclusion rule now matches keeps whatever selection it already has, until ``deselect``.
+    # A file an exclusion rule matches keeps whatever selection it already has, until ``deselect``:
+    # whether its bytes changed since (a new receipt), or it would no longer be admitted. The entry's
+    # file is found from the inbox path its receipt's sidecar names.
     retained = {e["receipt_id"] for e in report["entries"]
                 if exclusion_rules.receipted(e) and e.get("receipt_id")}
     cohorts = {}
+
+    def keep(r):
+        located = cohorts.get(LOCATOR + r["receipt_id"])
+        return r["receipt_id"] in retained or (
+            exclusions is not None and located is not None and exclusions.match(located) is not None)
     pruned = _reconcile(root, manifest, system, current, cohorts,
-                        lambda own, room: [r for r in own if r["path"] in current or r["receipt_id"] in retained])
+                        lambda own, room: [r for r in own if r["path"] in current or keep(r)])
     usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
     snapshot = event_reader.read_snapshot(root)
     retries = getattr(transport, "retries", None)
@@ -433,7 +448,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
             "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
             "manifest": manifest, "model": model, "transport": gated, "usage": usage,
             "snapshot": snapshot, "inspected_form": inspected_form, "deferred": deferred}, concurrency)
-    others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted, retained)
+    others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted, keep)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     others["orphaned"] = pruned["orphaned"]
     _qualification_counts(report, extracted, others, pub["status"] == "succeeded"
