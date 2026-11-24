@@ -343,6 +343,13 @@ class IsolatedWorkerTests(unittest.TestCase):
         with unittest.mock.patch.object(convert, "WORKER", changed):
             self.assertNotEqual(convert.code_sha256(), before)
 
+    def test_converter_identity_changes_with_the_shared_runner_and_the_sandbox(self):
+        before = convert.code_sha256()
+        for module in (convert.bounded, convert.office_runtime):
+            changed, _ = self.write("changed.py", Path(module.__file__).read_bytes() + b"\n# changed\n")
+            with self.subTest(module=module.__name__), unittest.mock.patch.object(module, "__file__", str(changed)):
+                self.assertNotEqual(convert.code_sha256(), before)
+
     def test_failure_code_reaches_the_stage_failure(self):
         failure = adapters.native_failure(convert.ConversionError("zip-bomb", "x"))
         self.assertEqual((failure.category, failure.code), ("blocked", "zip-bomb"))

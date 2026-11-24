@@ -142,7 +142,8 @@ def runtime(format_name):
 
 
 def code_sha256():
-    return extract.digest(Path(__file__).read_bytes() + WORKER.read_bytes() + Path(office_runtime.__file__).read_bytes())
+    parts = (Path(__file__), WORKER, Path(bounded.__file__), Path(office_runtime.__file__))
+    return extract.digest(b"".join(part.read_bytes() for part in parts))
 
 
 def request_version(format_name):
