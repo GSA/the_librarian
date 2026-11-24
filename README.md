@@ -66,7 +66,7 @@ PYTHONMALLOC=pymalloc .venv/bin/python -W error::ResourceWarning -X dev \
   .github/scripts/run_tests.py --expected-skips .github/expected-skips.txt
 ```
 
-A run that skips a test not listed (on a SQLite build without `sqlite_dbpage`, three file-identity tests also skip; CI's build has it, so the list stays exact there) in `.github/expected-skips.txt` fails; a provisioned Docling runtime
+A run that skips a test not listed in `.github/expected-skips.txt` fails (tests that exercise the `sqlite_dbpage` identity path skip on a SQLite build without that table, such as Ubuntu 24.04's; the `test-no-dbpage` CI leg runs there with `--allow-skip-reason "SQLite built without sqlite_dbpage"`, and `WithoutDbpage` tests cover the fallback on every build); a provisioned Docling runtime
 (`.github/scripts/provision-docling.sh`) makes the listed ones run, so use `.venv/bin/python -m unittest discover -s tests`
 if you have it.
 

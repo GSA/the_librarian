@@ -15,8 +15,10 @@ import unittest
 from unittest import mock
 
 from tests.support import default_policy_hash
+from tests.test_file_identity_locks import needs_dbpage, without_dbpage
 from tools.catalog import catalog_store as catalog
 from tools.catalog import storage
+from tools.file_identity import KeyedConnection
 from tools.intake import contracts, progress, progress_render, progress_serve, store
 
 SECRET = "SECRET-BODY-TEXT"
@@ -479,6 +481,7 @@ class CatalogTests(Case):
         result = progress.read_catalog(self.root)
         self.assertFalse(result["available"], result)
 
+    @needs_dbpage
     def test_without_a_receipt_a_repeat_render_reuses_this_processes_own_inspection(self):
         catalog.initialize(self.root)
         from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
@@ -492,6 +495,7 @@ class CatalogTests(Case):
         self.assertEqual(inspected.call_count, 1)
 
 
+    @needs_dbpage
     def test_a_large_catalog_is_never_inspected_and_without_a_receipt_reports_unvalidated(self):
         catalog.initialize(self.root)
         from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
@@ -505,6 +509,50 @@ class CatalogTests(Case):
         with mock.patch.object(progress, "INSPECT_LIMIT", 0), \
                 mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
             self.assertTrue(progress.read_catalog(self.root)["available"])
+
+    def test_without_dbpage_a_large_catalog_is_never_hashed_so_a_receipt_cannot_vouch_for_it(self):
+        """The byte-hash binding of a build without ``sqlite_dbpage`` costs a full serialize, which a
+        large catalog's render must not pay (Kata 8as8): it reports unvalidated, receipt or not."""
+        catalog.initialize(self.root)
+        from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
+        seed_catalog(self.root, 5)
+        catalog.status(self.root)
+        progress._catalog_seen.clear()
+        with without_dbpage(KeyedConnection), mock.patch.object(progress, "INSPECT_LIMIT", 0), \
+                mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
+            result = progress.read_catalog(self.root)
+        self.assertEqual((result["available"], result["error"]), (False, "unvalidated"))
+
+    def test_without_dbpage_a_small_catalog_is_vouched_for_by_its_byte_hash_receipt(self):
+        catalog.initialize(self.root)
+        from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
+        seed_catalog(self.root, 5)
+        with without_dbpage(KeyedConnection):
+            catalog.status(self.root)  # leaves a version 1 (byte hash) receipt
+            progress._catalog_seen.clear()
+            with mock.patch.object(catalog, "inspect", side_effect=AssertionError("replayed")):
+                result = progress.read_catalog(self.root)
+            self.assertTrue(result["available"], result)
+            self.assertEqual(result["receipts"], 5)
+            # A change the receipt does not cover is inspected again, and a corrupt one is refused.
+            with closing(sqlite3.connect(self.root / ".local/catalog/catalog.sqlite3")) as c:
+                c.execute("DROP TRIGGER IF EXISTS immutable_versions_update")
+                c.execute("UPDATE versions SET payload_hash='0'")
+                c.commit()
+            self.assertFalse(progress.read_catalog(self.root)["available"])
+
+    def test_without_dbpage_a_repeat_render_inspects_again_and_agrees_with_the_first(self):
+        catalog.initialize(self.root)
+        from tools.diagnostics.catalog_lock_benchmark import seed as seed_catalog
+        seed_catalog(self.root, 5)
+        progress._catalog_seen.clear()
+        real = catalog.inspect
+        with without_dbpage(KeyedConnection), mock.patch.object(catalog, "inspect", side_effect=real) as inspected:
+            first = progress.read_catalog(self.root)
+            second = progress.read_catalog(self.root)
+        self.assertEqual(inspected.call_count, 2)  # only an identity-bound file is remembered
+        self.assertEqual(first, second)
+        self.assertTrue(first["available"])
 
     def test_a_large_catalog_with_a_writer_journal_is_not_hashed(self):
         catalog.initialize(self.root)
