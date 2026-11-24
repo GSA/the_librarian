@@ -81,6 +81,48 @@ jobs:
         if: always()
         run: grep -E "\.\.\. skipped" test-output.log || true
 
+  test-no-dbpage:
+    # The adopter path on stock Ubuntu/WSL: Ubuntu 24.04's SQLite is built without sqlite_dbpage, so file
+    # identity falls back to the exact-bytes hash (Kata 8rzp). `test` runs on ubuntu-latest, whose SQLite
+    # has the table; this leg keeps the fallback honest. It runs in parallel with `test`, so it adds no
+    # wall time, and is deliberately not a required check: it pins an image on purpose.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: tools/context-mcp/pyproject.toml
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install ./tools/context-mcp
+      - name: This image's SQLite has no sqlite_dbpage
+        # If a runner image update adds the table, this leg would silently test nothing new: fail instead.
+        run: |
+          .venv/bin/python - <<'PY'
+          import sqlite3
+          try:
+              sqlite3.connect(":memory:").execute("SELECT 1 FROM sqlite_dbpage")
+          except sqlite3.OperationalError:
+              print("SQLite", sqlite3.sqlite_version, "has no sqlite_dbpage, as this leg requires")
+          else:
+              raise SystemExit("sqlite_dbpage is available here; this leg must run on a build without it")
+          PY
+      - name: Allow unprivileged PID namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
+      - name: Tests
+        env:
+          PYTHONMALLOC: pymalloc
+        run: |
+          .venv/bin/python -W error::ResourceWarning -X dev .github/scripts/run_tests.py \
+            --expected-skips .github/expected-skips.txt \
+            --allow-skip-reason "SQLite built without sqlite_dbpage"
+
   package-smoke:
     # The adopter path: package, unzip, fresh venv, initialize, preflight, MCP handshake.
     runs-on: ubuntu-latest

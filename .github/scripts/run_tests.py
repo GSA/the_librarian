@@ -3,7 +3,9 @@
 ``python -m unittest`` reports a skip as success, so a provisioned runtime that silently disappears (or a
 new ``skipUnless`` nobody noticed) would keep CI green. This runner compares every skipped test id with
 the lines of ``--expected-skips`` (blank lines and ``#`` comments ignored) and fails on any difference in
-either direction. Standard library only, so it also runs under the Docling interpreter.
+either direction. ``--allow-skip-reason`` exempts skips whose reason starts with a prefix (a leg that
+runs on a deliberately different platform, such as a SQLite without ``sqlite_dbpage``). Standard library
+only, so it also runs under the Docling interpreter.
 """
 import argparse
 from pathlib import Path
@@ -23,6 +25,8 @@ def main(argv=None):
     parser.add_argument("--start", default="tests", help="discovery directory (default: tests)")
     parser.add_argument("--pattern", default="test*.py")
     parser.add_argument("--expected-skips", help="file of test ids that must be the exact skip set")
+    parser.add_argument("--allow-skip-reason", action="append", metavar="PREFIX",
+                        help="also accept (never require) skips whose reason starts with PREFIX; repeatable")
     parser.add_argument("--durations", type=int, default=15, help="report the N slowest tests")
     arguments = parser.parse_args(argv)
 
@@ -33,7 +37,8 @@ def main(argv=None):
     if not result.wasSuccessful():
         return 1
 
-    skipped = {test.id() for test, _ in result.skipped}
+    allowed_reasons = tuple(arguments.allow_skip_reason or ())
+    skipped = {test.id() for test, reason in result.skipped if not reason.startswith(allowed_reasons)}
     allowed = expected(arguments.expected_skips)
     unexpected, missing = sorted(skipped - allowed), sorted(allowed - skipped)
     for name in unexpected:
