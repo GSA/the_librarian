@@ -15,7 +15,7 @@ from tools.catalog import catalog_store as catalog
 from tools.catalog.storage import CatalogError, safe_path
 from tools.diagnostics.ingest_benchmark import fixture
 from tools.extraction import extract
-from tools.intake import cohort, cohort_ingest, store
+from tools.intake import cohort_ingest, store
 from tools.intake.contracts import IntakeError
 
 
