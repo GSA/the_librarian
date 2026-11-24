@@ -16,20 +16,17 @@ import io
 import json
 import os
 from pathlib import Path
-import select
 import shutil
-import signal
 import sqlite3
 import stat
 import subprocess
 import sys
-import time
 import uuid
 from zipfile import BadZipFile, ZipFile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from tools.extraction import extract
+from tools.extraction import bounded, extract
 
 
 VERSION = 1
@@ -225,66 +222,12 @@ def _environment():
             "HOME": os.environ.get("HOME", "/")}
 
 
-def _terminate(process):
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            break
-        try:
-            process.wait(timeout=2)
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
-
-
 def _bounded(command, timeout, limit, cwd=None):
     """Run ``command`` in its own session; return (returncode, stdout) or raise a coded refusal."""
     try:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True, env=_environment(), cwd=cwd)
-    except OSError as error:
-        raise ConversionError("converter-runtime-failed", "Converter launch failed") from error
-    out, err, size = [], 0, 0
-    deadline = time.monotonic() + timeout
-    streams = {process.stdout, process.stderr}
-    try:
-        while streams:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ConversionError("conversion-timeout", "Conversion exceeded its wall-clock timeout")
-            ready, _, _ = select.select(list(streams), [], [], min(remaining, 1.0))
-            for stream in ready:
-                chunk = os.read(stream.fileno(), 1024 * 1024)
-                if not chunk:
-                    streams.discard(stream)
-                elif stream is process.stdout:
-                    size += len(chunk)
-                    require(size <= limit, "conversion-limit", "Converter output exceeds its limit")
-                    out.append(chunk)
-                else:
-                    err = min(err + len(chunk), MAX_STDERR)
-        remaining = max(deadline - time.monotonic(), 0.1)
-        try:
-            process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            raise ConversionError("conversion-timeout", "Conversion exceeded its wall-clock timeout") from error
-    finally:
-        if process.returncode is None:
-            _terminate(process)
-        else:
-            try:  # descendants may outlive their leader
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        process.stdout.close()
-        process.stderr.close()
-    return process.returncode, b"".join(out)
+        return bounded.run(command, timeout, limit, env=_environment(), stderr_limit=MAX_STDERR, cwd=cwd)
+    except bounded.BoundedError as error:
+        raise ConversionError(error.code, str(error)) from error
 
 
 def _worker(format_name, path, sha):

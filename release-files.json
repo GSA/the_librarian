@@ -134,6 +134,7 @@
   "tools/diagnostics/upload_planning_benchmark.py",
   "tools/diagnostics/retrieval_log.py",
   "tools/extraction/__init__.py",
+  "tools/extraction/bounded.py",
   "tools/extraction/convert.py",
   "tools/extraction/convert_worker.py",
   "tools/extraction/extract.py",
