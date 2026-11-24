@@ -57,6 +57,36 @@ adapter into that worktree's environment and run tests with
 the host-pip fallback above without recreating the environment. Do not skip
 MCP tests or install packages globally to hide the setup failure.
 
+### Excluding low-value inbox files and deselecting selections
+
+Copy [config/intake-exclusions.example.json](config/intake-exclusions.example.json) to the ignored
+`config/intake-exclusions.local.json` (`classify`, `ingest` and `qualify` read it automatically;
+`--exclusions FILE` names another). Each rule has an `id`, an optional `reason`, and `globs`
+(matched against the whole inbox-relative path; `*` stays in one segment, `**` crosses
+segments) and/or `extensions` (case-insensitive file-name endings). A matching file is reported
+`excluded` with its `rule` and what it would otherwise have been; one that would have been
+admitted still gets a receipt but is never extracted, sent to the model or selected. `classify`
+is the dry run (`counts.excluded`). The rules do not touch the standing policy and do not
+apply to an `--agent-origin` cohort (use its `exclude`).
+
+To remove selections already in the manifest (after adding a rule, or to drop byte-identical
+duplicates), dry run first, then `--apply`, then publish:
+
+```sh
+.venv/bin/python -m tools.intake.cohort deselect --root . --manifest config/selection.local.json \
+  --all-rules --dedupe --report /private/plan.json            # dry run: counts, groups, entries
+.venv/bin/python -m tools.intake.cohort deselect --root . --manifest config/selection.local.json \
+  --all-rules --dedupe --actor "$USER" --reason "low value" --apply
+.venv/bin/python -m tools.intake.cohort publish --root . --policy config/standing-policy.local.json \
+  --manifest config/selection.local.json
+```
+
+Selectors are `--receipt D123`, `--receipts-file` (IDs or a dry-run `--report`), `--rule ID` /
+`--all-rules` and `--dedupe` (of byte-identical selections across receipts it keeps the lowest
+receipt and removes the rest; every group is reported even without `--dedupe`). Receipts and files
+stay; only the selection goes, with a ledger record and a superseding review event
+([context/intake.md](context/intake.md#excluding-files-and-deselecting-selections)).
+
 ## Configuration
 
 | File | Purpose |
@@ -64,6 +94,7 @@ MCP tests or install packages globally to hide the setup failure.
 | `config/policy.json` | Defaults: `audience` (`authorized-local`), `handling`, `original_roots` (`sources/`), `markdown_roots` (`documents/`), exclusions, `transcript` rules, and optional relative `storage_roots` and `backup_retention_days` |
 | `config/policy.local.json` | Instance policy and `storage_roots` overrides, ignored by Git; applies to this checkout only, never to another `--root` that lacks its own policy files |
 | `config/selection.local.json` | Instance selection override, ignored by Git (same schema as `config/selection.json`; auto-selected when `--manifest` is omitted) |
+| `config/intake-exclusions.example.json` | Template for the ignored `config/intake-exclusions.local.json`: path-glob and extension rules that keep low-value inbox files (dependency trees, VCS internals, build caches) out of model review (`cohort ... --exclusions`, [below](#excluding-low-value-inbox-files-and-deselecting-selections)) |
 | `config/agent-origin.example.json` | Template for an ignored `config/*.local.json` origin file declaring an agent-written cohort (`cohort ... --agent-origin`) |
 
 Default stores (configurable via `storage_roots` and bound in `.local/instance.json`):

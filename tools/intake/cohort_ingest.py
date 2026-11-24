@@ -18,7 +18,8 @@ from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.extraction import convert, extract, mhtml
 from tools.durable import sha256_file
-from . import agent_origin, archives, cohort_runtime, contracts, docs, parse_pool, runner, store, upload
+from . import (agent_origin, archives, cohort_runtime, contracts, docs, exclusions as exclusion_rules, parse_pool,
+               runner, store, upload)
 from .contracts import IntakeError, LedgerBusy
 from .docsync import suffix_of
 
@@ -33,6 +34,8 @@ FLUSH = 500  # documents whose rows are written (or confirmed) in one ledger ope
 # Documents whose catalog registrations share one revision, per stage (the receipt, then the extraction
 # registration). 1 keeps the one-revision-per-registration path.
 BATCH_SIZE = 50
+# An excluded file (``exclusions``) is received and retained, never extracted, reviewed or selected.
+RECEIPT_ONLY = {"outcome": "receipt-only"}
 BUSY_FAILURE = {"outcome": "failed", "stage": "ledger", "status": "retryable", "category": "retryable",
                 "code": "ledger_busy", "attempts": runner.BUSY_RETRIES}
 # A correction chain the store cannot follow to one valid head fails its entry, not the run.
@@ -290,7 +293,7 @@ def _classified(root, path, relative, trusted, nested, provisioned, parse, deliv
     return _read_disposition(root, path, entry, parse, deliver, settings)
 
 
-def classify(root, inbox, trusted=None, keep_stat=False, origin=None, parse=None):
+def classify(root, inbox, trusted=None, keep_stat=False, origin=None, parse=None, exclusions=None):
     """Return one explicit disposition per inbox file; never writes the inbox.
 
     ``ingest`` passes ``keep_stat`` to keep each entry's private ``_stat`` (and ``_fast``) fields.
@@ -298,6 +301,9 @@ def classify(root, inbox, trusted=None, keep_stat=False, origin=None, parse=None
     under its excludes ``excluded`` without reading them. With ``parse`` (a ``parse_pool.Workers``) the
     files are read and hashed here, one at a time, and judged (format, strict decoding, MIME and
     transcript parsing) in the pool's workers; the entries are the same at any worker count.
+    ``exclusions`` (``exclusions.Rules``) reports each file a rule matches ``excluded`` with its ``rule``
+    and ``underlying`` disposition; it is applied after the file is judged, so a file that would have been
+    admitted still carries the format and hash its receipt needs.
     """
     root, inbox = Path(root).resolve(), Path(inbox).resolve()
     if root == inbox or inbox in root.parents:
@@ -322,6 +328,8 @@ def classify(root, inbox, trusted=None, keep_stat=False, origin=None, parse=None
             while pending:
                 entry = pending.pop()
                 manifest = entry.pop("_manifest", None)
+                if exclusion_rules.mark(entry, exclusions):
+                    manifest = None  # an excluded archive is not looked into
                 if manifest is not None:
                     pending.extend(_member_entries(root, entry["relative"], manifest, trusted, provisioned,
                                                    lambda name: agent_origin.excluded(origin, name)))
@@ -647,6 +655,43 @@ def _stage_receipts(root, inbox, entries, system, actor, outcomes):
     return staged
 
 
+def _receive_batch(root, inbox, entries, system, actor):
+    """The receipt half of ``_process_batch``: ``(entries whose receipt committed, {relative path: outcome})``.
+
+    The chunk's receipts commit as one catalog revision. ``outcomes`` holds every entry that did not
+    get one. Every step is idempotent by request identity, so running the chunk again completes it.
+    """
+    outcomes = {}
+    try:
+        staged = _stage_receipts(root, inbox, entries, system, actor, outcomes)
+    except LedgerBusy:
+        return [], {e["relative"]: dict(BUSY_FAILURE) for e in entries}
+    try:
+        pending = [(corr, "receipt") for _, corr, _, known in staged if upload.settled(known, corr) is None]
+        if pending:
+            runner.settle_batch(root, pending)
+        fresh = upload.known_requests(root, [corr for _, corr, _, _ in staged])
+    except LedgerBusy:
+        outcomes.update((entry["relative"], dict(BUSY_FAILURE)) for entry, *_ in staged)
+        return [], outcomes
+    registering = []
+    for entry, corr, existing, known in staged:
+        saved = known[corr] if upload.settled(known, corr) else fresh[corr]
+        try:
+            ack = upload.acknowledgment(root, corr, existing, saved)
+        except (IntakeError, OSError) as error:
+            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "receipt",
+                                           "code": error.code if isinstance(error, IntakeError) else "os-error"}
+            continue
+        _acknowledged(entry, ack)
+        failure = _received(entry, ack, saved[1]["stages"][0])
+        if failure is None:
+            registering.append(entry)
+        else:
+            outcomes[entry["relative"]] = failure
+    return registering, outcomes
+
+
 def _process_batch(root, inbox, entries, system, actor, heads, concurrency=1):
     """``_process`` for a chunk of entries: their receipts commit as one catalog revision, then
     their extraction registrations as one. Each entry gets exactly the outcome ``_process`` would give.
@@ -655,37 +700,24 @@ def _process_batch(root, inbox, entries, system, actor, heads, concurrency=1):
     crash or refusal anywhere is completed by running the chunk again; a refused entry never stops
     the others. Returns ``{relative path: outcome}``.
     """
-    outcomes = {}
     with extract.keeping_parsed(len(entries)):
-        try:
-            staged = _stage_receipts(root, inbox, entries, system, actor, outcomes)
-        except LedgerBusy:
-            return {e["relative"]: dict(BUSY_FAILURE) for e in entries}
-        try:
-            pending = [(corr, "receipt") for _, corr, _, known in staged if upload.settled(known, corr) is None]
-            if pending:
-                runner.settle_batch(root, pending)
-            fresh = upload.known_requests(root, [corr for _, corr, _, _ in staged])
-        except LedgerBusy:
-            outcomes.update((entry["relative"], dict(BUSY_FAILURE)) for entry, *_ in staged)
-            return outcomes
-        registering = []
-        for entry, corr, existing, known in staged:
-            saved = known[corr] if upload.settled(known, corr) else fresh[corr]
-            try:
-                ack = upload.acknowledgment(root, corr, existing, saved)
-            except (IntakeError, OSError) as error:
-                outcomes[entry["relative"]] = {"outcome": "failed", "stage": "receipt",
-                                               "code": error.code if isinstance(error, IntakeError) else "os-error"}
-                continue
-            _acknowledged(entry, ack)
-            failure = _received(entry, ack, saved[1]["stages"][0])
-            if failure is None:
-                registering.append(entry)
-            else:
-                outcomes[entry["relative"]] = failure
-        outcomes.update(_extract_batch(root, registering, actor, heads, concurrency))
+        registering, outcomes = _receive_batch(root, inbox, entries, system, actor)
+        if registering:
+            outcomes.update(_extract_batch(root, registering, actor, heads, concurrency))
     return outcomes
+
+
+def _receipt_only_batch(root, inbox, chunk, system, actor):
+    """Give the chunk's excluded files their receipts and nothing else; a busy ledger repeats the chunk."""
+    todo, results = list(chunk), {}
+    for _ in range(runner.BUSY_RETRIES):
+        registered, outcomes = _receive_batch(root, inbox, todo, system, actor)
+        results.update(outcomes)
+        results.update((entry["relative"], dict(RECEIPT_ONLY)) for entry in registered)
+        todo = [e for e in todo if results[e["relative"]].get("code") == "ledger_busy"]
+        if not todo:
+            break
+    return results
 
 
 def _stage_chunk(root, entries, name_of, stage_id, operation, arguments, heads):
@@ -860,8 +892,12 @@ def _counts(entries, admitted):
 
 def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, trust_stat=False,
            extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY,
-           origin=None, parse_workers=None):
+           origin=None, parse_workers=None, exclusions=None):
     """Classify the inbox, then submit and extract admitted files; return the report.
+
+    ``exclusions`` (``exclusions.Rules``) reports the files its rules match ``excluded``. One that
+    would have been admitted still gets its receipt (outcome ``receipt-only``, counted under
+    ``counts.excluded``) and is never extracted, reviewed or selected; ``limit`` does not bound receipts.
 
     Documents are processed in chunks of ``batch_size`` whose catalog registrations (the receipt, then
     the extraction registration) each commit as one revision; ``batch_size=1`` commits every
@@ -900,9 +936,10 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
         with store.locked(root) as c:
             trusted = docs.load(c, system)
     with _pool(parse_workers, batch_size) as pool:
-        entries = classify(root, inbox, trusted, True, origin, pool)
+        entries = classify(root, inbox, trusted, True, origin, pool, exclusions)
         declared = agent_origin.declare(inbox, origin, entries) if origin is not None else None
         admitted = [e for e in entries if e["disposition"] == "admit"]
+        receipted = [e for e in entries if exclusion_rules.receipted(e)]
         # Private stat fields never reach the report: take them off every entry now.
         stats = {e["relative"]: e.pop("_stat", None) for e in entries}
         fast = {e["relative"] for e in entries if e.pop("_fast", False)}
@@ -914,12 +951,31 @@ def ingest(root, inbox, *, system, actor, limit=None, batch_size=BATCH_SIZE, tru
                 entry.update(_trusted_entry(entry, trusted[entry["relative"]], system))
         _process_all(root, inbox, [e for e in todo if e["relative"] not in fast], system, actor,
                      batch_size, stats, extract_concurrency, pool)
+        _receive_excluded(root, inbox, receipted, system, actor, batch_size, stats)
     for entry in entries:
         entry.pop("_source", None)
     counts = _counts(entries, admitted)
+    if exclusions is not None:
+        counts["excluded"] = exclusion_rules.counts(entries, exclusions, ingested=True)
     if declared is not None:
         counts["agent_origin"] = declared
     return {"counts": counts, "entries": entries}
+
+
+def _receive_excluded(root, inbox, entries, system, actor, batch_size, stats):
+    """Give the files an exclusion rule matched their receipts, ``batch_size`` at a time, and nothing else."""
+    pending = []
+    for start in range(0, len(entries), batch_size):
+        chunk = entries[start:start + batch_size]
+        with extract.keeping_parsed(len(chunk)):
+            results = _receipt_only_batch(root, inbox, chunk, system, actor)
+        for entry in chunk:
+            entry.update(results[entry["relative"]])
+            pending.append((entry, stats[entry["relative"]]))
+        if len(pending) >= FLUSH:
+            _record(root, system, pending, store.Heads())
+            pending = []
+    _record(root, system, pending, store.Heads())
 
 
 def _pool(parse_workers, batch_size):

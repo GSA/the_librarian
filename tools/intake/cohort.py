@@ -21,7 +21,7 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
-from . import (agent_origin, cli, cohort_archives, cohort_rereview, cohort_review, docsync, model_review, runner,
+from . import (agent_origin, cli, cohort_archives, deselect as deselection, exclusions as exclusion_rules, cohort_rereview, cohort_review, docsync, model_review, runner,
                selection_manifest, standing, store, throttle, upload, usage_log)
 from . import cohort_runtime, contracts, parse_pool
 from .cohort_ingest import BATCH_SIZE, classify, ingest
@@ -333,11 +333,12 @@ def _check_options(concurrency, initial_concurrency, inspected_form, deferred="h
         raise IntakeError("invalid_deferred_mode")
 
 
-def _reconcile_qualified(root, manifest, system, current, cohorts, extracted):
+def _reconcile_qualified(root, manifest, system, current, cohorts, extracted, retained=frozenset()):
     """Reconcile the cohort's manifest entries to exactly its qualified renditions.
 
     Selections come from validated review evidence, keeping an operator's explicit selection whose
-    saved review was superseded. Returns ``_reconcile``'s counts.
+    saved review was superseded. ``retained`` receipts (those of excluded files) keep their entries:
+    an exclusion never removes a selection, ``deselect`` does. Returns ``_reconcile``'s counts.
     """
     qualified = [e for e in extracted if e.get("qualification") == "qualified"]
     stale = {e["superseded_event"] for e in extracted if "superseded_event" in e}
@@ -345,7 +346,8 @@ def _reconcile_qualified(root, manifest, system, current, cohorts, extracted):
 
     def reconciled(own, room):
         own = [r for r in own if not stale & set(r.get("review_event_ids") or [])]
-        chosen = [r for r in own if r["path"] in kept] + [e["selection"] for e in qualified]
+        chosen = [r for r in own if r["path"] in kept or r["receipt_id"] in retained
+                  ] + [e["selection"] for e in qualified]
         # A selection restored from saved evidence cannot exceed what the manifest can hold
         # next to other cohorts' entries; the surplus stays visibly pending, never invalid.
         surplus = {r["path"] for r in chosen[room:]}
@@ -379,7 +381,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
             context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
             initial_concurrency=None, inspected_form="list", trust_stat=False, deferred="hold",
             extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY,
-            origin=None, parse_workers=None):
+            origin=None, parse_workers=None, exclusions=None):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
 
     ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
@@ -394,6 +396,9 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     and restages this cohort's held deferrals that way from their saved findings (no model call).
     An agent ``origin`` (``agent_origin.load``) is passed to ``ingest``: the cohort's files are
     declared agent-generated and reviewed under the same standing policy as any other.
+    ``exclusions`` (``exclusions.Rules``) keeps the files its rules match out of extraction, model
+    review and selection; they get receipts and are reported ``excluded`` (see ``exclusions``). Their
+    earlier selections of this cohort are dropped like those of any file no longer extracted.
     """
     _check_options(concurrency, initial_concurrency, inspected_form, deferred)
     if not context:
@@ -402,7 +407,8 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     root = Path(root).resolve()
     _validate_inputs(root, policy_path, manifest, context, index_path, model)
     report = ingest(root, inbox, system=system, actor=actor, trust_stat=trust_stat,
-                    extract_concurrency=extract_concurrency, origin=origin, parse_workers=parse_workers)
+                    extract_concurrency=extract_concurrency, origin=origin, parse_workers=parse_workers,
+                    exclusions=exclusions)
     standing_policy, policy_sha = _ensure_standing_inputs(
         root, policy_path, manifest, model, context)
     extracted = [e for e in report["entries"] if e.get("outcome") == "extracted"]
@@ -411,9 +417,12 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     # Dropping the cohort's selections for renditions it no longer has comes before selecting
     # replacements, so replacing a rendition never needs spare manifest capacity.
     current = {e["rendition"] for e in extracted}
+    # A file an exclusion rule now matches keeps whatever selection it already has, until ``deselect``.
+    retained = {e["receipt_id"] for e in report["entries"]
+                if exclusion_rules.receipted(e) and e.get("receipt_id")}
     cohorts = {}
     pruned = _reconcile(root, manifest, system, current, cohorts,
-                        lambda own, room: [r for r in own if r["path"] in current])
+                        lambda own, room: [r for r in own if r["path"] in current or r["receipt_id"] in retained])
     usage = Counter({"prompt_tokens": 0, "completion_tokens": 0})
     snapshot = event_reader.read_snapshot(root)
     retries = getattr(transport, "retries", None)
@@ -424,7 +433,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
             "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
             "manifest": manifest, "model": model, "transport": gated, "usage": usage,
             "snapshot": snapshot, "inspected_form": inspected_form, "deferred": deferred}, concurrency)
-    others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted)
+    others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted, retained)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     others["orphaned"] = pruned["orphaned"]
     _qualification_counts(report, extracted, others, pub["status"] == "succeeded"
@@ -589,6 +598,9 @@ def _parser():
         command.add_argument("--inbox", required=True, type=Path)
         command.add_argument("--report", type=Path,
                              help="private (0600) per-file report with paths and hashes")
+        command.add_argument("--exclusions", type=Path,
+                             help="exclusion rules file (JSON); default config/intake-exclusions.local.json "
+                                  "in the instance when it exists; not for --agent-origin cohorts")
         command.add_argument("--agent-origin", type=Path,
                              help="origin file (JSON) declaring the inbox agent-written: generator, "
                                   "include/exclude paths and git provenance; indexed as low confidence")
@@ -615,6 +627,28 @@ def _parser():
             _model_options(command, models_required=True, deferred="hold")
             command.add_argument("--context", action="append", dest="context")
             command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
+    command = commands.add_parser(
+        "deselect", allow_abbrev=False,
+        help="Report (or with --apply remove) selections from the manifest by receipt, exclusion rule "
+             "or byte-identical duplicate; then run publish")
+    command.add_argument("--root", required=True, type=Path)
+    command.add_argument("--manifest", required=True)
+    command.add_argument("--receipt", action="append", default=[], metavar="D123",
+                         help="deselect this receipt's selection (repeatable)")
+    command.add_argument("--receipts-file", type=Path,
+                         help="receipt IDs (one per line) or the --report of an earlier dry run")
+    command.add_argument("--rule", action="append", default=[], metavar="ID",
+                         help="deselect selections whose inbox path this exclusion rule matches (repeatable)")
+    command.add_argument("--all-rules", action="store_true", help="every rule of the exclusion file")
+    command.add_argument("--exclusions", type=Path,
+                         help="exclusion rules file; default config/intake-exclusions.local.json")
+    command.add_argument("--system", help="only selections ingested under this --system label (with --rule)")
+    command.add_argument("--dedupe", action="store_true",
+                         help="of byte-identical selections keep the lowest receipt and deselect the rest")
+    command.add_argument("--actor", help="required with --apply; recorded in the evidence")
+    command.add_argument("--reason", help="optional operator note (printable ASCII, at most 200)")
+    command.add_argument("--report", type=Path, help="private (0600) report with paths, receipts and groups")
+    command.add_argument("--apply", action="store_true")
     command = commands.add_parser(
         "rereview", allow_abbrev=False,
         help="Report (or with --apply re-review with the model under the current policy) standing "
@@ -673,6 +707,19 @@ def _rereview(args):
         cost_estimate=args.cost_estimate)
 
 
+def _deselect(args):
+    """Run ``deselect``; return the report (printed body-free apart from ``--report``)."""
+    selecting = args.all_rules or args.rule
+    rules = (exclusion_rules.load(args.exclusions) if args.exclusions is not None
+             else exclusion_rules.discover(args.root)) if selecting or args.exclusions else None
+    contracts.require(not selecting or rules is not None, "exclusions_missing")
+    receipts = [*args.receipt, *(deselection.read_receipts(args.receipts_file) if args.receipts_file else [])]
+    return deselection.deselect(
+        args.root, args.manifest, actor=args.actor, receipts=receipts,
+        rules=rules if selecting else None, rule_ids=args.rule, system=args.system, dedupe=args.dedupe,
+        reason=args.reason, apply=args.apply)
+
+
 def _maintenance(args):
     """The report of a ledger maintenance command (identity recovery or the docs table)."""
     if args.command == "recover-identity":
@@ -692,6 +739,7 @@ def _maintenance(args):
 def _inbox_report(args):
     """The report of an inbox command: ``qualify``, ``ingest`` or ``classify``."""
     origin = agent_origin.load(args.agent_origin) if args.agent_origin else None
+    rules = exclusion_rules.resolve(args.root, args.exclusions, origin)
     if args.command == "qualify":
         return qualify(
             args.root, args.inbox, system=args.system, actor=args.actor,
@@ -702,19 +750,21 @@ def _inbox_report(args):
             initial_concurrency=args.initial_concurrency,
             inspected_form=args.inspected_form, trust_stat=args.trust_stat,
             deferred=args.deferred, extract_concurrency=args.extract_concurrency, origin=origin,
-            parse_workers=args.parse_workers)
+            parse_workers=args.parse_workers, exclusions=rules)
     if args.command == "ingest":
         return ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                       limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat,
                       extract_concurrency=args.extract_concurrency, origin=origin,
-                      parse_workers=args.parse_workers)
-    entries = classify(args.root, args.inbox, origin=origin)
+                      parse_workers=args.parse_workers, exclusions=rules)
+    entries = classify(args.root, args.inbox, origin=origin, exclusions=rules)
     admitted = [e for e in entries if e["disposition"] == "admit"]
     counts = {"files": len(entries), "disposition": dict(Counter(e["disposition"] for e in entries)),
               "format": dict(Counter(e["format"] for e in admitted)),
               "admitted_bytes": sum(e["bytes"] for e in admitted)}
     if origin is not None:
         counts["agent_origin"] = agent_origin.declare(args.inbox, origin, entries)
+    if rules is not None:
+        counts["excluded"] = exclusion_rules.counts(entries, rules)
     return {"counts": counts, "entries": entries}
 
 
@@ -745,6 +795,13 @@ def main(argv=None):
             return _archive_command(args)
         if args.command == "rereview":
             print(json.dumps(_rereview(args), sort_keys=True))
+            return 0
+        if args.command == "deselect":
+            report = _deselect(args)
+            if args.report:
+                _write_private(args.report, report)
+            print(json.dumps({k: v for k, v in report.items() if k not in {"entries", "groups", "unmatched"}},
+                             sort_keys=True))
             return 0
         if args.command == "publish":
             report = publish(args.root, policy_path=args.policy_path, manifest=args.manifest,
