@@ -157,12 +157,15 @@ def retention_days(value=None):
 
 
 def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, apply=False,
-          thin=False, protect=(), now=None, verified=()):
+          thin=False, protect=(), now=None, verified=(), lazy=False):
     """Delete backups older than the window, never leaving the store without a verified snapshot.
 
     With ``thin`` (operator prune) only the newest verified snapshot of each UTC day
     in the window is kept. ``protect`` names snapshots that must survive, such as a
-    restore source. ``verified`` names snapshots already verified by the caller.
+    restore source. ``verified`` names snapshots the caller has already verified *in full*: it must
+    never name one that only had its head or its hash checked, because a corruption the head check
+    cannot see would then count as the surviving verified snapshot (Kata 6jwh). With ``lazy`` nothing
+    is verified (and so nothing replayed) while no snapshot is old enough to delete.
     Without ``apply`` nothing is deleted.
     """
     days = retention_days(days)
@@ -172,10 +175,10 @@ def prune(backups, *, store_id, verify, errors=(), days=DEFAULT_RETENTION_DAYS, 
               "bytes_freed": 0, "oldest_kept_revision": None, "unverified_kept": 0, "refused": None}
     inside = [e for e in entries if e.created >= cutoff]
     good = _verifier(store_id, verify, errors, verified)
-    if not any(good(e) for e in reversed(inside)):
+    doomed = [e for e in entries if e.created < cutoff]
+    if not (lazy and not doomed and not thin) and not any(good(e) for e in reversed(inside)):
         report["refused"] = "no verified snapshot inside the retention window; nothing deleted"
         return report
-    doomed = [e for e in entries if e.created < cutoff]
     if thin:
         extra, report["unverified_kept"] = _thinned(inside, good)
         doomed += extra
@@ -235,12 +238,16 @@ def _delete(backups, doomed):
 
 
 def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_RETENTION_DAYS, protect=(),
-                   verify_fresh=None):
+                   verify_fresh=None, replayed=True):
     """Take ``take()`` only when today has no intact snapshot, then apply retention.
 
-    ``verify_fresh`` (default ``verify``) checks the snapshot ``take`` just wrote from an image it had
-    already validated; retention then reuses that result instead of verifying the same bytes again.
-    Every older snapshot is still verified with ``verify``.
+    ``verify_fresh`` (default ``verify``) checks the snapshot ``take`` just wrote, as the gate before
+    any deletion. With ``replayed`` (the default) ``take`` replayed the store's whole history before
+    writing it, so retention counts the new snapshot as verified without reading it again. A store
+    whose daily snapshot is only the image of a head-checked transaction passes ``replayed=False``:
+    retention then verifies snapshots (newest first, with ``verify``, which replays) only when one is
+    old enough to delete, and deletes nothing unless one passes, so a corruption copied into every new
+    snapshot cannot age out the last clean one (Kata 6jwh).
 
     Returns ``(snapshot, retention)``; both are None when today is already covered.
     A retention failure never fails the write that triggered it.
@@ -254,7 +261,8 @@ def daily_snapshot(backups, *, store_id, take, verify, errors=(), days=DEFAULT_R
         if not _verifies(Path(snapshot["snapshot"]), store_id, verify_fresh or verify, errors):
             return snapshot, {"applied": False, "refused": "new snapshot did not verify; nothing deleted"}
         retention = prune(backups, store_id=store_id, verify=verify, errors=errors, days=days,
-                          apply=True, protect=protect, verified=(Path(snapshot["snapshot"]),))
+                          apply=True, protect=protect, lazy=not replayed,
+                          verified=(Path(snapshot["snapshot"]),) if replayed else ())
     except (OSError, BackupError) as error:
         retention = {"applied": False, "refused": type(error).__name__}
     return snapshot, retention
