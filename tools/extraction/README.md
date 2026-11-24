@@ -141,6 +141,29 @@ manifest when reproducing an installation. Layout/table content is identified
 by that observed manifest, not an assumption that a mutable branch is stable.
 Weights and environments are ignored operational files and are never packaged.
 
+## Third-party licenses
+
+The Docling environment and model assets are fetched by the operator from their
+publishers and are not redistributed by this repository or its release package,
+so no NOTICE file accompanies it; each component stays under its own license
+(this project's CC0 dedication in [LICENSE.md](../../LICENSE.md) covers only this
+project's own files). Licenses recorded from the publishers' metadata for the
+pins in `requirements-docling.in` and `requirements-docling.txt` (re-check when a
+pin changes):
+
+| Component | License |
+|---|---|
+| Docling packages (`docling-slim`, `docling-core`, `docling-ibm-models`, `docling-parse`) | MIT |
+| `doclang`, `rapidocr`, `huggingface_hub`, `transformers`, `tokenizers`, `safetensors`, `accelerate`, `requests`, `opencv-python-headless` | Apache-2.0 |
+| `onnxruntime`, `pydantic`, `PyYAML`, `typer` and most other lock entries | MIT |
+| `torch`, `torchvision`, `numpy`, `scipy`, `pandas`, `lxml`, `Jinja2` and similar | BSD-family (`torch` also lists Apache-2.0 and MIT components) |
+| PDFium via `pypdfium2` | BSD-3-Clause / Apache-2.0, plus bundled dependency licenses |
+| `certifi`, `tqdm` | MPL-2.0 (`tqdm` MPL-2.0 AND MIT); file-level copyleft, used unmodified |
+| Docling layout model (`docling-layout-heron`), RapidOCR ONNX models | Apache-2.0 (Hugging Face model cards) |
+| Docling TableFormer weights (`docling-models`) | CDLA-Permissive-2.0 and Apache-2.0 (Hugging Face model card) |
+
+The adapter's own runtime dependencies (`mcp`, `anyio`, `jsonschema`) are MIT.
+
 ## Commands
 
 ```sh

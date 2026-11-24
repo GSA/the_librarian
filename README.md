@@ -504,3 +504,14 @@ listed in `release-files.json`.
 
 More detail: [AGENTS.md](AGENTS.md), role contracts in `agents/`,
 [ROADMAP.md](ROADMAP.md), and the [current-state design](docs/design/current-state.md).
+
+## License
+
+As a work of the United States government, this project is in the public domain
+within the United States, and copyright and related rights are waived worldwide
+through the [CC0 1.0 Universal public domain dedication](https://creativecommons.org/publicdomain/zero/1.0/).
+This is the GSA default project license; see [LICENSE.md](LICENSE.md),
+[CONTRIBUTING.md](CONTRIBUTING.md) (contributions are released under the same
+dedication) and [SECURITY.md](SECURITY.md). The repository contains no vendored
+third-party code; the licenses of the optional extraction dependencies and model
+assets are recorded in [tools/extraction/README.md](tools/extraction/README.md#third-party-licenses).
