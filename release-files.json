@@ -200,5 +200,8 @@
   "tests/test_evals.py",
   "tools/store_audit.py",
   "tests/test_store_audit.py",
-  "tests/test_review_event_receipt.py"
+  "tests/test_review_event_receipt.py",
+  "tools/retirement.py",
+  "tests/test_retirement.py",
+  "context/retirement.md"
 ]
