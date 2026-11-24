@@ -50,8 +50,11 @@ def recognised(raw):
     if FIRST_HEADER.match(head) is None:
         return False
     end = BLANK.search(head)
-    headers = BytesHeaderParser().parsebytes(head[:end.start()] if end else head)
-    return headers["MIME-Version"] is not None
+    try:
+        headers = BytesHeaderParser().parsebytes(head[:end.start()] if end else head)
+        return headers["MIME-Version"] is not None
+    except Exception:  # noqa: BLE001 - a header block that breaks the parser still claims to be MIME
+        return True  # so ``payload`` refuses it as ``mime-malformed`` instead of it being read as text
 
 
 def _decode(part):
@@ -215,7 +218,10 @@ class Converter(HTMLParser):
 def payload(raw):
     """Extract the text/html parts of a MIME message as numbered plain-text lines."""
     require(recognised(raw), "mime-unrecognised")
-    message = message_from_bytes(raw)
+    try:
+        message = message_from_bytes(raw)
+    except Exception as error:  # noqa: BLE001 - RecursionError on deeply nested multiparts, parser faults
+        raise MhtmlError("mime-malformed") from error
     parts = _html_parts(message)
     require(parts, "mime-no-html")
     records, used = [], []

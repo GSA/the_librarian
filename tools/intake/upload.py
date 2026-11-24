@@ -188,7 +188,7 @@ def check_type(raw, format_name, name):
                 info = archive.getinfo("mimetype")
                 require(info.file_size < 100, "type_mismatch")
                 mimetype = archive.read(info)
-        except (zipfile.BadZipFile, KeyError, OSError, RuntimeError, ValueError) as error:
+        except Exception as error:  # noqa: BLE001 - bad zip, unsupported compression, zlib/LZMA faults: all not an ODT
             raise IntakeError("type_mismatch") from error
         require(mimetype == b"application/vnd.oasis.opendocument.text", "type_mismatch")
     elif format_name == "mhtml":

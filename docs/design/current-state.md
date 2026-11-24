@@ -592,6 +592,27 @@ restated here.
   `tests/test_intake_parse_workers.py` (`IngestEquivalence::test_one_and_many_workers_end_in_the_same_report_catalog_and_ledger`,
   `::test_a_document_whose_worker_dies_fails_alone_and_a_rerun_completes_it`,
   `::test_a_changed_source_is_never_served_a_worker_parse`, `ClassifyEquivalence`, `PipelineTests`).
+- **One hostile file never stops a cohort run (Kata e275).** Source bytes are untrusted, so every
+  per-file read is contained and ends in a recorded, counted disposition. `extract.parse_payload` and
+  `extract.odt` report any failure that is not already an `ExtractionError` (a bad `text:c`, a corrupt
+  member, an unsupported compression method such as 99, `zlib.error`, `RecursionError`) as
+  `ExtractionError`; the ODT walkers (`walk`, `paragraph`) are iterative, `text:c` must be 1 to 5
+  decimal digits and at most 10,000, and XML nesting is capped at `MAX_XML_DEPTH` (256) before any walk.
+  The MIME reader parses with `message_from_bytes` inside a guard, so a deeply nested multipart is
+  `mime-malformed` (`needs-reader`) in `classify`, as nesting past `MAX_DEPTH` (16) already was.
+  `cohort_ingest.judge` never raises: an unanticipated fault in a worker or inline is `unreadable` with
+  code `parse-failed`, and a job error delivered by the pool does the same instead of re-raising. In the
+  ledger, a refused extraction is the existing `blocked` `native-input` stage (reported as
+  `failed prepare/native-input`), and a fault no adapter anticipated is `native-unexpected`, a `permanent`
+  failure that dead-letters the stage on its first attempt; the adapters' single and batch paths and the
+  PDF/image `prepare_many` catch it per file. A blocked or dead-letter stage is a decided disposition: a
+  rerun reports it again without running it (attempts stay at one) and the rest of the cohort proceeds;
+  `replay` or `recover-blocked-extractions` retries it after a toolkit fix, and a transient cause
+  (timeout, busy catalog) stays `retryable` within the request's attempt budget. Evidence:
+  `tests/test_hostile_input.py` (`ExtractorContainmentTests`, `MimeContainmentTests`,
+  `CohortContinuesTests::test_ingest_records_each_bad_odt_and_a_rerun_neither_crashes_nor_repeats`,
+  `::test_a_stage_that_raises_something_unexpected_is_dead_lettered_not_propagated`,
+  `AdapterClassificationTests`).
 - **A derived `docs` table answers "what is left" and lets a replay skip stat-identical files
   (Kata e22r).** The intake ledger holds one `docs` row per cohort document (system and
   inbox-relative path; format, submission id, SHA-256, receipt, retained original, rendition and its
