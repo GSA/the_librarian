@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   docling:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,7 +42,7 @@ jobs:
           python -m venv .venv
           .venv/bin/python -m pip install ./tools/context-mcp
       - name: Allow unprivileged user and PID namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
       - name: Cache the Docling runtime
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
