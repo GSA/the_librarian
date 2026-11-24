@@ -371,6 +371,59 @@ class EvaluationOptionTests(ReviewCase):
             self.assertEqual(parallel[name], serial[name])
         self.assertEqual(parallel["models"]["model-a"]["decisions"], {"accept": 2})
 
+    def test_rendition_hash_is_that_of_the_bytes_reviewed(self):
+        def transport(model, messages):
+            path = self.root / self.rendition
+            path.write_bytes(path.read_bytes() + b" ")
+            return reply()
+        report = model_review.evaluate_models(
+            self.root, [self.rendition], ["model-a"], transport, per_rendition=True)
+        self.assertEqual(report["renditions"][0]["rendition_sha256"], self.rendition_sha)
+
+    def test_model_seconds_exclude_limiter_queue_time(self):
+        import threading
+        import time as _time
+        lock, calls = threading.Lock(), []
+
+        def transport(model, messages):
+            with lock:
+                calls.append(model)
+                first = len(calls) == 1
+            if first:
+                raise model_review.TransportError("http-429")  # lowers the limit from 2 to 1
+            _time.sleep(0.1)
+            return reply()
+        report = model_review.evaluate_models(
+            self.root, [self.rendition] * 6, ["model-a"], transport, concurrency=2)
+        # Five calls ran 0.1 s each; waiting for the lowered slot would add several tenths more.
+        self.assertGreaterEqual(report["models"]["model-a"]["seconds"], 0.5)
+        self.assertLess(report["models"]["model-a"]["seconds"], 0.7)
+
+    def test_concurrent_evaluation_gates_each_http_attempt_of_the_real_transport(self):
+        import io as _io
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            models = Path(directory) / "models.json"
+            models.write_text(json.dumps({"providers": {"usai": {
+                "baseUrl": "https://api.example.invalid/v1", "apiKey": "k",
+                "models": [{"id": "model-a"}]}}}))
+            outcomes = [429]
+
+            def urlopen(request, timeout):
+                if outcomes:
+                    import email.message
+                    raise urllib.error.HTTPError(request.full_url, outcomes.pop(), "e",
+                                                 email.message.Message(), _io.BytesIO(b""))
+                return _io.BytesIO(json.dumps({"choices": [{"message": {
+                    "content": reply()["content"]}}], "usage": {}}).encode())
+            transport = model_review.usai_transport(models, urlopen=urlopen, sleep=lambda s: None,
+                                                    jitter=lambda: 0.0)
+            report = model_review.evaluate_models(
+                self.root, [self.rendition] * 3, ["model-a"], transport, concurrency=2)
+        self.assertEqual(report["models"]["model-a"]["reviewed"], 3)
+        self.assertEqual(report["throughput"]["throttle_signals"], 1)
+        self.assertIsNone(transport.gate)
+
     def test_concurrent_evaluation_backs_off_on_throttling(self):
         import threading
         lock, calls = threading.Lock(), []

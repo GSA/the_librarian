@@ -141,14 +141,15 @@ def task(root, rendition, inspected_form="list", criteria=standing.CRITERIA[0]):
     are accepted and recorded as the same explicit list. ``criteria`` (the policy's) selects the
     reviewer prompt.
     """
-    _, value = _rendition(root, rendition)
+    raw, value = _rendition(root, rendition)
     payload = value["payload"]
     records = payload[standing.EXTRACT_FORMATS[payload["format"]]]
     body = {"format": payload["format"],
             "records": [_record(i, r) for i, r in enumerate(records)],
             "warnings": [{"ref": f"#/payload/warnings/{i}", "text": w}
                          for i, w in enumerate(payload["warnings"])]}
-    return _task(body, value, inspected_form, criteria)
+    return {**_task(body, value, inspected_form, criteria),
+            "rendition_sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def _task(body, value=None, inspected_form="list", criteria=standing.CRITERIA[0]):
@@ -343,16 +344,33 @@ def evaluate_models(root, renditions, models, transport, *, clock=time.monotonic
     control = _task(CONTROL, criteria=criteria) if controls else None
     work = [(model, prepared) for model in models for prepared in tasks + ([control] if control else [])]
 
+    spent = threading.local()
+
+    def timed(call):
+        def run(*args):
+            started = clock()
+            try:
+                return call(*args)
+            finally:
+                spent.seconds = getattr(spent, "seconds", 0.0) + clock() - started
+        return run
+
     def one(item, call):
+        spent.seconds = 0.0
         started = clock()
         result = assess(item[1], item[0], call, max_prompt_chars)
-        return result, clock() - started
+        return result, (spent.seconds if limiter is not None else clock() - started)
     limiter = None
     if concurrency > 1:
         from concurrent.futures import ThreadPoolExecutor
         limiter = throttle.Limiter(concurrency)
-        with limiter.gating(transport) as gated, ThreadPoolExecutor(concurrency) as pool:
-            outcomes = list(pool.map(lambda item: one(item, gated), work))
+        # Seconds count request execution only: waiting for a slot under a lowered limit (or a
+        # transport's retry sleep) is not that model being slow.
+        with limiter.gating(transport if hasattr(transport, "gate") else timed(transport)) as gated:
+            if hasattr(transport, "gate"):
+                transport.gate = lambda fn: limiter.attempt(timed(fn))
+            with ThreadPoolExecutor(concurrency) as pool:
+                outcomes = list(pool.map(lambda item: one(item, gated), work))
     else:
         outcomes = [one(item, transport) for item in work]
     by_model = {model: [] for model in models}
@@ -376,7 +394,7 @@ def evaluate_models(root, renditions, models, transport, *, clock=time.monotonic
     if per_rendition:
         report["renditions"] = [
             {"index": i, "receipt_id": prepared["value"]["source"]["receipt_id"],
-             "rendition_sha256": hashlib.sha256(_rendition(root, renditions[i])[0]).hexdigest(),
+             "rendition_sha256": prepared["rendition_sha256"],
              "models": {model: {"decision": r.get("decision"), "status": r["status"],
                                 "complete": bool(r.get("complete")), "usage": dict(r["usage"])}
                         for model, rows in by_model.items()
