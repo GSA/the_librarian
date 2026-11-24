@@ -179,7 +179,7 @@ def _workdir(parent):
     return work
 
 
-def _run(mode, executable, work, arguments, timeout):
+def _run(mode, executable, work, arguments, timeout, diagnostics=None):
     """Run ``arguments`` (after the runtime's ``soffice`` when given) confined in ``mode``; ``(code, stdout)``."""
     real, root = runtime_root(executable) if executable is not None else (None, None)
     inner = ([str(real)] if real is not None else []) + arguments
@@ -187,7 +187,7 @@ def _run(mode, executable, work, arguments, timeout):
     environment = {"PATH": "/usr/bin:/bin"} if mode == "bwrap" else _environment(mode, work)
     # Never the toolkit's directory: the child's relative paths must land in the throwaway directory.
     return bounded.run(command, timeout, MAX_STDOUT, env=environment, stderr_limit=MAX_STDOUT,
-                       cwd=str(work / "tmp"))
+                       cwd=str(work / "tmp"), diagnostics=diagnostics)
 
 
 _MODE = {}
@@ -334,15 +334,19 @@ def exported(parent, raw, suffix, target, timeout=WALL_SECONDS):
         os.chmod(source, 0o444)
         os.chmod(work / "in", 0o555)
         view = _view(mode, work)
+        errors = []
         code, _ = _run(mode, executable, work, [
             "--headless", "--norestore", "--nologo", "--nodefault", "--nolockcheck",
             "-env:UserInstallation=file://" + view["profile"],
-            "--convert-to", target, "--outdir", view["out"], view["in"] + "/source" + suffix], timeout)
+            "--convert-to", target, "--outdir", view["out"], view["in"] + "/source" + suffix], timeout,
+            errors)
+        detail = b"".join(errors).decode("utf-8", "replace")[-2000:]
         produced = work / "out" / ("source." + target)
         if code < 0 or 128 < code < 160:  # killed by a signal (the launchers report 128 + signal)
-            raise bounded.BoundedError("legacy-conversion-crashed", "LibreOffice was killed by a signal")
+            raise bounded.BoundedError("legacy-conversion-crashed", "LibreOffice was killed by a signal", detail)
         if code != 0 or not produced.is_file() or produced.is_symlink():
-            raise bounded.BoundedError("legacy-conversion-failed", "LibreOffice did not convert the legacy document")
+            raise bounded.BoundedError("legacy-conversion-failed", "LibreOffice did not convert the legacy document",
+                                       detail)
         yield produced
     finally:
         os.chmod(work / "in", 0o700)

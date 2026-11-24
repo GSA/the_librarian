@@ -12,9 +12,10 @@ import time
 class BoundedError(Exception):
     """A refused or failed child run; ``code`` is a stable hyphenated reason."""
 
-    def __init__(self, code, message):
+    def __init__(self, code, message, detail=""):
         super().__init__(message)
         self.code = code
+        self.detail = detail  # a stderr tail for operators; never stored with a document's disposition
 
 
 def terminate(process):
@@ -36,19 +37,20 @@ def terminate(process):
     process.wait()
 
 
-def run(command, timeout, limit, *, env, stderr_limit, cwd=None):
+def run(command, timeout, limit, *, env, stderr_limit, cwd=None, diagnostics=None):
     """Run ``command`` in its own session; return (returncode, stdout) or raise ``BoundedError``.
 
     ``conversion-timeout`` when the wall clock runs out, ``conversion-limit`` when stdout exceeds
     ``limit``, ``converter-runtime-failed`` when the launch fails. The process group is killed on every
-    exit path, so a descendant that outlives its leader dies with it.
+    exit path, so a descendant that outlives its leader dies with it. When ``diagnostics`` is a list, the
+    last bytes of stderr (at most ``stderr_limit``) are appended to it.
     """
     try:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True, env=env, cwd=cwd)
     except OSError as error:
         raise BoundedError("converter-runtime-failed", "Converter launch failed") from error
-    out, err, size = [], 0, 0
+    out, err, size, tail = [], 0, 0, b""
     deadline = time.monotonic() + timeout
     streams = {process.stdout, process.stderr}
     try:
@@ -68,6 +70,7 @@ def run(command, timeout, limit, *, env, stderr_limit, cwd=None):
                     out.append(chunk)
                 else:
                     err = min(err + len(chunk), stderr_limit)
+                    tail = (tail + chunk)[-stderr_limit:]
         remaining = max(deadline - time.monotonic(), 0.1)
         try:
             process.wait(timeout=remaining)
@@ -83,4 +86,6 @@ def run(command, timeout, limit, *, env, stderr_limit, cwd=None):
                 pass
         process.stdout.close()
         process.stderr.close()
+        if diagnostics is not None:
+            diagnostics.append(tail)
     return process.returncode, b"".join(out)

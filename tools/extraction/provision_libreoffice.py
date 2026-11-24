@@ -199,7 +199,8 @@ def verify():
                 if produced.stat().st_size < 100 or not produced.read_bytes().startswith(b"PK"):
                     raise ProvisionError("The sandboxed conversion produced no document")
         except bounded.BoundedError as error:
-            raise ProvisionError("Sandboxed test conversion failed (%s)" % error.code) from error
+            raise ProvisionError("Sandboxed test conversion failed (%s)%s" % (
+                error.code, ("\nLibreOffice said:\n" + error.detail) if error.detail else "")) from error
     report["verified"] = True
     return report
 
