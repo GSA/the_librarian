@@ -74,7 +74,7 @@ class PublishScaleTests(unittest.TestCase):
             self.assertEqual(snapshot.event("rev-bench-3")["event_id"], "rev-bench-3")
 
     def test_a_cohort_sized_manifest_is_accepted_and_one_more_than_the_cap_is_not(self):
-        self.assertEqual(renditions.MAX_SELECTIONS, 50000)
+        self.assertEqual(renditions.MAX_SELECTIONS, 75000)
         api = index.rendition_api()
         api.validate_context = lambda context: None
         api.eligible = lambda path: True
