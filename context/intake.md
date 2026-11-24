@@ -452,15 +452,17 @@ into instance storage; see [Archives](#archives)), `skipped-asset` (web site ass
 `parse-failed`), `empty`, `over-limit` and
 `unsafe-path` (symlinks and non-regular files). Suffix is never format proof.
 
-A malformed or hostile file never stops the run. A malformed ODT (bad `text:c`, corrupt or
-unsupported-compression member, XML nested deeper than 256 levels) or a MIME file nested past 16
-levels is refused for that file alone: in `classify` as `needs-reader` (`mime-malformed`) or
-`unreadable`, in `ingest` as `failed prepare/native-input` (a `blocked` stage). A fault the adapters did not
-anticipate is `failed .../native-unexpected` (`dead-letter`). Both are recorded and counted in
-`failed_by_code`; a rerun reports them again without re-running them (one attempt each) and processes
-everything else. After a toolkit fix, `recover-blocked-extractions --code native-input --apply` restages the
-blocked ones, and `replay` resets a single stage; timeouts and a busy catalog stay `retryable` within the
-retry budget.
+A malformed or hostile file never stops the run. Two places refuse it, and they differ:
+
+- **Classification refusals** (no ledger stage): a MIME file nested past 16 levels is `needs-reader`
+  (`mime-malformed`), and a reader fault is `unreadable` (`parse-failed`). They are counted under
+  `disposition`, never ingested, and re-judged on every rerun.
+- **Extraction failures** (admitted, then refused while preparing): a malformed ODT (bad `text:c`, corrupt or
+  unsupported-compression member, XML nested deeper than 256 levels) is `failed prepare/native-input`, a
+  `blocked` stage; a fault no adapter anticipated is `native-unexpected`, a `dead-letter` stage. Both are
+  recorded and counted in `failed_by_code`, and a rerun reports them again without running them (one attempt each).
+  After a toolkit fix, `recover-blocked-extractions --code native-input --apply` restages the blocked ones and
+  `replay` resets one stage; timeouts and a busy catalog stay `retryable` within the retry budget.
 
 `mhtml` extraction (`tools/extraction/mhtml.py`, stdlib `email` + `html.parser`)
 recognises MIME by content, reads only non-attachment `text/html` parts with
