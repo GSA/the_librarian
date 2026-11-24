@@ -586,7 +586,7 @@ restated here.
   written first lets the next writer roll a crashed append forward (`recover`, called under
   the lock and before `qualify`/`publish` read the manifest). A replacement, an empty list, a
   non-canonical file or a stale view takes the full read, validate and atomic rewrite. The
-  manifest holds at most `renditions.MAX_SELECTIONS` (50,000) entries
+  manifest holds at most `renditions.MAX_SELECTIONS` (75,000) entries
   across all cohorts (sized for a 36,000-document cohort at the observed 37%
   acceptance, about 13,000 selections, with headroom; Kata jysk). An in-scope entry with no saved review is not sent to the
   model when the manifest has no room for it: `qualify` checks the room (an
@@ -636,8 +636,12 @@ restated here.
   1.0 / 1.4 GB. Budget at the cap: a first publish under one minute and a
   re-publish under ten seconds on that host (those budgets were set at the
   former 20,000 cap). At the 50,000 cap (Kata q4ks, same synthetic benchmark, shared host): first
-  publish 220 s, unchanged re-publish 32 s, peak memory 3.6 GB. The cap change and the code edits
-  change `engine_fingerprint` (it hashes `renditions.py`, `qualification.py`,
+  publish 220 s, unchanged re-publish 32 s, peak memory 3.6 GB. At the 75,000 cap (Kata qzya,
+  same synthetic benchmark, shared 14-core host, load average 1-6): first publish 218 s,
+  unchanged re-publish 35 s, peak memory 3.1 GB; the per-select manifest append
+  (`tools/diagnostics/selection_manifest_benchmark.py --selections 75000`) stays flat, 7 ms
+  to 15,000 entries and 15-30 ms per select from 20,000 to 75,000 as host load varied. The
+  cap change and the code edits change `engine_fingerprint` (it hashes `renditions.py`, `qualification.py`,
   `context_index.py` and `policy.py`), so every existing index is stale once
   and is rebuilt by the next publish; no manifest, store or published output
   changes. Evidence: `tests/test_publish_scale.py` (constant policy reads and
@@ -662,7 +666,7 @@ restated here.
   `model_calls_skipped`. With no policy file, the generated scope is
   `receipts: ["D*"]` (every upload receipt `D<number>`, audience `source`),
   which is also allowed in a hand-written policy and is not limited by the
-  50,000-entry list cap; an existing policy is never rewritten or widened.
+  75,000-entry list cap; an existing policy is never rewritten or widened.
   Widening a policy's scope changes its hash, and the hash is part of every
   standing request, so the operator raises `version` with the edit and every
   in-scope entry is then reviewed once under the new policy (one call each,
@@ -1590,11 +1594,12 @@ owner preference rather than measured or test-enforced facts.
   number.
 - Declining agent memory and the dead-weight pruning signal (sections 6): reasoned,
   not measured.
-- The 50,000-entry manifest cap is an implementation limit, a runaway guard, not a design
-  goal. It replaced 20,000 (Kata q4ks, when about 11,600 reviewed selections sat staged
-  behind a full manifest), which had replaced 5,000 (Kata jysk) once publishing was linear
-  in selections (see "Publishing a cohort-sized manifest" in section 3). Measured at 50,000:
-  see that section. Not measured above 50,000.
+- The 75,000-entry manifest cap is an implementation limit, a runaway guard, not a design
+  goal. It replaced 50,000 (Kata qzya, when the live instance held 49,864 of 50,000
+  selections), which had replaced 20,000 (Kata q4ks, when about 11,600 reviewed selections
+  sat staged behind a full manifest), which had replaced 5,000 (Kata jysk) once publishing
+  was linear in selections (see "Publishing a cohort-sized manifest" in section 3). Measured
+  at 50,000 and 75,000: see that section. Not measured above 75,000.
   Before Kata m0tg each select rewrote and revalidated the whole manifest (20 ms
   at 1,000 entries, 93 ms at 5,000, 274 ms at 20,000, so filling a manifest was
   quadratic); the append is flat.
