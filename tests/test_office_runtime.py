@@ -173,6 +173,8 @@ class ConfinementChecks:
         self.assertEqual(lines["interfaces"], "lo,")
         self.assertEqual(lines["env"], "0")
         self.assertEqual(lines["tmp-writable"], "yes")
+        self.assertEqual(lines["cwd-writable"], "yes")
+        self.assertFalse((Path.cwd() / "probe").exists(), "a relative write escaped into the toolkit directory")
         self.assertClean()
 
     def test_the_profile_switches_macros_and_updates_off(self):

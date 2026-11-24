@@ -185,7 +185,9 @@ def _run(mode, executable, work, arguments, timeout):
     inner = ([str(real)] if real is not None else []) + arguments
     command = _command(mode, root, work, inner, timeout)
     environment = {"PATH": "/usr/bin:/bin"} if mode == "bwrap" else _environment(mode, work)
-    return bounded.run(command, timeout, MAX_STDOUT, env=environment, stderr_limit=MAX_STDOUT)
+    # Never the toolkit's directory: the child's relative paths must land in the throwaway directory.
+    return bounded.run(command, timeout, MAX_STDOUT, env=environment, stderr_limit=MAX_STDOUT,
+                       cwd=str(work / "tmp"))
 
 
 _MODE = {}
