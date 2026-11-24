@@ -203,6 +203,20 @@ restated here.
   dependency whose change breaks behavior (`mcp`) is pinned and refused by
   preflight. Revisit if a real instance fails or diverges because of an unpinned
   package; the first step then is to pin that package, not to add a lock file.
+- **Fresh-start check.** `librarian-preflight --verify-start` (`preflight.fresh_start`)
+  starts a new server process as a client does (default client environment, so no
+  `PYTHONPATH` or inherited venv; working directory outside the instance; the
+  console script beside the interpreter unless `--server-command` names the
+  client's), calls `status` and one `search`, and fails with the server's stderr
+  on a failed start, an error result, or any step over `--client-timeout-seconds`
+  (default 60); it reports `initialize`/`status`/`search`/`total` timings. The
+  upgrade procedure in the README requires it, because the store audits never start
+  the server and running servers keep old code (the nfkc upgrade passed every audit
+  while a fresh start failed with `ModuleNotFoundError: tools`; Kata 90t5).
+  A fresh process is not a cold page cache, so timings are cold only when the host's
+  cache is. Evidence: `tests/test_preflight.py::FreshStart` (working server,
+  import failure, timeout, clean environment and cwd, CLI exit status) and the
+  `package-smoke` job, which runs it on the unzipped package.
 - **Optional Docling worker** runs in its own interpreter with pinned assets
   (`tests/test_docling.py::test_changed_profile_or_assets_cannot_match_prepared_identity`).
   Each conversion reads a private 0700/0400 copy of the assets made inside its own
