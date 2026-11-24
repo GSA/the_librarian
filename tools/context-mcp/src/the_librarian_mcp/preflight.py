@@ -1,8 +1,12 @@
 """Check local agent prerequisites; optionally refresh only the disposable index."""
 
+import asyncio
 import json
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import time
 
 from .config import Config, parser
 
@@ -86,7 +90,90 @@ def legacy_converter_runtime(config: Config) -> dict:
     return check
 
 
-def preflight(config: Config, *, refresh_index: bool = False) -> dict:
+START_ACTION = (
+    "Start the server the way the client configuration does and read its stderr; after an upgrade, "
+    "reinstall the adapter into the instance .venv (pip install ./tools/context-mcp) and re-run this check.")
+
+
+def default_server_command() -> list[str]:
+    """The console script beside this interpreter, which is what a client configuration names."""
+    script = Path(sys.executable).parent / "librarian-mcp"
+    return [str(script)] if script.is_file() else [sys.executable, "-m", "the_librarian_mcp.server"]
+
+
+def server_arguments(config: Config) -> list[str]:
+    """The server options a client configuration would carry; logs stay off so the check records nothing."""
+    return ["--root", str(config.root), "--manifest", str(config.manifest), "--db", str(config.db),
+            "--max-source-chars", str(config.max_source_chars),
+            "--max-output-chars", str(config.max_output_chars),
+            "--max-results", str(config.max_results), "--timeout-seconds", str(config.timeout_seconds)]
+
+
+async def _fresh_session(command: list[str], config: Config, query: str, limit: float,
+                         scratch: Path, errlog, timings: dict) -> dict:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    # env=None gives the client's default environment (HOME, LOGNAME, PATH, SHELL, TERM, USER): no
+    # PYTHONPATH and no inherited virtual environment. cwd is outside the instance.
+    parameters = StdioServerParameters(command=command[0], args=[*command[1:], *server_arguments(config)],
+                                       cwd=scratch)
+
+    async def timed(name, call):
+        begin = time.monotonic()
+        try:
+            return await asyncio.wait_for(call, limit)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"{name} exceeded the {limit:g} s client timeout") from None
+        finally:
+            timings[name] = round(time.monotonic() - begin, 3)
+
+    begin = time.monotonic()
+    async with stdio_client(parameters, errlog=errlog) as (read, write):
+        async with ClientSession(read, write) as session:
+            await timed("initialize", session.initialize())
+            status = await timed("status", session.call_tool("status", {}))
+            if status.is_error:
+                raise RuntimeError(f"status returned an error: {status.content[0].text[:500]}")
+            status_payload = json.loads(status.content[0].text)
+            search = await timed("search", session.call_tool("search", {"query": query}))
+            if search.is_error:
+                raise RuntimeError(f"search returned an error: {search.content[0].text[:500]}")
+            if not isinstance(json.loads(search.content[0].text).get("hits"), list):
+                raise RuntimeError("search returned no hits list")
+    timings["total"] = round(time.monotonic() - begin, 3)
+    return {"documents": status_payload.get("documents"), "fresh": status_payload.get("fresh")}
+
+
+def fresh_start(config: Config, *, command: list[str] | None = None, query: str = "documentation",
+                client_timeout: float = 60) -> dict:
+    """Start the MCP server like a client does (new process, default client environment, cwd outside the
+    instance), call ``status`` and one ``search``, and fail on any error or any step over ``client_timeout``.
+
+    A process-fresh start is not a cold page cache: the timings are cold only when the host's cache is.
+    """
+    command = command or default_server_command()
+    timings: dict = {}
+    base = {"name": "fresh_mcp_start", "command": command, "client_timeout_seconds": client_timeout}
+    with tempfile.TemporaryDirectory(prefix="librarian-start-") as scratch, \
+            tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as errlog:
+        try:
+            result = asyncio.run(_fresh_session(command, config, query, client_timeout,
+                                                Path(scratch), errlog, timings))
+        except Exception as error:  # includes ExceptionGroup raised by the stdio transport
+            errlog.seek(0)
+            diagnostic = errlog.read()[-2000:].strip()
+            while isinstance(error, BaseExceptionGroup) and error.exceptions:
+                error = error.exceptions[0]
+            summary = f"{type(error).__name__}: {error}"
+            return {**base, "ok": False, "timings": timings, "action": START_ACTION,
+                    "error": f"{summary}\n{diagnostic}" if diagnostic else summary}
+    return {**base, "ok": True, "timings": timings, "result": result,
+            "action": "Record these timings in the upgrade notes; the slowest step must stay under the client timeout."}
+
+
+def preflight(config: Config, *, refresh_index: bool = False, verify_start: bool = False,
+              server_command: list[str] | None = None, client_timeout: float = 60) -> dict:
     checks = [run_check(
         "runtime", [sys.executable, "-B", "-c", RUNTIME], config,
         "Install the adapter's declared dependencies in this interpreter; do not alter the stores.",
@@ -129,9 +216,11 @@ def preflight(config: Config, *, refresh_index: bool = False) -> dict:
     ))
     checks.append(pdf_image_runtime(config))
     checks.append(legacy_converter_runtime(config))
+    if verify_start:
+        checks.append(fresh_start(config, command=server_command, client_timeout=client_timeout))
     return {
         "command": "preflight", "ok": all(check["ok"] for check in checks),
-        "refresh_requested": refresh_index, "checks": checks,
+        "refresh_requested": refresh_index, "start_verification_requested": verify_start, "checks": checks,
         "notice": "Local engineering readiness, not client connection, authorization or operational acceptance. "
                   "No database backup, authoritative write, intake or selection expansion is performed. "
                   "Store status may maintain private validation caches.",
@@ -142,13 +231,27 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser(__doc__)
     arguments.add_argument("--refresh-index", action="store_true",
                            help="Explicitly rebuild the disposable index after prerequisite checks")
+    arguments.add_argument("--verify-start", action="store_true",
+                           help="Also start a fresh librarian-mcp as a client does and call status and search")
+    arguments.add_argument("--server-command", type=Path, default=None,
+                           help="Server executable named by the client configuration "
+                                "(default: librarian-mcp beside this interpreter)")
+    arguments.add_argument("--client-timeout-seconds", type=float, default=60,
+                           help="Fail if the start, status or search exceeds the client's timeout (default 60)")
     options = vars(arguments.parse_args(argv))
     refresh_index = options.pop("refresh_index")
+    verify_start = options.pop("verify_start")
+    server_command = options.pop("server_command")
+    client_timeout = options.pop("client_timeout_seconds")
+    if client_timeout <= 0:
+        arguments.error("--client-timeout-seconds must be positive")
     try:
         config = Config(**options)
     except ValueError as error:
         arguments.error(str(error))
-    report = preflight(config, refresh_index=refresh_index)
+    report = preflight(config, refresh_index=refresh_index, verify_start=verify_start,
+                       server_command=None if server_command is None else [str(server_command)],
+                       client_timeout=client_timeout)
     print(json.dumps(report, ensure_ascii=False))
     return 0 if report["ok"] else 1
 

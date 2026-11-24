@@ -15,6 +15,6 @@ cd "$work/kit"
 python -m venv .venv
 .venv/bin/python -m pip install --quiet ./tools/context-mcp
 .venv/bin/python -m tools.initialize
-.venv/bin/librarian-preflight --root "$PWD"
+.venv/bin/librarian-preflight --root "$PWD" --verify-start
 .venv/bin/python "$repo/.github/scripts/mcp_probe.py" "$PWD"
 echo "package smoke test passed"

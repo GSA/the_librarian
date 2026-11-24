@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -125,6 +126,83 @@ class PreflightRuntimeProbe(unittest.TestCase):
         refresh = next(c for c in report["checks"] if c["name"] == "refresh_index")
         self.assertTrue(refresh["skipped"])
         self.assertFalse(refresh["ok"])
+
+
+class FreshStart(unittest.TestCase):
+    """The fresh-process start check that every instance upgrade must pass (Kata 90t5)."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name).resolve()
+        self.root = self.home / "kit"
+        clone_release(self.root)
+        setup = subprocess.run([sys.executable, str(self.root / "tools/initialize.py")],
+                               capture_output=True, text=True)
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        self.config = Config(root=self.root)
+
+    def stub(self, source: str) -> list[str]:
+        script = self.home / "stub.py"
+        script.write_text(source, encoding="utf-8")
+        return [sys.executable, str(script)]
+
+    def test_a_working_server_passes_with_timings_for_every_step(self):
+        # The default command is the console script beside this interpreter, as in a client configuration.
+        report = preflight.fresh_start(self.config, client_timeout=60)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["result"]["documents"], 0)
+        self.assertEqual(set(report["timings"]), {"initialize", "status", "search", "total"})
+        self.assertLess(max(report["timings"].values()), 60)
+
+    def test_an_import_failure_at_start_fails_with_the_servers_stderr(self):
+        command = self.stub("import tools_that_are_not_importable\n")
+        report = preflight.fresh_start(self.config, command=command, client_timeout=30)
+        self.assertFalse(report["ok"])
+        self.assertIn("ModuleNotFoundError", report["error"])
+        self.assertIn("tools_that_are_not_importable", report["error"])
+        self.assertIn("reinstall the adapter", report["action"])
+
+    def test_a_server_slower_than_the_client_timeout_fails(self):
+        command = self.stub("import time\ntime.sleep(60)\n")
+        report = preflight.fresh_start(self.config, command=command, client_timeout=1)
+        self.assertFalse(report["ok"])
+        self.assertIn("client timeout", report["error"] + json.dumps(report["timings"]))
+
+    def test_the_server_starts_in_a_clean_environment_outside_the_instance(self):
+        record = self.home / "record.json"
+        command = self.stub(
+            "import json, os\n"
+            f"open({str(record)!r}, 'w').write(json.dumps({{'cwd': os.getcwd(), "
+            "'pythonpath': os.environ.get('PYTHONPATH'), 'venv': os.environ.get('VIRTUAL_ENV')}))\n")
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root), "VIRTUAL_ENV": str(self.root)}):
+            report = preflight.fresh_start(self.config, command=command, client_timeout=10)
+        self.assertFalse(report["ok"])  # the stub is not an MCP server; only its environment matters
+        seen = json.loads(record.read_text())
+        self.assertIsNone(seen["pythonpath"])
+        self.assertIsNone(seen["venv"])
+        self.assertFalse(Path(seen["cwd"]).is_relative_to(self.root))
+
+    def test_the_cli_runs_the_check_only_on_request_and_exits_non_zero_on_failure(self):
+        out = io.StringIO()
+        script = Path(self.stub("")[1])
+        script.chmod(0o755)
+        script.write_text("#!" + sys.executable + "\nimport not_a_module_anywhere\n", encoding="utf-8")
+        with mock.patch.object(preflight, "run_check", return_value={"name": "x", "ok": True, "result": {}}), \
+                contextlib.redirect_stdout(out):
+            code = preflight.main(["--root", str(self.root), "--verify-start", "--server-command", str(script),
+                                   "--client-timeout-seconds", "30"])
+        report = json.loads(out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertTrue(report["start_verification_requested"])
+        self.assertEqual(report["checks"][-1]["name"], "fresh_mcp_start")
+        self.assertFalse(report["checks"][-1]["ok"])
+        out = io.StringIO()
+        with mock.patch.object(preflight, "run_check", return_value={"name": "x", "ok": True, "result": {}}), \
+                mock.patch.object(preflight, "fresh_start") as start, contextlib.redirect_stdout(out):
+            code = preflight.main(["--root", str(self.root)])
+        start.assert_not_called()
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
