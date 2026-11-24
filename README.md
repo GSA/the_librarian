@@ -72,12 +72,14 @@ Default stores (configurable via `storage_roots` and bound in `.local/instance.j
 `data/extractions/.local` (extracted renditions), `.local/intake` (optional intake
 recovery ledger), and `.local/diagnostics/retrieval.jsonl` (default path for the
 diagnostics CLI; MCP retrieval logging is opt-in via `--diagnostics-log`). Each
-catalog `submit` and review-event `append` takes a verified snapshot before the
+catalog `submit`, review-event `append` and claim-correction `record`/`resolve`/`intake` takes a verified snapshot before the
 write only when the store has none for the current UTC day, then deletes
 snapshots older than seven days (set `backup_retention_days` in
 `config/policy.local.json` to change). `python3 -m tools.backups status` reports
-backup count and size; `python3 -m tools.backups prune` is a dry run and
-`--apply` keeps the newest verified snapshot per day. See the
+backup count and size of each store (catalog, review events, claim corrections once initialized);
+`python3 -m tools.backups prune` is a dry run (`--store catalog|review-events|claim-corrections|all`) and
+`--apply` keeps the newest verified snapshot per day. Retention only counts snapshots whose history
+was replayed, so a corruption copied into new daily snapshots never ages out the last clean one. See the
 [current-state design](docs/design/current-state.md) (backups).
 Ingest cost still grows with history; measure it on synthetic cohorts with
 `python3 tools/diagnostics/ingest_benchmark.py --sizes 100,200 --resume` and see the
@@ -316,10 +318,10 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.extraction.extract` | Text, Gemini transcript, and ODT extraction (`prepare`, `verify`, `register`) |
 | `python -m tools.extraction.docling_extract` | Optional PDF and image extraction (`inspect`, `prepare`, `verify`, `register`) |
 | `python -m tools.retirement` | Read-only retirement manifest of a legacy tree joined to catalog receipts (`manifest`) and byte check of a restored copy (`verify`); see [context/retirement.md](context/retirement.md) |
-| `python -m tools.store_audit` | Scheduled full verification of the catalog, review events, intake ledger and newest backups; JSON report, exit 1 if any store is flagged (cron/systemd timer; see the design doc) |
+| `python -m tools.store_audit` | Scheduled full verification of the catalog, review events, claim corrections (when initialized), intake ledger and newest backups; JSON report, exit 1 if any store is flagged (cron/systemd timer; see the design doc) |
 | `python -m tools.review_events.event_store` | Review store: `init`, `status`, `audit`, `schema`, `get`, `append`, `backup`, `verify-backup`, `restore` |
 | `python -m tools.review_events.event_reader` | Query (`query`) and export (`export`) reviews |
-| `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore` |
+| `python -m tools.review_events.corrections` | Claim corrections: `init`, `status`, `list`, `record` (correct/dispute a quoted claim), `resolve` (confirm/retract), `intake` (a `claim-corrections-v1` file), `backup`, `verify-backup`, `restore`; `tools.backups status`/`prune` cover its snapshots |
 | `python -m tools.context_index.cli` | Derived index: `build`, `status`, `search`, `get`, `get-many`, `catalog` |
 | `python -m tools.context_index.integrity` | Read-only integrity audit of registered files against their ingest hashes: `audit`, `check PATH...` (exit 1 on a mismatch) |
 | `python -m tools.intake.cli` | Durable intake: `initialize`, `stage`, `submit-file`, `drop-scan`, `drop-submit`, `list`, `dead-letter`, `inspect`, `run`, `resume`, `replay`, `recover-conflicts`, `acknowledge`, `audit`, `progress`, `progress-serve` |
@@ -384,8 +386,8 @@ A reported file is restored from backup or re-ingested; the audit repairs nothin
 
 Reads and writes trust the stores' read-validation receipts and never replay a store's whole history
 (there is no daily full check), so a store edited outside the application is found by the store audit,
-which replays the catalog, the review events and the intake ledger in full, verifies the newest backup of
-the catalog and of the review events, and prints a body-free JSON report (exit 0 all verified, 1 a store
+which replays the catalog, the review events, the claim corrections (when initialized) and the intake
+ledger in full, verifies the newest backup of each of the first three, and prints a body-free JSON report (exit 0 all verified, 1 a store
 was flagged, 2 it could not run):
 
 ```sh
