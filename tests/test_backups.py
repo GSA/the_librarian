@@ -13,7 +13,6 @@ from tools.catalog import backups as catalog_backups
 from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tests.support import WorkspaceCase
-from tests.test_file_identity_locks import needs_dbpage
 from tools.diagnostics.catalog_lock_benchmark import registration
 
 DAY = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
