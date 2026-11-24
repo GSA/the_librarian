@@ -9,7 +9,8 @@ qualifies anything by itself. ``tools/intake/standing.py`` still decides.
 
 Sample evaluation scores candidate models on a few renditions plus synthetic
 control tasks and reports body-free counts and token usage, which feed the
-cost estimate required before any bulk run.
+cost estimate required before any bulk run. Criteria, per-rendition decisions, concurrency
+and the output-token limit are options of the command line.
 """
 import argparse
 from collections import Counter
@@ -27,7 +28,7 @@ import urllib.error
 import urllib.request
 
 from tools.catalog import catalog_store as catalog
-from . import standing, store_busy, usage_log
+from . import standing, store_busy, throttle, usage_log
 
 PROVIDER = "usai"
 MAX_PROMPT_CHARS = 400_000
@@ -294,34 +295,71 @@ def review(root, rendition, standing_policy, model, transport,
     return {**result, "findings_path": name, "findings_sha256": digest}
 
 
+def _positive(value, name):
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _score(model_results, models_seconds):
+    """Fold one model's ordered ``(is_control, result)`` pairs and call seconds into a score."""
+    score = Counter({"documents": 0, "complete": 0, "reviewed": 0, "invalid-reply": 0,
+                     "transport-error": 0, "too-large": 0, "control-caught": 0,
+                     "control-tasks": 0})
+    decisions, usage = Counter(), Counter()
+    for is_control, result in model_results:
+        usage.update(result["usage"])
+        if is_control:
+            score["control-tasks"] += 1
+            score["control-caught"] += result.get("decision") in {"reject", "defer"}
+            continue
+        score["documents"] += 1
+        score[result["status"]] += 1
+        score["complete"] += bool(result.get("complete"))
+        if "decision" in result:
+            decisions[result["decision"]] += 1
+    return {**score, "decisions": dict(decisions),
+            "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")},
+            "seconds": round(models_seconds, 3)}
+
+
 def evaluate_models(root, renditions, models, transport, *, clock=time.monotonic,
-                    controls=False, max_prompt_chars=MAX_PROMPT_CHARS):
-    """Score models on sample renditions (and optional controls); body-free, writes nothing."""
-    tasks = [task(root, r) for r in renditions]
-    control = _task(CONTROL) if controls else None
-    scores = {}
-    for model in models:
-        score = Counter({"documents": 0, "complete": 0, "reviewed": 0, "invalid-reply": 0,
-                         "transport-error": 0, "too-large": 0, "control-caught": 0,
-                         "control-tasks": 0})
-        decisions, usage, seconds = Counter(), Counter(), 0.0
-        for prepared in tasks + ([control] if control else []):
-            started = clock()
-            result = assess(prepared, model, transport, max_prompt_chars)
-            seconds += clock() - started
-            usage.update(result["usage"])
-            if prepared is control:
-                score["control-tasks"] += 1
-                score["control-caught"] += result.get("decision") in {"reject", "defer"}
-                continue
-            score["documents"] += 1
-            score[result["status"]] += 1
-            score["complete"] += bool(result.get("complete"))
-            if "decision" in result:
-                decisions[result["decision"]] += 1
-        scores[model] = {**score, "decisions": dict(decisions),
-                         "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")},
-                         "seconds": round(seconds, 3)}
+                    controls=False, max_prompt_chars=MAX_PROMPT_CHARS, criteria=None,
+                    per_rendition=False, concurrency=1):
+    """Score models on sample renditions (and optional controls); body-free, writes nothing.
+
+    ``criteria`` selects the reviewer prompt (default: the newest, ``standing.CRITERIA[-1]``).
+    ``per_rendition`` adds ``renditions``: for each sample, in argument order, its receipt id and
+    rendition hash plus each model's decision, status, complete flag and token usage, so callers
+    can compute agreement per stratum. ``concurrency`` above 1 runs the model calls on a bounded
+    thread pool under the adaptive limiter (429/503 halve it, the transport's own retries still
+    apply); results are folded in argument order, so the report does not depend on timing.
+    """
+    criteria = standing.CRITERIA[-1] if criteria is None else criteria
+    if criteria not in PROMPTS:
+        raise ValueError("criteria must be one of " + ", ".join(PROMPTS))
+    _positive(concurrency, "concurrency")
+    tasks = [task(root, r, criteria=criteria) for r in renditions]
+    control = _task(CONTROL, criteria=criteria) if controls else None
+    work = [(model, prepared) for model in models for prepared in tasks + ([control] if control else [])]
+
+    def one(item, call):
+        started = clock()
+        result = assess(item[1], item[0], call, max_prompt_chars)
+        return result, clock() - started
+    limiter = None
+    if concurrency > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        limiter = throttle.Limiter(concurrency)
+        with limiter.gating(transport) as gated, ThreadPoolExecutor(concurrency) as pool:
+            outcomes = list(pool.map(lambda item: one(item, gated), work))
+    else:
+        outcomes = [one(item, transport) for item in work]
+    by_model = {model: [] for model in models}
+    for (model, prepared), (result, seconds) in zip(work, outcomes):
+        by_model[model].append((prepared is control, result, seconds))
+    scores = {model: _score([(c, r) for c, r, _ in rows], sum(sec for *_, sec in rows))
+              for model, rows in by_model.items()}
 
     def rank(model):
         s = scores[model]
@@ -329,10 +367,22 @@ def evaluate_models(root, renditions, models, transport, *, clock=time.monotonic
         return (-s["control-caught"], -s["complete"], failures,
                 s["usage"]["prompt_tokens"] + s["usage"]["completion_tokens"], s["seconds"], model)
     selected = min(models, key=rank) if models else None
-    return {"documents": len(tasks), "controls": int(bool(controls)), "models": scores,
-            "selected": selected,
-            "rule": "most control tasks caught, then most complete inspections, then fewest "
-                    "failed replies, then fewest tokens, then fastest"}
+    report = {"documents": len(tasks), "controls": int(bool(controls)), "criteria": criteria,
+              "models": scores, "selected": selected,
+              "rule": "most control tasks caught, then most complete inspections, then fewest "
+                      "failed replies, then fewest tokens, then fastest"}
+    if limiter is not None:
+        report["throughput"] = limiter.report()
+    if per_rendition:
+        report["renditions"] = [
+            {"index": i, "receipt_id": prepared["value"]["source"]["receipt_id"],
+             "rendition_sha256": hashlib.sha256(_rendition(root, renditions[i])[0]).hexdigest(),
+             "models": {model: {"decision": r.get("decision"), "status": r["status"],
+                                "complete": bool(r.get("complete")), "usage": dict(r["usage"])}
+                        for model, rows in by_model.items()
+                        for r in [rows[i][1]]}}
+            for i, prepared in enumerate(tasks)]
+    return report
 
 
 def estimate(sample, *, admitted, sample_bytes=None, admitted_bytes=None):
@@ -391,7 +441,7 @@ def _retry_after(error):
 def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=5,
                    backoff_seconds=2.0, max_wait_seconds=60.0, max_retry_seconds=600.0,
                    sleep=time.sleep, clock=time.monotonic, jitter=random.random,
-                   urlopen=None, recorder=None):
+                   urlopen=None, recorder=None, max_tokens=None):
     """OpenAI-compatible chat transport restricted to one configured provider's models.
 
     Rate limits (429), transient server errors (500, 502, 503, 504) and network
@@ -403,8 +453,11 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
     the whole call) runs as ``gate(fn)``, where ``fn()`` returns ``(reply, failure)``: the
     adaptive concurrency limiter uses it so a retry waits for a free slot under the current
     limit, and no slot is held while the transport sleeps before that retry.
-    Each successful reply's usage goes to ``recorder``.
+    Each successful reply's usage goes to ``recorder``. ``max_tokens`` (a positive integer) is sent
+    as the request's ``max_tokens``; unset, the request carries only the model and messages.
     """
+    if max_tokens is not None:
+        _positive(max_tokens, "max_tokens")
     if type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer")
     config = json.loads(Path(models_path).read_text())["providers"][provider]
@@ -415,8 +468,11 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
 
     def attempt(model, messages):
         """One request; returns the reply or (code, retryable, Retry-After seconds)."""
+        body = {"model": model, "messages": messages}
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
         request = urllib.request.Request(
-            url, data=json.dumps({"model": model, "messages": messages}).encode(),
+            url, data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + api_key(config["apiKey"]),
                      "Content-Type": "application/json"}, method="POST")
         try:
@@ -465,6 +521,26 @@ def usai_transport(models_path, provider=PROVIDER, timeout=300, *, max_attempts=
     return call
 
 
+def _positive_option(text):
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _policy_criteria(root, name):
+    """The criteria a standing policy file below ``root`` pins; the refusal code only on failure."""
+    try:
+        raw = standing.read_private(root, name, standing.LIMIT)
+        return standing.criteria(
+            standing.load_policy(root, name, hashlib.sha256(raw).hexdigest()))
+    except (standing.Refusal, OSError) as error:
+        raise ValueError(getattr(error, "code", "standing-policy-unreadable")) from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -475,10 +551,30 @@ def main(argv=None):
     sample.add_argument("--model", action="append", required=True, dest="models")
     sample.add_argument("--rendition", action="append", required=True, dest="renditions")
     sample.add_argument("--controls", action="store_true")
+    sample.add_argument("--criteria", choices=sorted(PROMPTS),
+                        help="review prompt to score under (default: the criteria of --policy, "
+                             "else the newest, %s)" % standing.CRITERIA[-1])
+    sample.add_argument("--policy", help="standing policy file below --root whose criteria are the "
+                                         "default for --criteria")
+    sample.add_argument("--per-rendition", action="store_true",
+                        help="also print each rendition's receipt id, hash and every model's "
+                             "decision, status, complete flag and usage (body-free)")
+    sample.add_argument("--concurrency", type=_positive_option, default=1,
+                        help="most model calls in flight (default 1, serial); backs off on 429/503")
+    sample.add_argument("--max-output-tokens", type=_positive_option,
+                        help="send max_tokens with each request (default: not sent)")
     args = parser.parse_args(argv)
+    criteria = args.criteria
+    if criteria is None and args.policy:
+        try:
+            criteria = _policy_criteria(args.root, args.policy)
+        except ValueError as error:
+            parser.error(f"--policy refused: {error}")
     report = evaluate_models(args.root, args.renditions, args.models,
                              usai_transport(args.models_config, recorder=usage_log.Recorder(
-                                 "librarian intake", PROVIDER)), controls=args.controls)
+                                 "librarian intake", PROVIDER), max_tokens=args.max_output_tokens),
+                             controls=args.controls, criteria=criteria,
+                             per_rendition=args.per_rendition, concurrency=args.concurrency)
     print(json.dumps(report, sort_keys=True))
     return 0
 

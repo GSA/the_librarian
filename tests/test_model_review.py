@@ -285,6 +285,183 @@ class EvaluationTests(ReviewCase):
         self.assertEqual(report["selected"], "model-b")
 
 
+class EvaluationOptionTests(ReviewCase):
+    """Criteria choice, per-rendition decisions and bounded concurrency of ``evaluate``."""
+
+    def systems(self, **options):
+        seen = []
+
+        def transport(model, messages):
+            seen.append(messages[0]["content"])
+            return reply()
+        model_review.evaluate_models(self.root, [self.rendition], ["model-a"], transport, **options)
+        return seen
+
+    def test_evaluate_sends_the_requested_criteria_prompt(self):
+        self.assertEqual(self.systems(criteria="standing-review-v2"), [model_review.SYSTEM_V2])
+        self.assertEqual(self.systems(criteria="standing-review-v1"), [model_review.SYSTEM])
+
+    def test_evaluate_defaults_to_the_newest_criteria(self):
+        self.assertEqual(self.systems(), [model_review.SYSTEM_V2])
+
+    def test_unknown_criteria_is_refused_before_any_call(self):
+        with self.assertRaises(ValueError):
+            self.systems(criteria="standing-review-v9")
+
+    def test_aggregate_report_has_no_per_rendition_section_by_default(self):
+        report = model_review.evaluate_models(self.root, [self.rendition], ["model-a"], Transport())
+        self.assertNotIn("renditions", report)
+        self.assertEqual(report["criteria"], "standing-review-v2")
+
+    def test_per_rendition_decisions_are_keyed_and_body_free(self):
+        decisions = iter(["accept", "reject", "defer", "accept"])
+
+        def transport(model, messages):
+            return reply(decision=next(decisions), records=[0])
+        report = model_review.evaluate_models(
+            self.root, [self.rendition, self.rendition], ["model-a", "model-b"], transport,
+            per_rendition=True)
+        rows = report["renditions"]
+        self.assertEqual([r["index"] for r in rows], [0, 1])
+        self.assertEqual({r["receipt_id"] for r in rows}, {"D1"})
+        self.assertEqual({r["rendition_sha256"] for r in rows}, {self.rendition_sha})
+        self.assertEqual(rows[0]["models"]["model-a"],
+                         {"decision": "accept", "status": "reviewed", "complete": False,
+                          "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
+        self.assertEqual(rows[1]["models"]["model-b"]["decision"], "accept")
+        raw = json.dumps(report)
+        for text in ("Distinct heading phrase", "Checked every record", "sources/notes.md",
+                     self.rendition):
+            self.assertNotIn(text, raw)
+
+    def test_failed_replies_report_status_without_decision(self):
+        report = model_review.evaluate_models(
+            self.root, [self.rendition], ["model-a"],
+            Transport({"content": "nope", "usage": {"completion_tokens": 4096}}), per_rendition=True)
+        row = report["renditions"][0]["models"]["model-a"]
+        self.assertEqual(row, {"decision": None, "status": "invalid-reply", "complete": False,
+                               "usage": {"prompt_tokens": 0, "completion_tokens": 4096}})
+
+    def test_concurrent_evaluation_matches_serial_and_is_bounded(self):
+        import threading
+        lock, state = threading.Lock(), {"now": 0, "peak": 0}
+        barrier = threading.Barrier(2, timeout=5)
+
+        def transport(model, messages):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            with lock:
+                state["now"] -= 1
+            decision = "accept" if "Second line" in messages[-1]["content"] else "reject"
+            return reply(decision=decision)
+        models = ["model-a", "model-b", "model-c", "model-d"]
+        serial = model_review.evaluate_models(
+            self.root, [self.rendition] * 2, models, lambda m, msgs: reply(), per_rendition=True)
+        parallel = model_review.evaluate_models(
+            self.root, [self.rendition] * 2, models, transport, per_rendition=True, concurrency=2)
+        self.assertEqual(state["peak"], 2)
+        self.assertEqual([r["index"] for r in parallel["renditions"]], [0, 1])
+        self.assertEqual(list(parallel["models"]), models)
+        for name in ("renditions", "documents", "controls"):
+            self.assertEqual(parallel[name], serial[name])
+        self.assertEqual(parallel["models"]["model-a"]["decisions"], {"accept": 2})
+
+    def test_concurrent_evaluation_backs_off_on_throttling(self):
+        import threading
+        lock, calls = threading.Lock(), []
+
+        def transport(model, messages):
+            with lock:
+                calls.append(model)
+                first = len(calls) == 1
+            if first:
+                raise model_review.TransportError("http-429")
+            return reply()
+        report = model_review.evaluate_models(
+            self.root, [self.rendition] * 3, ["model-a"], transport, concurrency=3)
+        self.assertEqual(report["models"]["model-a"]["transport-error"], 1)
+        self.assertEqual(report["throughput"]["throttle_signals"], 1)
+        self.assertLessEqual(report["throughput"]["lowest"], 2)
+
+    def test_concurrency_must_be_a_positive_integer(self):
+        for bad in (0, -1, True, "2"):
+            with self.assertRaises(ValueError):
+                model_review.evaluate_models(self.root, [self.rendition], ["model-a"],
+                                             Transport(), concurrency=bad)
+
+
+class EvaluateCommandTests(ReviewCase):
+    """The ``evaluate`` command line over a fake transport (no model is ever called)."""
+
+    def run_main(self, *extra, policy=None):
+        import contextlib
+        import io
+        self.systems, self.transport_args = [], {}
+
+        def fake_transport(path, **options):
+            self.transport_args = options
+
+            def call(model, messages):
+                self.systems.append(messages[0]["content"])
+                return reply()
+            return call
+        if policy is not None:
+            target = self.root / "config" / "standing-policy.local.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(policy))
+            target.chmod(0o600)
+        out = io.StringIO()
+        with patch.object(model_review, "usai_transport", fake_transport), \
+                patch.object(model_review.usage_log, "Recorder"), contextlib.redirect_stdout(out):
+            model_review.main(["evaluate", "--root", str(self.root), "--models-config", "m.json",
+                               "--model", "model-a", "--rendition", self.rendition, *extra])
+        return json.loads(out.getvalue())
+
+    def v2_policy(self):
+        return {**self.policy, "schema": standing.POLICY_SCHEMA_V2, "criteria": "standing-review-v2",
+                "carries": [], "selection": {"context": ["documents/AGENTS.md"]}}
+
+    def test_default_criteria_is_the_newest_without_a_policy(self):
+        self.run_main()
+        self.assertEqual(self.systems, [model_review.SYSTEM_V2])
+
+    def test_criteria_option_selects_v1(self):
+        report = self.run_main("--criteria", "standing-review-v1")
+        self.assertEqual(self.systems, [model_review.SYSTEM])
+        self.assertEqual(report["criteria"], "standing-review-v1")
+
+    def test_default_criteria_follow_the_policy_given(self):
+        self.run_main("--policy", "config/standing-policy.local.json",
+                      policy={**self.v2_policy(), "criteria": "standing-review-v1"})
+        self.assertEqual(self.systems, [model_review.SYSTEM])
+
+    def test_explicit_criteria_overrides_the_policy(self):
+        self.run_main("--policy", "config/standing-policy.local.json",
+                      "--criteria", "standing-review-v2",
+                      policy={**self.v2_policy(), "criteria": "standing-review-v1"})
+        self.assertEqual(self.systems, [model_review.SYSTEM_V2])
+
+    def test_per_rendition_flag_adds_the_decisions_section(self):
+        self.assertNotIn("renditions", self.run_main())
+        self.assertEqual(self.run_main("--per-rendition")["renditions"][0]["receipt_id"], "D1")
+
+    def test_max_output_tokens_reaches_the_transport_only_when_set(self):
+        self.run_main()
+        self.assertIsNone(self.transport_args.get("max_tokens"))
+        self.run_main("--max-output-tokens", "8192", "--concurrency", "2")
+        self.assertEqual(self.transport_args["max_tokens"], 8192)
+
+    def test_nonpositive_options_are_refused(self):
+        for option in ("--concurrency", "--max-output-tokens"):
+            with self.assertRaises(SystemExit):
+                self.run_main(option, "0")
+
+
 class EstimateTests(ReviewCase):
     def test_estimate_extrapolates_sample_tokens_per_document(self):
         estimate = model_review.estimate(
@@ -431,6 +608,23 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(self.waits, [7.0, 4.0, 8.0])
         self.assertEqual(dict(call.retries), {"http-429": 1, "http-503": 1, "network": 1})
         self.assertEqual(set(self.urls), {"https://api.example.invalid/v1/chat/completions"})
+
+    def test_max_tokens_is_sent_only_when_configured(self):
+        import io as _io
+        bodies = []
+
+        def urlopen(request, timeout):
+            bodies.append(json.loads(request.data))
+            return _io.BytesIO(json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode())
+        for options in ({}, {"max_tokens": 8192}):
+            model_review.usai_transport(self.models, urlopen=urlopen, **options)("model-a", [])
+        self.assertEqual(set(bodies[0]), {"model", "messages"})
+        self.assertEqual(bodies[1]["max_tokens"], 8192)
+
+    def test_max_tokens_must_be_a_positive_integer(self):
+        for bad in (0, -5, True, "4096"):
+            with self.assertRaises(ValueError):
+                model_review.usai_transport(self.models, max_tokens=bad)
 
     def test_waits_are_capped(self):
         call = self.transport((429, "3600"), (429, "soon"), 200, max_wait_seconds=30.0,
