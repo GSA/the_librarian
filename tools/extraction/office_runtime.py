@@ -136,6 +136,9 @@ def _bwrap(root, work):
         elif path.is_dir():
             argv += ["--ro-bind", str(path), str(path)]
     argv += ["--ro-bind", "/usr", "/usr"]
+    # LibreOffice's launcher needs a writable /tmp or /var/tmp for its IPC pipe, or it exits. These come first so a
+    # runtime installed under /tmp (bound below) is not hidden by them.
+    argv += ["--size", str(TMP_BYTES // 8), "--tmpfs", "/tmp", "--size", str(TMP_BYTES // 8), "--tmpfs", "/var/tmp"]
     for name in SYSTEM_FILES:
         argv += ["--ro-bind-try", name, name]
     argv += ["--ro-bind-try", "/etc/fonts", "/etc/fonts"]
@@ -144,8 +147,7 @@ def _bwrap(root, work):
     argv += ["--ro-bind", str(work / "in"), "/work/in", "--bind", str(work / "out"), "/work/out",
              "--bind", str(work / "profile"), "/work/profile",
              "--size", str(TMP_BYTES), "--tmpfs", "/work/tmp", "--dir", "/work/tmp/home",
-             # LibreOffice's launcher needs a writable /tmp or /var/tmp for its IPC pipe, or it exits.
-             "--size", str(TMP_BYTES // 8), "--tmpfs", "/tmp", "--size", str(TMP_BYTES // 8), "--tmpfs", "/var/tmp",
+
              "--proc", "/proc", "--dev", "/dev", "--chdir", "/work/tmp"]
     for key, value in _environment("bwrap", work).items():
         argv += ["--setenv", key, value]
