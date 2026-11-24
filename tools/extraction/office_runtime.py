@@ -40,7 +40,7 @@ WALL_SECONDS = 300
 PROBE_SECONDS = 30
 VERSION_SECONDS = 60
 MAX_STDOUT = 64 * 1024
-TMP_BYTES = 512 * 1024 * 1024
+TMP_BYTES = 512 * 1024 * 1024  # the private temp tmpfs (and an eighth of it for each of /tmp and /var/tmp)
 # Applied to the whole sandbox (``bwrap`` and every descendant inherit them). CPU is set per run.
 LIMITS = {"RLIMIT_AS": 6 * 1024 ** 3, "RLIMIT_FSIZE": 128 * 1024 ** 2, "RLIMIT_NOFILE": 1024, "RLIMIT_CORE": 0}
 CPU_SLACK = 30
@@ -144,6 +144,8 @@ def _bwrap(root, work):
     argv += ["--ro-bind", str(work / "in"), "/work/in", "--bind", str(work / "out"), "/work/out",
              "--bind", str(work / "profile"), "/work/profile",
              "--size", str(TMP_BYTES), "--tmpfs", "/work/tmp", "--dir", "/work/tmp/home",
+             # LibreOffice's launcher needs a writable /tmp or /var/tmp for its IPC pipe, or it exits.
+             "--size", str(TMP_BYTES // 8), "--tmpfs", "/tmp", "--size", str(TMP_BYTES // 8), "--tmpfs", "/var/tmp",
              "--proc", "/proc", "--dev", "/dev", "--chdir", "/work/tmp"]
     for key, value in _environment("bwrap", work).items():
         argv += ["--setenv", key, value]

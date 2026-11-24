@@ -160,6 +160,7 @@ class ConfinementChecks:
             '  echo "interfaces=$(cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d " " | tr "\\n" ",")";\n'
             '  echo "env=$(env | grep -c "^LIBRARIAN\\|^SECRET")";\n'
             '  echo "cwd-writable=$( (: > ./probe) 2>/dev/null && echo yes || echo no)";\n'
+            '  echo "shared-tmp-writable=$( (: > /tmp/probe-$$ && rm /tmp/probe-$$) 2>/dev/null && echo yes || echo no)";\n'
             '  echo "tmp-writable=$( (: > "$TMPDIR/probe") 2>/dev/null && echo yes || echo no)";\n'
             '  echo "tree=$(ls "%s" 2>/dev/null | wc -l)"; } > "$report"\n'
             'cp "$report" "$OUT/source.$TARGET"\n' % self.base)
@@ -174,6 +175,7 @@ class ConfinementChecks:
         self.assertEqual(lines["env"], "0")
         self.assertEqual(lines["tmp-writable"], "yes")
         self.assertEqual(lines["cwd-writable"], "yes")
+        self.assertEqual(lines["shared-tmp-writable"], "yes")  # LibreOffice's launcher needs /tmp or /var/tmp
         self.assertFalse((Path.cwd() / "probe").exists(), "a relative write escaped into the toolkit directory")
         self.assertClean()
 
