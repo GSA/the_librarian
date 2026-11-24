@@ -274,13 +274,16 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     prune_command = commands.add_parser("prune")
-    prune_command.add_argument("--store", choices=("catalog", "review-events", "all"), default="all")
+    prune_command.add_argument("--store", choices=("catalog", "review-events", "claim-corrections", "all"), default="all")
     prune_command.add_argument("--apply", action="store_true", help="delete; the default is a dry run")
     args = parser.parse_args(argv)
     try:
         from tools.catalog import catalog_store
-        from tools.review_events import event_store
-        stores = {"catalog": catalog_store, "review-events": event_store}
+        from tools.review_events import corrections, event_store
+        stores = {"catalog": catalog_store, "review-events": event_store, "claim-corrections": corrections}
+        if args.command == "status" or args.store == "all":
+            if not corrections.locations(args.root)[1].exists():
+                del stores["claim-corrections"]  # an instance that never initialized the optional store
         if args.command == "status":
             result = {name: module.backup_inventory(args.root) for name, module in stores.items()}
         else:

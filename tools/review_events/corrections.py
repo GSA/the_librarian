@@ -298,6 +298,7 @@ def initialize(root):
         try:
             with closing(sqlite3.connect(temporary, isolation_level=None)) as connection:
                 connection.execute("PRAGMA journal_mode=DELETE")
+                connection.execute("PRAGMA synchronous=FULL")
                 connection.executescript(schema_sql())
                 metadata = {"store_id": str(uuid.uuid4()), "created_at": store.now(),
                             "contract_hash": contract_hash(), "authority": AUTHORITY}
@@ -512,6 +513,22 @@ def backup(root):
     home, db, backups = locations(root)
     with store.writer_lock(home), closing(store.connect(db)) as connection:
         return {"command": "backup", **snapshot(connection, backups, "manual")}
+
+
+def backup_inventory(root):
+    return snapshots.inventory(locations(root)[2])
+
+
+def prune(root, *, apply=False):
+    """Operator prune: newest verified snapshot per UTC day inside the window; dry run by default."""
+    home, db, backups = locations(root)
+    require(db.exists(), "Claim-correction store is missing; run init first")
+    with store.writer_lock(home), closing(store.connect(db)) as connection:
+        # Hold the writer lock so prune cannot overlap a write's retention or a restore.
+        store_id = inspect(connection)[0]["store_id"]
+        return snapshots.prune(backups, store_id=store_id, verify=verified_snapshot,
+                               errors=(contract.ReviewError,), days=contract.policy.backup_retention_days(root),
+                               apply=apply, thin=True)
 
 
 def restore(root, source, expected_state=None):

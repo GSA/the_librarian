@@ -13,7 +13,7 @@ from tools import store_audit
 from tools.catalog import catalog_store as catalog
 from tools.diagnostics.catalog_lock_benchmark import registration
 from tools.intake import store
-from tools.review_events import event_history, event_store as events
+from tools.review_events import corrections, event_history, event_store as events
 from tools.review_events import review_events as contract
 from tests.test_file_identity_locks import needs_dbpage
 from tests.test_review_event_memo import add
@@ -53,6 +53,44 @@ class Audit(AuditCase):
         self.assertTrue(all(entry["ok"] for entry in report["stores"]))
         self.assertIsNotNone(self.stores(report)["catalog"]["backup"])
         self.assertNotIn("Synthetic", out)
+
+    def initialize_corrections(self):
+        corrections.initialize(self.root)
+        return corrections.locations(self.root)
+
+    def test_a_claim_correction_store_is_audited_when_it_exists(self):
+        self.assertNotIn("claim-corrections", self.stores(json.loads(self.run_main()[1])))  # optional store
+        self.initialize_corrections()
+        code, out, _ = self.run_main()
+        entry = self.stores(json.loads(out))["claim-corrections"]
+        self.assertEqual((code, entry["ok"], entry["records"], entry["revision"]), (0, True, 0, 0))
+        self.assertIsNotNone(entry["backup"])
+        self.assertNotIn("Synthetic", out)
+
+    def test_a_damaged_claim_correction_store_is_flagged_and_the_others_still_run(self):
+        _, db, _ = self.initialize_corrections()
+        with closing(sqlite3.connect(db, isolation_level=None)) as connection:
+            connection.execute("DROP TRIGGER immutable_metadata_update")
+            connection.execute("UPDATE metadata SET value='x' WHERE key='authority'")
+        os.chmod(db, 0o600)
+        code, out, _ = self.run_main("--no-backups")
+        flagged = self.stores(json.loads(out))
+        self.assertEqual(code, 1)
+        self.assertFalse(flagged["claim-corrections"]["ok"])
+        self.assertTrue(flagged["catalog"]["ok"] and flagged["review-events"]["ok"])
+
+    def test_a_corrupt_newest_claim_correction_backup_is_flagged(self):
+        _, _, backups = self.initialize_corrections()
+        newest = sorted(backups.glob("*.sqlite3"))[-1]
+        raw = bytearray(newest.read_bytes())
+        raw[-1] ^= 0xFF
+        newest.write_bytes(bytes(raw))
+        os.chmod(newest, 0o600)
+        code, out, _ = self.run_main()
+        flagged = self.stores(json.loads(out))
+        self.assertEqual(code, 1)
+        self.assertFalse(flagged["claim-corrections"]["ok"])
+        self.assertTrue(flagged["catalog"]["ok"])
 
     def test_it_replays_every_store_in_full_whatever_the_receipts_say(self):
         calls = {"catalog": 0, "events": 0}
