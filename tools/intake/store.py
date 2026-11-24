@@ -10,7 +10,7 @@ import sqlite3
 import stat
 import time
 
-from tools import policy
+from tools import policy, validation_scope
 from tools.durable import fsync_directory, reserve
 from . import docs
 from .contracts import IntakeError, LedgerBusy, decode, decode_request, digest, request_layout, require
@@ -65,7 +65,7 @@ CORRECTION_INDEX = DDL[DDL.index("CREATE INDEX IF NOT EXISTS requests_correction
 
 def safe(path):
     path = Path(path).absolute()
-    require(not any(p.is_symlink() for p in (path, *path.parents)), "unsafe_path")
+    require(not validation_scope.has_symlink(path), "unsafe_path")
     return path
 
 
