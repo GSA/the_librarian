@@ -22,7 +22,7 @@ import zipfile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from tools.durable import batched_directory_syncs, batching, fsync_directory, fsync_directory_later
+from tools.durable import batched_directory_syncs, batching, fsync_directory_later
 from tools.extraction import convert, mhtml
 from tools.extraction.extract import TEXT_SUFFIXES
 from . import runner, store

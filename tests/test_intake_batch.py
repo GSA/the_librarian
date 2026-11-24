@@ -746,6 +746,22 @@ class DirectorySyncOrder(unittest.TestCase):
         self.assertLess(len(many), 12 * len(one))
         self.assertLessEqual(len(many) / 12, 7)
 
+    @staticmethod
+    def killing_flush(before, nth):
+        """A ``DirectorySyncs.flush`` that raises ``Interrupted`` at the ``nth`` flush with work, before or after syncing."""
+        real_flush, seen = durable.DirectorySyncs.flush, [0]
+
+        def flush(self):
+            if not self.pending:
+                return real_flush(self)
+            seen[0] += 1
+            if before and seen[0] == nth:
+                raise Interrupted
+            real_flush(self)
+            if not before and seen[0] == nth:
+                raise Interrupted
+        return flush
+
     def test_a_rerun_makes_durable_what_a_killed_run_left_unsynced_before_it_commits_anything_that_names_it(self):
         # Kill the run at the Nth flush that has work, before and after it syncs; the entries the killed run
         # linked but did not sync (retained copies, renditions, saved registrations, completions) stay dirty
@@ -755,18 +771,8 @@ class DirectorySyncOrder(unittest.TestCase):
             for nth in (1, 2, 3, 4):
                 with self.subTest(before=before, nth=nth):
                     root, inbox = make_instance(self, 3)
-                    dirty, violations, syncs, seen = set(), [], [], [0]
-                    real_flush = durable.DirectorySyncs.flush
-
-                    def flush(self, before=before, nth=nth):
-                        if not self.pending:
-                            return real_flush(self)
-                        seen[0] += 1
-                        if before and seen[0] == nth:
-                            raise Interrupted
-                        real_flush(self)
-                        if not before and seen[0] == nth:
-                            raise Interrupted
+                    dirty, violations, syncs = set(), [], []
+                    flush = self.killing_flush(before, nth)
                     with self.tracking(root, dirty, violations, syncs, flush), self.assertRaises(Interrupted):
                         cohort.ingest(root, inbox, system="s", actor="a", batch_size=3, parse_workers=1)
                     if before:
