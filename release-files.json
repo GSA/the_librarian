@@ -31,6 +31,7 @@
   "tests/test_intake_archives.py",
   "tests/test_intake_agent_origin.py",
   "tests/test_intake_exclusions.py",
+  "tests/test_hostile_input.py",
   "tests/test_intake_docs.py",
   "tests/test_intake_concurrency.py",
   "tests/test_intake_parse_workers.py",
