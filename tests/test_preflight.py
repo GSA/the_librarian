@@ -7,7 +7,6 @@ Everything happens in temporary workspaces; no real instance is opened.
 """
 
 import contextlib
-import importlib.util
 import io
 import json
 import os
