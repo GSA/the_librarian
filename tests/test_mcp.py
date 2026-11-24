@@ -87,6 +87,21 @@ class MCPConfig(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "complete trusted toolkit clone"):
                 Config(root=root)
 
+    def test_config_loads_in_a_clean_install_where_tools_is_not_importable(self):
+        """An adopter's venv has only the adapter; the toolkit is reached by path, never via sys.path."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "kit"
+            clone_release(root)
+            elsewhere = Path(directory).resolve() / "elsewhere"
+            elsewhere.mkdir()
+            code = ("import sys\n"
+                    "from pathlib import Path\n"
+                    "from the_librarian_mcp.config import Config\n"
+                    "assert not any(Path(p, 'tools', 'policy.py').exists() for p in sys.path if p), sys.path\n"
+                    f"Config(root=Path({str(root)!r}))\n")
+            result = subprocess.run([sys.executable, "-c", code], cwd=elsewhere, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_script_path_overrides_are_not_accepted(self):
         arguments = parser("test")
         for option in ("--reader", "--event-reader"):

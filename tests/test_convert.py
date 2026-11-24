@@ -17,7 +17,7 @@ from tools.extraction import convert, convert_worker as worker
 from tools.intake import adapters, cohort, cohort_ingest, upload
 from tools.intake.contracts import IntakeError
 
-from test_intake_cohort import QualifyCase
+from tests.test_intake_cohort import QualifyCase
 
 W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
 WR = W + ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'

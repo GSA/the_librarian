@@ -137,7 +137,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(store.inspect(self.root, "req-native")["stages"][0]["status"], "staged")
 
     def test_docling_timeout_is_retryable(self):
-        import test_docling
+        from tests import test_docling
         fixture = test_docling.DoclingLifecycle()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -274,7 +274,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(events.status(self.root)["revision"], 2)
 
     def test_docling_changed_and_missing_artifacts_block_recovery(self):
-        import test_docling
+        from tests import test_docling
         fixture = test_docling.DoclingLifecycle()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -294,7 +294,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(catalog.status(root)["revision"], 1)
 
     def docling_fixture(self):
-        import test_docling
+        from tests import test_docling
         fixture = test_docling.DoclingLifecycle()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -341,7 +341,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(list((fixture.root / docling.HOME).rglob("extraction.json")), [])
 
     def test_docling_stage_boundaries_and_restart(self):
-        import test_docling
+        from tests import test_docling
         fixture = test_docling.DoclingLifecycle()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)

@@ -1,6 +1,6 @@
 # Toolkit-wide lint gate. Kept deliberately narrow: pyflakes plus bug-prone
 # bugbear checks. Style rules (formatting, line length) are not enforced.
-target-version = "py311"
+target-version = "py314"
 required-version = "==0.17.5"
 extend-exclude = [".local", "build", "dist"]
 

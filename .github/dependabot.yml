@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /tools/context-mcp
+    schedule:
+      interval: weekly
+    ignore:
+      # Pinned exactly on purpose: preflight and the adapter tests assert mcp==2.2.0, so bump it by hand with them.
+      - dependency-name: mcp

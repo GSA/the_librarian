@@ -1,0 +1,66 @@
+name: Nightly
+
+# Slow or forward-looking checks that should not gate a pull request.
+on:
+  schedule:
+    - cron: "43 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  debug-allocator:
+    # The full suite under the CPython debug memory allocator (-X dev default), which PR CI leaves out for speed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: tools/context-mcp/pyproject.toml
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install ./tools/context-mcp
+      - name: Allow unprivileged PID namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
+      - name: Tests with the debug allocator
+        run: |
+          .venv/bin/python -W error::ResourceWarning -X dev .github/scripts/run_tests.py \
+            --expected-skips .github/expected-skips.txt
+
+  next-python:
+    # Early warning for the next Python release (3.15 is released); informational, never a required check.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+          cache: pip
+          cache-dependency-path: tools/context-mcp/pyproject.toml
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install ./tools/context-mcp
+      - name: Allow unprivileged PID namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
+      - name: Tests on Python 3.15
+        env:
+          PYTHONMALLOC: pymalloc
+        run: |
+          .venv/bin/python -W error::ResourceWarning -X dev .github/scripts/run_tests.py \
+            --expected-skips .github/expected-skips.txt

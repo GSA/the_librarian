@@ -220,13 +220,30 @@ restated here.
   enforces at runtime, and every direct pin must appear in it unchanged
   (`tests/test_docling.py::WorkerRequirements`).
   The reader needs none of it.
-- **Continuous integration** (`.github/workflows/ci.yml`) runs on pull requests
-  and pushes to `main` with Python 3.14: it installs `tools/context-mcp` into a
-  fresh `.venv`, then runs `ruff check`, the schema snapshot `--check` and the
-  unittest suite. `ruff.toml` pins the ruff version and enforces only pyflakes
-  (`F`), bugbear (`B`, minus `B007`/`B905`) and `SIM115`; formatting and line
-  length are not enforced. Ruff is a CI/development tool, not a runtime
-  dependency.
+- **Continuous integration** (`.github/workflows/`) has three kinds of workflow.
+  `ci.yml` runs on pull requests and pushes to `main` with Python 3.14 as three
+  independent jobs, each with a timeout, a pip cache and least-privilege
+  permissions (`contents: read`; a newer push to a PR cancels its superseded run).
+  `lint` runs `ruff check` and the schema snapshot `--check`. `test` runs the
+  unittest suite through `.github/scripts/run_tests.py` with `-X dev`, but with
+  `PYTHONMALLOC=pymalloc` (the debug allocator `-X dev` implies cost about 70% of
+  the run and `ResourceWarning` detection does not need it), and fails when the
+  skipped-test set differs from `.github/expected-skips.txt`, in either direction.
+  `package-smoke` (`.github/scripts/package-smoke.sh`) packages the toolkit, unzips
+  it, builds a fresh venv from the copy, runs `tools.initialize`,
+  `librarian-preflight` and an MCP `status`/`search` handshake, which is the path an
+  adopter follows (`tests/test_mcp.py::MCPConfig::test_config_loads_in_a_clean_install_where_tools_is_not_importable`
+  pins the import boundary it depends on). `docling.yml` provisions the pinned
+  Docling runtime and models (cached; `.github/scripts/provision-docling.sh`) and
+  runs the PDF/image `RuntimeTests` and the opt-in `RealWorkerTests` with an empty
+  skip set, nightly, on demand and on pull requests touching the extraction code.
+  `nightly.yml` runs the full suite under the debug allocator and, as an
+  informational job, on Python 3.15. Every action is pinned to a commit SHA and
+  Dependabot proposes updates. `ruff.toml` pins the ruff version and `py314`
+  target and enforces only pyflakes (`F`), bugbear (`B`, minus `B007`/`B905`) and
+  `SIM115`; formatting and line length are not enforced. Ruff is a CI/development
+  tool, not a runtime dependency. The required checks for `main` are `lint`,
+  `test` and `package-smoke`; the other jobs are informational.
 - The first proof-of-concept installation is closed; this repository does not
   maintain or port from it. Its clean-copy tests only prove this repository's
   packaging and policy boundary.

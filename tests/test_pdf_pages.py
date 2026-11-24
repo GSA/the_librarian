@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from pdf_fixtures import encrypted_pdf, text_pdf
+from tests.pdf_fixtures import encrypted_pdf, text_pdf
 from tools.context_index import confidence
 from tools.extraction import pdf_image, pdf_pages
 

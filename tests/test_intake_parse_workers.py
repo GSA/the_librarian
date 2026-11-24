@@ -9,8 +9,8 @@ from tools.extraction import extract
 from tools.intake import cohort, cohort_ingest, parse_pool, store
 from tools.intake.contracts import IntakeError
 
-from test_intake_batch import make_instance, snapshot
-from test_intake_cohort import CohortCase
+from tests.test_intake_batch import make_instance, snapshot
+from tests.test_intake_cohort import CohortCase
 
 
 def slow_then(value, delay):

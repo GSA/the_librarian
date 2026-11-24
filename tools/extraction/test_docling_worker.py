@@ -3,12 +3,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
-import uuid
 
 
 HERE = Path(__file__).resolve().parent
@@ -19,14 +18,12 @@ SPEC.loader.exec_module(worker)
 
 class WorkerTests(unittest.TestCase):
     def setUp(self):
-        self.home = HERE / ".local" / ("test-worker-" + uuid.uuid4().hex)
-        self.home.mkdir(parents=True, mode=0o700)
+        scratch = tempfile.TemporaryDirectory(prefix="test-worker-")
+        self.addCleanup(scratch.cleanup)
+        self.home = Path(scratch.name)
         self.assets = self.home / "models"
         self.assets.mkdir()
         (self.assets / "weights.bin").write_bytes(b"public synthetic model bytes")
-
-    def tearDown(self):
-        shutil.rmtree(self.home)
 
     def test_fixed_profile_forbids_remote_and_automatic_backends(self):
         p = worker.profile()
@@ -638,12 +635,10 @@ def native_pdf(*, password=None):
 class RealWorkerTests(unittest.TestCase):
     """Every inference is a fresh unshare -Urn subprocess, never an online retry."""
     def setUp(self):
-        self.home = HERE / ".local" / ("real-worker-" + uuid.uuid4().hex)
-        self.home.mkdir(parents=True, mode=0o700)
+        scratch = tempfile.TemporaryDirectory(prefix="real-worker-")
+        self.addCleanup(scratch.cleanup)
+        self.home = Path(scratch.name)
         self.assets = Path(os.environ["DOCLING_ARTIFACTS_PATH"]).absolute()
-
-    def tearDown(self):
-        shutil.rmtree(self.home)
 
     def fixtures(self):
         from io import BytesIO

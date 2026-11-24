@@ -57,6 +57,19 @@ adapter into that worktree's environment and run tests with
 the host-pip fallback above without recreating the environment. Do not skip
 MCP tests or install packages globally to hide the setup failure.
 
+Every test module also runs on its own (`.venv/bin/python -m unittest tests.test_convert`).
+CI is `.github/workflows/ci.yml` (`lint`, `test`, `package-smoke`, the checks `main` should require)
+plus `docling.yml` (the PDF/image runtime tests) and `nightly.yml`. To reproduce the `test` job locally:
+
+```sh
+PYTHONMALLOC=pymalloc .venv/bin/python -W error::ResourceWarning -X dev \
+  .github/scripts/run_tests.py --expected-skips .github/expected-skips.txt
+```
+
+A run that skips a test not listed (on a SQLite build without `sqlite_dbpage`, three file-identity tests also skip; CI's build has it, so the list stays exact there) in `.github/expected-skips.txt` fails; a provisioned Docling runtime
+(`.github/scripts/provision-docling.sh`) makes the listed ones run, so use `.venv/bin/python -m unittest discover -s tests`
+if you have it.
+
 ### Excluding low-value inbox files and deselecting selections
 
 Copy [config/intake-exclusions.example.json](config/intake-exclusions.example.json) to the ignored
