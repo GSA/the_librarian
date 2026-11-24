@@ -37,7 +37,7 @@ TOOLKIT_FILES = frozenset({
     "tools/diagnostics/__init__.py", "tools/diagnostics/retrieval_log.py",
     "tools/schemas/__init__.py", "tools/schemas/export_schemas.py",
     "tools/schemas/catalog.sql", "tools/schemas/context-index.sql",
-    "tools/schemas/review-events.sql",
+    "tools/schemas/review-events.sql", "tools/schemas/intake.sql", "tools/schemas/corrections.sql",
 })
 
 

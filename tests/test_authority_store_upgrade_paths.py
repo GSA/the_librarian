@@ -22,7 +22,7 @@ from tests.support import WorkspaceCase, clone_release
 from tools import policy
 from tools.catalog import catalog_store as catalog
 from tools.catalog import storage
-from tools.review_events import event_history
+from tools.review_events import corrections, event_history
 from tools.review_events import event_store as events
 
 CATALOG_USER_VERSION = "Unsupported catalog version"
@@ -62,13 +62,28 @@ def retag_review_contract(db):
          (event_history.trigger_sql("metadata", "update"),))
 
 
-# name -> (store, tamper, expected refusal). "catalog"/"review" pick the store the marker lives in.
+def bump_corrections_version(db):
+    edit(db, ("PRAGMA user_version=2",))
+
+
+def retag_corrections_contract(db):
+    edit(db, ("DROP TRIGGER immutable_metadata_update",),
+         ("UPDATE metadata SET value=? WHERE key='contract_hash'", ("0" * 64,)),
+         (corrections.TRIGGERS["immutable_metadata_update"],))
+
+
+# name -> (store, tamper, expected refusal). "catalog"/"review"/"corrections" pick the store the marker
+# lives in. Storage migration and its recovery move the corrections directory with the review events
+# but never open it, so only the entry-point matrix below covers that store.
 VARIANTS = {
     "catalog user_version": ("catalog", bump_user_version("catalog"), CATALOG_USER_VERSION),
     "catalog contract_version": ("catalog", retag_catalog_contract, CATALOG_MARKER),
     "review user_version": ("review", bump_user_version("review"), REVIEW_USER_VERSION),
     "review contract_hash": ("review", retag_review_contract, REVIEW_MARKER),
+    "corrections user_version": ("corrections", bump_corrections_version, REVIEW_USER_VERSION),
+    "corrections contract_hash": ("corrections", retag_corrections_contract, REVIEW_MARKER),
 }
+MODULES = {"catalog": catalog, "review": events, "corrections": corrections}
 
 
 class AuthorityStoreUpgradePaths(unittest.TestCase):
@@ -92,6 +107,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
         review = events.status(root)
         events.append(root, event_history.bundle([pending]), "test-runner", "req-populate",
                       review["revision"], review["state_token"])
+        corrections.initialize(root)
         self.assertEqual((catalog.status(root)["revision"], events.status(root)["events"]), (1, 1))
         self.pending = pending
         return root, aux
@@ -114,23 +130,36 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
 
     def commands(self, root, aux, store, refusal):
         """Every CLI that opens the store under test, upgrade/init/recover paths first."""
-        snapshot = next((root / (".local/catalog" if store == "catalog" else ".local/review-events")
-                         / "backups").glob("*.sqlite3"))
+        homes = {"catalog": ".local/catalog", "review": ".local/review-events",
+                 "corrections": ".local/review-events/corrections"}
+        snapshot = next((root / homes[store] / "backups").glob("*.sqlite3"))
         token = "0" * 64
         submission = aux / "submission.json"
         submission.write_text(json.dumps({"records": [
             {"id": "S2", "kind": "source", "data": {"category": "artifact", "provenance": []}}]}))
         bundle = aux / "bundle.json"
         bundle.write_text(json.dumps(event_history.bundle([dict(self.pending, event_id="rev-second")])))
-        module = {"catalog": "tools.catalog.catalog_store", "review": "tools.review_events.event_store"}[store]
-        yield ("initialize", ("tools/initialize.py",))
-        yield ("initialize --recover-migration", ("tools/initialize.py", "--recover-migration"))
-        yield ("initialize --relocate", ("tools/initialize.py", "--relocate"))
-        for name in ("init", "status", "audit", "backup"):
+        module = {"catalog": "tools.catalog.catalog_store", "review": "tools.review_events.event_store",
+                  "corrections": "tools.review_events.corrections"}[store]
+        if store != "corrections":  # the instance initializer does not open the optional corrections store
+            yield ("initialize", ("tools/initialize.py",))
+            yield ("initialize --recover-migration", ("tools/initialize.py", "--recover-migration"))
+            yield ("initialize --relocate", ("tools/initialize.py", "--relocate"))
+        for name in ("init", "status", "audit", "backup") if store != "corrections" else ("init", "status", "backup"):
             yield (f"{store} {name}", ("-m", module, "--root", str(root), name))
         yield (f"{store} restore", ("-m", module, "--root", str(root), "restore", str(snapshot),
                                     "--expected-state", token))
-        if store == "catalog":
+        if store == "corrections":
+            yield ("corrections list", ("-m", module, "--root", str(root), "list"))
+            drafts = aux / "corrections.json"
+            drafts.write_text(json.dumps({"schema": "claim-corrections-v1", "corrections": [{
+                "kind": "dispute", "locator": "documents/a.md#h", "claim": "Synthetic claim.", "summary": "Synthetic.",
+                "source": {"type": "question", "question": "Synthetic?", "answer": "Synthetic.",
+                           "answered_by": "synthetic-officer", "answered_on": "2024-05-01"}}]}))
+            yield ("corrections intake", ("-m", module, "--root", str(root), "intake", str(drafts),
+                                                 "--actor", "test-runner", "--request-id", "req-refused",
+                                                 "--expected-state", token))
+        elif store == "catalog":
             for name in ("query", "export"):
                 yield (f"catalog {name}", ("-m", module, "--root", str(root), name))
             yield ("catalog submit", ("-m", module, "--root", str(root), "submit", str(submission),
@@ -150,8 +179,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
         for name, (store, tamper, refusal) in VARIANTS.items():
             with self.subTest(variant=name):
                 root, aux = self.build()
-                db = root / (".local/catalog/catalog.sqlite3" if store == "catalog"
-                             else ".local/review-events/events.sqlite3")
+                db = MODULES[store].locations(root)[1]
                 commands = list(self.commands(root, aux, store, refusal))
                 tamper(db)
                 tampered = tree(root)
@@ -168,7 +196,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
         for name, (store, tamper, refusal) in VARIANTS.items():
             with self.subTest(variant=name):
                 root, _ = self.build()
-                module = catalog if store == "catalog" else events
+                module = MODULES[store]
                 db = module.locations(root)[1]
                 snapshot = next(module.locations(root)[2].glob("*.sqlite3"))
                 tamper(db)
@@ -200,7 +228,7 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
         for name, (store, tamper, refusal) in VARIANTS.items():
             with self.subTest(variant=name):
                 root, _ = self.build()
-                module = catalog if store == "catalog" else events
+                module = MODULES[store]
                 tamper(module.locations(root)[1])
                 authority = {path: path.read_bytes() for home in (catalog.locations(root)[0],
                                                                   events.locations(root)[0])
@@ -211,9 +239,11 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
 
     def test_storage_migration_refuses_a_changed_store_before_moving_anything(self):
         for name, (store, tamper, refusal) in VARIANTS.items():
+            if store == "corrections":
+                continue  # migration never opens that store; see the move test below
             with self.subTest(variant=name):
                 root, _ = self.build()
-                module = catalog if store == "catalog" else events
+                module = MODULES[store]
                 tamper(module.locations(root)[1])
                 (root / "config/policy.local.json").write_text(json.dumps({"storage_roots": {
                     "catalog_home": ".local/moved/catalog", "review_events_home": ".local/moved/review-events"}}))
@@ -221,10 +251,24 @@ class AuthorityStoreUpgradePaths(unittest.TestCase):
                                                   refusal, f"{name}: --migrate-storage")
                 self.assertFalse((root / ".local/migration.json").exists())
 
+    def test_storage_migration_carries_the_corrections_store_with_the_review_events(self):
+        root, _ = self.build()
+        before = corrections.status(root)
+        (root / "config/policy.local.json").write_text(json.dumps({"storage_roots": {
+            "catalog_home": ".local/moved/catalog", "review_events_home": ".local/moved/review-events"}}))
+        result = self.run_cli(root, "tools/initialize.py", "--migrate-storage")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(corrections.status(root), before)
+        self.assertTrue((root / ".local/moved/review-events/corrections/corrections.sqlite3").is_file())
+        self.assertFalse((root / ".local/review-events").exists())
+        self.assertTrue(list((root / ".local/moved/review-events/corrections/backups").glob("*.sqlite3")))
+
     def test_recover_migration_rolls_files_back_but_never_repairs_a_changed_store(self):
         old = {"catalog_home": ".local/catalog", "review_events_home": ".local/review-events"}
         new = {"catalog_home": ".local/moved/catalog", "review_events_home": ".local/moved/review-events"}
         for name, (store, tamper, refusal) in VARIANTS.items():
+            if store == "corrections":
+                continue
             with self.subTest(variant=name):
                 root, _ = self.build()
                 (root / "config/policy.local.json").write_text(json.dumps({"storage_roots": new}))

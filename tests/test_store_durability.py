@@ -18,7 +18,7 @@ from tests.test_intake import request
 from tests.support import WorkspaceCase
 from tools.catalog import catalog_store as catalog
 from tools.intake import store as intake
-from tools.review_events import event_history
+from tools.review_events import corrections, event_history
 from tools.review_events import event_store as events
 
 FULL = 2
@@ -128,6 +128,34 @@ class ReviewEventStore(DurabilityCase, WorkspaceCase):
             with closing(events.connect(events.locations(self.root)[1], write=True)) as connection:
                 self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], FULL)
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+
+
+class ClaimCorrectionStore(DurabilityCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def test_initialize_and_backup_run_with_full(self):
+        with Watcher().active() as watcher:
+            corrections.initialize(self.root)
+            corrections.backup(self.root)
+            self.assertDurable(watcher, set())  # every write connection reports FULL
+            self.assertTrue(any(r["database"].startswith("init-") for r in watcher.writers()))
+
+    def test_the_write_connection_reports_full_on_a_rollback_journal(self):
+        with Watcher().active():
+            corrections.initialize(self.root)
+            with closing(corrections.store.connect(corrections.locations(self.root)[1], write=True)) as connection:
+                self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], FULL)
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+
+    def test_append_runs_with_full(self):
+        from tests.test_corrections_backups import record
+        with Watcher().active() as watcher:
+            corrections.initialize(self.root)
+            record(self.root, "req-durability")
+            self.assertDurable(watcher, {corrections.locations(self.root)[1].name})
 
 
 class IntakeLedger(DurabilityCase):

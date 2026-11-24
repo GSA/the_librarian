@@ -24,6 +24,7 @@
   "tests/test_intake_adapters.py",
   "tests/test_standing.py",
   "tests/test_corrections.py",
+  "tests/test_corrections_backups.py",
   "tests/test_intake_upload.py",
   "tests/test_intake_cohort.py",
   "tests/test_intake_archives.py",

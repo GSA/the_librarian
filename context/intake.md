@@ -41,7 +41,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
   and under `status --audit`. There is no daily expiry (Kata 91h5): the first write of a UTC day
   holds the writer lock for the daily snapshot only (about 2 s at 132k revisions), not for a
   replay. The full replay is the scheduled `python -m tools.store_audit --root ROOT` (catalog,
-  review events, intake ledger, newest backups; JSON report, exit 1 when any store is flagged;
+  review events, claim corrections, intake ledger, newest backups; JSON report, exit 1 when any store is flagged;
   [design](../docs/design/current-state.md#store-validation-cadence-kata-91h5)). A lost race is a
   retryable `catalog-stale-state` (another writer committed after the pin) or
   `catalog-busy` (lock wait exceeded) attempt, never `native-input`. Such an attempt wrote

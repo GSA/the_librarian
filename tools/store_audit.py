@@ -2,9 +2,10 @@
 """Scheduled full verification of the authority stores; reports every store that fails, changes nothing.
 
 Reads trust the persisted validation receipts and never replay the whole history (Kata 91h5), so
-this is the one routine that does: the catalog, the review events and the intake ledger are each
-replayed in full, and the newest verified backup of the catalog and the review events is checked
-against its receipt. A refusal is reported, not raised, so one damaged store never hides another.
+this is the one routine that does: the catalog, the review events, the claim corrections (when that
+optional store exists) and the intake ledger are each replayed in full, and the newest verified backup
+of each of the first three is checked against its receipt. A refusal is reported, not raised, so one
+damaged store never hides another.
 The only writes are the receipts that record the new baseline after a store passes, and a store
 that fails loses its review-event receipt so no later reader trusts it.
 
@@ -53,7 +54,7 @@ def audit(root, *, backups=True):
     """The report for the instance at ``root``: one entry per store, ``ok`` only if all verified."""
     from tools.catalog import catalog_store as catalog
     from tools.intake import store as ledger
-    from tools.review_events import event_store as events
+    from tools.review_events import corrections, event_store as events
 
     def catalog_check():
         state = catalog.status(root, audit=True)
@@ -69,11 +70,25 @@ def audit(root, *, backups=True):
             result.update(_newest(events.locations(root)[2], lambda path: events.verified_snapshot(path, root)))
         return result
 
+    def corrections_check():
+        # corrections.read replays the whole store on every call; there is no receipt to bypass.
+        state = corrections.status(root)
+        result = {"revision": state["revision"], "records": state["records"], "state_token": state["state_token"]}
+        if backups:
+            result.update(_newest(corrections.locations(root)[2], corrections.verified_snapshot))
+        return result
+
     def ledger_check():
         result = ledger.audit(root)
         return {"requests": result["requests"]}
 
     stores = [_run("catalog", catalog_check), _run("review-events", events_check)]
+    try:
+        initialized = corrections.locations(root)[1].exists()
+    except Exception:
+        initialized = True  # an unusable location is itself a failure to report, not a store to skip
+    if initialized:
+        stores.append(_run("claim-corrections", corrections_check))
     try:
         present = ledger.locations(root)[2].exists()
     except Exception:

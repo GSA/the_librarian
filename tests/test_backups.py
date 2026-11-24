@@ -13,6 +13,7 @@ from tools.catalog import backups as catalog_backups
 from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tests.support import WorkspaceCase
+from tools.diagnostics.catalog_lock_benchmark import registration
 
 DAY = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -130,6 +131,51 @@ class DailySnapshots(unittest.TestCase):
         ages = {backups.scan(self.backups)[0].created}
         self.assertGreaterEqual(min(ages), self.clock.value - timedelta(days=7))
         self.assertEqual(len(self.files(".json")), 8)
+
+    def test_a_head_only_checked_daily_snapshot_never_displaces_a_fully_verified_one(self):
+        """Kata 6jwh: retention counts only replay-verified snapshots, so a corruption that the
+        writer's identity check cannot see never ages out the last clean snapshot."""
+        state = catalog.status(self.root)["state_token"]
+        catalog.submit(self.root, registration(0), actor="t", request_id="req-0", expected_state=state,
+                       reason="Daily snapshot test")
+        clean = self.files()[0]  # the snapshot taken at init: replay-verified
+        catalog.verify_backup(clean)
+        home, db, _ = catalog.locations(self.root)
+        saved = json.loads((home / ".local" / "read-validation.json").read_text())["binding"]["identity"]
+        raw = bytearray(db.read_bytes())
+        at = raw.index(b"Synthetic.")
+        raw[at:at + 10] = b"Syntheticx"
+        os.chmod(db, 0o600)
+        with open(db, "r+b") as stream:
+            stream.write(bytes(raw))
+        reports = []
+        with patch.object(catalog, "file_identity", lambda path, connection: saved):
+            for day in range(1, 10):  # longer than the 7-day window
+                self.clock.advance(days=1)
+                state = catalog.status(self.root)["state_token"]
+                result = catalog.submit(self.root, registration(day), actor="t", request_id=f"req-{day}",
+                                        expected_state=state, reason="Daily snapshot test")
+                reports.append(result["retention"])
+        self.assertTrue(clean.exists() and self.files(".json")[0].exists())
+        catalog.verify_backup(clean)
+        self.assertIn("no verified snapshot", reports[-1]["refused"])
+        corrupt = [p for p in self.files() if p != clean]
+        self.assertTrue(corrupt)
+        with self.assertRaises(catalog.CatalogError):
+            catalog.verify_backup(corrupt[-1])  # the newest snapshot carries the corruption
+        with self.assertRaises(catalog.CatalogError):  # operator prune replays the live store first
+            catalog.prune(self.root, apply=True)
+        self.assertTrue(clean.exists())
+
+    def test_retention_replays_nothing_when_no_snapshot_has_aged_out(self):
+        self.write("S1")
+        self.clock.advance(days=1)
+        calls = []
+        real = catalog_backups.verify_backup
+        with patch.object(catalog_backups, "verify_backup",
+                          lambda path, replay=True: calls.append(replay) or real(path, replay=replay)):
+            self.write("S2")
+        self.assertEqual(calls, [False])  # only the fresh-snapshot receipt check, no history replay
 
     def test_failed_verification_of_the_new_snapshot_deletes_nothing(self):
         self.write("S1")

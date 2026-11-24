@@ -30,7 +30,7 @@ restated here.
 
   | Kind | Stores | Rule of thumb |
   |---|---|---|
-  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step (`tests/test_authority_store_upgrade_paths.py`). |
+  | Authority | Catalog (`LCAT`, hash-chained immutable revisions, ABORT triggers on update/delete); review events (`LREV`, append-only hash chain with corrections, schema `contract_hash`); claim corrections (`LRCO`, optional, hash-chained records and batches, ABORT triggers, `synchronous=FULL`) | Cannot be recomputed. Never rebuilt as an upgrade or recovery step (`tests/test_authority_store_upgrade_paths.py`). |
   | Operational | Intake ledger (`LINT`, exact request bytes, stages, attempts, replays; `synchronous=FULL`, rollback journal) | Private work intent. Cannot reconstruct authority. |
   | Derived | FTS5 context index (`LCTX`) with engine fingerprint, manifest hash, policy hash, audience and a logical corpus root | Rebuildable; a stale index refuses reads. |
 
@@ -422,7 +422,9 @@ restated here.
   `tools/schemas/corrections.sql`; hash-chained records and batches, immutable triggers, full
   validation on every read, writer lock, `--expected-state`, idempotent `--request-id`, actor
   attribution, daily and manual snapshots, `verify-backup`, same-lineage `restore` with a
-  safety backup). It is a separate store, not a review-event kind: a new kind would change the
+  safety backup, `synchronous=FULL` on a rollback journal; covered by `tools.backups`, the
+  scheduled `tools.store_audit`, and the durability and upgrade-path tests like the other
+  authority stores, Kata 6jwh). It is a separate store, not a review-event kind: a new kind would change the
   review-event contract hash existing stores pin, and review-event appends change the review
   state Docling selections bind, so every correction would force a rebuild. A `correct` (with
   the corrected statement) or `dispute` quotes a claim at an indexed locator; recording needs a
@@ -785,7 +787,27 @@ restated here.
   `.partial` files older than `backup_retention_days` (default 7, minimum 1) are
   removed after the new snapshot verifies; nothing is deleted unless a verified
   snapshot remains in the window; a retention failure never fails the write.
-  `python3 -m tools.backups prune` is a dry run unless `--apply`.
+  `python3 -m tools.backups status` and `prune` cover the catalog, the review events and (when it
+  exists) the claim corrections (`--store catalog|review-events|claim-corrections|all`); `prune` is a
+  dry run unless `--apply`. The claim-correction store follows the same rules as the review events:
+  `tools.review_events.corrections` has `backup`, `verify-backup` and `restore`, `backup_inventory` and
+  `prune`, and `python -m tools.store_audit` replays it and checks its newest backup.
+- **What counts as verified for retention (Kata 6jwh).** Only a snapshot whose whole history was
+  replayed counts. The review-event and claim-correction daily snapshots are taken from a copy that is
+  replayed on the spot, so the new one counts without another read. The catalog's daily snapshot is the
+  serialized image of a transaction whose head was validated by a receipt (Kata 91h5), which is a head
+  check and not a replay, so a corruption the identity check cannot see (an edit that restores the file
+  identity, or silent media corruption) would be copied into every new day's snapshot. The catalog
+  therefore does **not** count the new snapshot as verified. Retention replays catalog snapshots
+  (newest first, `verify_backup` with the default `replay=True`) only when one is old enough to delete,
+  and deletes nothing unless a replayed snapshot remains in the window, so a stretch of days with a
+  silently corrupt head never ages out the last clean snapshot; the retention report says `refused`
+  until a clean snapshot is inside the window, and `store_audit` reports the newest snapshot. The cost
+  is one full catalog replay under the writer lock on the first write after the oldest snapshot ages
+  out, which is once per UTC day in steady state (the write itself and taking the snapshot still replay nothing). The
+  alternative, replaying every new snapshot, would restore the pre-91h5 cost on every day's first
+  write. The fresh snapshot is still checked against its receipt (fields, size, SHA-256, state) before
+  anything is deleted.
 - **Loss window.** Between snapshots recovery relies on `synchronous=FULL` (`tests/test_store_durability.py`) and
   the hash-chained history: the worst case restores the day's first snapshot and
   replays that day's requests by their original request ids. This is a deliberate
@@ -795,12 +817,17 @@ restated here.
   transaction that was just fully inspected, written, fsynced, re-read and refused
   unless its hash equals the image (`tools/catalog/backups.py`, "Backup bytes mismatch").
   Fresh verification checks fields, size, SHA-256 and receipt state instead of a
-  third replay; every older snapshot is still fully verified before it counts.
+  third replay, as the gate before any deletion; it does not make the snapshot count as
+  verified for retention (above); every snapshot that is counted has been fully replayed.
 - Evidence: `tests/test_backups.py` (daily gate reads no snapshot body, truncated or
   malformed/foreign-receipt snapshots do not count, a same-size corrupt snapshot passes the gate
   but fails `verify_backup`, window pruning, never deleting the only verified
   snapshot, dry-run default, protected snapshots, restore, review events follow
-  the same rule), `tests/test_catalog_daily_snapshot.py`.
+  the same rule; `test_a_head_only_checked_daily_snapshot_never_displaces_a_fully_verified_one` is
+  the corruption-then-retention scenario for the catalog),
+  `tests/test_corrections_backups.py` (the claim-correction store: daily snapshot, retention,
+  corruption-then-retention, prune, `tools.backups` CLI, `synchronous=FULL` at init),
+  `tests/test_catalog_daily_snapshot.py`.
 - Not covered: offsite copies, scheduled backups, snapshots of the intake ledger
   and the rebuildable index.
 
@@ -920,9 +947,10 @@ supersedes the daily full check kept by Kata qwtp (D2).
   its bytes are a valid store is checked by `verify-backup`, restore and the audit of the newest
   backup, as for every snapshot older than the one just written.
 - **Scheduled audit.** `python -m tools.store_audit --root ROOT` replays the catalog
-  (`status --audit`), the review events (`status --audit`, which also re-baselines the receipt) and
-  the intake ledger (`intake audit`), verifies the newest backup of the catalog and of the review
-  events against its receipt (`--no-backups` skips that), and prints one body-free JSON object:
+  (`status --audit`), the review events (`status --audit`, which also re-baselines the receipt),
+  the claim corrections when that store exists (reported as `claim-corrections`; it replays on every
+  read, so it has no receipt) and the intake ledger (`intake audit`), verifies the newest backup of
+  the catalog, the review events and the claim corrections against its receipt (`--no-backups` skips that), and prints one body-free JSON object:
   `ok`, and per store `ok`, the state it verified or the refusal, and the seconds taken. A failing
   store is reported and the others still run; exit status 0 when everything verified, 1 when any
   store was flagged, 2 for a usage error. It takes no writer lock and changes nothing except the

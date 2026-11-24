@@ -27,7 +27,8 @@ class MCPConfig(unittest.TestCase):
         self.assertLessEqual(TOOLKIT_FILES, set(json.loads((ROOT / "release-files.json").read_text())))
 
     def test_incomplete_clone_missing_new_dependencies_is_rejected(self):
-        for missing in ("tools/context_index/cli.py", "tools/catalog/contracts.py"):
+        for missing in ("tools/context_index/cli.py", "tools/catalog/contracts.py",
+                        "tools/schemas/corrections.sql", "tools/schemas/intake.sql"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve() / "kit"
                 clone_release(root)

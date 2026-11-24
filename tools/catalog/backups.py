@@ -20,12 +20,16 @@ def _daily_snapshot(root, connection, backups, state, inspected=False):
     The snapshot is the serialized image of the transaction that is fully inspected here (or was
     just inspected by the caller, ``inspected``), so the history is replayed once for the day; the
     published bytes are then bound to that image by hash instead of being replayed again.
+
+    That is a head check, not a replay (Kata 91h5), so retention does not count this snapshot as
+    verified (``replayed=False``): it replays snapshots only when one is old enough to delete and
+    deletes nothing unless a replayed one remains in the window (Kata 6jwh).
     """
     return snapshots.daily_snapshot(
         backups, store_id=state["store_id"],
         take=lambda: _snapshot_in_transaction(connection, backups, "daily", image=True, inspected=inspected),
         verify=verify_backup, verify_fresh=lambda path: verify_backup(path, replay=False),
-        errors=(CatalogError,), days=policy.backup_retention_days(root))
+        errors=(CatalogError,), days=policy.backup_retention_days(root), replayed=False)
 
 
 def backup_inventory(root):
