@@ -364,7 +364,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(store.inspect(self.root, "req-one")["complete"])
 
     def test_cli_clean_copy_end_to_end(self):
-        from support import clone_release
+        from tests.support import clone_release
         import subprocess
         import sys
         clone = self.root / "clone"

@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from pdf_fixtures import encrypted_pdf, image_pdf, jpeg_header, png, png_header, text_pdf
+from tests.pdf_fixtures import encrypted_pdf, image_pdf, jpeg_header, png, png_header, text_pdf
 from tools.catalog import catalog_store as catalog
 from tools.context_index import confidence, context_index as index, renditions
 from tools.extraction import docling_worker, pdf_image, pdf_pages

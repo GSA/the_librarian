@@ -15,7 +15,7 @@ from tools.review_events import event_store as events
 from tools.intake import adapters, contracts, runner, standing, standing_events, standing_publication, store
 
 from tests.support import WorkspaceCase
-from test_intake_adapters import stage, stage_request
+from tests.test_intake_adapters import stage, stage_request
 
 RUN = "a" * 64
 RENDITION = f"data/extractions/.local/D1/{RUN}/extraction.json"
