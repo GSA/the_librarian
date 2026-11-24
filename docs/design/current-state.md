@@ -172,6 +172,13 @@ restated here.
   Git checkout whose top level is the toolkit root and skips in packaged kits,
   which carry no `.git`. Evidence:
   `tests/test_packaging.py::PackageTests::test_manifest_covers_every_tracked_file`.
+- **License.** The repository takes GSA's default project license: `LICENSE.md`
+  (US-government public domain plus the CC0 1.0 Universal waiver), with matching
+  `CONTRIBUTING.md` and `SECURITY.md`, all packaged. The adapter declares
+  `license = "CC0-1.0"` and ships an identical `tools/context-mcp/LICENSE.md`
+  (setuptools cannot read above the package directory). The repository vendors no
+  third-party code; licenses of the fetched Docling environment and model assets
+  are listed in `tools/extraction/README.md`. Evidence: `tests/test_license.py`.
 - **Runtime checks.** `librarian-preflight` probes Python >= 3.14, `mcp==2.2.0`
   and SQLite FTS5 in the interpreter the adapter runs on, and the adapter refuses
   to start on an incomplete clone or a symlinked toolkit path
