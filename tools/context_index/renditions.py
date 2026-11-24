@@ -47,6 +47,13 @@ FORMATS = frozenset({"gemini-txt", "text", "mhtml", "odt", "docling", "pdf-text"
                      "pdf-pages"})
 # Page-located line renditions of PDFs and images (tools/extraction/pdf_image.py, pdf_pages.py).
 PAGE_LINE_FORMATS = frozenset({"pdf-text", "ocr", "pdf-pages"})
+# Markdown renditions (converter output, and text renditions of .md originals) also get one search
+# section per heading span, so terms on different lines of one passage match together. A span larger
+# than this many characters of extraction JSON is split into whole-record chunks.
+MAX_HEADING_SECTION_CHARS = 24000
+MARKDOWN_SUFFIXES = (".md", ".markdown")
+_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)|[ \t]*)$")
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def validate_item(item, engine, pattern, seen, valid_contexts):
@@ -792,6 +799,66 @@ def _describe_record(format_, record, index, parents):
                      "xml_locator": record["locator"]})
 
 
+def _markdown(value):
+    payload = value.get("payload")
+    if payload is None:
+        return False
+    return payload["format"] == "converted" or (
+        payload["format"] == "text" and value["source"]["path"].lower().endswith(MARKDOWN_SUFFIXES))
+
+
+def heading_sections(value, rows, lines):
+    """Search sections over the heading spans of a Markdown rendition's line records.
+
+    ``rows`` are the records ``records`` yielded; ``lines`` the physical JSON lines. A span runs from a
+    heading (outside fenced code) to the next heading of any level, so it never overlaps another span;
+    one longer than ``MAX_HEADING_SECTION_CHARS`` is cut into consecutive whole-record chunks. A span or
+    chunk of one record adds nothing over its line record and is skipped. Citations stay exact: each
+    section's text is the physical JSON lines its records occupy.
+    """
+    if not _markdown(value):
+        return
+    starts, fence = [], None
+    for position, row in enumerate(rows):
+        line = row["search_text"].rstrip("\r\n")
+        match = _FENCE.match(line)
+        if fence:
+            if match and match[1][0] == fence[0] and len(match[1]) >= fence[1] and not match[2].strip():
+                fence = None
+            continue
+        if match and not (match[1][0] == "`" and "`" in match[2]):
+            fence = (match[1][0], len(match[1]))
+            continue
+        heading = _HEADING.match(line)
+        if heading:
+            starts.append((position, re.sub(r"[ \t]+#+[ \t]*$", "", heading[2] or "").strip() or "Heading"))
+    original = "original_line" if value["payload"]["format"] == "text" else "converted_line"
+    for number, (first, title) in enumerate(starts):
+        end = starts[number + 1][0] if number + 1 < len(starts) else len(rows)
+        chunk, size = [], 0
+        for row in rows[first:end] + [None]:
+            length = None if row is None else len(row["text"])
+            if row is not None and (not chunk or size + length <= MAX_HEADING_SECTION_CHARS):
+                chunk.append(row)
+                size += length
+                continue
+            if len(chunk) > 1:
+                head, tail = chunk[0], chunk[-1]
+                yield {
+                    "anchor": "heading-" + head["anchor"].split("-", 1)[1], "title": title,
+                    "start": head["start"], "end": tail["end"],
+                    "text": "".join(lines[head["start"] - 1:tail["end"]]),
+                    "search_text": "".join(item["search_text"] for item in chunk),
+                    "source_location": {
+                        "json_pointer_start": head["source_location"]["json_pointer"],
+                        "json_pointer_end": tail["source_location"]["json_pointer"],
+                        original + "_start": head["source_location"][original],
+                        original + "_end": tail["source_location"][original],
+                    },
+                }
+            chunk, size = ([row], length) if row is not None else ([], 0)
+
+
 def store(connection, selected, engine):
     for item, raw, value, metadata, label in selected:
         path = item["path"]
@@ -803,13 +870,17 @@ def store(connection, selected, engine):
         connection.execute("INSERT INTO rendition_documents VALUES (?,?)",
                            (path, json.dumps(metadata, ensure_ascii=False)))
         ids = {}
-        for record in records(raw, value, engine):
+        rows = list(records(raw, value, engine))
+        lines = raw.decode("utf-8").split("\n") if _markdown(value) else None
+        lines = lines and [part + "\n" for part in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
+        spans = [dict(item, kind="rendition-heading", parent=None) for item in heading_sections(value, rows, lines)]
+        for record in rows + spans:
             locator = path + "#" + record["anchor"]
             cursor = connection.execute(
                 "INSERT INTO sections (path,locator,title,kind,line_start,line_end,parent_id,"
                 "lead_end,text,lead_text,table_header) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (path, locator, record["title"], "extraction-record", record["start"], record["end"],
-                 ids.get(record["parent"]), record["end"], record["text"], record["text"], "null"),
+                (path, locator, record["title"], record.get("kind", "extraction-record"), record["start"],
+                 record["end"], ids.get(record["parent"]), record["end"], record["text"], record["text"], "null"),
             )
             ids[record["anchor"]] = cursor.lastrowid
             connection.execute("INSERT INTO aliases VALUES (?,?)", (locator, cursor.lastrowid))

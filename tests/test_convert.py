@@ -424,7 +424,8 @@ class CohortConversionTests(QualifyCase):
         config, _ = index.load_manifest(self.root / "config/selection.local.json", self.root)
         with closing(index.readonly(self.root / cohort.DEFAULT_INDEX)) as db:
             hit = index.search(db, "Speaker reminder", 10, None, root=self.root)["hits"][0]
-            self.assertRegex(hit["locator"], r"#line-\d+$")
+            # A converted rendition is Markdown: the passage may be cited by its line or heading span.
+            self.assertRegex(hit["locator"], r"#(line|heading)-\d+$")
             got = packets.packet(db, config, hit["locator"], 60000, root=self.root)
             self.assertEqual(hit["confidence"], {"level": "low", "reasons": ["converted-format"]})
             self.assertEqual(index.search(db, "SELECT code", 10, None, root=self.root)["hits"][0]

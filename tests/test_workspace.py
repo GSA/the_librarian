@@ -337,6 +337,77 @@ class WorkspaceTests(WorkspaceCase):
         self.assertIn(content, piece["text"])
         self.assertEqual(piece["line_end"] - piece["line_start"], 6)
 
+    HEADED = (b"# Deploy runbook\n\nIntro line.\n\n## Rollback\n\nThe router flips traffic back.\n"
+              b"Blue green environments stay warm.\n\n```\n# not a heading\n```\n\n## Contacts\n\nNobody.\n")
+
+    def test_markdown_rendition_heading_section_matches_terms_on_different_lines(self):
+        prepared = self.selected_text(self.HEADED, "sources/runbook.md")
+        with closing(index.readonly(self.db)) as db:
+            hits = index.search(db, "router blue green", 10, None, root=self.root)["hits"]
+            self.assertEqual([hit["locator"] for hit in hits], [prepared["rendition"] + "#heading-5"])
+            hit = hits[0]
+            self.assertEqual(hit["title"], "Rollback")
+            self.assertEqual(hit["source_location"], {
+                "json_pointer_start": "/payload/lines/4", "json_pointer_end": "/payload/lines/12",
+                "original_line_start": 5, "original_line_end": 13})
+            raw = (self.root / prepared["rendition"]).read_text()
+            physical = [part + "\n" for part in raw.split("\n")[:-1]]
+            packet = packets.packet(db, self.config, hit["locator"], 60000, root=self.root)
+            piece = next(p for p in packet["pieces"] if p["locator"] == hit["locator"])
+            self.assertEqual(piece["text"], "".join(physical[piece["line_start"] - 1:piece["line_end"]]))
+            self.assertIn("The router flips traffic back.", piece["text"])
+            self.assertIn("# not a heading", piece["text"])
+            self.assertNotIn("Nobody", piece["text"])
+            # A fenced line is not a heading, and single-line matches still cite the line record.
+            self.assertEqual(index.search(db, "flips", 10, None, root=self.root)["hits"][0]["locator"],
+                             prepared["rendition"] + "#line-7")
+
+    def test_heading_hit_is_not_repeated_by_its_own_line_hits(self):
+        prepared = self.selected_text(self.HEADED, "sources/runbook.md")
+        with closing(index.readonly(self.db)) as db:
+            hits = index.search(db, "router", 10, None, root=self.root)["hits"]
+        self.assertEqual(len(hits), 1, [hit["locator"] for hit in hits])
+        self.assertTrue(hits[0]["locator"].startswith(prepared["rendition"] + "#"))
+
+    def test_overlap_filter_keeps_nested_markdown_document_hits(self):
+        rows = [{"path": "documents/a.md", "kind": "heading", "line_start": 1, "line_end": 9},
+                {"path": "documents/a.md", "kind": "heading", "line_start": 3, "line_end": 5},
+                {"path": "r.json", "kind": "rendition-heading", "line_start": 10, "line_end": 20},
+                {"path": "r.json", "kind": "extraction-record", "line_start": 12, "line_end": 18},
+                {"path": "r.json", "kind": "extraction-record", "line_start": 21, "line_end": 27}]
+        kept = index._without_overlaps(lambda count: rows[:count], 10)
+        self.assertEqual([(row["path"], row["line_start"]) for row in kept],
+                         [("documents/a.md", 1), ("documents/a.md", 3), ("r.json", 10), ("r.json", 21)])
+        self.assertEqual(len(index._without_overlaps(lambda count: rows[:count], 1)), 1)
+
+    def test_low_confidence_exclusion_counts_a_heading_passage_once(self):
+        rows = [{"path": "r", "kind": "rendition-heading", "line_start": 10, "line_end": 40},
+                {"path": "r", "kind": "extraction-record", "line_start": 12, "line_end": 18},
+                {"path": "r", "kind": "rendition-heading", "line_start": 41, "line_end": 60},
+                {"path": "s", "kind": "extraction-record", "line_start": 12, "line_end": 18}]
+        self.assertEqual(index._passages(rows), 3)
+
+    def test_plain_text_rendition_gets_no_heading_sections(self):
+        self.selected_text(self.HEADED, "sources/runbook.txt")
+        with closing(index.readonly(self.db)) as db:
+            self.assertEqual(index.search(db, "router blue green", 10, None, root=self.root)["hits"], [])
+            kinds = {row[0] for row in db.execute("SELECT kind FROM sections")}
+        self.assertNotIn("rendition-heading", kinds)
+
+    def test_long_heading_span_is_split_into_whole_record_chunks(self):
+        body = b"".join(b"filler line %d with words\n" % n for n in range(40))
+        prepared = None
+        with unittest.mock.patch.object(index.renditions, "MAX_HEADING_SECTION_CHARS", 1500):
+            prepared = self.selected_text(b"# Big\n" + body + b"## Next\nend\n", "sources/big.md")
+        with closing(index.readonly(self.db)) as db:
+            rows = db.execute("SELECT locator,line_start,line_end,length(text) FROM sections "
+                              "WHERE kind='rendition-heading' ORDER BY line_start").fetchall()
+        self.assertGreater(len(rows), 1)
+        self.assertTrue(all(row[3] <= 1500 for row in rows))
+        self.assertEqual(rows[0][0], prepared["rendition"] + "#heading-1")
+        for before, after in zip(rows, rows[1:]):
+            self.assertEqual(after[1], before[2] + 1)
+
     def test_text_rendition_refuses_inconsistent_byte_mapping(self):
         api = index.rendition_api()
         payload = extract.text(b"one\r\ntwo")

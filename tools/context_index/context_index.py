@@ -734,6 +734,38 @@ def classify_absence(connection, query, path):
 LOW_CONFIDENCE = ("include", "last", "exclude")
 
 
+def _without_overlaps(fetch, limit):
+    """The first ``limit`` ranked rows, skipping a row whose lines overlap a better-ranked row of the
+    same document when either is a rendition heading section: it contains its line records, so a
+    passage is returned once, by whichever ranks higher (Markdown document sections keep their
+    nested hits). Fetches more rows until ``limit`` are kept or none remain."""
+    count = limit * 4
+    while True:
+        rows = fetch(count)
+        kept = []
+        for row in rows:
+            if not any(other["path"] == row["path"] and "rendition-heading" in (other["kind"], row["kind"])
+                       and other["line_start"] <= row["line_end"] and row["line_start"] <= other["line_end"]
+                       for other in kept):
+                kept.append(row)
+                if len(kept) == limit:
+                    return kept
+        if len(rows) < count:
+            return kept
+        count *= 4
+
+
+def _passages(rows):
+    """Matching passages among ``rows``: a rendition heading section that contains a matching line
+    record is the same passage as that record, so it is counted once (as search returns it once)."""
+    records = {}
+    for row in rows:
+        if row["kind"] != "rendition-heading":
+            records.setdefault(row["path"], []).append((row["line_start"], row["line_end"]))
+    return sum(1 for row in rows if row["kind"] != "rendition-heading" or not any(
+        row["line_start"] <= start and end <= row["line_end"] for start, end in records.get(row["path"], ())))
+
+
 def search(connection, query, limit, path, *, root=None, low_confidence="include"):
     """Literal search; ``low_confidence`` keeps low-confidence hits in rank order (``include``),
     ranks them after every normal hit (``last``) or leaves them out and counts them (``exclude``)."""
@@ -762,12 +794,11 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
     low = ("(c.level='low' OR s.id IN (SELECT value FROM json_each(?)) "
            "OR s.path IN (SELECT value FROM json_each(?)))")
     order = " ORDER BY " + (low + "," if low_confidence == "last" else "")
-    rows = connection.execute(
-        "SELECT s.*,d.role,c.label AS confidence,snippet(search_fts,1,'','',' … ',36) AS excerpt "
-        + matching + (" AND NOT " + low if low_confidence == "exclude" else "")
-        + order + "bm25(search_fts),s.path,s.line_start LIMIT ?",
-        [*parameters, *([corrected, changed] if low_confidence != "include" else []), limit],
-    ).fetchall()
+    statement = ("SELECT s.*,d.role,c.label AS confidence,snippet(search_fts,1,'','',' … ',36) AS excerpt "
+                 + matching + (" AND NOT " + low if low_confidence == "exclude" else "")
+                 + order + "bm25(search_fts),s.path,s.line_start LIMIT ?")
+    arguments = [*parameters, *([corrected, changed] if low_confidence != "include" else [])]
+    rows = _without_overlaps(lambda count: connection.execute(statement, [*arguments, count]).fetchall(), limit)
     hits, labels = [], []
     for row in rows:
         hit = {
@@ -798,8 +829,9 @@ def search(connection, query, limit, path, *, root=None, low_confidence="include
                       hits=hits, low_confidence=low_confidence,
                       confidence=confidence.summary(labels))
     if low_confidence == "exclude":
-        result["low_confidence_excluded"] = connection.execute(
-            "SELECT count(*) " + matching + " AND " + low, [*parameters, corrected, changed]).fetchone()[0]
+        result["low_confidence_excluded"] = _passages(connection.execute(
+            "SELECT s.path,s.kind,s.line_start,s.line_end " + matching + " AND " + low,
+            [*parameters, corrected, changed]).fetchall())
     if not hits and result.get("low_confidence_excluded"):
         result["filtered"] = {
             "classification": "low-confidence-excluded",
