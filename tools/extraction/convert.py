@@ -16,17 +16,14 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import stat
-import subprocess
 import sys
-import uuid
 from zipfile import BadZipFile, ZipFile
 
 from tools import policy
 from tools.catalog import catalog_store as catalog
-from tools.extraction import bounded, extract
+from tools.extraction import bounded, extract, office_runtime
 
 
 VERSION = 1
@@ -114,43 +111,38 @@ def text_refusal(raw):
 
 
 def soffice():
-    return shutil.which("soffice")
+    """The ``soffice`` a legacy conversion would use (see ``office_runtime.locate``), or None."""
+    path = office_runtime.locate()
+    return str(path) if path is not None else None
+
+
+def runtime_refusal():
+    """``needs-converter-runtime`` (no LibreOffice), ``needs-converter-sandbox`` (no confinement) or None."""
+    return office_runtime.refusal()
 
 
 def admission(raw, suffix):
-    """``sniff`` plus runtime availability: legacy formats need a local LibreOffice."""
+    """``sniff`` plus runtime availability: legacy formats need a provisioned, confinable LibreOffice."""
     format_name, code = sniff(raw, suffix)
-    if format_name == "office-legacy" and soffice() is None:
-        return None, "needs-converter-runtime"
+    if format_name == "office-legacy":
+        code = runtime_refusal()
+        if code is not None:
+            return None, code
     return format_name, code
-
-
-_RUNTIME = {}
 
 
 def runtime(format_name):
     """The external runtime a format's conversion depends on; part of the conversion identity."""
     if format_name != "office-legacy":
         return {"python": "stdlib"}
-    path = soffice()
-    require(path is not None, "needs-converter-runtime", "Legacy Office conversion needs LibreOffice (soffice)")
-    info = os.stat(path)
-    key = (path, info.st_ino, info.st_size, info.st_mtime_ns)
-    if key not in _RUNTIME:
-        try:
-            done = subprocess.run([path, "--version"], capture_output=True, timeout=60,
-                                  env=_environment(), check=False)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise ConversionError("converter-runtime-failed", "soffice --version failed") from error
-        version = done.stdout.decode("utf-8", "replace").strip()[:200]
-        require(done.returncode == 0 and version, "converter-runtime-failed", "soffice --version failed")
-        _RUNTIME.clear()
-        _RUNTIME[key] = version
-    return {"python": "stdlib", "soffice": _RUNTIME[key]}
+    try:
+        return {"python": "stdlib", **office_runtime.identity()}
+    except bounded.BoundedError as error:
+        raise ConversionError(error.code, str(error)) from error
 
 
 def code_sha256():
-    return extract.digest(Path(__file__).read_bytes() + WORKER.read_bytes())
+    return extract.digest(Path(__file__).read_bytes() + WORKER.read_bytes() + Path(office_runtime.__file__).read_bytes())
 
 
 def request_version(format_name):
@@ -174,7 +166,7 @@ _VERSIONS = {}
 
 
 def fingerprint(root, format_name):
-    """Converter identity: both converter files, the toolkit policy and the external runtime."""
+    """Converter identity: the converter, worker and sandbox files, the toolkit policy and the external runtime."""
     return extract.digest((code_sha256() + policy.fingerprint(root)
                            + extract.encoded(runtime(format_name)).decode()).encode())
 
@@ -250,32 +242,17 @@ def _worker(format_name, path, sha):
 
 
 def _legacy(root, path, sha):
-    """Convert a legacy binary original with soffice into its successor format, then convert that."""
-    executable = soffice()
-    require(executable is not None, "needs-converter-runtime", "Legacy Office conversion needs LibreOffice (soffice)")
-    suffix = path.suffix.lower()
-    target, worker_format = LEGACY[suffix]
+    """Convert a legacy binary original with the sandboxed LibreOffice into its successor format, then convert that."""
+    target, worker_format = LEGACY[path.suffix.lower()]
+    raw = _read(path)
+    require(extract.digest(raw) == sha, "source-changed", "Source changed during conversion")
     home = catalog.private_directory(root / extract.HOME)
-    work = home / ("convert-" + uuid.uuid4().hex)
-    os.mkdir(work, 0o700)
     try:
-        for name in ("in", "out", "profile"):
-            os.mkdir(work / name, 0o700)
-        copy = work / "in" / ("source" + suffix)
-        raw = _read(path)
-        require(extract.digest(raw) == sha, "source-changed", "Source changed during conversion")
-        copy.write_bytes(raw)
-        code, _ = _bounded([executable, "--headless", "--norestore", "--nologo", "--nodefault", "--nolockcheck",
-                            "-env:UserInstallation=" + (work / "profile").as_uri(),
-                            "--convert-to", target, "--outdir", str(work / "out"), str(copy)],
-                           SOFFICE_SECONDS, MAX_STDERR, cwd=str(work))
-        produced = work / "out" / ("source." + target)
-        require(code == 0 and produced.is_file() and not produced.is_symlink(), "legacy-conversion-failed",
-                "LibreOffice did not convert the legacy document")
-        converted = _read(produced)
-        markdown, fidelity = _worker(worker_format, produced, extract.digest(converted))
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+        with office_runtime.exported(home, raw, path.suffix.lower(), target, SOFFICE_SECONDS) as produced:
+            converted = _read(produced)
+            markdown, fidelity = _worker(worker_format, produced, extract.digest(converted))
+    except bounded.BoundedError as error:
+        raise ConversionError(error.code, str(error)) from error
     fidelity = deepcopy(fidelity)
     fidelity["notes"] = sorted(set(fidelity.get("notes", [])) | {"legacy binary converted by LibreOffice to "
                                                                   + target + " first"})

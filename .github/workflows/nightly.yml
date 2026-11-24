@@ -31,6 +31,8 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install ./tools/context-mcp
+      - name: Install bubblewrap
+        run: command -v bwrap || sudo apt-get install -y --no-install-recommends bubblewrap
       - name: Allow unprivileged PID namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
       - name: Tests with the debug allocator
@@ -56,6 +58,8 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install ./tools/context-mcp
+      - name: Install bubblewrap
+        run: command -v bwrap || sudo apt-get install -y --no-install-recommends bubblewrap
       - name: Allow unprivileged PID namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
       - name: Tests on Python 3.15

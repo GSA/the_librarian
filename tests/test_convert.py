@@ -13,7 +13,7 @@ import warnings
 import zipfile
 
 from tools.catalog import catalog_store as catalog
-from tools.extraction import convert, convert_worker as worker
+from tools.extraction import convert, convert_worker as worker, office_runtime
 from tools.intake import adapters, cohort, cohort_ingest, upload
 from tools.intake.contracts import IntakeError
 
@@ -291,10 +291,14 @@ class SniffAndAdmissionTests(unittest.TestCase):
         self.assertEqual(convert.sniff(b"plain", ".sql"), (None, None))
 
     def test_legacy_binary_needs_a_converter_runtime_when_soffice_is_absent(self):
-        with unittest.mock.patch.object(convert, "soffice", return_value=None):
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=None):
             self.assertEqual(convert.admission(convert.OLE, ".doc"), (None, "needs-converter-runtime"))
-        with unittest.mock.patch.object(convert, "soffice", return_value="/opt/soffice"):
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=Path("/opt/soffice")), \
+                unittest.mock.patch.object(office_runtime, "sandbox_mode", return_value="bwrap"):
             self.assertEqual(convert.admission(convert.OLE, ".doc"), ("office-legacy", None))
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=Path("/opt/soffice")), \
+                unittest.mock.patch.object(office_runtime, "sandbox_mode", return_value=None):
+            self.assertEqual(convert.admission(convert.OLE, ".doc"), (None, "needs-converter-sandbox"))
 
     def test_text_refusal_codes(self):
         self.assertIsNone(convert.text_refusal(b"SELECT 1;\r\n\tx\n"))
@@ -362,6 +366,8 @@ def fake_soffice(directory, produced):
 class CohortConversionTests(QualifyCase):
     def setUp(self):
         super().setUp()
+        convert.forget_parsed()  # a remembered conversion of an earlier test's identical bytes would hide a mocked refusal
+        self.addCleanup(convert.forget_parsed)
         self.writable()
         extra = {"conv/plan.docx": docx(), "conv/deck.pptx": pptx(), "conv/book.xlsx": xlsx(),
                  "conv/flow.vsdx": vsdx(), "conv/memo.rtf": RTF, "conv/query.sql": b"SELECT code FROM fund;\n",
@@ -377,7 +383,7 @@ class CohortConversionTests(QualifyCase):
                 path.chmod(0o555 if path.is_dir() else 0o444)
 
     def test_classify_routes_documents_to_converters_and_disguised_text_to_the_text_reader(self):
-        with unittest.mock.patch.object(convert, "soffice", return_value=None):
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=None):
             entries = {e["relative"]: e for e in cohort.classify(self.root, self.inbox)}
         got = {k: (v["disposition"], v["format"], v.get("code")) for k, v in entries.items() if k.startswith("conv/")}
         self.assertEqual(got, {
@@ -399,7 +405,7 @@ class CohortConversionTests(QualifyCase):
     def test_converted_documents_are_derived_renditions_reviewed_selected_and_retrievable(self):
         from tools.context_index import context_index as index, packets
         transport, calls = self._transport()
-        with unittest.mock.patch.object(convert, "soffice", return_value=None):
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=None):
             report = self._qualify(transport)
         entries = {e["relative"]: e for e in report["entries"]}
         for name in ("conv/plan.docx", "conv/deck.pptx", "conv/book.xlsx", "conv/flow.vsdx", "conv/memo.rtf",
@@ -435,7 +441,7 @@ class CohortConversionTests(QualifyCase):
             self.assertTrue(index.search(db, "Approve", 10, None, root=self.root)["hits"])
 
     def test_converter_change_extracts_again_even_under_trust_stat(self):
-        with unittest.mock.patch.object(convert, "soffice", return_value=None):
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=None):
             first = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
             old = {e["relative"]: e for e in first["entries"]}
             again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner", trust_stat=True)
@@ -454,7 +460,7 @@ class CohortConversionTests(QualifyCase):
         def refuse(*_):
             raise convert.ConversionError("zip-bomb", "refused")
         with unittest.mock.patch.object(convert, "_worker", side_effect=refuse), \
-                unittest.mock.patch.object(convert, "soffice", return_value=None):
+                unittest.mock.patch.object(office_runtime, "locate", return_value=None):
             report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
         plan = next(e for e in report["entries"] if e["relative"] == "conv/plan.docx")
         self.assertEqual((plan["outcome"], plan["code"]), ("failed", "zip-bomb"))
@@ -465,13 +471,12 @@ class CohortConversionTests(QualifyCase):
         tools = Path(self.temp.name) / "bin"
         tools.mkdir()
         fake_soffice(tools, docx())
-        path = os.environ["PATH"]
-        with unittest.mock.patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + path}):
-            convert._RUNTIME.clear()
+        with unittest.mock.patch.dict(os.environ, {office_runtime.RUNTIME_ENV: str(tools / "soffice")}):
+            office_runtime.reset()
             entries = {e["relative"]: e for e in cohort.classify(self.root, self.inbox)}
             self.assertEqual(entries["conv/old.doc"]["format"], "office-legacy")
             report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
-        convert._RUNTIME.clear()
+        office_runtime.reset()
         old = next(e for e in report["entries"] if e["relative"] == "conv/old.doc")
         self.assertEqual(old["outcome"], "extracted")
         payload = json.loads((self.root / old["rendition"]).read_text())["payload"]
@@ -479,6 +484,53 @@ class CohortConversionTests(QualifyCase):
         self.assertEqual(payload["conversion"]["runtime"]["soffice"], "LibreOffice 9.9 fake")
         self.assertIn("Fund codes are four characters\n", [line["text"] for line in payload["lines"]])
         self.assertFalse(any(p.name.startswith("convert-") for p in (self.root / "data/extractions/.local").iterdir()))
+
+    def legacy_ingest(self, body, seconds=None):
+        """Ingest twice with a fake soffice running ``body`` (unconfined, so it can count its launches).
+
+        Returns (first report, second report, number of soffice conversions started).
+        """
+        tools = Path(self.temp.name) / "bin"
+        tools.mkdir(exist_ok=True)
+        counter = Path(self.temp.name) / "launches"
+        script = tools / "soffice"
+        script.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "LibreOffice 9.9 fake"; exit 0; fi\n'
+                          'echo x >> "%s"\n' % counter + body)
+        script.chmod(stat.S_IRWXU)
+        environment = {office_runtime.RUNTIME_ENV: str(script), office_runtime.SANDBOX_ENV: "none"}
+        with unittest.mock.patch.dict(os.environ, environment), \
+                unittest.mock.patch.object(convert, "SOFFICE_SECONDS", seconds or convert.SOFFICE_SECONDS):
+            office_runtime.reset()
+            report = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+            again = cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        office_runtime.reset()
+        return report, again, len(counter.read_text().split()) if counter.exists() else 0
+
+    def check_legacy_failure(self, body, code, seconds=None):
+        report, again, launches = self.legacy_ingest(body, seconds)
+        old = next(e for e in report["entries"] if e["relative"] == "conv/old.doc")
+        self.assertEqual((old["outcome"], old.get("code")), ("failed", code))
+        other = next(e for e in report["entries"] if e["relative"] == "conv/plan.docx")
+        self.assertEqual(other["outcome"], "extracted")  # one bad file never halts the cohort
+        self.assertEqual(launches, 1, "the failed conversion must not be launched again on a rerun")
+        self.assertEqual(next(e for e in again["entries"] if e["relative"] == "conv/old.doc")["outcome"], "failed")
+        self.assertFalse(any(p.name.startswith("convert-") for p in (self.root / "data/extractions/.local").iterdir()))
+
+    def test_a_hung_legacy_conversion_is_a_durable_disposition_and_not_repeated(self):
+        self.check_legacy_failure("sleep 60\n", "conversion-timeout", seconds=2)
+
+    def test_a_crashing_legacy_conversion_is_a_durable_disposition_and_not_repeated(self):
+        self.check_legacy_failure("sh -c 'kill -SEGV $$'\nexit $?\n", "legacy-conversion-crashed")
+
+    def test_a_failing_legacy_conversion_is_a_durable_disposition_and_not_repeated(self):
+        self.check_legacy_failure("exit 1\n", "legacy-conversion-failed")
+
+    def test_without_a_sandbox_legacy_files_wait_with_their_own_code(self):
+        with unittest.mock.patch.object(office_runtime, "locate", return_value=Path("/opt/soffice")), \
+                unittest.mock.patch.object(office_runtime, "sandbox_mode", return_value=None):
+            entries = {e["relative"]: e for e in cohort.classify(self.root, self.inbox)}
+        self.assertEqual((entries["conv/old.doc"]["disposition"], entries["conv/old.doc"]["code"]),
+                         ("needs-reader", "needs-converter-sandbox"))
 
     def test_upload_accepts_converter_formats_only_for_matching_content(self):
         upload.check_type(docx(), "docx", "plan.doc")

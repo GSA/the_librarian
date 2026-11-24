@@ -67,6 +67,25 @@ def pdf_image_runtime(config: Config) -> dict:
     return check
 
 
+def legacy_converter_runtime(config: Config) -> dict:
+    """Informational: whether cohort intake can convert legacy Office files (a LibreOffice and a sandbox).
+
+    An absent runtime is not a failure; those files stay ``needs-reader`` until it is provisioned.
+    """
+    check = run_check(
+        "legacy_converter_runtime",
+        module_command(config, "tools.extraction.office_runtime", "status"),
+        config, "Run python -m tools.extraction.office_runtime status and resolve its diagnostic.",
+    )
+    if check["ok"]:
+        result = check["result"]
+        check["provisioned"] = result.get("provisioned") is True
+        check["ready"] = result.get("ready") is True
+        check["action"] = result.get("action") or (
+            "Legacy .doc/.xls/.ppt/.vsd files in cohort intake are converted by the sandboxed runtime.")
+    return check
+
+
 def preflight(config: Config, *, refresh_index: bool = False) -> dict:
     checks = [run_check(
         "runtime", [sys.executable, "-B", "-c", RUNTIME], config,
@@ -109,6 +128,7 @@ def preflight(config: Config, *, refresh_index: bool = False) -> dict:
         "After maintained-context edits, run this command with --refresh-index; this refreshes only derived data.",
     ))
     checks.append(pdf_image_runtime(config))
+    checks.append(legacy_converter_runtime(config))
     return {
         "command": "preflight", "ok": all(check["ok"] for check in checks),
         "refresh_requested": refresh_index, "checks": checks,

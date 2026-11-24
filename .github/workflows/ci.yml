@@ -56,9 +56,12 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install ./tools/context-mcp
+      - name: Install bubblewrap
+        # The LibreOffice sandbox tests (tests/test_office_runtime.py) run the real launcher and must not skip.
+        run: command -v bwrap || sudo apt-get install -y --no-install-recommends bubblewrap
       - name: Allow unprivileged PID namespaces
         # GitHub's Ubuntu 24.04 images restrict them with AppArmor; the PID-namespace hardening
-        # test in test_pdf_pages needs them and must run, not skip.
+        # test in test_pdf_pages and the bubblewrap/unshare sandbox tests need them and must run, not skip.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
       - name: Tests
         shell: bash

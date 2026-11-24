@@ -38,6 +38,20 @@ python3 -m venv .venv
 If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 `python3 -m pip --python .venv/bin/python install ./tools/context-mcp`.
 
+### Optional: legacy Office files (`.doc`, `.xls`, `.ppt`, `.vsd`)
+
+Old binary Office formats convert only with a LibreOffice runtime, which is optional. A teammate
+provisions it without root or sudo, checksum-verified and confined by a sandbox with no network:
+
+```sh
+.venv/bin/python -m tools.extraction.provision_libreoffice install
+.venv/bin/python -m tools.extraction.office_runtime status
+```
+
+Until then those files stay `needs-reader` with code `needs-converter-runtime`. Install options,
+the security model and failure codes are in
+[tools/extraction/README.md](tools/extraction/README.md#legacy-office-conversion-libreoffice).
+
 ### Development and agent worktrees
 
 This section is the canonical setup and troubleshooting guide for development
@@ -59,14 +73,14 @@ MCP tests or install packages globally to hide the setup failure.
 
 Every test module also runs on its own (`.venv/bin/python -m unittest tests.test_convert`).
 CI is `.github/workflows/ci.yml` (`lint`, `test`, `package-smoke`, the checks `main` should require)
-plus `docling.yml` (the PDF/image runtime tests) and `nightly.yml`. To reproduce the `test` job locally:
+plus `docling.yml` (the PDF/image runtime tests), `libreoffice.yml` (the legacy Office runtime tests) and `nightly.yml`. To reproduce the `test` job locally:
 
 ```sh
 PYTHONMALLOC=pymalloc .venv/bin/python -W error::ResourceWarning -X dev \
   .github/scripts/run_tests.py --expected-skips .github/expected-skips.txt
 ```
 
-A run that skips a test not listed (on a SQLite build without `sqlite_dbpage`, three file-identity tests also skip; CI's build has it, so the list stays exact there) in `.github/expected-skips.txt` fails; a provisioned Docling runtime
+A run that skips a test not listed (the legacy Office sandbox tests need `bwrap` or unprivileged user namespaces and must run in CI; on a SQLite build without `sqlite_dbpage`, three file-identity tests also skip; CI's build has it, so the list stays exact there) in `.github/expected-skips.txt` fails; a provisioned Docling runtime
 (`.github/scripts/provision-docling.sh`) makes the listed ones run, so use `.venv/bin/python -m unittest discover -s tests`
 if you have it.
 
@@ -361,6 +375,8 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.catalog.inventory` | List files under a configured root (`--root`, `--limit`, `directory`; metadata only) |
 | `python -m tools.extraction.extract` | Text, Gemini transcript, and ODT extraction (`prepare`, `verify`, `register`) |
 | `python -m tools.extraction.docling_extract` | Optional PDF and image extraction (`inspect`, `prepare`, `verify`, `register`) |
+| `python -m tools.extraction.provision_libreoffice` | Optional legacy Office runtime without root: `install` (pinned, checksum-verified), `verify`, `status`; see [tools/extraction/README.md](tools/extraction/README.md#legacy-office-conversion-libreoffice) |
+| `python -m tools.extraction.office_runtime` | `status`: whether legacy Office files convert now, and under which sandbox |
 | `python -m tools.retirement` | Read-only retirement manifest of a legacy tree joined to catalog receipts (`manifest`) and byte check of a restored copy (`verify`); see [context/retirement.md](context/retirement.md) |
 | `python -m tools.store_audit` | Scheduled full verification of the catalog, review events, claim corrections (when initialized), intake ledger and newest backups; JSON report, exit 1 if any store is flagged (cron/systemd timer; see the design doc) |
 | `python -m tools.review_events.event_store` | Review store: `init`, `status`, `audit`, `schema`, `get`, `append`, `backup`, `verify-backup`, `restore` |
