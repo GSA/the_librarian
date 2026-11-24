@@ -123,7 +123,7 @@ class ManifestTests(RetirementCase):
             {"match": {"prefix": "tools/"}, "disposition": "tooling", "reason": "legacy tooling"},
             {"match": {"path": "README.md"}, "disposition": "tooling", "reason": "readme"},
             {"match": {"sha256": digest(b"# Changed\nafter intake\n")}, "disposition": "superseded",
-             "reason": "later version"},
+             "reason": "must not hide a changed registered file"},
             {"match": {"path": "INBOX/01-NEW/drop/other.zip"}, "disposition": "owner-waived", "reason": "waived"},
             {"match": {"prefix": "INBOX/"}, "disposition": "bogus", "reason": "must not win over a receipt"},
         ]}
@@ -131,10 +131,15 @@ class ManifestTests(RetirementCase):
         self.assertEqual(manifest["INBOX/01-NEW/video.mp4"]["category"], "disposition:deferred-local-copy")
         self.assertEqual(manifest["INBOX/01-NEW/video.mp4"]["reason"], "video, not reviewed")
         self.assertEqual(manifest["tools/helper/run.py"]["category"], "disposition:tooling")
-        self.assertEqual(manifest["INBOX/01-NEW/changed.md"]["category"], "disposition:superseded")
+        self.assertEqual(manifest["INBOX/01-NEW/changed.md"]["category"], "ledger-hash-mismatch")
         self.assertEqual(manifest["INBOX/01-NEW/drop/other.zip"]["category"], "disposition:owner-waived")
         self.assertEqual(manifest["INBOX/01-NEW/a/notes.md"]["category"], "receipt-verified")
         self.assertEqual(manifest["INBOX/01-NEW/drop/bundle.zip"]["category"], "archive-expanded")
+        self.assertEqual((summary["unresolved"], summary["ready"], status), (1, False, 1))
+        self.put("INBOX/01-NEW/changed.md", b"# Changed\nbefore\n")  # back to the ingested bytes
+        self.out = Path(self.temp.name) / "out2"
+        status, summary, manifest = self.build(rules)
+        self.assertEqual(manifest["INBOX/01-NEW/changed.md"]["category"], "receipt-verified")
         self.assertEqual((summary["unresolved"], summary["ready"], status), (0, True, 0))
 
     def test_bad_rule_files_are_refused(self):
@@ -174,6 +179,36 @@ class ManifestTests(RetirementCase):
             self.build()
         self.assertEqual(str(caught.exception), "output_inside_tree")
         self.assertFalse(self.out.exists())
+
+    def test_output_inside_the_instance_is_refused_without_changing_it(self):
+        for out in (self.root, self.root / "retirement-output"):
+            before = (self.root.stat().st_mode, sorted(p.name for p in self.root.iterdir()))
+            self.out = out
+            with self.assertRaises(retirement.RetirementError) as caught:
+                self.build()
+            self.assertEqual(str(caught.exception), "output_inside_instance")
+            self.assertEqual((self.root.stat().st_mode, sorted(p.name for p in self.root.iterdir())), before)
+
+    def test_an_unlistable_directory_is_unresolved_not_skipped(self):
+        hidden = self.tree / "hidden"
+        hidden.mkdir()
+        (hidden / "inside.txt").write_bytes(b"x")
+        hidden.chmod(0)
+        if os.access(hidden, os.R_OK):
+            self.skipTest("running with permission override")
+        self.addCleanup(hidden.chmod, 0o700)
+        _, summary, manifest = self.build()
+        self.assertEqual((manifest["hidden"]["category"], manifest["hidden"]["kind"]), ("unreadable", "directory"))
+        self.assertFalse(summary["ready"])
+        self.out = Path(self.temp.name) / "out2"
+        copy = Path(self.temp.name) / "restored"
+        copy.mkdir()
+        (copy / "hidden").mkdir()
+        (copy / "hidden").chmod(0)
+        self.addCleanup((copy / "hidden").chmod, 0o700)
+        report = retirement.verify(summary["manifest"], copy)
+        self.assertGreaterEqual(report["unreadable"], 1)
+        self.assertGreater(report["mismatches"], 0)
 
     def test_missing_stores_are_refused_rather_than_reported_as_all_unregistered(self):
         (self.root / policy.storage_roots(self.root)["catalog_home"] / "catalog.sqlite3").unlink()
@@ -219,6 +254,34 @@ class VerifyTests(RetirementCase):
         detail = json.loads((Path(self.temp.name) / "verify.json").read_text())
         self.assertIn("INBOX/01-NEW/video.mp4", detail["missing"])
         self.assertEqual((Path(self.temp.name) / "verify.json").stat().st_mode & 0o777, 0o600)
+
+    def test_recorded_deletions_are_accepted_only_for_that_path_and_hash(self):
+        copy = self.copy()
+        archive = copy / "INBOX/01-NEW/drop/other.zip"
+        raw = archive.read_bytes()
+        archive.unlink()
+        log = Path(self.temp.name) / "deletions.jsonl"
+
+        def record(relative, sha256):
+            log.write_text(json.dumps({"inbox": str(copy / "INBOX/01-NEW"), "relative": relative,
+                                       "sha256": sha256}) + "\n")
+        _, summary, _ = self.build()
+        run = lambda: retirement.verify(summary["manifest"], copy, deletions=log)  # noqa: E731
+        record("drop/other.zip", digest(raw))
+        report = run()
+        self.assertEqual((report["removed"], report["missing"], report["mismatches"]), (1, 0, 0))
+        record("drop/other.zip", digest(b"another file"))
+        self.assertEqual((run()["removed"], run()["missing"]), (0, 1))
+        record("drop/bundle.zip", digest(raw))
+        self.assertEqual(run()["missing"], 1)
+        (copy / "README.md").unlink()
+        record("drop/other.zip", digest(raw))
+        report = run()
+        self.assertEqual((report["removed"], report["missing"], report["mismatches"]), (1, 1, 1))
+        self.assertEqual(retirement.verify(summary["manifest"], copy)["missing"], 2)
+        log.write_text("not json\n")
+        with self.assertRaises(retirement.RetirementError):
+            run()
 
     def test_a_tampered_manifest_is_refused(self):
         _, summary, _ = self.build()

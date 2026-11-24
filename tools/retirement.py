@@ -5,7 +5,8 @@ each one to the instance: first by the intake ledger's ``docs`` rows (system and
 recorded SHA-256), then by content against the catalog's current ``original`` artifacts. Every
 file ends in exactly one category; a file with neither a receipt nor an explicit, reasoned
 disposition is *unresolved*, and the manifest is ``ready`` only when nothing is unresolved.
-``verify`` re-hashes a restored or archived copy against a manifest. Neither command writes the
+``verify`` re-hashes a restored or archived copy against a manifest (with ``--deletions`` it also accepts
+the originals ``deletions.jsonl`` records as deleted from a live tree). Neither command writes the
 tree or the instance; output goes to a private directory outside the tree.
 
 The catalog and the ledger are opened read-only with plain SQLite. This is a dry-run join, not an
@@ -38,8 +39,10 @@ RULES_SCHEMA = "retirement-dispositions/1"
 MANIFEST = "manifest.jsonl"
 SUMMARY = "summary.json"
 CHUNK = 1024 * 1024
-DISPOSITIONABLE = {"no-receipt", "ledger-hash-mismatch", "ledger-not-in-catalog", "archive-not-expanded"}
-UNRESOLVED = DISPOSITIONABLE | {"unreadable", "changed-during-read"}
+# A file whose receipt exists but whose bytes changed since intake (``ledger-hash-mismatch``) is never
+# disposed of by a rule: re-ingest it as a correction or remove the stale receipt claim.
+DISPOSITIONABLE = {"no-receipt", "ledger-not-in-catalog", "archive-not-expanded"}
+UNRESOLVED = DISPOSITIONABLE | {"ledger-hash-mismatch", "unreadable", "changed-during-read"}
 ORIGINALS = (
     "SELECT json_extract(v.payload,'$.data.sha256'), json_extract(v.payload,'$.data.receipt_id') "
     "FROM current_records c JOIN versions v ON v.revision=c.revision AND v.ordinal=c.ordinal "
@@ -75,14 +78,15 @@ def _hash(path):
 
 
 def _walk(tree):
-    """Every non-directory path below ``tree`` (links included, never followed), sorted."""
-    found = []
-    for directory, names, files in os.walk(tree, followlinks=False):
+    """``(paths, failures)``: every non-directory path below ``tree`` (links included, never followed), sorted,
+    and the directories that could not be listed (their files are unknown, so they are never skipped silently)."""
+    found, failures = [], []
+    for directory, names, files in os.walk(tree, followlinks=False, onerror=failures.append):
         names.sort()
         here = Path(directory)
         found += [here / name for name in files]
         found += [here / name for name in names if (here / name).is_symlink()]
-    return sorted(found)
+    return sorted(found), sorted(Path(error.filename) for error in failures if error.filename)
 
 
 def _scan(path):
@@ -258,14 +262,19 @@ def build(root, tree, out, *, systems=(), rules=(), workers=2, catalog_file=None
     _require(tree.is_dir(), "tree_unavailable")
     _require(root.is_dir(), "root_unavailable")
     _require(out != tree and tree not in out.parents and out not in tree.parents, "output_inside_tree")
+    _require(out != root and root not in out.parents and out not in root.parents, "output_inside_instance")
     _require(not (out / MANIFEST).exists(), "output_exists")
     mapping = _parse_systems(systems)
     originals, revision, catalog_path = _originals(root, catalog_file)
     ledger = _ledger(root, {system for _, system in mapping}) if mapping else {}
     archive_store = _archives(root)
-    paths = _walk(tree)
+    paths, failures = _walk(tree)
     scans = _scan_all(paths, workers)
     entries, categories = [], defaultdict(lambda: {"files": 0, "bytes": 0})
+    for directory in failures:
+        entries.append({"path": _name(directory.relative_to(tree)), "size": None, "sha256": None,
+                        "category": "unreadable", "kind": "directory"})
+        categories["unreadable"]["files"] += 1
     for path, scan in zip(paths, scans):
         relative = _name(path.relative_to(tree))
         entry = {"path": relative, **_classify(relative, scan, mapping, ledger, originals, archive_store, rules)}
@@ -273,6 +282,7 @@ def build(root, tree, out, *, systems=(), rules=(), workers=2, catalog_file=None
         bucket = categories[entry["category"]]
         bucket["files"] += 1
         bucket["bytes"] += entry["size"] or 0
+    entries.sort(key=lambda e: e["path"])
     body = "".join(_line(e) + "\n" for e in entries)
     unresolved = sum(b["files"] for name, b in categories.items() if name in UNRESOLVED)
     header = {"schema": MANIFEST_SCHEMA, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -309,20 +319,45 @@ def read_manifest(path):
     return header, entries
 
 
-def verify(manifest, tree, *, workers=2, report=None):
-    """Compare ``tree`` with ``manifest``; return body-free counts (details go to the private ``report``)."""
+def _recorded_removals(tree, deletions):
+    """``{tree-relative path: sha256}`` of the originals ``deletions.jsonl`` records as deleted below ``tree``."""
+    removed = {}
+    try:
+        lines = Path(deletions).read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            if line.strip():
+                record = json.loads(line)
+                path = (Path(record["inbox"]) / record["relative"]).resolve().relative_to(tree)
+                removed[_name(path)] = record["sha256"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RetirementError("deletions_invalid") from error
+    return removed
+
+
+def verify(manifest, tree, *, workers=2, report=None, deletions=None):
+    """Compare ``tree`` with ``manifest``; return body-free counts (details go to the private ``report``).
+
+    Against a cold archive or restored copy, use no ``deletions``: every entry must be present. Against the
+    live tree after archive originals were deleted, pass the instance's ``deletions.jsonl``: an entry that
+    is missing is accepted only when a record names that path and the manifest's SHA-256 (``removed``);
+    anything else missing, changed or extra is still a mismatch.
+    """
     header, entries = read_manifest(manifest)
     tree = Path(tree).resolve()
     _require(tree.is_dir(), "tree_unavailable")
     wanted = {e["path"]: e for e in entries}
-    present = {_name(p.relative_to(tree)): p for p in _walk(tree)}
+    paths, failures = _walk(tree)
+    present = {_name(p.relative_to(tree)): p for p in paths}
+    removed = _recorded_removals(tree, deletions) if deletions else {}
     problems = {"missing": [], "extra": sorted(set(present) - set(wanted)), "size_mismatch": [],
-                "hash_mismatch": [], "link_mismatch": [], "unreadable": []}
+                "hash_mismatch": [], "link_mismatch": [], "unreadable": [_name(d.relative_to(tree)) for d in failures],
+                "removed": []}
     check = []
     for relative, entry in wanted.items():
         path = present.get(relative)
         if path is None:
-            problems["missing"].append(relative)
+            bucket = "removed" if removed.get(relative) == entry["sha256"] is not None else "missing"
+            problems[bucket].append(relative)
         elif entry["category"] == "symlink":
             if not path.is_symlink() or os.readlink(path) != entry["target"]:
                 problems["link_mismatch"].append(relative)
@@ -338,10 +373,10 @@ def verify(manifest, tree, *, workers=2, report=None):
         elif scan["sha256"] != wanted[relative]["sha256"]:
             problems["hash_mismatch"].append(relative)
     counts = {name: len(items) for name, items in problems.items()}
-    mismatches = sum(counts.values())
+    mismatches = sum(v for k, v in counts.items() if k != "removed")
     result = {"entries": len(entries), "matched": len(entries) - len(set().union(
-        *(set(problems[k]) for k in problems if k != "extra"))), "extra": counts["extra"],
-        **{k: v for k, v in counts.items() if k != "extra"}, "mismatches": mismatches,
+        *(set(problems[k]) for k in problems if k != "extra"))),
+        **counts, "mismatches": mismatches,
         "manifest_sha256": hashlib.sha256(Path(manifest).read_bytes()).hexdigest()}
     if report is not None:
         _write_private(Path(report), json.dumps({**result, **problems}, sort_keys=True, indent=1) + "\n")
@@ -366,6 +401,8 @@ def parser():
     check_command.add_argument("--manifest", type=Path, required=True)
     check_command.add_argument("--tree", type=Path, required=True)
     check_command.add_argument("--report", type=Path, help="private (0600) file listing every difference")
+    check_command.add_argument("--deletions", type=Path, help="deletions.jsonl: accept a missing entry only when "
+                                                              "it records that path and hash as deleted")
     check_command.add_argument("--workers", type=int, default=2)
     return value
 
@@ -378,7 +415,8 @@ def main(argv=None):
                        workers=args.workers, catalog_file=args.catalog_file)
         status = 0 if result["ready"] else 1
     else:
-        result = verify(args.manifest, args.tree, workers=args.workers, report=args.report)
+        result = verify(args.manifest, args.tree, workers=args.workers, report=args.report,
+                        deletions=args.deletions)
         status = 0 if result["mismatches"] == 0 else 1
     sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
     return status
