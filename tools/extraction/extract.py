@@ -30,6 +30,8 @@ MAX_SOURCE = 16 * 1024 * 1024
 MAX_XML = 8 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 MAX_ELEMENTS = 100000
+# Real ODF nests tens of levels (lists in tables in frames); deeper is hostile input, refused before any walk.
+MAX_XML_DEPTH = 256
 # UTF-8 text-like document suffixes the strict text reader admits. Each file must
 # still decode as strict UTF-8 without NUL; the suffix is never a format proof.
 # Legacy ".doc"/".eml" exports are admitted only when they are such text (MHTML).
@@ -184,38 +186,93 @@ def xml(raw, name):
             f"Unsupported XML encoding: {name}")
     root = ET.fromstring(text)
     require(sum(1 for _ in root.iter()) <= MAX_ELEMENTS, f"XML element limit exceeded: {name}")
+    require(depth(root) <= MAX_XML_DEPTH, f"XML nesting limit exceeded: {name}")
     return root
 
 
+def depth(root):
+    """The deepest nesting level of ``root`` (1 for a lone element), without recursion."""
+    deepest, stack = 0, [(root, 1)]
+    while stack:
+        element, level = stack.pop()
+        deepest = max(deepest, level)
+        stack.extend((child, level + 1) for child in element)
+    return deepest
+
+
 def walk(element, path=""):
-    locator = path or f"/{element.tag}[1]"
-    yield element, locator
-    counts = Counter()
-    for child in element:
-        counts[child.tag] += 1
-        yield from walk(child, f"{locator}/{child.tag}[{counts[child.tag]}]")
+    """Every element below ``element`` in document order with its locator; iterative, so depth never matters."""
+    stack = [(element, path or f"/{element.tag}[1]")]
+    while stack:
+        current, locator = stack.pop()
+        yield current, locator
+        counts, children = Counter(), []
+        for child in current:
+            counts[child.tag] += 1
+            children.append((child, f"{locator}/{child.tag}[{counts[child.tag]}]"))
+        stack.extend(reversed(children))
+
+
+def space_count(element):
+    """The ``text:c`` repeat of a ``text:s`` element; anything but a plain bounded number is refused."""
+    raw = element.get(tag("text", "c"), "1")
+    require(re.fullmatch(r"[0-9]{1,5}", raw) is not None, "Unsupported ODT repeated-space count")
+    count = int(raw)
+    require(1 <= count <= 10000, "Unsupported ODT repeated-space count")
+    return count
 
 
 def paragraph(element):
-    if element.tag == tag("text", "s"):
-        count = int(element.get(tag("text", "c"), "1"))
-        require(1 <= count <= 10000, "Unsupported ODT repeated-space count")
-        return " " * count
-    if element.tag == tag("text", "tab"):
-        return "\t"
-    if element.tag == tag("text", "line-break"):
-        return "\n"
-    value = element.text or ""
-    for child in element:
-        # Nested paragraphs (e.g. notes/text boxes) have their own located records.
-        if child.tag not in {tag("text", "p"), tag("text", "h")}:
-            value += paragraph(child)
-        value += child.tail or ""
-    require(len(value) <= MAX_XML, "ODT paragraph expansion exceeds limit")
-    return value
+    """The text of a paragraph or heading: its inline content in document order, nested paragraphs excluded.
+
+    Iterative (an explicit stack of text pieces and elements), so nesting depth never reaches the
+    interpreter's recursion limit.
+    """
+    pieces, size, stack = [], 0, [element]
+    nested = {tag("text", "p"), tag("text", "h")}
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            piece = current
+        elif current.tag == tag("text", "s"):
+            piece = " " * space_count(current)
+        elif current.tag == tag("text", "tab"):
+            piece = "\t"
+        elif current.tag == tag("text", "line-break"):
+            piece = "\n"
+        else:
+            piece = current.text or ""
+            # Nested paragraphs (e.g. notes/text boxes) have their own located records.
+            for child in reversed(list(current)):
+                stack.append(child.tail or "")
+                if child.tag not in nested:
+                    stack.append(child)
+        size += len(piece)
+        require(size <= MAX_XML, "ODT paragraph expansion exceeds limit")
+        pieces.append(piece)
+    return "".join(pieces)
+
+
+def contained(label, parse, raw):
+    """``parse(raw)``, with any failure that is not already a refusal reported as one.
+
+    Source bytes are untrusted: a corrupt member, an unsupported compression method, a decoder error
+    or a nesting that exhausts the interpreter all say only that this document cannot be read, so each
+    becomes an ``ExtractionError`` that fails this document alone instead of the run.
+    """
+    try:
+        return parse(raw)
+    except ExtractionError:
+        raise
+    except Exception as error:  # noqa: BLE001 - includes RecursionError, zlib.error, NotImplementedError
+        raise ExtractionError("Malformed %s input (%s)" % (label, type(error).__name__)) from error
 
 
 def odt(raw):
+    return contained("ODT", _odt, raw)
+
+
+def _odt(raw):
     with ZipFile(io.BytesIO(raw)) as archive:
         entries = archive.infolist()
         require(len(entries) <= 512, "ODT member count exceeds limit")
@@ -369,8 +426,9 @@ def parse_payload(format_name, raw, root, settings=None):
     """The payload of ``raw`` read as ``format_name``: a pure function of the bytes, the format and the
     instance policy, so it may run in another process (``tools/intake/parse_pool.py``). A caller that
     already holds the policy ``settings`` passes them, and the parse reads nothing from ``root``."""
-    return {"gemini-txt": lambda r: gemini(r, root, settings), "text": text, "mhtml": mime_html,
-            "odt": odt}[format_name](raw)
+    parse = {"gemini-txt": lambda r: gemini(r, root, settings), "text": text, "mhtml": mime_html,
+             "odt": odt}[format_name]
+    return contained(format_name, parse, raw)
 
 
 def remember(key, payload, size):

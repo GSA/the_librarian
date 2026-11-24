@@ -59,6 +59,24 @@ def native_failure(error):
     return StageFailure("blocked", "native-input")
 
 
+# Exceptions the catch-all must leave alone: the runner classifies them (contention, the ledger's own
+# refusals), and an unreadable catalog deliberately stops the run rather than failing one file.
+PASS_THROUGH = (StageFailure, standing.Refusal, standing.CatalogUnavailable, OSError, sqlite3.Error, IntakeError)
+
+
+def unexpected_failure(error):
+    """The failure recorded for an exception no adapter anticipated (a parser bug, an unsupported member,
+    exhausted recursion): permanent, so the stage dead-letters with a stable code and the run goes on.
+
+    A recognised cause (a timeout, a lost catalog race) keeps the precise failure ``native_failure``
+    gives it; only the catch-all ``native-input`` is replaced. The exception text is never persisted.
+    """
+    failure = native_failure(error)
+    if failure.code != "native-input":
+        return failure
+    return StageFailure("permanent", "native-unexpected")
+
+
 STANDING_REVIEW = ("policy_path", "policy_sha256", "rendition", "rendition_sha256",
                    "findings_path", "findings_sha256", "event_id")
 
@@ -196,6 +214,10 @@ def _prepare(root, stage):
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         # Undecodable native inputs block durably rather than escaping as a crash.
         raise StageFailure("blocked", "native-input") from error
+    except PASS_THROUGH:
+        raise  # the runner classifies these itself, or (an unreadable catalog) they stop the run by design
+    except Exception as error:  # noqa: BLE001 - one file's unexpected failure must not end the run
+        raise unexpected_failure(error) from error
 
 
 def execute(root, stage, intent, previous=None):
@@ -353,6 +375,10 @@ def _execute(root, stage, intent, previous=None, extra_guard=None):
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         # Undecodable native inputs block durably rather than escaping as a crash.
         raise StageFailure("blocked", "native-input") from error
+    except PASS_THROUGH:
+        raise  # the runner classifies these itself, or (an unreadable catalog) they stop the run by design
+    except Exception as error:  # noqa: BLE001 - one file's unexpected failure must not end the run
+        raise unexpected_failure(error) from error
 
 
 def receipt_marker(args):
@@ -399,7 +425,11 @@ def _failure_of(error):
         failure = StageFailure("blocked", "native-input")
         failure.__cause__ = error
         return failure
-    return error
+    if isinstance(error, PASS_THROUGH):
+        return error
+    failure = unexpected_failure(error)
+    failure.__cause__ = error
+    return failure
 
 
 def execute_batch(root, entries):
@@ -487,8 +517,11 @@ def execute_batch(root, entries):
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             outcomes[index] = _failure_of(error)
             continue
-        except (StageFailure, OSError, sqlite3.Error, IntakeError) as error:
+        except PASS_THROUGH as error:
             outcomes[index] = error
+            continue
+        except Exception as error:  # noqa: BLE001 - this stage's unexpected failure, recorded on it alone
+            outcomes[index] = unexpected_failure(error)
             continue
         items.append({"receipt": args["receipt"], "format_name": args["format_name"], "actor": args.get("actor"),
                       "expected_state": args.get("expected_state"), "prepared": prepared})
@@ -502,7 +535,7 @@ def execute_batch(root, entries):
             continue
         try:
             results = module.register_batch(root, [item for _, item in chosen])
-        except (OSError, sqlite3.Error, *NATIVE_ERRORS) as error:
+        except Exception as error:  # noqa: BLE001 - unexpected faults are each stage's failure too
             # A failure of the whole batch (the extraction lock held too long, say) is each stage's failure,
             # classified like the single path's, so its attempt is recorded and contention is retried.
             results = [error] * len(chosen)

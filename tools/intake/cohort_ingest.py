@@ -73,6 +73,8 @@ def _mime(raw):
         mhtml.payload(raw)
     except mhtml.MhtmlError as error:
         return None, error.code
+    except Exception:  # noqa: BLE001 - the reader contains its own faults; this is the last guard
+        return None, "mime-malformed"
     return "mhtml", None
 
 
@@ -143,13 +145,26 @@ def _unread_disposition(path, size, provisioned=False):
     return None
 
 
+PARSE_FAILED = "parse-failed"
+
+
 def judge(name, raw, settings, nbytes):
     """The format and disposition of a text, ODT or office/RTF file from its bytes alone.
+
+    A fault no reader anticipated (the bytes are untrusted) refuses this file as ``unreadable`` with
+    code ``parse-failed`` and never raises, so one hostile file cannot end the classification.
 
     A pure function of ``name`` (only its suffix counts), the bytes, the instance policy ``settings`` and the
     file's size, so it runs in a parse worker as well as in this process. Returns ``{"format", "disposition"}``
     and, for a refusal, ``"code"``.
     """
+    try:
+        return _judge(name, raw, settings, nbytes)
+    except Exception:  # noqa: BLE001 - includes RecursionError from a hostile document
+        return {"format": None, "disposition": "unreadable", "code": PARSE_FAILED}
+
+
+def _judge(name, raw, settings, nbytes):
     fmt, refusal = _format(Path(name), raw, None, settings)
     if refusal:
         # MIME that cannot be read strictly is never admitted as raw encoded text.
@@ -174,7 +189,10 @@ def _read_disposition(root, path, entry, parse=None, deliver=None, settings=None
     ``deliver`` may be called later, in the order the files were submitted.
     """
     if path.suffix.lower() in RUNTIME_FORMATS:
-        result = cohort_runtime.read_disposition(path, entry)
+        try:
+            result = cohort_runtime.read_disposition(path, entry)
+        except Exception:  # noqa: BLE001 - a header parser fault refuses this file, never the run
+            result = {**entry, "disposition": "unreadable", "code": PARSE_FAILED}
         return deliver(result) if deliver else result
     try:
         raw = upload.read_file(path, max(upload.FORMATS[f][1] for f in (*TEXT_FORMATS, *convert.FORMATS)))
@@ -186,9 +204,9 @@ def _read_disposition(root, path, entry, parse=None, deliver=None, settings=None
 
     def finish(judged, error):
         if error is not None:
-            if not isinstance(error, parse_pool.WorkerDied):
-                raise error
-            judged = WORKER_DIED
+            # A worker that died, or a result that could not travel back, is this file's refusal alone.
+            judged = WORKER_DIED if isinstance(error, parse_pool.WorkerDied) else {
+                "format": None, "disposition": "unreadable", "code": PARSE_FAILED}
         entry.update(format=judged["format"], sha256=sha256)
         result = {**entry, **{k: v for k, v in judged.items() if k != "format"}}
         return deliver(result) if deliver else result
@@ -286,7 +304,13 @@ def _classified(root, path, relative, trusted, nested, provisioned, parse, deliv
     if ":" not in path.name and archives.kind(path.name) and info.st_size > 0:
         if nested >= MAX_NESTING:
             return deliver({**entry, "disposition": "needs-reader", "code": "archive-nesting"})
-        return deliver({**entry, **_archive_disposition(root, path, not nested)})
+        try:
+            decided = _archive_disposition(root, path, not nested)
+        except (IntakeError, OSError) as error:
+            # A damaged saved manifest or an unreadable archive refuses this file, not the classification.
+            decided = {"disposition": "unreadable",
+                       "code": getattr(error, "code", "os-error").replace("_", "-")}
+        return deliver({**entry, **decided})
     unread = _unread_disposition(path, info.st_size, provisioned)
     if unread is not None:
         return deliver({**entry, **unread})

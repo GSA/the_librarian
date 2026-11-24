@@ -448,8 +448,21 @@ without LibreOffice), `encrypted-document`, `unsupported-container`, `container-
 archive whose sibling `_extracted/<name>/` is classified instead, or whose members were expanded
 into instance storage; see [Archives](#archives)), `skipped-asset` (web site assets),
 `skipped-artifact` (alternate-data-stream sidecars such as `:Zone.Identifier`),
-`unreadable` (fails strict UTF-8 or signature checks), `empty`, `over-limit` and
+`unreadable` (fails strict UTF-8 or signature checks, or a reader failed on it unexpectedly: code
+`parse-failed`), `empty`, `over-limit` and
 `unsafe-path` (symlinks and non-regular files). Suffix is never format proof.
+
+A malformed or hostile file never stops the run. Two places refuse it, and they differ:
+
+- **Classification refusals** (no ledger stage): a MIME file nested past 16 levels is `needs-reader`
+  (`mime-malformed`), and a reader fault is `unreadable` (`parse-failed`). They are counted under
+  `disposition`, never ingested, and re-judged on every rerun.
+- **Extraction failures** (admitted, then refused while preparing): a malformed ODT (bad `text:c`, corrupt or
+  unsupported-compression member, XML nested deeper than 256 levels) is `failed prepare/native-input`, a
+  `blocked` stage; a fault no adapter anticipated is `native-unexpected`, a `dead-letter` stage. Both are
+  recorded and counted in `failed_by_code`, and a rerun reports them again without running them (one attempt each).
+  After a toolkit fix, `recover-blocked-extractions --code native-input --apply` restages the blocked ones and
+  `replay` resets one stage; timeouts and a busy catalog stay `retryable` within the retry budget.
 
 `mhtml` extraction (`tools/extraction/mhtml.py`, stdlib `email` + `html.parser`)
 recognises MIME by content, reads only non-attachment `text/html` parts with

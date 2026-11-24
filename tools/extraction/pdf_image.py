@@ -730,8 +730,7 @@ def prepare(root, receipt, format_name, prepared=None, paths=None, limits=None):
             "kind": value["payload"]["method"]["kind"]}
 
 
-PREPARE_ERRORS = (extract.ExtractionError, bridge.BridgeError, catalog.CatalogError, OSError,
-                  sqlite3.Error, ValueError, KeyError)
+PREPARE_ERRORS = (Exception,)  # one file's unexpected failure is that file's outcome, never the batch's
 
 
 def prepare_many(root, requests, concurrency=DEFAULT_CONCURRENCY, paths=None, limits=None):
