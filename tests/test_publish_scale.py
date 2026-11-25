@@ -15,6 +15,7 @@ from tools.context_index import context_index as index, renditions
 from tools.diagnostics import publish_benchmark as bench
 from tools.intake import cohort
 from tools.review_events import event_reader
+from tests.test_file_identity_locks import needs_dbpage
 
 
 class PublishScaleTests(unittest.TestCase):
@@ -66,6 +67,7 @@ class PublishScaleTests(unittest.TestCase):
         snapshot._events = [second]
         self.assertIsNone(snapshot.event("rev-a"))
 
+    @needs_dbpage  # without sqlite_dbpage nothing is memoized (WithoutDbpage in test_review_event_memo)
     def test_a_memoized_snapshot_serves_lookups_from_its_history(self):
         temp, root = self.build(6)
         self.addCleanup(temp.cleanup)

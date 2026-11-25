@@ -13,6 +13,8 @@ from tools.catalog import backups as catalog_backups
 from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tests.support import WorkspaceCase
+from tests.test_file_identity_locks import needs_dbpage, without_dbpage
+from tools.file_identity import KeyedConnection
 from tools.diagnostics.catalog_lock_benchmark import registration
 
 DAY = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
@@ -132,6 +134,7 @@ class DailySnapshots(unittest.TestCase):
         self.assertGreaterEqual(min(ages), self.clock.value - timedelta(days=7))
         self.assertEqual(len(self.files(".json")), 8)
 
+    @needs_dbpage
     def test_a_head_only_checked_daily_snapshot_never_displaces_a_fully_verified_one(self):
         """Kata 6jwh: retention counts only replay-verified snapshots, so a corruption that the
         writer's identity check cannot see never ages out the last clean snapshot."""
@@ -166,6 +169,31 @@ class DailySnapshots(unittest.TestCase):
         with self.assertRaises(catalog.CatalogError):  # operator prune replays the live store first
             catalog.prune(self.root, apply=True)
         self.assertTrue(clean.exists())
+
+    def test_without_dbpage_a_corruption_is_refused_at_the_next_write_and_the_clean_snapshot_stays(self):
+        """On a build without ``sqlite_dbpage`` the receipt binds the exact bytes, so the corruption the
+        identity test above has to smuggle past the writer is seen at once and no snapshot is taken of it."""
+        with without_dbpage(KeyedConnection):
+            state = catalog.status(self.root)["state_token"]
+            catalog.submit(self.root, registration(0), actor="t", request_id="req-0", expected_state=state,
+                           reason="Daily snapshot test")
+            clean = self.files()[0]
+            catalog.verify_backup(clean)
+            _, db, _ = catalog.locations(self.root)
+            raw = bytearray(db.read_bytes())
+            at = raw.index(b"Synthetic.")
+            raw[at:at + 10] = b"Syntheticx"
+            os.chmod(db, 0o600)
+            with open(db, "r+b") as stream:
+                stream.write(bytes(raw))
+            self.clock.advance(days=1)
+            with self.assertRaises(catalog.CatalogError):
+                catalog.status(self.root)
+            with self.assertRaises(catalog.CatalogError):
+                catalog.submit(self.root, registration(1), actor="t", request_id="req-1",
+                               expected_state=state, reason="Daily snapshot test")
+        self.assertEqual(self.files(), [clean])
+        catalog.verify_backup(clean)
 
     def test_retention_replays_nothing_when_no_snapshot_has_aged_out(self):
         self.write("S1")

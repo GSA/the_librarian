@@ -19,7 +19,8 @@ from tools.review_events import event_reader
 from tools.review_events import event_history
 from tools.review_events import event_store as events
 from tools.review_events import review_events as contract
-from tests.test_file_identity_locks import needs_dbpage
+from tests.test_file_identity_locks import needs_dbpage, without_dbpage
+from tools.file_identity import KeyedConnection
 from tests.test_intake_cohort import QualifyCase
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +114,14 @@ class MemoCase(unittest.TestCase):
             os.utime(descriptor, ns=(before.st_atime_ns, before.st_mtime_ns))
         os.close(descriptor)
         self.assertEqual(os.stat(self.db).st_size, before.st_size)
+
+
+    def bump_counter(self):
+        """What a SQLite commit does to the header, without a commit (an editor who knows the format)."""
+        descriptor = os.open(self.db, os.O_RDWR)
+        counter = int.from_bytes(os.pread(descriptor, 4, 24), "big")
+        os.pwrite(descriptor, (counter + 1).to_bytes(4, "big"), 24)
+        os.close(descriptor)
 
 
 @needs_dbpage
@@ -385,6 +394,7 @@ class DeltaVerification(MemoCase):
         event_history.clear_memo()
         return self.read()
 
+    @needs_dbpage
     def test_an_append_validates_only_its_incoming_events_not_the_history(self):
         self.read()
         calls, patched = self.full_passes()
@@ -450,13 +460,7 @@ class DeltaVerification(MemoCase):
         os.chmod(self.db, 0o600)
         self.refused()
 
-    def bump_counter(self):
-        """What a SQLite commit does to the header, without a commit (an editor who knows the format)."""
-        descriptor = os.open(self.db, os.O_RDWR)
-        counter = int.from_bytes(os.pread(descriptor, 4, 24), "big")
-        os.pwrite(descriptor, (counter + 1).to_bytes(4, "big"), 24)
-        os.close(descriptor)
-
+    @needs_dbpage
     def test_an_old_row_edit_disguised_as_a_commit_is_seen_by_an_audit_and_a_full_read(self):
         """The stated bound of the delta: rows before the remembered head are read again only at the
         next full check (audit, publication, backup, other contract or file); not at a new UTC day."""
@@ -473,6 +477,7 @@ class DeltaVerification(MemoCase):
         with self.assertRaisesRegex(contract.ReviewError, "Event payload hash mismatch"):
             event_reader.read_snapshot(self.root, full=True)
 
+    @needs_dbpage
     def test_an_audit_refuses_the_disguised_edit(self):
         self.read()
         self.raw_edit(restore_mtime=False)
@@ -486,6 +491,7 @@ class DeltaVerification(MemoCase):
         self.raw_edit(restore_mtime=False)
         self.refused("Event payload hash mismatch")
 
+    @needs_dbpage
     def test_a_state_or_indexed_read_does_no_work_proportional_to_the_history(self):
         self.read()
         add(self.root, 3)
@@ -500,6 +506,7 @@ class DeltaVerification(MemoCase):
         self.assertIsNone(snapshot._events)
         self.assertEqual(len(snapshot.events), 4)  # built on use, bounded to this read
 
+    @needs_dbpage
     def test_a_publication_read_replays_everything_it_serves(self):
         self.read()
         add(self.root, 3)
@@ -509,6 +516,7 @@ class DeltaVerification(MemoCase):
             event_reader.read_snapshot(self.root)
         self.assertEqual(len(calls), 1)
 
+    @needs_dbpage
     def test_a_full_read_catches_an_old_row_edit_the_delta_would_not(self):
         self.read()
         with closing(events.connect(self.db)) as connection:
@@ -545,6 +553,58 @@ class DeltaVerification(MemoCase):
             connection.execute("UPDATE events SET entry_hash='0' WHERE sequence=3")
         os.chmod(self.db, 0o600)
         self.refused()
+
+
+class WithoutDbpage(MemoCase):
+    """On a SQLite build without ``sqlite_dbpage`` (stock Ubuntu 24.04) nothing is memoized or bound
+    by identity: every read validates in full, so the identity-restoring and counter-bumping edits
+    that the memo documents as residuals are refused at once. Runs on every build by hiding the table."""
+
+    def setUp(self):
+        super().setUp()
+        hidden = without_dbpage(KeyedConnection)
+        hidden.start()
+        self.addCleanup(hidden.stop)
+        self.new_process(keep_receipt=False)
+
+    def test_every_read_validates_in_full_and_nothing_is_remembered(self):
+        calls, patched = self.full_passes()
+        with patched:
+            self.assertEqual(self.read().state["events"], 3)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(self.read().state["events"], 3)
+            self.assertEqual(len(calls), 2)  # the second read of an unchanged store replays again
+            add(self.root, 3)
+            before = len(calls)
+            self.assertEqual(self.read().state["events"], 4)
+            self.assertEqual(len(calls), before + 1)
+        self.assertFalse(event_history._MEMO)
+        self.assertFalse(self.receipt.exists())
+
+    def test_a_publication_read_and_a_state_read_each_replay_everything(self):
+        calls, patched = self.full_passes()
+        with patched:
+            event_reader.read_snapshot(self.root, full=True)
+            event_reader.read_snapshot(self.root)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_snapshot_still_answers_lookups_without_a_remembered_history(self):
+        add(self.root, 3)
+        snapshot = self.read()
+        self.assertEqual(snapshot.event("rev-memo-3")["event_id"], "rev-memo-3")
+        self.assertEqual(len(snapshot.events), 4)
+        self.assertEqual(snapshot.at("sources/memo-1.txt")[0]["event_id"], "rev-memo-1")
+
+    def test_an_old_row_edit_disguised_as_a_commit_is_refused_by_the_next_read(self):
+        self.read()
+        self.raw_edit(restore_mtime=False)
+        self.bump_counter()
+        self.refused("Event payload hash mismatch")
+
+    def test_an_edit_that_restores_size_and_times_is_refused_by_the_next_read(self):
+        self.read()
+        self.raw_edit(restore_mtime=True)
+        self.refused("Event payload hash mismatch")
 
 
 class QualifyEquivalence(QualifyCase):
