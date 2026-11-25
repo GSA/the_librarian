@@ -351,6 +351,7 @@ class PublishedTests(PartsCase):
 class PlainPublishedTests(PublishedTests):
     test_the_review_event_and_published_scope_show_each_parts_inspection = None
     test_the_search_text_is_reduced_and_the_label_and_metadata_say_images_were_omitted = None
+    test_an_authored_eval_case_reaches_the_part_reviewed_image_note_by_search = None
 
     SOURCE = b"# Plain notes\n\nThe cutover decision was recorded here.\n"
 
