@@ -82,6 +82,26 @@ def failure_status(request, attempts, ordinal, error):
     return failure, status
 
 
+def position(c, correlation_id, stage_id, request, saved, started):
+    """``(attempts of the cycle, unfinished attempt or None, ordinal to work on, refusal code or None)``.
+
+    The one rule ``run`` and ``run_batch`` share for when a stage may be worked: an unfinished attempt is
+    resumed without charge; otherwise the backoff must have passed and the attempt budgets must have room.
+    """
+    attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? AND cycle=? ORDER BY ordinal",
+                         (correlation_id, stage_id, saved["cycle"])).fetchall()
+    unfinished = attempts[-1] if attempts and attempts[-1]["outcome"] is None else None
+    ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
+    if unfinished is not None:
+        return attempts, unfinished, ordinal, None
+    if attempts and started < attempts[-1]["eligible_at"]:
+        return attempts, unfinished, ordinal, "backoff_pending"
+    charged, lost = spent(attempts)
+    if not (charged < request["retry"]["max_attempts"] and lost < CONTENTION_BUDGET):
+        return attempts, unfinished, ordinal, "attempt_limit"
+    return attempts, unfinished, ordinal, None
+
+
 def run(root, correlation_id, stage_id, *, now=None, clock=None):
     # Explicit now retains the fixed-time interface used by existing callers.
     clock = clock if clock is not None else time.time if now is None else lambda: now
@@ -91,14 +111,8 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
         if saved["status"] in {"succeeded", "return-pending"}:
             return store.summary(c, correlation_id)
         require(saved["status"] not in {"blocked", "dead-letter"}, "explicit_replay_required")
-        attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? AND cycle=? ORDER BY ordinal", (correlation_id, stage_id, saved["cycle"])).fetchall()
-        unfinished = attempts[-1] if attempts and attempts[-1]["outcome"] is None else None
-        if attempts and unfinished is None:
-            require(started >= attempts[-1]["eligible_at"], "backoff_pending")
-        ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
-        if unfinished is None:
-            charged, lost = spent(attempts)
-            require(charged < request["retry"]["max_attempts"] and lost < CONTENTION_BUDGET, "attempt_limit")
+        attempts, unfinished, ordinal, refusal = position(c, correlation_id, stage_id, request, saved, started)
+        require(refusal is None, refusal)
 
         def begin(intent=None):
             """Save the new ``intent`` and record the attempt as running in one commit (the intent is
@@ -165,16 +179,9 @@ def run_batch(root, items, *, clock=None):
             request, stage, saved = selected(c, correlation_id, stage_id)
             if saved["status"] in {"succeeded", "return-pending", "blocked", "dead-letter"}:
                 continue
-            attempts = c.execute("SELECT * FROM attempts WHERE correlation_id=? AND stage_id=? AND cycle=? ORDER BY ordinal",
-                                 (correlation_id, stage_id, saved["cycle"])).fetchall()
-            unfinished = attempts[-1] if attempts and attempts[-1]["outcome"] is None else None
-            if attempts and unfinished is None and started < attempts[-1]["eligible_at"]:
+            attempts, unfinished, ordinal, refusal = position(c, correlation_id, stage_id, request, saved, started)
+            if refusal is not None:
                 continue
-            ordinal = unfinished["ordinal"] if unfinished else len(attempts) + 1
-            if unfinished is None:
-                charged, lost = spent(attempts)
-                if not (charged < request["retry"]["max_attempts"] and lost < CONTENTION_BUDGET):
-                    continue
             live.append({"correlation_id": correlation_id, "stage_id": stage_id, "request": request,
                          "stage": stage, "saved": saved, "attempts": attempts, "unfinished": unfinished,
                          "ordinal": ordinal, "error": None, "intent": None})
