@@ -116,6 +116,8 @@ jobs:
           else:
               raise SystemExit("sqlite_dbpage is available here; this leg must run on a build without it")
           PY
+      - name: Install bubblewrap
+        run: command -v bwrap || sudo apt-get install -y --no-install-recommends bubblewrap
       - name: Allow unprivileged PID namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "sysctl not present on this image; namespaces are checked by the skip allowlist"
       - name: Tests
