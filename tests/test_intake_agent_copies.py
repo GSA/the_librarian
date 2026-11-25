@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import unittest
 
-from tools.intake import agent_copies, agent_origin, cohort, deselect, store, upload
+from tools.intake import agent_copies, agent_origin, cohort, deselect, store
 from tools.intake.contracts import IntakeError
 from tests.test_intake_cohort import QualifyCase, tree
 
