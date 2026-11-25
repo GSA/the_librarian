@@ -335,6 +335,19 @@ class PublishedTests(PartsCase):
         self.assertTrue(any("QUJDQUJD" in piece["text"] for piece in image_hits["pieces"]))
 
 
+    def test_an_authored_eval_case_reaches_the_part_reviewed_image_note_by_search(self):
+        from tools.evals import cases as case_file, runner as eval_runner
+        n = len(model_review.plan(self.root, self.rendition, max_prompt_chars=CAP)["tasks"])
+        self.publish(Transport(*[{} for _ in range(n)]))
+        case = {"id": "cutover-decision", "origin": "authored", "query": "cutover decision recorded", "k": 5,
+                "expect_paths": [self.rendition], "expect_confidence": "low"}
+        document = {"schema": case_file.SCHEMA, "cases": [case]}
+        case_file.validate(document)
+        card = eval_runner.run(self.root, document, "0" * 64)
+        self.assertEqual(card["aggregates"]["cases"], 1)
+        self.assertEqual(card["cases"][0]["status"], "pass", card["cases"][0])
+
+
 class PlainPublishedTests(PublishedTests):
     test_the_review_event_and_published_scope_show_each_parts_inspection = None
     test_the_search_text_is_reduced_and_the_label_and_metadata_say_images_were_omitted = None
