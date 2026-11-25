@@ -580,6 +580,25 @@ restated here.
   `test_qualified_agent_context_is_low_confidence_and_labelled_in_search_and_get`,
   `test_classify_cli_reports_the_declared_origin_for_a_dry_run`),
   `tests/test_intake_upload.py::test_agent_declaration_may_name_its_source_repository`.
+- **Copies of agent-written context are reported, not detected at intake** (Kata rqr2).
+  `cohort agent-copies --agent-system S` (`tools/intake/agent_copies.py`) reads the intake
+  ledger's `docs` rows: the files of the named cohorts whose submission sidecar carries
+  `origin.agent_generated` are the reference, and every other ingested file whose inbox path ends
+  on whole segments with a reference path is `identical` (same original SHA-256) or `similar`
+  (line-sequence ratio at least `--min-similarity`, default 0.9); a bare path tail is only counted
+  `different`, and a file carrying its own declaration is `already_declared`. It writes nothing
+  and never changes a label, a selection or a submission. `--report` (0600) lists receipts and
+  paths and is accepted by `deselect --receipts-file`, so removing the copies stays an explicit
+  owner action. Carrying the `agent-generated` reason onto a copy automatically is not built:
+  that would assert authorship from similarity and change a submission's identity after the fact.
+  Evidence: `tests/test_intake_agent_copies.py`
+  (`test_identical_and_near_identical_copies_of_agent_files_are_reported_by_path_tail`,
+  `test_a_path_tail_alone_is_not_a_copy_and_counts_are_body_free`,
+  `test_a_threshold_decides_what_near_identical_means`,
+  `test_an_agent_origin_copy_is_not_reported_as_undeclared`,
+  `test_the_report_marks_copies_that_are_selected_and_writes_nothing`,
+  `test_the_report_feeds_deselect_as_a_receipts_file`,
+  `test_cli_prints_counts_and_writes_the_private_report_with_paths`).
 - **Markdown renditions are searched by heading span as well as by record** (Kata q886). The
   index stores one section per extraction record (a line of a text, converted, MHTML or page
   rendition), and literal search needs every query word in one section, so a passage whose words
