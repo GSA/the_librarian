@@ -18,7 +18,7 @@ import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import random
 import re
 import sys
@@ -700,9 +700,47 @@ def _policy_criteria(root, name):
         raise ValueError(getattr(error, "code", "standing-policy-unreadable")) from None
 
 
+def plan_report(root, renditions_, criteria, inspected_form="list", *, max_prompt_chars=None,
+                max_records=standing.DEFAULT_MAX_RECORDS, max_pages=standing.DEFAULT_MAX_PAGES):
+    """Body-free plan of how each rendition would be reviewed; reads renditions, writes nothing.
+
+    One entry per rendition (receipt, status ``whole``/``parts``/``too-large``/``over-budget``, parts,
+    prompt characters, reduced inline data) and totals: model calls (one per part), prompt characters
+    and the usual four-characters-per-token estimate, which is what a bulk run's cost note starts from.
+    """
+    rows, totals, statuses = [], Counter(), Counter()
+    for name in renditions_:
+        planned = plan(root, name, inspected_form, criteria, max_prompt_chars=max_prompt_chars,
+                       max_records=max_records, max_pages=max_pages)
+        status = planned["status"] or ("parts" if planned["parted"] else "whole")
+        statuses[status] += 1
+        calls = len(planned["tasks"])
+        totals.update(model_calls=calls, prompt_chars=planned["chars"])
+        reductions = planned["reductions"] or {}
+        rows.append({"receipt_id": PurePosixPath(name).parts[-3], "status": status, "parts": calls,
+                     "prompt_chars": planned["chars"], "inline_images": reductions.get("count", 0)})
+    return {"renditions": rows,
+            "totals": {"renditions": len(rows), "model_calls": totals["model_calls"],
+                       "prompt_chars": totals["prompt_chars"],
+                       "prompt_tokens_approx": -(-totals["prompt_chars"] // 4),
+                       "by_status": dict(statuses)}}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
+    preview = commands.add_parser("plan", allow_abbrev=False,
+                                  help="how renditions would be reviewed (parts, calls, prompt size); "
+                                       "body-free, makes no model call and writes nothing")
+    preview.add_argument("--root", required=True, type=Path)
+    preview.add_argument("--rendition", action="append", required=True, dest="renditions")
+    preview.add_argument("--criteria", choices=sorted(PROMPTS), default=standing.CRITERIA[-1])
+    preview.add_argument("--inspected-form", choices=FORMS, default="list")
+    preview.add_argument("--max-prompt-chars", type=_positive_option, default=MAX_PROMPT_CHARS)
+    preview.add_argument("--max-records", type=_positive_option, default=standing.DEFAULT_MAX_RECORDS,
+                         help="the policy's per-review record budget (default %d)" % standing.DEFAULT_MAX_RECORDS)
+    preview.add_argument("--max-pages", type=_positive_option, default=standing.DEFAULT_MAX_PAGES,
+                         help="the policy's per-review page budget (default %d)" % standing.DEFAULT_MAX_PAGES)
     sample = commands.add_parser("evaluate", allow_abbrev=False,
                                  help="score models on sample renditions; body-free output")
     sample.add_argument("--root", required=True, type=Path)
@@ -723,6 +761,11 @@ def main(argv=None):
     sample.add_argument("--max-output-tokens", type=_positive_option,
                         help="send max_tokens with each request (default: not sent)")
     args = parser.parse_args(argv)
+    if args.command == "plan":
+        print(json.dumps(plan_report(args.root, args.renditions, args.criteria, args.inspected_form,
+                                     max_prompt_chars=args.max_prompt_chars, max_records=args.max_records,
+                                     max_pages=args.max_pages), sort_keys=True))
+        return 0
     criteria = args.criteria
     if criteria is None and args.policy:
         try:

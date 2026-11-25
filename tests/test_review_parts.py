@@ -126,6 +126,39 @@ class PlanTests(PartsCase):
         self.assertEqual((planned["status"], planned["tasks"]), ("over-budget", []))
 
 
+class PlanCommandTests(PartsCase):
+    def run_plan(self, *extra):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = model_review.main(["plan", "--root", str(self.root), "--rendition", self.rendition,
+                                      "--max-prompt-chars", str(CAP), "--criteria", "standing-review-v1", *extra])
+        return code, json.loads(out.getvalue())
+
+    def test_the_read_only_plan_reports_parts_calls_and_prompt_size_without_a_body(self):
+        code, report = self.run_plan()
+        planned = self.plan()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["totals"], {"renditions": 1, "model_calls": len(planned["tasks"]),
+                                            "prompt_chars": planned["chars"],
+                                            "prompt_tokens_approx": -(-planned["chars"] // 4),
+                                            "by_status": {"parts": 1}})
+        row = report["renditions"][0]
+        self.assertEqual((row["receipt_id"], row["parts"], row["status"]), ("D1", len(planned["tasks"]), "parts"))
+        self.assertNotIn("Row 0000", json.dumps(report))
+
+    def test_the_plan_names_what_stays_too_large_or_over_budget(self):
+        _, report = self.run_plan("--max-records", "1")
+        self.assertEqual(report["totals"]["by_status"], {"over-budget": 1})
+        self.assertEqual(report["totals"]["model_calls"], 0)
+
+    def test_the_plan_writes_nothing(self):
+        before = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*"))
+        self.run_plan()
+        self.assertEqual(sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*")), before)
+
+
 class ReviewPartsTests(PartsCase):
     def test_parts_combine_into_one_findings_record_that_qualifies(self):
         transport = Transport()

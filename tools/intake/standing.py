@@ -51,6 +51,8 @@ DEFERRED_MODES = ("hold", "qualify-low-confidence")
 # policy budget then apply to each part, and a rendition needing more than this many parts is over budget.
 MAX_PARTS = 64
 MAX_REVIEW_RECORDS = MAX_PARTS * renditions.DOCLING_MAX_RECORDS
+DEFAULT_MAX_RECORDS = renditions.DOCLING_MAX_RECORDS  # the budget a cohort policy gets
+DEFAULT_MAX_PAGES = renditions.DOCLING_MAX_PAGES
 DECISION_ORDER = ("accept", "defer", "reject")  # least to most severe
 DOCLING_INSPECTED = frozenset({"pages", "texts", "tables", "warnings"})
 EXTRACT_INSPECTED = frozenset({"records", "warnings"})
