@@ -990,7 +990,9 @@ restated here.
   a prompt even alone, after inline data is reduced: a record is never cut, so that rendition stays
   `pending-review` and visible, and `cohort rereview` lists it under `skipped.too-large`.
   `over-budget` now means the rendition needs more than 64 parts, or the combined findings exceed
-  `max_findings_bytes`. Neither makes a model call. A review held earlier as
+  `max_findings_bytes`. `too-large` and the more-than-64-parts refusal are decided before any call;
+  findings over `max_findings_bytes` are only known after the parts were reviewed, so their calls are
+  spent (and counted in usage) while no findings are written. A review held earlier as
   `standing-exception-budget-exceeded` (made in one call, refused on the per-review page or record
   budget) is selected by `cohort rereview` as reason `budget-exceeded` when the rendition now needs
   parts, and reviewed as a correction like any other head. `rereview` dry runs count each part as a

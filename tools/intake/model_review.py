@@ -386,7 +386,8 @@ def review(root, rendition, standing_policy, model, transport,
     into one findings record (``_combine``). A part that fails ends the review, with the usage of the
     calls already made. ``too-large`` is a single record that does not fit a prompt even alone;
     ``over-budget`` is a rendition needing more than ``standing.MAX_PARTS`` parts, or findings over
-    the policy's ``max_findings_bytes``. Neither makes a call.
+    the policy's ``max_findings_bytes``; the first two are refused before any call, the last only after
+    the parts were reviewed (their usage is reported, no findings are written).
     """
     reviewer = PROVIDER + ":" + model
     if standing_policy["reviewer"] != reviewer:
