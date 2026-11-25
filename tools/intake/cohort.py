@@ -355,7 +355,14 @@ def _reconcile_qualified(root, manifest, system, current, cohorts, extracted, ke
 
     def reconciled(own, room):
         own = [r for r in own if not stale & set(r.get("review_event_ids") or [])]
-        chosen = [r for r in own if r["path"] in kept or keep(r)] + [e["selection"] for e in qualified]
+        served = {r["path"] for r in own}
+        retained = [r for r in own if r["path"] in kept or keep(r)]
+        ordered = qualified
+        if len(retained) + len(qualified) > room:
+            # Room is short: selections the manifest already serves come before new ones (the sort
+            # is stable), so only entries not yet served are held back. A cohort that fits keeps its order.
+            ordered = sorted(qualified, key=lambda e: e["rendition"] not in served)
+        chosen = retained + [e["selection"] for e in ordered]
         # A selection restored from saved evidence cannot exceed what the manifest can hold
         # next to other cohorts' entries; the surplus stays visibly pending, never invalid.
         surplus = {r["path"] for r in chosen[room:]}

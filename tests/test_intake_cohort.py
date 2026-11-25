@@ -1685,6 +1685,29 @@ class SharedManifestTests(QualifyCase):
         self.assertEqual(outcome(skipped), outcome(paid))
         self.assertEqual(paid["counts"]["selection_capacity"], {"entries": 1, "model_calls_skipped": 0})
 
+    def test_a_full_manifest_holds_back_restored_selections_not_ones_it_already_serves(self):
+        first, second = self.qualify("a"), self.qualify("b")
+        a_paths = [e["rendition"] for e in first["entries"] if "rendition" in e]
+        # Saved reviews whose selections are no longer in the manifest, except the last of them.
+        raw = json.loads(self.manifest.read_text())
+        raw["renditions"] = [r for r in raw["renditions"] if r["path"] not in a_paths[:2]]
+        self.manifest.write_text(json.dumps(raw))
+        self.calls.clear()
+        with self.capped(4):
+            report = self.qualify("a")
+        served = {r["path"] for r in self.selections()}
+        # Room for one of the two restorable selections: the one already served stays, the new one waits.
+        self.assertEqual(len(served), 4)
+        self.assertIn(a_paths[2], served)
+        self.assertEqual(sum(p in served for p in a_paths[:2]), 1)
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 2, "pending-review": 1})
+        self.assertEqual(report["counts"]["selection_capacity"], {"entries": 1, "model_calls_skipped": 0})
+        self.assertEqual(self.calls, [])
+        # Once room exists the held-back selection returns with no model call.
+        resumed = self.qualify("a")
+        self.assertEqual((self.calls, resumed["counts"]["qualification"], len(self.selections())),
+                         ([], {"qualified": 3}, 5))
+
     def test_a_saved_review_is_never_repeated_and_is_selected_when_room_exists(self):
         self.qualify("a")
         # Room looked available, so both of B's reviews were paid and saved; the select was refused.

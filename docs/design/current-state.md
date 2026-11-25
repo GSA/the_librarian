@@ -776,7 +776,10 @@ restated here.
   outcomes do not depend on completion order. An entry with a saved review is
   never re-reviewed and is selected when room exists; a select refused by a
   concurrent cohort's write still ends `selection-capacity` with its review
-  kept. `counts.selection_capacity` reports `entries` held and
+  kept. When the cohort's own selections do not fit beside other cohorts' entries,
+  selections the manifest already serves are kept first and only entries not yet in
+  the manifest are held back (Kata j0an; `test_a_full_manifest_holds_back_restored_selections_not_ones_it_already_serves`).
+  `counts.selection_capacity` reports `entries` held and
   `model_calls_skipped`. Measured on a synthetic 40-file cohort with the cap
   lowered to 10: 40 calls and 4,230 prompt tokens before, 10 and 1,058 after
   (60 files, cap 20: 60 and 6,350 before, 20 and 2,117 after), same
