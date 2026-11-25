@@ -1619,11 +1619,14 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   evidence, settle the attempt and stage, drop the claim). Preparing the intent and running the effect happen
   between them with no ledger lock, so `progress`, a second `ingest` and `qualify` proceed during extraction,
   catalog revisions and file syncs. Measured with `tools/diagnostics/batch_ingest_benchmark.py` (2,000-document
-  seed, 100 new documents, which now also reports `ledger_lock_*`: holds, held ms per document and share of
-  wall, longest hold): at `batch_size=50` the lock was held 74.9% of 12.7 s wall (95 ms per document, one
-  chunk hold of 2.8 s); it is held 12.3% of 8.1 s (10 ms per document, longest hold 138 ms). At `batch_size=1`:
-  83.1% of 52 s before, 37.1% of 40 s now (the one-at-a-time path takes the lock 15 (before) to 21 (now) times per
-  document for ledger reads, so many short holds remain; use batches).
+  seed, 100 new synthetic text documents, run back to back on one host against the tree before this change and
+  this one; it reports `ledger_lock_*`: holds, held ms per document, share of wall, longest hold): at `batch_size=50`
+  the lock was held 73% of the run (16.5 ms per document, longest hold 435 ms) and is held 13% (2.8 ms per
+  document, longest hold 51 ms); at `batch_size=1` 83% before and 35% now. Wall time is unchanged within noise
+  for one process (the work is the same; what changes is who can run beside it). The one-at-a-time path takes
+  the lock 15 (before) to 21 (now) times per document for ledger reads and writes, so use batches. Absolute
+  times vary with host load; the shares are the comparison. Documents of the text family are all this
+  harness has: the longer a stage's native work (a conversion of seconds), the larger the share released.
   - *Claim.* The `claims` table (one row per stage with an unfinished attempt: `owner`, `lease_until`, and the
     attempt's cycle and ordinal) is additive: a ledger created before it gets exactly that table from the next
     writer to open it (as the correction index was), a stage with no row is unclaimed, and `audit` and the
