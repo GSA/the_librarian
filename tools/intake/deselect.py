@@ -8,8 +8,9 @@
   ``exclusions``): the selections whose inbox path, read from the intake ledger's ``docs`` rows, a
   rule matches;
 * **byte-identical duplicates** (``--dedupe``): selections of different receipts whose original has
-  the same SHA-256 form a group; every group is reported, and ``--dedupe`` keeps the lowest receipt
-  that no other selector removes and deselects the rest.
+  the same SHA-256 form a group; every group is reported, and ``--dedupe`` keeps the copy with the
+  best path class (``path_rank``: plain folder, archive member, build/cache, VCS internals), then the
+  lowest receipt, among those no other selector removes and deselects the rest.
 
 Receipts, retained originals, renditions and extractions are never touched: only the manifest entry
 goes, so ``publish`` stops serving it. The removal is durable in three places, written in this order
@@ -53,6 +54,27 @@ RETRIES = 5
 LOG_LIMIT = 256 * 1024 * 1024
 RECEIPT = re.compile(r"D0*[1-9][0-9]*")
 ACTOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}")
+
+
+VCS_DIRECTORY = re.compile(r"(?:^|/)(?:\.svn|\.git|\.hg|CVS)(?:/|$)", re.IGNORECASE)
+BUILD_DIRECTORY = re.compile(r"(?:^|/)(?:build|dist|target|node_modules|\.cache|\.m2|__pycache__)(?:/|$)",
+                             re.IGNORECASE)
+
+
+def path_rank(path):
+    """How poor an inbox path is as the one search results cite for a document (lower is better).
+
+    0 a plain document folder (and a receipt with no known path); 1 an archive member (``A.zip!/m``) or
+    an operator's ``_extracted`` folder; 2 build or cache output; 3 version-control internals. A path
+    takes its worst class, so a member inside ``.svn`` is 3 whatever archive holds it.
+    """
+    if not path:
+        return 0
+    if VCS_DIRECTORY.search(path):
+        return 3
+    if BUILD_DIRECTORY.search(path):
+        return 2
+    return 1 if "!/" in path or "/_extracted/" in "/" + path else 0
 
 
 def _number(receipt):
@@ -228,15 +250,17 @@ def build_plan(root, c, selected, *, receipts=(), rules=None, rule_ids=(), syste
     for original, members in sorted(by_original.items()):
         if len({m["receipt_id"] for m in members}) < 2:
             continue
-        members.sort(key=lambda m: (_number(m["receipt_id"]), m["path"]))
+        members.sort(key=lambda m: (path_rank(rows[m["receipt_id"]][1] if m["receipt_id"] in rows else None),
+                                    _number(m["receipt_id"]), m["path"]))
         left = [m for m in members if m["path"] not in removed]
         keep = left[0]["receipt_id"] if left else None
         if dedupe and keep is not None:
             for member in left:
                 if member["receipt_id"] != keep:
                     removed[member["path"]] = "duplicate-of:" + keep
-        groups.append({"sha256": original, "keep": keep, "receipts": [m["receipt_id"] for m in members],
-                       "removed": [m["receipt_id"] for m in members if m["path"] in removed]})
+        ordered = sorted(members, key=lambda m: (_number(m["receipt_id"]), m["path"]))
+        groups.append({"sha256": original, "keep": keep, "receipts": [m["receipt_id"] for m in ordered],
+                       "removed": [m["receipt_id"] for m in ordered if m["path"] in removed]})
     entries = []
     for entry in selected:
         if entry["path"] in removed:

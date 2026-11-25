@@ -112,8 +112,8 @@ duplicates), dry run first, then `--apply`, then publish:
 ```
 
 Selectors are `--receipt D123`, `--receipts-file` (IDs or a dry-run `--report`), `--rule ID` /
-`--all-rules` and `--dedupe` (of byte-identical selections across receipts it keeps the lowest
-receipt and removes the rest; every group is reported even without `--dedupe`). Receipts and files
+`--all-rules` and `--dedupe` (of byte-identical selections across receipts it keeps the copy with the
+clearest path, then the lowest receipt, and removes the rest; every group is reported even without `--dedupe`). Receipts and files
 stay; only the selection goes, with a ledger record and a superseding review event
 ([context/intake.md](context/intake.md#excluding-files-and-deselecting-selections)).
 
