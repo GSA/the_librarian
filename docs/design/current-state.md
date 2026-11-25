@@ -526,7 +526,12 @@ restated here.
   (or a dry-run report), exclusion rules matched against the `docs` row's inbox path, and
   `--dedupe` over groups of selections whose originals share a SHA-256 (from the `docs` row, else the
   catalog's original, so the optional table is not needed; groups are always
-  reported; the lowest receipt left after the other selectors is kept, so no group is emptied).
+  reported; of the copies the other selectors leave, the one with the best `path_rank` of its
+  inbox path is kept, then the lowest receipt, so no group is emptied: plain folder 0, archive
+  member (`A.zip!/m`) or `_extracted` folder 1, build/cache output 2, VCS internals 3, the worst
+  class a path matches; a receipt with no `docs` row ranks 0, i.e. falls back to lowest receipt.
+  The preference exists because search results cite the kept copy's path; it only affects a
+  `--dedupe` run, never a group already deduplicated).
   `--apply` holds the ledger writer lock and recovers an interrupted manifest append, then writes
   in this order: a fsynced `begin` record in `<intake home>/deselections.jsonl`, one superseding
   `dispositioned` review event per removed entry's live review (`rev-deselect-<hash of the
@@ -550,7 +555,12 @@ restated here.
   `test_byte_identical_selections_across_receipts_are_reported_as_groups_without_removing`,
   `test_dedupe_never_removes_the_last_copy_when_a_rule_removes_the_others`,
   `test_a_selection_survives_its_file_changing_or_becoming_unadmittable_while_excluded`,
-  `test_dedupe_finds_groups_from_the_catalog_without_the_docs_table`).
+  `test_dedupe_finds_groups_from_the_catalog_without_the_docs_table`,
+  `test_path_class_ranks_plain_before_archive_before_build_before_vcs`,
+  `test_dedupe_keeps_the_plain_path_over_a_lower_receipt_under_vcs_internals`,
+  `test_equal_path_classes_still_keep_the_lowest_receipt`,
+  `test_a_group_with_only_poor_paths_is_still_kept_once`,
+  `test_a_rule_removal_still_wins_over_path_preference`).
 - **Agent-written context is a cohort with a declared origin** (Kata 2ket). `cohort
   classify|ingest|qualify --agent-origin FILE` (`tools/intake/agent_origin.py`) reads a private
   version-1 origin file (`generator`, optional `source_repository`, `provenance` `git|none`,
