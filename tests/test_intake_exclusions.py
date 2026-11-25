@@ -525,6 +525,63 @@ class DuplicateTests(DeselectCase):
         self.assertNotIn(copies[0], kept)
 
 
+class PathPreferenceTests(DeselectCase):
+    """``--dedupe`` keeps the copy with the clearest path, then the lowest receipt (Kata jen3)."""
+
+    def test_path_class_ranks_plain_before_archive_before_build_before_vcs(self):
+        rank = deselect.path_rank
+        self.assertEqual(rank("pack/_extracted/pack/guide.md"), rank("pack.zip!/docs/guide.md"))
+        order = [rank(p) for p in ("docs/guide.md", "pack.zip!/docs/guide.md", "app/build/guide.md",
+                                   "repo/.svn/pristine/ab/guide.md")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(len(set(order)), 4)
+        self.assertEqual(rank("a.zip!/b.tar.gz!/c/.svn/x.md"), rank("repo/.svn/x.md"))
+        self.assertEqual(rank(None), rank("docs/guide.md"))
+        self.assertGreater(rank("Repo/.SVN/x.md"), rank("docs/guide.md"))
+        self.assertEqual(rank("rebuild/guide.md"), rank("docs/guide.md"))
+
+    def add_copies(self, *names):
+        for name in names:
+            (self.inbox / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.inbox / name).write_bytes(b"# Preferred\nPath preference text\n")
+        self.first = self._qualify(self.transport)
+        return [self.receipt(n) for n in names]
+
+    def test_dedupe_keeps_the_plain_path_over_a_lower_receipt_under_vcs_internals(self):
+        vcs, plain = self.add_copies(".svn/pristine/ab/guide.md", "manual/guide.md")
+        self.assertLess(int(vcs[1:]), int(plain[1:]), "the fixture needs the poorer path to hold the lower receipt")
+        report = self.run_deselect(dedupe=True, actor="operator", apply=True)
+        left = {s["receipt_id"] for s in self.selected()}
+        self.assertIn(plain, left)
+        self.assertNotIn(vcs, left)
+        group = next(g for g in report["groups"] if plain in g["receipts"])
+        self.assertEqual((group["keep"], group["removed"]), (plain, [vcs]))
+        entry = next(e for e in report["entries"] if e["receipt_id"] == vcs)
+        self.assertEqual(entry["reason"], "duplicate-of:" + plain)
+
+    def test_equal_path_classes_still_keep_the_lowest_receipt(self):
+        first, second = self.add_copies("alpha/guide.md", "beta/guide.md")
+        self.run_deselect(dedupe=True, actor="operator", apply=True)
+        left = {s["receipt_id"] for s in self.selected()}
+        self.assertIn(min(first, second, key=lambda r: int(r[1:])), left)
+        self.assertEqual(len({first, second} & left), 1)
+
+    def test_a_group_with_only_poor_paths_is_still_kept_once(self):
+        a, b = self.add_copies(".svn/a/guide.md", ".svn/b/guide.md")
+        self.run_deselect(dedupe=True, actor="operator", apply=True)
+        left = {s["receipt_id"] for s in self.selected()}
+        self.assertEqual(len({a, b} & left), 1)
+        self.assertIn(min(a, b, key=lambda r: int(r[1:])), left)
+
+    def test_a_rule_removal_still_wins_over_path_preference(self):
+        vcs, plain = self.add_copies(".svn/pristine/ab/guide.md", "manual/guide.md")
+        sub = {"version": 1, "rules": [{"id": "manual", "globs": ["manual/**"]}]}
+        self.run_deselect(rules=rules(sub), rule_ids=["manual"], dedupe=True, actor="operator", apply=True)
+        left = {s["receipt_id"] for s in self.selected()}
+        self.assertIn(vcs, left)
+        self.assertNotIn(plain, left)
+
+
 class DuplicateWithoutDocsTests(DeselectCase):
     """The same duplicate detection when the optional ``docs`` table is absent or lacks a row."""
 
