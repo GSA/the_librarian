@@ -95,10 +95,13 @@ def failure_status(request, attempts, ordinal, error):
 # attempt without charging it. A lease race can at worst run an effect twice (its markers and request IDs make
 # that idempotent), never record twice: the evidence is written only while the claim is still the writer's.
 LEASE_SECONDS = 900
-# Operations whose effect reads or writes the shared selection manifest or the publication index. The
-# manifest's writers (``standing-select``, ``qualify``'s reconcile, ``deselect``) exclude each other through the
-# ledger lock, and a publication must see the manifest it pinned, so these keep the lock for the whole run.
-LOCKED_OPERATIONS = {"standing-select", "standing-publish", "index-build"}
+# Operations that keep the ledger lock for the whole run. ``standing-select`` writes the shared selection
+# manifest, whose writers exclude each other through the ledger lock; ``standing-publish`` and ``index-build`` must
+# see the manifest they pinned; ``standing-review`` and ``review-append`` commit review events against a pinned
+# store revision, which another qualify process would otherwise stale. Each is model-free and short (the model call
+# is made before the stage, outside the ledger), so the lock costs little there; ``events.append`` is timed in
+# ``tests/test_intake_claims.py`` and a stale-revision retry is the follow-up that would let them release it too.
+LOCKED_OPERATIONS = {"standing-review", "standing-select", "standing-publish", "index-build", "review-append"}
 NATIVE_ERRORS = (adapters.StageFailure, OSError, sqlite3.Error, IntakeError)
 
 

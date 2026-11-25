@@ -462,33 +462,37 @@ class IngestKeepsTheLedgerFree(unittest.TestCase):
         self.assertEqual(commits[0], commits[1])  # a chunk's ledger commits do not grow with its converted documents
 
 
-class LedgerExclusiveEffects(cohort_tests.QualifyCase):
+class QualifyStagesKeepTheLedgerLock(cohort_tests.QualifyCase):
+    """``qualify``'s stages commit against a pinned review-event revision and write the shared selection manifest,
+    so they keep the ledger lock (the decision for the review path); the model call is made outside it already."""
+
     def ingest(self):
         return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
 
-    """``qualify``: the review runs outside the ledger lock; the selection manifest write keeps it."""
-
-    def test_the_review_event_commit_runs_without_the_ledger_lock_and_the_manifest_append_with_it(self):
+    def test_the_review_event_commit_and_the_manifest_append_run_under_the_ledger_lock_and_are_brief(self):
         from tools.intake import standing_publication
         from tools.review_events import event_store as events
-        seen = {}
+        seen, holds = {}, {}
 
         def watch(label, real):
             def wrapped(*args, **kwargs):
                 seen.setdefault(label, []).append(ledger_is_free(self.root))
-                return real(*args, **kwargs)
+                start = time.perf_counter()
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    holds.setdefault(label, []).append(time.perf_counter() - start)
             return wrapped
         self.ingest()
         transport, _ = self._transport()
         with patch.object(events, "append", watch("review", events.append)), \
                 patch.object(standing_publication, "write_manifest",
                              watch("manifest", standing_publication.write_manifest)):
-            report = self._qualify(transport)
-        self.assertTrue(report["counts"]["qualified"] if "qualified" in report["counts"] else report["entries"])
-        self.assertTrue(seen["review"])
-        self.assertEqual(set(seen["review"]), {True})    # a model-free stage no longer queues the ledger
-        self.assertTrue(seen["manifest"])
-        self.assertEqual(set(seen["manifest"]), {False})  # the manifest append still excludes other writers
+            self._qualify(transport)
+        for label in ("review", "manifest"):
+            self.assertTrue(seen[label])
+            self.assertEqual(set(seen[label]), {False}, label)
+            self.assertLess(max(holds[label]), 1.0, label)  # a stub-transport hold is milliseconds, not seconds
 
 
 class LockOrder(unittest.TestCase):
