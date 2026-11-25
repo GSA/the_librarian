@@ -1686,7 +1686,7 @@ class SharedManifestTests(QualifyCase):
         self.assertEqual(paid["counts"]["selection_capacity"], {"entries": 1, "model_calls_skipped": 0})
 
     def test_a_full_manifest_holds_back_restored_selections_not_ones_it_already_serves(self):
-        first, second = self.qualify("a"), self.qualify("b")
+        first, _second = self.qualify("a"), self.qualify("b")
         a_paths = [e["rendition"] for e in first["entries"] if "rendition" in e]
         # Saved reviews whose selections are no longer in the manifest, except the last of them.
         raw = json.loads(self.manifest.read_text())
