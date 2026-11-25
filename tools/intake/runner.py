@@ -95,6 +95,9 @@ def failure_status(request, attempts, ordinal, error):
 # attempt without charging it. A lease race can at worst run an effect twice (its markers and request IDs make
 # that idempotent), never record twice: the evidence is written only while the claim is still the writer's.
 LEASE_SECONDS = 900
+# A run in native work renews its lease this often (a third of it), so a chunk whose work outlasts one lease
+# is not taken over while its owner is alive; a process that stops, or whose host dies, stops renewing.
+HEARTBEAT_SECONDS = LEASE_SECONDS / 3
 # Operations that keep the ledger lock for the whole run. ``standing-select`` writes the shared selection
 # manifest, whose writers exclude each other through the ledger lock; ``standing-publish`` and ``index-build`` must
 # see the manifest they pinned; ``standing-review`` and ``review-append`` commit review events against a pinned
@@ -199,7 +202,46 @@ def owns(c, turn, owner):
     return row is not None and (row[0], row[1], row[2]) == (owner, turn["saved"]["cycle"], turn["ordinal"])
 
 
-def begin(c, turn, intent, owner, started):
+def lease_end(started, since):
+    """The end of a lease taken now: the run's clock at ``started`` plus the time elapsed since, plus a lease.
+
+    Measured from the claim, not from the start of the run, whatever the injected clock is (a long preparation
+    must not use up the lease before it exists).
+    """
+    return started + (time.monotonic() - since) + LEASE_SECONDS
+
+
+@contextmanager
+def heartbeat(root, turns, owner, started, since):
+    """Renew the claims of ``turns`` every ``HEARTBEAT_SECONDS`` while the block runs (their native work).
+
+    A renewal only extends a claim that is still this owner's, so it never resurrects a settled or taken-over
+    one, and a ledger that is busy or unavailable skips that beat (the lease is three beats long).
+    """
+    turns = [turn for turn in turns if turn["claimed"]]
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(HEARTBEAT_SECONDS):
+            try:
+                with store.locked(root, wait=5) as c, c:
+                    for turn in turns:
+                        c.execute("UPDATE claims SET lease_until=? WHERE correlation_id=? AND stage_id=? AND owner=?",
+                                  (lease_end(started, since), turn["correlation_id"], turn["stage_id"], owner))
+            except Exception:  # noqa: BLE001 - a missed beat is covered by the rest of the lease
+                pass
+    thread = threading.Thread(target=beat, name="intake-claim-heartbeat", daemon=True)
+    if turns:
+        thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        if turns:
+            thread.join()
+
+
+def begin(c, turn, intent, owner, started, since):
     """Save the new ``intent``, record the attempt as running and take the claim in one commit (the intent is
     written first, so it is durable whenever the attempt is). The caller's transaction commits it."""
     if intent is not None:
@@ -213,7 +255,7 @@ def begin(c, turn, intent, owner, started):
     if turn["claimed"]:
         c.execute("INSERT OR REPLACE INTO claims VALUES (?,?,?,?,?,?)",
                   (turn["correlation_id"], turn["stage_id"], turn["saved"]["cycle"], turn["ordinal"],
-                   owner, started + LEASE_SECONDS))
+                   owner, lease_end(started, since)))
 
 
 def record_failure(c, turn, error, started, ended):
@@ -257,6 +299,27 @@ def release(root, turns, owner):
         pass
 
 
+def pinned_policy(root, turn):
+    """The failure when the instance policy is no longer the request's, else ``None``."""
+    try:
+        require(policy.for_root(root)[1] == turn["request"]["policy"]["sha256"], "policy_changed")
+    except NATIVE_ERRORS as error:
+        return error
+    return None
+
+
+def reconcile(root, turn, intent, error, prepared_unpinned):
+    """``(intent, error)`` to run under after the second look.
+
+    A run that prepared because no intent was saved may find, under the lock, that another run pinned one meanwhile:
+    that saved intent decides (the stage runs under what is pinned, never under a rival preparation), the
+    preparation's own failure is moot, and the policy is checked again.
+    """
+    if prepared_unpinned and turn["saved"]["intent"]:
+        return decode(turn["saved"]["intent"].encode()), pinned_policy(root, turn)
+    return intent, error
+
+
 def guarded(root, turn):
     """``(intent, error)``: the stage's pinned intent (saved, else freshly prepared) or the failure that refused it."""
     try:
@@ -270,7 +333,7 @@ def guarded(root, turn):
 def run(root, correlation_id, stage_id, *, now=None, clock=None):
     # Explicit now retains the fixed-time interface used by existing callers.
     clock = clock if clock is not None else time.time if now is None else lambda: now
-    started, owner = clock(), owner_id()
+    started, since, owner = clock(), time.monotonic(), owner_id()
     with running(owner), ExitStack() as stack:
         c = stack.enter_context(store.locked(root))
         turn, reason = look(c, correlation_id, stage_id, started, owner)
@@ -279,7 +342,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             return store.summary(c, correlation_id)
         if turn["claimed"] and not turn["saved"]["intent"]:
             # Preparing a stage reads and parses its source: do it without the ledger lock, then look again
-            # under the lock, since another process may have claimed the stage meanwhile.
+            # under the lock, since another process may have claimed or pinned the stage meanwhile.
             stack.close()
             intent, error = guarded(root, turn)
             c = stack.enter_context(store.locked(root))
@@ -287,8 +350,7 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
             if turn is None:
                 require(reason in {"settled", "held"}, reason)
                 return store.summary(c, correlation_id)
-            if turn["saved"]["intent"]:  # another process pinned it first: that intent decides
-                intent = decode(turn["saved"]["intent"].encode())
+            intent, error = reconcile(root, turn, intent, error, True)
         else:
             intent, error = guarded(root, turn)
         if error is not None:
@@ -296,13 +358,14 @@ def run(root, correlation_id, stage_id, *, now=None, clock=None):
                 record_failure(c, turn, error, started, clock())
             return store.summary(c, correlation_id)
         with c:
-            begin(c, turn, intent if turn["saved"]["intent"] is None else None, owner, started)
+            begin(c, turn, intent if turn["saved"]["intent"] is None else None, owner, started, since)
         saved = turn["saved"]
         previous = decode(saved["evidence"].encode()) if saved["evidence"] else None
         if turn["claimed"]:
             stack.close()  # the ledger lock is free during the effect
         try:
-            evidence, error = adapters.execute(store.safe(root), turn["stage"], intent, previous), None
+            with heartbeat(root, [turn], owner, started, since):
+                evidence, error = adapters.execute(store.safe(root), turn["stage"], intent, previous), None
         except NATIVE_ERRORS as failure:
             evidence, error = None, failure
         except BaseException:
@@ -335,14 +398,14 @@ def run_batch(root, items, *, clock=None):
     marker and its evidence is recorded without a second write.
     """
     clock = clock if clock is not None else time.time
-    started, owner = clock(), owner_id()
+    started, since, owner = clock(), time.monotonic(), owner_id()
     with running(owner):
         with store.locked(root) as c:
             live = []
             for correlation_id, stage_id in items:
                 turn, _ = look(c, correlation_id, stage_id, started, owner)
                 if turn is not None:
-                    turn.update(error=None, intent=None, recorded=False)
+                    turn.update(error=None, intent=None, recorded=False, unpinned=not turn["saved"]["intent"])
                     live.append(turn)
             operations = {turn["stage"]["operation"] for turn in live}
             require(len(operations) <= 1 and not operations & LOCKED_OPERATIONS, "unsupported_batch")
@@ -356,22 +419,24 @@ def run_batch(root, items, *, clock=None):
                 for turn in live:
                     again, _ = look(c, turn["correlation_id"], turn["stage_id"], started, owner)
                     if again is not None:  # not claimed by another process since the first look
-                        again.update(error=turn["error"], intent=turn["intent"], recorded=False)
+                        intent, error = reconcile(root, again, turn["intent"], turn["error"], turn["unpinned"])
+                        again.update(error=error, intent=intent, recorded=False)
                         current.append(again)
                 live = current
                 with c:
                     for turn in live:
                         if turn["error"] is not None:
-                            record_failure(c, turn, turn["error"], started, started)
+                            record_failure(c, turn, turn["error"], started, clock())
                             turn["recorded"] = True
                         else:
-                            begin(c, turn, turn["intent"] if turn["saved"]["intent"] is None else None, owner, started)
+                            begin(c, turn, turn["intent"] if turn["saved"]["intent"] is None else None, owner, started, since)
             ready = [turn for turn in live if turn["error"] is None]
             if ready:
                 try:
-                    outcomes = adapters.execute_batch(store.safe(root), [
-                        (turn["stage"], turn["intent"], decode(turn["saved"]["evidence"].encode()) if turn["saved"]["evidence"] else None)
-                        for turn in ready])
+                    with heartbeat(root, ready, owner, started, since):
+                        outcomes = adapters.execute_batch(store.safe(root), [
+                            (turn["stage"], turn["intent"], decode(turn["saved"]["evidence"].encode()) if turn["saved"]["evidence"] else None)
+                            for turn in ready])
                 except BaseException:
                     release(root, ready, owner)
                     raise

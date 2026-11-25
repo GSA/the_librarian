@@ -196,6 +196,114 @@ class LiveClaims(Stage):
         self.assertEqual((stage["status"], stage["attempts"][0]["outcome"]), ("return-pending", "return-pending"))
 
 
+class ReviewFixes(Stage):
+    """Findings of the one review of this change (job 971): backoff timing, lease timing, heartbeat, intent reconciliation."""
+
+    def test_a_chunk_whose_preparation_fails_after_a_long_time_still_backs_off_from_the_failure(self):
+        store.stage(self.root, request("req-b", policy=POLICY))
+        times = iter([0, 100, 100, 100, 100])
+        clock = lambda: next(times, 100)
+        failure = adapters.StageFailure("retryable", "busy")
+
+        def prepare(root, stage):
+            raise failure
+        with patch.object(adapters, "prepare", prepare):
+            runner.run_batch(self.root, [("req-one", "delivery")], clock=clock)
+        attempt = self.stage_row()["attempts"][0]
+        self.assertEqual((attempt["ended"], attempt["eligible_at"]), (100, 105))  # from the failure, not from the start
+        with patch.object(adapters, "prepare", lambda root, stage: {"pinned": "original"}), \
+                patch.object(adapters, "execute_batch", lambda root, entries: [{"boundary": "return-pending"} for _ in entries]):
+            again = runner.run_batch(self.root, [("req-one", "delivery")], clock=lambda: 101)
+        self.assertEqual(len(again["req-one"]["stages"][0]["attempts"]), 1)  # still in backoff: not retried
+        self.assertEqual(again["req-one"]["stages"][0]["status"], "retryable")
+
+    def test_the_lease_runs_from_the_claim_not_from_the_start_of_a_slow_preparation(self):
+        seen = []
+
+        def slow_prepare(root, stage):
+            time.sleep(1.2)
+            return {"pinned": "original"}
+
+        def execute_batch(root, entries):
+            seen.append(self.claims()[0][1])
+            return [{"boundary": "return-pending"} for _ in entries]
+        with patch.object(runner, "LEASE_SECONDS", 1), patch.object(adapters, "prepare", slow_prepare), \
+                patch.object(adapters, "execute_batch", execute_batch):
+            runner.run_batch(self.root, [("req-one", "delivery")], clock=lambda: 0)
+        self.assertGreaterEqual(seen[0], 2.1)  # 1.2 s of preparation plus a full 1 s lease, not 1 s from the start
+
+    def test_a_run_in_native_work_renews_its_lease_so_a_long_chunk_is_not_taken_over(self):
+        gate = self.gate(1)
+        with patch.object(runner, "LEASE_SECONDS", 1), patch.object(runner, "HEARTBEAT_SECONDS", 0.1), self.patched():
+            worker = self.start(clock=lambda: 0)
+            self.assertTrue(gate["entered"].wait(30))
+            first = self.claims()[0][1]
+            deadline = time.monotonic() + 10
+            while self.claims()[0][1] <= first and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertGreater(self.claims()[0][1], first)
+            gate["release"].set()
+            worker.join(30)
+        self.assertEqual(self.errors, [])
+        self.assertEqual(self.claims(), [])  # the renewal ends with the run and never resurrects a claim
+
+    def test_a_stage_another_run_pinned_meanwhile_runs_under_that_intent_not_a_stale_preparation(self):
+        efforts, intents = [], []
+
+        def prepare(root, stage):
+            if not efforts:
+                efforts.append(1)
+                with patch.object(adapters, "prepare", lambda r, s: {"pinned": "other"}), \
+                        patch.object(adapters, "execute", side_effect=adapters.StageFailure("retryable", "busy")):
+                    runner.run(self.root, "req-one", "delivery", clock=lambda: 0)  # pins its intent, then fails
+                return {"pinned": "mine"}
+            return {"pinned": "unexpected"}
+
+        def execute(root, stage, intent, previous):
+            intents.append(intent)
+            return {"boundary": "return-pending"}
+        with patch.object(adapters, "prepare", prepare), patch.object(adapters, "execute", execute):
+            runner.run(self.root, "req-one", "delivery", clock=lambda: 100)
+        self.assertEqual(intents, [{"pinned": "other"}])
+        stage = self.stage_row()
+        self.assertEqual((stage["status"], len(stage["attempts"])), ("return-pending", 2))
+
+    def test_a_preparation_failure_that_another_run_made_moot_does_not_fail_the_stage(self):
+        efforts = []
+
+        def prepare(root, stage):
+            if not efforts:
+                efforts.append(1)
+                with patch.object(adapters, "prepare", lambda r, s: {"pinned": "other"}), \
+                        patch.object(adapters, "execute", side_effect=adapters.StageFailure("retryable", "busy")):
+                    runner.run(self.root, "req-one", "delivery", clock=lambda: 0)
+                raise adapters.StageFailure("permanent", "stale-preparation")
+            return {"pinned": "unexpected"}
+        with patch.object(adapters, "prepare", prepare), patch.object(adapters, "execute", self.effect):
+            runner.run(self.root, "req-one", "delivery", clock=lambda: 100)
+        self.assertEqual(self.stage_row()["status"], "return-pending")
+        self.assertEqual(self.calls, [1])
+
+    def test_a_chunk_runs_a_stage_another_run_pinned_meanwhile_under_that_intent(self):
+        intents, efforts = [], []
+
+        def prepare(root, stage):
+            if not efforts:
+                efforts.append(1)
+                with patch.object(adapters, "prepare", lambda r, s: {"pinned": "other"}), \
+                        patch.object(adapters, "execute", side_effect=adapters.StageFailure("retryable", "busy")):
+                    runner.run(self.root, "req-one", "delivery", clock=lambda: 0)
+                return {"pinned": "mine"}
+            return {"pinned": "unexpected"}
+
+        def execute_batch(root, entries):
+            intents.extend(intent for _, intent, _ in entries)
+            return [{"boundary": "return-pending"} for _ in entries]
+        with patch.object(adapters, "prepare", prepare), patch.object(adapters, "execute_batch", execute_batch):
+            runner.run_batch(self.root, [("req-one", "delivery")], clock=lambda: 100)
+        self.assertEqual(intents, [{"pinned": "other"}])
+
+
 class DeadOwners(Stage):
     def killed_run(self):
         script = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, %r)\n"

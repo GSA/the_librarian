@@ -202,6 +202,7 @@ def measure(args):
         change_counter = lambda: int.from_bytes(ledger_db.read_bytes()[24:28], "big")  # +1 per committed write
         before_revisions, before_io = revisions(), Path("/proc/self/io").read_text()
         before_commits, before_size = change_counter(), ledger_db.stat().st_size
+        holds.clear()  # only the ingest below is measured: not the warm-up read above
         sync0 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
         start, cpu = time.perf_counter(), time.process_time()
         parameters = inspect.signature(cohort.ingest).parameters
