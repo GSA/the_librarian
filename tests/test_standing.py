@@ -985,6 +985,84 @@ class StandingExtractTests(WorkspaceCase):
         self.save("config/standing-policy.json", self.policy)
         self.assertEqual(self.outcome(), ("exception", ["budget-exceeded"]))
 
+    def parts(self, *spans, decisions=None):
+        """Findings for a two-record rendition reviewed in ``spans`` (first, last) parts."""
+        decisions = decisions or ["accept"] * len(spans)
+        entries = [{"first": a, "last": b, "warnings": 1 if n == 0 else 0, "decision": d,
+                    "inspected": {"records": b - a + 1, "warnings": 1 if n == 0 else 0}}
+                   for n, ((a, b), d) in enumerate(zip(spans, decisions))]
+        return entries
+
+    def with_parts(self, entries, **changes):
+        findings = {**self.findings, "parts": entries,
+                    "inspected": {"records": ["0-1"], "warnings": ["#/payload/warnings/0"]}, **changes}
+        self.save("config/standing-findings.json", findings)
+
+    def test_parts_apply_the_record_budget_to_each_part_not_the_rendition(self):
+        self.policy["budget"]["max_records"] = 1
+        self.save("config/standing-policy.json", self.policy)
+        self.with_parts(self.parts((0, 0), (1, 1)))
+        result = standing.evaluate(self.root, self.args())
+        self.assertEqual((result["outcome"], result["reasons"]), ("qualified", ["complete-inspected-scope"]))
+        self.assertEqual(result["inspected"], {"records": 2, "warnings": 1})
+        self.assertEqual([(p["first"], p["last"]) for p in result["parts"]], [(0, 0), (1, 1)])
+
+    def test_a_part_over_the_record_budget_is_still_over_budget(self):
+        self.policy["budget"]["max_records"] = 1
+        self.save("config/standing-policy.json", self.policy)
+        self.with_parts(self.parts((0, 1), (1, 1)))
+        self.assertEqual(self.outcome(), ("exception", ["findings-mismatch"]))
+        self.with_parts(self.parts((0, 1)))
+        self.assertEqual(self.outcome(), ("exception", ["budget-exceeded"]))
+
+    def test_parts_must_cover_the_records_in_order_without_gaps_or_overlap(self):
+        for label, entries in (("gap", self.parts((0, 0))), ("overlap", self.parts((0, 1), (1, 1))),
+                               ("unordered", self.parts((1, 1), (0, 0))),
+                               ("beyond", self.parts((0, 0), (1, 2)))):
+            with self.subTest(label=label):
+                self.with_parts(entries)
+                self.assertEqual(self.outcome(), ("exception", ["findings-mismatch"]))
+
+    def test_parts_must_agree_with_the_decision_and_with_what_was_inspected(self):
+        self.with_parts(self.parts((0, 0), (1, 1), decisions=["accept", "reject"]))
+        self.assertEqual(self.outcome(), ("exception", ["findings-mismatch"]))
+        self.with_parts(self.parts((0, 0), (1, 1), decisions=["accept", "reject"]), decision="reject")
+        self.assertEqual(self.outcome(), ("rejected", ["reviewer-rejected"]))
+        broken = self.parts((0, 0), (1, 1))
+        broken[1]["inspected"]["records"] = 0
+        self.with_parts(broken)
+        self.assertEqual(self.outcome(), ("exception", ["findings-mismatch"]))
+
+    def test_a_part_that_left_a_record_uninspected_is_pending_not_filled_in(self):
+        broken = self.parts((0, 0), (1, 1))
+        broken[1]["inspected"]["records"] = 0
+        self.with_parts(broken, inspected={"records": [0], "warnings": ["#/payload/warnings/0"]})
+        self.assertEqual(self.outcome(), ("pending-review", ["insufficient-inspected-scope"]))
+
+    def test_more_parts_than_the_bound_are_refused(self):
+        entries = [{"first": 0, "last": 1, "warnings": 1, "decision": "accept",
+                    "inspected": {"records": 2, "warnings": 1}}] * (standing.MAX_PARTS + 1)
+        self.with_parts(entries)
+        self.assertEqual(self.outcome(), ("exception", ["invalid-findings"]))
+
+    def test_inspected_records_may_be_written_as_ranges(self):
+        self.save("config/standing-findings.json",
+                  {**self.findings, "inspected": {"records": ["0-1"], "warnings": ["#/payload/warnings/0"]}})
+        self.assertEqual(self.outcome(), ("qualified", ["complete-inspected-scope"]))
+        self.save("config/standing-findings.json",
+                  {**self.findings, "inspected": {"records": ["1-0"], "warnings": ["#/payload/warnings/0"]}})
+        self.assertEqual(self.outcome(), ("exception", ["invalid-findings"]))
+
+    def test_recorded_reductions_travel_to_the_result_and_must_be_well_formed(self):
+        reductions = {"count": 1, "bytes": 5000, "images": [
+            {"record": 1, "mime": "image/png", "bytes": 5000, "sha256": "a" * 64}]}
+        self.save("config/standing-findings.json", {**self.findings, "reductions": reductions})
+        result = standing.evaluate(self.root, self.args())
+        self.assertEqual(result["outcome"], "qualified")
+        self.assertEqual(result["reductions"], {"count": 1, "bytes": 5000})
+        self.save("config/standing-findings.json", {**self.findings, "reductions": {"count": "1"}})
+        self.assertEqual(self.outcome(), ("exception", ["invalid-findings"]))
+
     def test_review_select_publish_records_qualification(self):
         review = self.args()
         stage_request(self.root, [

@@ -46,6 +46,12 @@ LIMIT = 1024 * 1024
 # outcome; ``qualify-low-confidence`` (an explicit operator opt-in recorded as the ``deferred``
 # argument of the standing request) qualifies a completely inspected deferral as low confidence.
 DEFERRED_MODES = ("hold", "qualify-low-confidence")
+# A model review of a rendition too large for one call is made in contiguous parts (see
+# ``model_review.plan``); the findings record each part. ``max_records`` and ``max_pages`` of a
+# policy budget then apply to each part, and a rendition needing more than this many parts is over budget.
+MAX_PARTS = 64
+MAX_REVIEW_RECORDS = MAX_PARTS * renditions.DOCLING_MAX_RECORDS
+DECISION_ORDER = ("accept", "defer", "reject")  # least to most severe
 DOCLING_INSPECTED = frozenset({"pages", "texts", "tables", "warnings"})
 EXTRACT_INSPECTED = frozenset({"records", "warnings"})
 
@@ -211,13 +217,90 @@ def refused_scope(root, standing, rendition, rendition_sha256):
         standing["scope"], value["source"]["receipt_id"], value["source"]["audience"])
 
 
+def expand_records(items, limit):
+    """Expand ``inspected_records``: integers and inclusive ``"first-last"`` strings.
+
+    Returns the indices in the order given, or None when an item is malformed, a range runs
+    backwards, or the expansion would exceed ``limit`` indices (the rendition's record count),
+    so a hostile range cannot allocate. Overlaps and repeats surface as duplicates, which the
+    caller rejects exactly as for a plain list.
+    """
+    if not isinstance(items, list):
+        return None
+    out = []
+    for item in items:
+        if type(item) is int:
+            out.append(item)
+            continue
+        found = re.fullmatch(r"\s*([0-9]{1,9})\s*-\s*([0-9]{1,9})\s*", item) if isinstance(item, str) else None
+        if not found:
+            return None
+        first, last = int(found[1]), int(found[2])
+        if last < first or last - first + 1 > limit or len(out) + last - first + 1 > limit:
+            return None
+        out.extend(range(first, last + 1))
+    return out if len(out) <= limit else None
+
+
+def compress_records(indices):
+    """``indices`` (distinct integers) as ascending runs: a lone index, or a ``"first-last"`` string."""
+    out, run = [], None
+    for i in sorted(indices):
+        if run is not None and i == run[1] + 1:
+            run[1] = i
+            continue
+        if run is not None:
+            out.append(run[0] if run[0] == run[1] else f"{run[0]}-{run[1]}")
+        run = [i, i]
+    if run is not None:
+        out.append(run[0] if run[0] == run[1] else f"{run[0]}-{run[1]}")
+    return out
+
+
 def _inspected_valid(inspected):
-    return (isinstance(inspected, dict) and set(inspected) in (DOCLING_INSPECTED, EXTRACT_INSPECTED)
-            and all(isinstance(inspected[k], list) and len(inspected[k]) <= renditions.DOCLING_MAX_RECORDS
+    if not (isinstance(inspected, dict) and set(inspected) in (DOCLING_INSPECTED, EXTRACT_INSPECTED)):
+        return False
+    records = inspected.get("records")
+    # Records may be written as ranges (a part-reviewed rendition lists tens of thousands); every
+    # other list is bounded as before.
+    expanded = expand_records(records, MAX_REVIEW_RECORDS) if records is not None else []
+    return (expanded is not None and len(set(expanded)) == len(expanded)
+            and all(isinstance(inspected[k], list) and (k == "records" and len(records) <= MAX_REVIEW_RECORDS
+                                                        or len(inspected[k]) <= renditions.DOCLING_MAX_RECORDS)
                     for k in inspected)
-            and all(type(p) is int for k in ("pages", "records") for p in inspected.get(k, []))
+            and all(type(p) is int for p in inspected.get("pages", []))
             and all(isinstance(r, str) for k in ("texts", "tables", "warnings")
                     for r in inspected.get(k, [])))
+
+
+def _count(value, limit=1 << 40):
+    return type(value) is int and 0 <= value <= limit
+
+
+def _parts_valid(parts):
+    return (isinstance(parts, list) and 0 < len(parts) <= MAX_PARTS
+            and all(isinstance(p, dict) and set(p) == {"first", "last", "warnings", "decision", "inspected"}
+                    and _count(p["first"]) and _count(p["last"]) and _count(p["warnings"])
+                    and p["last"] >= p["first"] and p["decision"] in DECISION_ORDER
+                    and isinstance(p["inspected"], dict) and set(p["inspected"]) == {"records", "warnings"}
+                    and _count(p["inspected"]["records"]) and _count(p["inspected"]["warnings"])
+                    for p in parts))
+
+
+def _reductions_valid(value):
+    keys = {"count", "bytes", "images"}
+    return (isinstance(value, dict) and keys <= set(value) <= keys | {"more"}
+            and _count(value["count"]) and _count(value["bytes"]) and _count(value.get("more", 0))
+            and isinstance(value["images"], list) and len(value["images"]) <= 20
+            and all(isinstance(i, dict) and set(i) == {"record", "mime", "bytes", "sha256"}
+                    and _count(i["record"]) and _count(i["bytes"]) and _text(i["mime"], 200)
+                    and isinstance(i["sha256"], str) and re.fullmatch(r"[a-f0-9]{64}", i["sha256"])
+                    for i in value["images"]))
+
+
+# Present only when a review needed them: ``parts`` (one entry per contiguous part of a rendition
+# reviewed in parts) and ``reductions`` (inline data replaced by placeholders in the review prompt).
+OPTIONAL_FINDINGS = frozenset({"parts", "reductions"})
 
 
 def _findings_valid(value):
@@ -226,9 +309,11 @@ def _findings_valid(value):
             "schema", "policy", "rendition", "rendition_sha256", "reviewer", "decision",
             "inspected", "explanation", "contradictions", "missing_evidence",
             "correction_of", "new_mapping", "exception_resolution"}
-            | FINDINGS_SCHEMAS[value["schema"]]):
+            | FINDINGS_SCHEMAS[value["schema"]] | (set(value) & OPTIONAL_FINDINGS)):
         return False
-    return (_texts(value.get("unverifiable_references", []))
+    return (("parts" not in value or _parts_valid(value["parts"]))
+            and ("reductions" not in value or _reductions_valid(value["reductions"]))
+            and _texts(value.get("unverifiable_references", []))
             and _texts(value.get("embedded_instructions", []))
             and type(value.get("sparse", False)) is bool
             and isinstance(value["policy"], dict) and set(value["policy"]) == {"policy_id", "version"}
@@ -482,12 +567,49 @@ def _conflicting(snapshot, standing, qualified, result, args):
                and not standing_events.matches(e, candidate, args) for e in same)
 
 
+def inspected_sets(inspected):
+    """``inspected`` with its ``records`` expanded from ranges, every list sorted."""
+    return {key: sorted(expand_records(items, MAX_REVIEW_RECORDS) if key == "records" else items)
+            for key, items in inspected.items()}
+
+
+def _parts_failure(findings, value, expected, budget):
+    """The exception code when the parts of a part-reviewed rendition do not add up, else None.
+
+    Parts must be contiguous and cover the rendition's records exactly once, in order; all warnings
+    belong to the first part; each part is within the policy's per-review record and page budget; each
+    part's inspected counts must equal what the findings list inside its range; and the document's
+    decision must be the strictest part decision (``reject``, then ``defer``, then ``accept``).
+    """
+    parts, total = findings["parts"], len(expected["records"])
+    if parts[0]["first"] != 0 or parts[-1]["last"] != total - 1 or any(
+            b["first"] != a["last"] + 1 for a, b in zip(parts, parts[1:])):
+        return "findings-mismatch"
+    if parts[0]["warnings"] != len(expected["warnings"]) or any(p["warnings"] for p in parts[1:]):
+        return "findings-mismatch"
+    inspected = inspected_sets(findings["inspected"])
+    records, listed = set(inspected["records"]), set(inspected["warnings"])
+    lines = value["payload"][EXTRACT_FORMATS[value["payload"]["format"]]]
+    paged = value["payload"]["format"] in renditions.PAGE_LINE_FORMATS
+    for n, part in enumerate(parts):
+        span = range(part["first"], part["last"] + 1)
+        if len(span) > budget["max_records"]:
+            return "budget-exceeded"
+        if paged and len({lines[i]["page"] for i in span}) > budget["max_pages"]:
+            return "budget-exceeded"
+        if (part["inspected"]["records"] != sum(i in records for i in span)
+                or part["inspected"]["warnings"] != (len(listed) if n == 0 else 0)):
+            return "findings-mismatch"
+    worst = max((p["decision"] for p in parts), key=DECISION_ORDER.index)
+    return None if findings["decision"] == worst else "findings-mismatch"
+
+
 def _decision(findings, expected, deferred):
     if findings["decision"] == "reject":
         return "rejected", ("reviewer-rejected",)
     if findings["decision"] == "defer" and deferred == "hold":
         return "deferred", ("reviewer-deferred",)
-    inspected = {key: sorted(findings["inspected"][key]) for key in expected}
+    inspected = {key: items for key, items in inspected_sets(findings["inspected"]).items() if key in expected}
     if inspected != expected:
         return "pending-review", ("insufficient-inspected-scope",)
     if findings["decision"] == "defer":
@@ -553,8 +675,16 @@ def evaluate(root, args, snapshot=None):
     if set(findings["inspected"]) != set(expected):
         return outcome("exception", "findings-mismatch")
     result["inspected"] = {key: len(items) for key, items in expected.items()}
-    if pages > standing["budget"]["max_pages"] or len(records) > standing["budget"]["max_records"]:
+    if "parts" in findings:
+        failure = "findings-mismatch" if "records" not in expected else _parts_failure(findings, value, expected, standing["budget"])
+        if failure:
+            return outcome("exception", failure)
+        result["parts"] = [{k: p[k] for k in ("first", "last", "warnings", "decision")}
+                           for p in findings["parts"]]
+    elif pages > standing["budget"]["max_pages"] or len(records) > standing["budget"]["max_records"]:
         return outcome("exception", "budget-exceeded")
+    if "reductions" in findings:
+        result["reductions"] = {k: findings["reductions"][k] for k in ("count", "bytes")}
     if findings["correction_of"] is not None or findings["new_mapping"]:
         return outcome("pending-review", "independent-review-required")
     snapshot = _snapshot(root, snapshot)
