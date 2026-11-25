@@ -799,10 +799,26 @@ capped at 60 s and all waits within 600 s; other HTTP errors and invalid replies
 fail at once and the rendition stays `pending-review`.
 
 `python -m tools.intake.model_review evaluate --root ROOT --models-config FILE
---model M ... --rendition PATH ... [--controls]` scores candidate models on a
-sample (complete inspections, failed replies, decisions, token usage, time, and
-whether a synthetic garbled/injection control was rejected) and prints a
-body-free report with the selected model and rule. `estimate()` extrapolates
+--model M ... --rendition PATH ... [--controls] [--criteria standing-review-v1|-v2]
+[--policy PATH] [--per-rendition] [--concurrency N] [--max-output-tokens N]` scores
+candidate models on a sample (complete inspections, failed replies, decisions, token usage,
+time, and whether a synthetic garbled/injection control was rejected) and prints a
+body-free report with the selected model and rule. The report names the `criteria` it scored
+under. `--criteria` picks the review prompt; by default it is the criteria of the standing
+policy named by `--policy` (a file below ROOT, loaded like `qualify` does), else the newest
+(`standing-review-v2`); `standing-review-v1` stays selectable to compare prompts. Score a model
+under the criteria its instance's policy pins, or the numbers do not predict `qualify`.
+`--per-rendition` adds `renditions`: one entry per `--rendition`, in argument order, with
+`index`, `receipt_id`, `rendition_sha256` and, per model, `decision` (null when no valid
+reply), `status`, `complete` and `usage`; it carries no titles, file names, text or
+explanations, so a caller can join the receipt ids to its own strata and compute agreement.
+Without it the output keeps the aggregate shape. `--concurrency N` (default 1, serial) runs
+model calls on a bounded pool through the adaptive limiter that `qualify` uses: HTTP 429/503
+halve the limit (see `throughput` in the report) on top of the transport's own retries, and
+results are folded in argument order, so the report is the same as a serial run's apart from
+timing. `--max-output-tokens N` sends `max_tokens` with each request (`usai_transport(...,
+max_tokens=N)`); unset, the request is unchanged. Raise it when replies end at exactly the
+default completion limit: truncated JSON is counted as `invalid-reply`. `estimate()` extrapolates
 sample token usage to the admitted count and bytes. Record the chosen model,
 rationale and estimate privately before any bulk review (and a budget ceiling, if
 the owner sets one), and actual usage after it.

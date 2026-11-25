@@ -639,7 +639,13 @@ restated here.
   findings, events, ledger and manifest across adaptive/fixed and list/ranges against a counting
   stub; restart with zero calls), `tests/test_model_review.py::RangeFindingsTests`.
 - **Model choice and cost** are the operator's. `model_review.evaluate` scores
-  candidate models on a sample and `estimate()` extrapolates token use; nothing in
+  candidate models on a sample under a chosen `--criteria` (default: the `--policy`
+  file's, else the newest), optionally with body-free per-rendition decisions,
+  bounded `--concurrency` (adaptive limiter, deterministic order) and
+  `--max-output-tokens`
+  (`tests/test_model_review.py::EvaluationOptionTests`, `EvaluateCommandTests`,
+  `RetryTests::test_max_tokens_is_sent_only_when_configured`), and `estimate()`
+  extrapolates token use; nothing in
   the code requires an approved budget ceiling and the current instance runs
   without one. (An earlier record said a ceiling was required before bulk review;
   the owner decided otherwise and the code never enforced it.)
