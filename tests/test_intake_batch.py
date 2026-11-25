@@ -534,6 +534,10 @@ elif point == "after-requests-staged":    # a chunk's requests are one commit; k
     wrap(store, "stage_many", after=hit)
 elif point == "before-native-work":       # intents and running attempts committed, the effect not yet run
     wrap(adapters, "execute_batch", before=lambda kwargs: hit())
+elif point == "before-single-effect":     # a one-document run: intent, attempt and claim committed, the ledger lock released
+    wrap(adapters, "execute", before=lambda kwargs: hit())
+elif point == "after-single-effect":      # the effect ran with no ledger lock; its evidence is not recorded
+    wrap(adapters, "execute", after=hit)
 elif point == "after-ledger-update":      # everything of this batch is durable
     wrap(runner, "run_batch", after=hit)
 elif point == "between-ledger-members":   # inside the ledger transaction that records the evidence
@@ -636,6 +640,21 @@ class CrashInjection(unittest.TestCase):
         for point, nth in POINTS:
             with self.subTest(point=point, nth=nth):
                 self.assert_completed_once(*self.crash(point, nth))
+
+    def test_a_kill_in_a_one_document_run_with_the_ledger_lock_released_is_completed_uncharged(self):
+        for point in ("before-single-effect", "after-single-effect"):
+            for nth in (1, 2, 3):
+                with self.subTest(point=point, nth=nth):
+                    root, inbox = self.crash(point, nth, size=1)
+                    with closing(sqlite3.connect(store.locations(root)[2])) as c:
+                        unfinished = c.execute("SELECT count(*) FROM attempts WHERE outcome IS NULL").fetchone()[0]
+                        claimed = c.execute("SELECT count(*) FROM claims").fetchone()[0]
+                    self.assertEqual((unfinished, claimed), (1, 1))  # the dead process's attempt and claim remain
+                    self.assert_completed_once(root, inbox)
+                    with closing(sqlite3.connect(store.locations(root)[2])) as c:
+                        self.assertEqual(c.execute("SELECT count(*) FROM claims").fetchone()[0], 0)
+                        self.assertEqual(c.execute("SELECT max(ordinal) FROM attempts").fetchone()[0], 1)  # none charged
+                        self.assertEqual(c.execute("SELECT count(*) FROM attempts WHERE outcome IS NULL").fetchone()[0], 0)
 
     def test_a_rerun_with_a_different_batch_size_also_completes(self):
         root, inbox = self.crash("after-catalog-commit", 1)
