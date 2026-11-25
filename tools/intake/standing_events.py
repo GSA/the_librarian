@@ -69,11 +69,11 @@ def _fit(items, room, findings_sha256):
 def _parts(result):
     """One statement saying the rendition was reviewed in parts, and what each part covered."""
     parts = result.get("parts")
-    if not parts or len(parts) < 2:
+    if not parts:
         return []
     each = "; ".join(f"part {n}: records {p['first']}-{p['last']}, {p['warnings']} warnings, {p['decision']}"
                      for n, p in enumerate(parts, 1))
-    return [confidence.PARTS_PREFIX + f"{len(parts)} parts, each inspected separately and combined "
+    return [confidence.PARTS_PREFIX + f"{len(parts)} part{'s' * (len(parts) != 1)}, each inspected separately and combined "
             f"by the strictest decision; consistency across parts was not checked. {each} "
             f"(findings sha256 {result['findings_sha256']})."]
 

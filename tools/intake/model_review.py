@@ -120,7 +120,6 @@ continues in a later part is not missing evidence, and the number of records sho
 this part, not of the whole rendition."""
 
 
-PART_MARGIN = 600  # room for a part note, whose digits are not known while the parts are cut
 FORMS = ("list", "ranges")
 CONTROL = {"format": "text", "records": [
     {"i": 0, "text": "Lorem ipsum dolor sit amet ~~~ 0x00 0x00 ### %%% ??? \u00ff\u00fe"},
@@ -246,9 +245,12 @@ def _cut(value, shown, warnings, inspected_form, criteria, notes, max_prompt_cha
     fixed = len(_task(_body(value, [], []), value, inspected_form, criteria, notes)["messages"][0]["content"])
     empty = len(json.dumps(_body(value, [], []), ensure_ascii=False))
     first_extra = len(json.dumps(_body(value, [], warnings), ensure_ascii=False)) - empty
+    # The part note's digits are not known while the parts are cut: reserve its widest form (the
+    # last part number of the most parts, the widest record numbers), so a part never outgrows its cap.
+    reserve = len(part_note(standing.MAX_PARTS, standing.MAX_PARTS, len(shown), len(shown)))
     cuts, start = [], 0
     while start < len(shown):
-        size = fixed + PART_MARGIN + empty + (first_extra if not cuts else 0)
+        size = fixed + reserve + empty + (first_extra if not cuts else 0)
         end, seen = start, set()
         while end < len(shown):
             page = records[end]["page"] if paged else None
@@ -349,7 +351,7 @@ def _combine(results, tasks, reductions):
     ``sparse`` holds only when every part is sparse. A single-part review is exactly its reply.
     """
     parsed = [r["parsed"] for r in results]
-    if len(parsed) == 1:
+    if len(parsed) == 1 and "part" not in tasks[0]:
         merged = {**parsed[0], "records": parsed[0]["records"]}
         parts = None
     else:
@@ -364,7 +366,7 @@ def _combine(results, tasks, reductions):
         merged = {"decision": max((p["decision"] for p in parsed), key=standing.DECISION_ORDER.index),
                   "records": sorted(i for p in parsed for i in p["records"]),
                   "warnings": sorted(w for p in parsed for w in p["warnings"]),
-                  "explanation": f"Reviewed in {count} parts. {explanation}"[:2000],
+                  "explanation": f"Reviewed in {count} part{'s' * (count != 1)}. {explanation}"[:2000],
                   **{key: union(key) for key in ("contradictions", "missing_evidence",
                                                  "unverifiable_references", "embedded_instructions")},
                   "sparse": all(p["sparse"] for p in parsed)}

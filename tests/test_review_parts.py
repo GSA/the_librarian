@@ -159,6 +159,50 @@ class PlanCommandTests(PartsCase):
         self.assertEqual(sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*")), before)
 
 
+class BlankPagesTests(PartsCase):
+    """A PDF whose page inventory exceeds the page budget but whose text sits on fewer pages."""
+
+    def setUp(self):
+        super().setUp()
+        path = self.root / self.rendition
+        value = json.loads(path.read_text())
+        payload = value["payload"]
+        payload["format"] = "pdf-text"
+        payload["lines"] = [{"line": n + 1, "page": 1, "text": line["text"]}
+                            for n, line in enumerate(payload["lines"][:3])]
+        payload["pages"] = [{"page": n} for n in (1, 2, 3)]
+        path.write_text(json.dumps(value))
+
+    def test_a_single_part_cut_for_the_page_budget_is_recorded_as_a_part_so_it_can_qualify(self):
+        planned = model_review.plan(self.root, self.rendition, max_pages=1)
+        self.assertEqual((len(planned["tasks"]), planned["parted"]), (1, True))
+        transport = Transport()
+        self.policy["budget"]["max_pages"] = 1
+        result = model_review.review(self.root, self.rendition, self.policy, "model-a", transport)
+        findings = self.findings(result)
+        self.assertEqual(len(findings["parts"]), 1)
+        # The same part check ``standing.evaluate`` applies: one part of three inventory pages, budget one.
+        value = json.loads((self.root / self.rendition).read_text())
+        expected = {"records": list(range(3)), "warnings": ["#/payload/warnings/0"]}
+        self.assertIsNone(standing._parts_failure(findings, value, expected, self.policy["budget"]))
+        self.assertEqual(findings["inspected"]["records"], ["0-2"])
+
+
+class PartBoundaryTests(PartsCase):
+    SOURCE = b"short line\n" + b"y" * 6000 + b"\nanother short line\n"
+
+    def test_a_record_is_too_large_only_when_its_own_part_prompt_exceeds_the_cap(self):
+        def status(cap):
+            return model_review.plan(self.root, self.rendition, max_prompt_chars=cap)["status"]
+        lowest = next(cap for cap in range(6000, 20000) if status(cap) is None)
+        tasks = model_review.plan(self.root, self.rendition, max_prompt_chars=lowest)["tasks"]
+        real = max(sum(len(m["content"]) for m in t["messages"]) for t in tasks)
+        self.assertLessEqual(real, lowest)
+        # The reserve for the part note is its widest form, a few digits, not a fixed block.
+        self.assertLessEqual(lowest - real, 12)
+        self.assertEqual(status(lowest - 1), "too-large")
+
+
 class ReviewPartsTests(PartsCase):
     def test_parts_combine_into_one_findings_record_that_qualifies(self):
         transport = Transport()
