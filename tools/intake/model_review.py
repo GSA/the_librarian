@@ -198,7 +198,7 @@ def _chars(prepared):
 
 
 def plan(root, rendition, inspected_form="list", criteria=standing.CRITERIA[0], *,
-         max_prompt_chars=MAX_PROMPT_CHARS, max_records=None, max_pages=None):
+         max_prompt_chars=None, max_records=None, max_pages=None):
     """How one rendition is reviewed: a body-free plan with the exact prompts.
 
     ``{"status", "tasks", "chars", "parted", "reductions", "rendition_sha256"}``. A rendition that fits
@@ -211,6 +211,7 @@ def plan(root, rendition, inspected_form="list", criteria=standing.CRITERIA[0], 
     the warnings, or a later record on its own, does not fit a prompt (a record is never cut), and
     ``over-budget`` when more than ``standing.MAX_PARTS`` parts would be needed; ``tasks`` is then empty.
     """
+    max_prompt_chars = MAX_PROMPT_CHARS if max_prompt_chars is None else max_prompt_chars
     raw, value, records, shown, reductions = _load(root, rendition)
     digest = hashlib.sha256(raw).hexdigest()
     payload = value["payload"]
@@ -308,8 +309,9 @@ def _usage(reply):
     return {key: int(usage.get(key) or 0) for key in ("prompt_tokens", "completion_tokens")}
 
 
-def assess(prepared, model, transport, max_prompt_chars=MAX_PROMPT_CHARS):
+def assess(prepared, model, transport, max_prompt_chars=None):
     """One model call over a prepared task; returns a body-free status plus the parsed reply."""
+    max_prompt_chars = MAX_PROMPT_CHARS if max_prompt_chars is None else max_prompt_chars
     if sum(len(m["content"]) for m in prepared["messages"]) > max_prompt_chars:
         return {"status": "too-large", "usage": _usage({})}
     try:
@@ -374,7 +376,7 @@ def _combine(results, tasks, reductions):
 
 
 def review(root, rendition, standing_policy, model, transport,
-           max_prompt_chars=MAX_PROMPT_CHARS, inspected_form="list"):
+           max_prompt_chars=None, inspected_form="list"):
     """Review one rendition with one model and record the reported findings privately.
 
     A rendition that does not fit one prompt (``max_prompt_chars``) or the policy's ``max_records``
@@ -400,8 +402,10 @@ def review(root, rendition, standing_policy, model, transport,
         if result["status"] != "reviewed":
             return {**result, "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")}}
         results.append(result)
-    result = {"status": "reviewed", "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")}}
     parsed, parts = _combine(results, planned["tasks"], planned["reductions"])
+    result = {"status": "reviewed", "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")},
+              "decision": parsed["decision"], "parts": len(planned["tasks"]),
+              "complete": all(r["complete"] for r in results)}
     raw, value = _rendition(root, rendition)
     schema = standing.CRITERIA_FINDINGS[criteria]
     records = standing.compress_records(parsed["records"]) if parts else parsed["records"]
@@ -462,7 +466,7 @@ def _score(model_results, models_seconds):
 
 
 def evaluate_models(root, renditions, models, transport, *, clock=time.monotonic,
-                    controls=False, max_prompt_chars=MAX_PROMPT_CHARS, criteria=None,
+                    controls=False, max_prompt_chars=None, criteria=None,
                     per_rendition=False, concurrency=1):
     """Score models on sample renditions (and optional controls); body-free, writes nothing.
 

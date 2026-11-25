@@ -2549,6 +2549,47 @@ class RereviewTests(QualifyCase):
             if request["correction_of"]:
                 self.assertEqual(request["correlation_id"], request["correction_of"] + "-c1")
 
+    def legacy_single_call(self):
+        """The review as it was before parts: one prompt for the whole rendition, whatever its size."""
+        real = model_review.plan
+
+        def whole(root, rendition, form="list", criteria=standing.CRITERIA[0], **limits):
+            return real(root, rendition, form, criteria)
+        return unittest.mock.patch.object(model_review, "plan", side_effect=whole)
+
+    def test_a_review_blocked_on_the_record_budget_is_re_reviewed_in_parts(self):
+        self.ingest()
+        self.write_policy(1)
+        policy = json.loads((self.root / self.POLICY).read_text())
+        policy["budget"]["max_records"] = 1
+        (self.root / self.POLICY).write_text(json.dumps(policy))
+        with self.legacy_single_call():
+            first = self._qualify(self.transport())["counts"]["qualification"]
+        held = first["exception"]
+        self.assertGreater(held, 0)  # the reviews of the longer documents ended budget-exceeded
+        spent = len(self.calls)
+        dry = self.rereview()
+        self.assertEqual(dry["selected"], {"budget-exceeded": held})
+        self.assertGreater(dry["estimate"]["model_calls"], held)  # each needs several parts
+        self.assertEqual(len(self.calls), spent)
+
+        applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(applied["results"], {"qualified": held})
+        self.assertEqual(len(self.calls), spent + dry["estimate"]["model_calls"])
+        self.assertEqual(self.rereview()["selected"], {})
+        report = self._qualify(self.transport())
+        self.assertEqual(report["counts"]["qualification"].get("exception"), None)
+
+    def test_dry_run_skips_a_record_no_prompt_can_hold_and_never_cuts_it(self):
+        self._qualify(self.transport(incomplete=["Just text"]))
+        self.assertEqual(self.rereview()["selected"], {"insufficient-inspected-scope": 1})
+        spent = len(self.calls)
+        with unittest.mock.patch.object(model_review, "MAX_PROMPT_CHARS", 100):
+            dry = self.rereview()
+            applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual((dry["estimate"]["model_calls"], dry["skipped"]["too-large"]), (0, 1))
+        self.assertEqual((applied["results"], len(self.calls)), ({}, spent))
+
     def test_new_criteria_carry_qualified_reviews_and_re_review_older_rejections_as_low_confidence(self):
         from tools.context_index import context_index as index
         self.ingest()

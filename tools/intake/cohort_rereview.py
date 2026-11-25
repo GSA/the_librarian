@@ -22,12 +22,15 @@ from . import adapters, cohort_review, docs, model_review, standing, store, thro
 from .contracts import IntakeError
 
 INSUFFICIENT = "standing-pending-review-insufficient-inspected-scope"
+# A review refused on the per-review record or page budget: it was made in one call, before a
+# rendition could be reviewed in parts. Only a rendition that now needs parts is worth a new review.
+BUDGET = "standing-exception-budget-exceeded"
 UNRESOLVED = "standing-pending-review-unresolved-evidence"
 # Codes of an older-policy review that a review under the current policy can settle.
 OLDER_PENDING = frozenset({UNRESOLVED, INSUFFICIENT,
                            "standing-policy-changed"})
 REASONS = ("resume", "older-policy-pending", "older-policy-deferred", "older-policy-rejected",
-           "insufficient-inspected-scope", "current-policy-deferred")
+           "insufficient-inspected-scope", "current-policy-deferred", "budget-exceeded")
 # ``standing-<submission>-<rendition sha256[:12]>-<policy sha256[:8]>`` and its ``-c<n>`` corrections.
 NAME = re.compile(r"standing-(.+)-([0-9a-f]{12})-[0-9a-f]{8}(?:-c[0-9]+)?")
 CHARS_PER_TOKEN = 4
@@ -64,6 +67,8 @@ def _heads(c):
 def _reason(root, head, current, include_current_deferred, snapshot):
     """Why ``head`` (a blocked review) is re-reviewed, or ``(None, skip reason)``."""
     code = head["code"]
+    if code == BUDGET:
+        return "budget-exceeded", None
     if head["args"]["policy_sha256"] != current:
         if code == cohort_review.DEFERRED_HELD:
             return "older-policy-deferred", None
@@ -159,7 +164,8 @@ def _entry(head):
 
 
 def _check(root, head, standing_policy, inspected_form):
-    """The prompt size of a head's review under the current policy, or the reason no call is made."""
+    """``(model calls, prompt chars)`` of a head's review under the current policy, or the reason no
+    call is made. A rendition too large for one prompt or one budget is reviewed in parts: one call each."""
     args = head["args"]
     try:
         _, value, failure = standing._rendition(root, args, index.rendition_api(root))
@@ -171,17 +177,17 @@ def _check(root, head, standing_policy, inspected_form):
         return None, failure
     if not standing.permits(standing_policy["scope"], value["source"]["receipt_id"], value["source"]["audience"]):
         return None, "out-of-scope"
+    budget = standing_policy["budget"]
     try:
-        prepared = model_review.task(root, args["rendition"], inspected_form,
-                                     standing.criteria(standing_policy))
+        planned = model_review.plan(root, args["rendition"], inspected_form, standing.criteria(standing_policy),
+                                    max_records=budget["max_records"], max_pages=budget["max_pages"])
     except (OSError, ValueError, KeyError):
         return None, "rendition-unreadable"
-    if len(prepared["expected"]["records"]) > standing_policy["budget"]["max_records"]:
-        return None, "over-budget"
-    chars = sum(len(m["content"]) for m in prepared["messages"])
-    if chars > model_review.MAX_PROMPT_CHARS:
-        return None, "too-large"
-    return chars, None
+    if planned["status"]:
+        return None, planned["status"]
+    if head["reason"] == "budget-exceeded" and not planned["parted"]:
+        return None, "not-over-budget"  # the findings, not the rendition, were over budget
+    return (len(planned["tasks"]), planned["chars"]), None
 
 
 def _per_document(cost_estimate, model):
@@ -201,10 +207,12 @@ def plan(root, selected, skipped, standing_policy, *, limit=None, inspected_form
 
     Reads each rendition to be reviewed (never the ledger): one the current policy would not
     review (out of scope, over budget, too large for a prompt, stale) is skipped without a call.
-    ``limit`` bounds the model calls; resumed heads cost none and are always included.
+    A rendition reviewed in parts costs one call per part (``model_calls``; ``documents`` counts the
+    renditions). ``limit`` bounds the renditions reviewed, so a part-reviewed one is never started
+    and left half done; resumed heads cost none and are always included.
     """
     skipped = Counter(skipped)
-    work, chars, held = [], 0, Counter()
+    work, chars, calls, held = [], 0, 0, Counter()
     for head in selected:
         if head["reason"] != "resume":
             size, reason = _check(root, head, standing_policy, inspected_form)
@@ -214,10 +222,11 @@ def plan(root, selected, skipped, standing_policy, *, limit=None, inspected_form
             if limit is not None and sum(h["reason"] != "resume" for h in work) >= limit:
                 held[head["reason"]] += 1
                 continue
-            chars += size
+            calls += size[0]
+            chars += size[1]
         work.append(head)
-    calls = sum(h["reason"] != "resume" for h in work)
-    estimate = {"model_calls": calls, "prompt_chars": chars,
+    documents = sum(h["reason"] != "resume" for h in work)
+    estimate = {"documents": documents, "model_calls": calls, "prompt_chars": chars,
                 "prompt_tokens_approx": math.ceil(chars / CHARS_PER_TOKEN)}
     per = _per_document(cost_estimate, model)
     if per is not None:
