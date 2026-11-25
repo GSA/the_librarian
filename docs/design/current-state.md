@@ -562,6 +562,28 @@ restated here.
   `test_qualified_agent_context_is_low_confidence_and_labelled_in_search_and_get`,
   `test_classify_cli_reports_the_declared_origin_for_a_dry_run`),
   `tests/test_intake_upload.py::test_agent_declaration_may_name_its_source_repository`.
+- **Markdown renditions are searched by heading span as well as by record** (Kata q886). The
+  index stores one section per extraction record (a line of a text, converted, MHTML or page
+  rendition), and literal search needs every query word in one section, so a passage whose words
+  sit on neighbouring lines never matched. For a `converted` rendition (converter output is
+  Markdown) and a `text` rendition of a `.md`/`.markdown` original, `renditions.heading_sections`
+  adds a `rendition-heading` section per heading span: from a heading outside fenced code to the
+  next heading of any level (so spans never overlap), title the heading text, anchor
+  `heading-<first record>`, text the exact physical JSON lines of its records, and
+  `source_location` the first/last JSON pointer and original or converted line. A span over
+  `MAX_HEADING_SECTION_CHARS` (24,000 JSON characters, inside the MCP 30,000 source budget) is
+  cut into whole-record chunks; a one-record span or chunk is skipped. Line records are unchanged,
+  so citations, review inspection (`renditions.records`) and claim placement are unchanged.
+  `search` returns a passage once: a hit overlapping a better-ranked hit of the same document is
+  dropped when either is a heading span (`_without_overlaps`, fetching more rows until `limit`
+  are kept), and `low_confidence_excluded` counts a heading span containing a matching record once
+  (`_passages`). The change alters the engine fingerprint, so an existing index is rebuilt once.
+  Evidence: `tests/test_workspace.py::WorkspaceTests::test_markdown_rendition_heading_section_matches_terms_on_different_lines`,
+  `::test_heading_hit_is_not_repeated_by_its_own_line_hits`,
+  `::test_overlap_filter_keeps_nested_markdown_document_hits`,
+  `::test_low_confidence_exclusion_counts_a_heading_passage_once`,
+  `::test_plain_text_rendition_gets_no_heading_sections`,
+  `::test_long_heading_span_is_split_into_whole_record_chunks`.
 - **Only an absent registration is `unregistered-rendition`.** The standing check reads a
   receipt's registration from one catalog state. The catalog raises `MissingRecord` for an absent
   record or receipt, and only that, or a malformed receipt ID, yields the `unregistered-rendition`

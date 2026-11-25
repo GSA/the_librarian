@@ -485,7 +485,11 @@ report` summarizes it without bodies. See the
 [current-state design](docs/design/current-state.md) (observation).
 
 Agents should use `search` to find candidates, then `get` or `get_many` to read
-the cited text. A search with no hits returns an `absence` reason: the indexed
+the cited text. Every query word must occur in one indexed section: a Markdown
+heading section, one extraction record (a line of a text or converted rendition),
+or, for Markdown renditions (converter output and `.md` originals), the span of
+records under one heading, so words on nearby lines of one passage match together
+and the hit cites that span (`#heading-N`). A search with no hits returns an `absence` reason: the indexed
 documents lack the terms (`absent-corpus`), contain only some of them
 (`absent-partial`), or contain them only in separate sections
 (`present-uncombined`).
