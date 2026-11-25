@@ -585,8 +585,9 @@ restated here.
   ledger's `docs` rows: the files of the named cohorts whose submission sidecar carries
   `origin.agent_generated` are the reference, and every other ingested file whose inbox path ends
   on whole segments with a reference path is `identical` (same original SHA-256) or `similar`
-  (line-sequence ratio at least `--min-similarity`, default 0.9); a bare path tail is only counted
-  `different`, and a file carrying its own declaration is `already_declared`. It writes nothing
+  (shared lines by multiplicity, order-insensitive and linear in size, at least `--min-similarity`, default 0.9; a retained original whose bytes no longer match its recorded SHA-256 is `not_compared`); a bare path tail is only counted
+  `different`, and a file carrying its own declaration is `already_declared`. With `--manifest`, a selected receipt replaced by a newer submission of its path is examined from
+  the catalog and its pinned sidecar (`current: false`). It writes nothing
   and never changes a label, a selection or a submission. `--report` (0600) lists receipts and
   paths and is accepted by `deselect --receipts-file`, so removing the copies stays an explicit
   owner action. Carrying the `agent-generated` reason onto a copy automatically is not built:
@@ -596,6 +597,9 @@ restated here.
   `test_a_path_tail_alone_is_not_a_copy_and_counts_are_body_free`,
   `test_a_threshold_decides_what_near_identical_means`,
   `test_an_agent_origin_copy_is_not_reported_as_undeclared`,
+  `test_many_repeated_lines_are_compared_in_bounded_time`,
+  `test_a_retained_original_that_no_longer_matches_its_ledger_hash_is_not_evidence`,
+  `test_a_selected_receipt_replaced_by_a_newer_one_is_still_reported_with_a_manifest`,
   `test_the_report_marks_copies_that_are_selected_and_writes_nothing`,
   `test_the_report_feeds_deselect_as_a_receipts_file`,
   `test_cli_prints_counts_and_writes_the_private_report_with_paths`).

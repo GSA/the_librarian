@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import unittest
 
-from tools.intake import agent_copies, agent_origin, cohort, deselect, upload
+from tools.intake import agent_copies, agent_origin, cohort, deselect, store, upload
 from tools.intake.contracts import IntakeError
 from tests.test_intake_cohort import QualifyCase, tree
 
@@ -105,6 +105,40 @@ class AgentCopyReportTests(CopyCase):
         self.assertEqual(sum(e["selected"] for e in report["entries"]), 1)
         self.assertEqual(report["counts"]["selected"], 1)
         self.assertEqual(before, (tree(self.agent), tree(self.copies), path.read_bytes()))
+
+    def test_many_repeated_lines_are_compared_in_bounded_time(self):
+        repeated = b"# Template\n" + b"| row |\n" * 30000
+        write(self.agent, {"TEMPLATE/table.md": repeated})
+        write(self.copies, {"snap/TEMPLATE/table.md": repeated + b"One edit.\n"})
+        cohort.ingest(self.root, self.agent, system="agent-docs", actor="cohort-runner",
+                      origin=agent_origin.validate(ORIGIN))
+        cohort.ingest(self.root, self.copies, system="inbox-02", actor="cohort-runner")
+        found = self.by_path(self.report())["snap/TEMPLATE/table.md"]
+        self.assertEqual(found["match"], "similar")
+
+    def test_a_retained_original_that_no_longer_matches_its_ledger_hash_is_not_evidence(self):
+        entry = self.by_path(self.report())["snapshots/old/REFERENCE/meeting.md"]
+        with store.locked(self.root) as c:
+            original = c.execute("SELECT original FROM docs WHERE receipt_id=?", (entry["receipt_id"],)).fetchone()[0]
+        path = self.root / original
+        path.chmod(0o600)
+        path.write_bytes(AGENT["REFERENCE/meeting.md"])  # now looks like the agent file, but is not what was submitted
+        report = self.report()
+        self.assertNotIn("snapshots/old/REFERENCE/meeting.md", self.by_path(report))
+        self.assertEqual((report["counts"]["similar"], report["counts"]["not_compared"]), (0, 1))
+
+    def test_a_selected_receipt_replaced_by_a_newer_one_is_still_reported_with_a_manifest(self):
+        old = self.by_path(self.report())["snapshots/old/REFERENCE/meeting.md"]["receipt_id"]
+        path = self.root / "config/selection.json"
+        path.write_text(json.dumps({"renditions": [{"receipt_id": old}]}))
+        write(self.copies, {"snapshots/old/REFERENCE/meeting.md": b"# Rewritten\nNothing like the agent file.\n"})
+        cohort.ingest(self.root, self.copies, system="inbox-02", actor="cohort-runner")
+        self.assertNotIn(old, {e["receipt_id"] for e in self.report()["entries"]})
+        report = self.report(manifest=path)
+        kept = next(e for e in report["entries"] if e["receipt_id"] == old)
+        self.assertEqual((kept["inbox_path"], kept["system"], kept["match"], kept["selected"], kept["current"]),
+                         ("snapshots/old/REFERENCE/meeting.md", "inbox-02", "similar", True, False))
+        self.assertEqual(report["counts"]["selected"], 1)
 
     def test_the_report_feeds_deselect_as_a_receipts_file(self):
         report = self.report()

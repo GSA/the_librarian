@@ -9,22 +9,29 @@ ends with a reference file's inbox-relative path (whole segments; ``ARCHIVE!/MEM
 ``ARCHIVE/MEMBER``) is compared by content:
 
 * ``identical``: the same original SHA-256;
-* ``similar``: at least ``min_similarity`` (default 0.9) of the lines in common, so a snapshot that
-  predates or follows an edit is found;
+* ``similar``: at least ``min_similarity`` (default 0.9) of the lines in common (``2 * shared /
+  (lines + lines)``, counting repeated lines by multiplicity and ignoring order, so the work is linear
+  in the file size), so a snapshot that predates or follows an edit is found;
 * anything else is only counted ``different``, since a path tail alone proves nothing (many trees
   have a ``README.md``).
 
 A file that itself carries an agent declaration is counted ``already_declared`` and not reported.
 The report is read-only and decides nothing: it lists receipts, and a report written with
 ``--report`` is accepted by ``deselect --receipts-file`` once the owner has looked at it. Files over
-``COMPARE_LIMIT`` bytes are not compared by lines (``not_compared``) unless byte-identical.
+``COMPARE_LIMIT`` bytes, and retained originals that are missing or no longer match their recorded
+SHA-256, are not compared by lines (``not_compared``) unless byte-identical by the ledger's hashes.
+With ``manifest``, a selected receipt that a newer submission of the same inbox path has replaced
+(so no ``docs`` row names it) is still examined, from its catalog registration and pinned sidecar,
+because ``deselect`` can only remove what the report names.
 """
-import difflib
+from collections import Counter
 from pathlib import Path
 
 from tools.context_index import context_index as index
+from tools.catalog import catalog_store as catalog
 from . import docs, store, upload
-from .contracts import IntakeError, decode, require
+from .contracts import IntakeError, decode, digest, relative, require
+from urllib.parse import unquote
 
 SCHEMA = "librarian-agent-copies-report/1"
 MIN_SIMILARITY = 0.9
@@ -49,19 +56,21 @@ def _declared(root, original):
         return None
 
 
-def _lines(root, original):
+def _lines(root, row):
+    """The lines of ``row``'s retained original, only when its bytes are the ones the ledger recorded."""
     try:
-        raw = upload.read_file(Path(root) / original, COMPARE_LIMIT)
+        raw = upload.read_file(Path(root) / row["original"], COMPARE_LIMIT)
     except (IntakeError, OSError):
         return None
-    return raw.decode("utf-8", "replace").splitlines()
+    return Counter(raw.decode("utf-8", "replace").splitlines()) if digest(raw) == row["sha256"] else None
 
 
 def _similarity(root, agent, other):
-    first, second = _lines(root, agent["original"]), _lines(root, other["original"])
+    first, second = _lines(root, agent), _lines(root, other)
     if first is None or second is None:
         return None
-    return difflib.SequenceMatcher(None, first, second, autojunk=False).ratio()
+    total = sum(first.values()) + sum(second.values())
+    return 1.0 if total == 0 else 2 * sum((first & second).values()) / total
 
 
 def _selected(root, manifest):
@@ -72,6 +81,34 @@ def _selected(root, manifest):
         return {e["receipt_id"] for e in value.get("renditions", []) if isinstance(e, dict) and "receipt_id" in e}
     except (index.IndexError_, OSError, AttributeError) as error:
         raise IntakeError("agent_copies_manifest_invalid") from error
+
+
+def _historical(root, receipts):
+    """Rows for selected ``receipts`` no ``docs`` row names, from the catalog and each pinned sidecar."""
+    found = []
+    if not receipts:
+        return found
+    try:
+        held = catalog.receipt_metadata(root, sorted(receipts))["registrations"]
+    except (catalog.CatalogError, OSError, ValueError) as error:
+        raise IntakeError("agent_copies_catalog_unavailable") from error
+    for receipt, registration in sorted(held.items()):
+        data = registration["artifact"]["data"]
+        pinned = next((p for p in registration["receipt"]["data"]["provenance"]
+                       if p["path"].endswith("/" + upload.SIDECAR)), None)
+        try:
+            relative(data["path"])
+            body = upload.read_file(Path(root) / pinned["path"], upload.MIB)
+            require(digest(body) == pinned["sha256"])
+            origin = decode(body)["origin"]
+            require(origin["kind"] == "local-path")
+            declared = origin.get("agent_generated")
+            found.append({"system": origin["system"], "path": unquote(origin["locator"]),
+                          "sha256": data["sha256"], "receipt_id": receipt, "original": data["path"],
+                          "declared": declared is not None, "current": False})
+        except (IntakeError, OSError, KeyError, TypeError, AttributeError):
+            continue
+    return found
 
 
 def report(root, *, agent_systems, min_similarity=MIN_SIMILARITY, manifest=None):
@@ -88,8 +125,13 @@ def report(root, *, agent_systems, min_similarity=MIN_SIMILARITY, manifest=None)
         rows = [dict(r) for r in c.execute(
             "SELECT system, path, sha256, receipt_id, original FROM docs WHERE receipt_id IS NOT NULL "
             "ORDER BY system, path")]
+    for row in rows:
+        row["declared"] = _declared(root, row["original"]) is not None
+        row["current"] = True
+    if selected:
+        rows += _historical(root, selected - {r["receipt_id"] for r in rows})
     systems = set(agent_systems)
-    agents = [r for r in rows if r["system"] in systems and _declared(root, r["original"]) is not None]
+    agents = [r for r in rows if r["system"] in systems and r["declared"] and r["current"]]
     require(agents, "agent_copies_no_declared_files")
     others = [r for r in rows if r["system"] not in systems]
     by_tail = {}
@@ -105,7 +147,7 @@ def report(root, *, agent_systems, min_similarity=MIN_SIMILARITY, manifest=None)
         if not matches:
             continue
         counts["tail_matches"] += 1
-        if _declared(root, other["original"]) is not None:
+        if other["declared"]:
             counts["already_declared"] += 1
             continue
         found = None
@@ -126,7 +168,7 @@ def report(root, *, agent_systems, min_similarity=MIN_SIMILARITY, manifest=None)
         entry = {"receipt_id": other["receipt_id"], "system": other["system"], "inbox_path": other["path"],
                  "sha256": other["sha256"], "match": kind, "similarity": ratio,
                  "agent_receipt_id": agent["receipt_id"], "agent_system": agent["system"],
-                 "agent_path": agent["path"]}
+                 "agent_path": agent["path"], "current": other["current"]}
         if selected is not None:
             entry["selected"] = other["receipt_id"] in selected
         entries.append(entry)

@@ -789,12 +789,12 @@ agent-copies --root R --agent-system SYSTEM [--agent-system ...] [--min-similari
 are those of the named `--system` cohorts that were submitted with `origin.agent_generated` (a
 system with none is `agent_copies_no_declared_files`). Every other ingested file whose inbox path
 ends, on whole segments, with a reference file's inbox-relative path is compared: `identical`
-(same original SHA-256) or `similar` (at least `--min-similarity` of the lines in common, so a
-snapshot from before or after an edit is found). A path tail alone is not a copy (`different`),
+(same original SHA-256) or `similar` (at least `--min-similarity` of the lines in common, counted by multiplicity and ignoring order, so a
+snapshot from before or after an edit is found; retained originals that no longer match their recorded SHA-256 are `not_compared`, never evidence). A path tail alone is not a copy (`different`),
 and a file that itself carries a declaration is `already_declared`. Output is body-free counts
 (`agent_files`, `candidates`, `tail_matches`, `identical`, `similar`, `different`,
 `already_declared`, `not_compared`, and `selected` with `--manifest`); `--report FILE` (0600) lists
-each copy with its receipt, system, inbox path, similarity and the agent file it copies.
+each copy with its receipt, system, inbox path, similarity and the agent file it copies. With `--manifest`, a selected receipt that a newer submission of the same path has replaced is still examined (`current: false`), so `deselect` can remove it.
 Act on it by reading the report and running `deselect --receipts-file FILE --apply`, or by
 re-ingesting the copy under an `--agent-origin` file; neither is automatic.
 
