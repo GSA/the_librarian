@@ -63,6 +63,7 @@ def engine_fingerprint():
         no_symlinks(Path(__file__).with_name("qualification.py")),
         no_symlinks(Path(__file__).with_name("packets.py")),
         no_symlinks(Path(__file__).with_name("confidence.py")),
+        no_symlinks(Path(__file__).with_name("inline_data.py")),
         no_symlinks(Path(policy.__file__)),
     )))
 

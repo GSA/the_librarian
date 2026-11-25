@@ -3,12 +3,18 @@ import hashlib
 import json
 import unittest
 
+from contextlib import closing
+
+from tools.context_index import context_index as index
+from tools.context_index import packets
 from tools.extraction import extract
 from tools.catalog import catalog_store as catalog
 from tools.intake import model_review, standing, store
 from tools.review_events import event_store as events
 
 from tests.support import WorkspaceCase
+from tests.test_intake_adapters import stage, stage_request
+from tools.intake import runner
 
 CAP = 7000  # a small prompt cap so a short synthetic note is "too large"
 
@@ -227,6 +233,89 @@ class InlineDataTests(PartsCase):
         image = findings["reductions"]["images"][0]
         self.assertEqual((image["mime"], image["bytes"]), ("image/png", 40000))
         self.assertEqual(self.evaluate(result)["reductions"], {"count": 1, "bytes": 40000})
+
+
+DB = "tools/context_index/.local/index.sqlite3"
+
+
+class PublishedTests(PartsCase):
+    """What an agent sees after a part-reviewed or image-reduced rendition is published."""
+
+    SOURCE = (b"# Transition notes\n\nThe cutover decision was recorded here.\n\n![shot](" + uri(40000).encode()
+              + b")\n\nNext steps follow.\n" + b"".join(b"Filler line %03d with some words\n" % n for n in range(240)))
+
+    def publish(self, transport, cap=CAP):
+        result = model_review.review(self.root, self.rendition, self.policy, "model-a", transport,
+                                     max_prompt_chars=cap)
+        self.assertEqual(result["status"], "reviewed")
+        raw = json.dumps(self.policy).encode()
+        (self.root / "config/standing-policy.json").write_bytes(raw)
+        (self.root / "config/standing-policy.json").chmod(0o600)
+        args = {"policy_path": "config/standing-policy.json", "policy_sha256": hashlib.sha256(raw).hexdigest(),
+                "rendition": self.rendition, "rendition_sha256": self.rendition_sha,
+                "findings_path": result["findings_path"], "findings_sha256": result["findings_sha256"],
+                "event_id": "rev-parts"}
+        stage_request(self.root, [
+            stage("review", "standing-review", {**args, "request_id": "req-r"}, "review"),
+            stage("publication", "standing-select", {**args, "request_id": "req-s",
+                                                     "manifest": "config/selection.json"}, "select"),
+            stage("publication", "standing-publish", {"policy_path": args["policy_path"],
+                  "policy_sha256": args["policy_sha256"], "manifest": "config/selection.json", "db": DB},
+                  "publish")], "req-parts")
+        for name in ("review", "select", "publish"):
+            done = runner.run(self.root, "req-parts", name)
+            self.assertEqual(next(x for x in done["stages"] if x["id"] == name)["status"], "succeeded", name)
+        self.config = json.loads((self.root / "config/selection.json").read_text())
+        return result
+
+    def read(self, term):
+        with closing(index.readonly(self.root / DB)) as db:
+            hits = index.search(db, term, 10, None, root=self.root)["hits"]
+            packet = packets.packet(db, self.config, hits[0]["locator"], 2_000_000, root=self.root) if hits else None
+        return hits, packet
+
+    def test_the_review_event_and_published_scope_show_each_parts_inspection(self):
+        n = len(model_review.plan(self.root, self.rendition, max_prompt_chars=CAP)["tasks"])
+        self.assertGreater(n, 1)
+        self.publish(Transport(*[{} for _ in range(n)]))
+        hits, packet = self.read("cutover")
+        scope = packet["renditions"][self.rendition]["qualification"]["reviewed_scope"][0]
+        self.assertEqual(len(scope["parts"]), 1)
+        statement = scope["parts"][0]
+        self.assertIn(f"{n} parts", statement)
+        for number in range(1, n + 1):
+            self.assertIn(f"part {number}: records ", statement)
+        self.assertIn("inline data", scope["reductions"][0].lower())
+        self.assertIn("1 image", scope["reductions"][0])
+
+    def test_the_search_text_is_reduced_and_the_label_and_metadata_say_images_were_omitted(self):
+        self.publish(Transport(), cap=400_000)
+        self.assertEqual(self.read("QUJDQUJD")[0], [])
+        hits, packet = self.read("cutover")
+        self.assertEqual(hits[0]["confidence"], {"level": "low", "reasons": ["inline-data-reduced"]})
+        info = packet["renditions"][self.rendition]["inline_data"]
+        self.assertEqual((info["count"], info["bytes"]), (1, 40000))
+        self.assertEqual(info["images"][0]["mime"], "image/png")
+        self.assertIn("original", packet["confidence"]["reasons"]["inline-data-reduced"]["correction"])
+        # The cited text stays the exact extraction lines: the original bytes are not edited.
+        image_hits = self.read("shot")[1]
+        self.assertTrue(any("QUJDQUJD" in piece["text"] for piece in image_hits["pieces"]))
+
+
+class PlainPublishedTests(PublishedTests):
+    test_the_review_event_and_published_scope_show_each_parts_inspection = None
+    test_the_search_text_is_reduced_and_the_label_and_metadata_say_images_were_omitted = None
+
+    SOURCE = b"# Plain notes\n\nThe cutover decision was recorded here.\n"
+
+    def test_a_rendition_without_inline_data_is_normal_and_has_no_inline_metadata(self):
+        self.publish(Transport(), cap=400_000)
+        hits, packet = self.read("cutover")
+        self.assertEqual(hits[0]["confidence"], {"level": "normal", "reasons": []})
+        self.assertNotIn("inline_data", packet["renditions"][self.rendition])
+        scope = packet["renditions"][self.rendition]["qualification"]["reviewed_scope"][0]
+        self.assertNotIn("parts", scope)
+        self.assertNotIn("reductions", scope)
 
 
 if __name__ == "__main__":
