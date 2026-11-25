@@ -71,6 +71,25 @@ def pdf_image_runtime(config: Config) -> dict:
     return check
 
 
+def legacy_converter_runtime(config: Config) -> dict:
+    """Informational: whether cohort intake can convert legacy Office files (a LibreOffice and a sandbox).
+
+    An absent runtime is not a failure; those files stay ``needs-reader`` until it is provisioned.
+    """
+    check = run_check(
+        "legacy_converter_runtime",
+        module_command(config, "tools.extraction.office_runtime", "status"),
+        config, "Run python -m tools.extraction.office_runtime status and resolve its diagnostic.",
+    )
+    if check["ok"]:
+        result = check["result"]
+        check["provisioned"] = result.get("provisioned") is True
+        check["ready"] = result.get("ready") is True
+        check["action"] = result.get("action") or (
+            "Legacy .doc/.xls/.ppt/.vsd files in cohort intake are converted by the sandboxed runtime.")
+    return check
+
+
 START_ACTION = (
     "Start the server the way the client configuration does and read its stderr; after an upgrade, "
     "reinstall the adapter into the instance .venv (pip install ./tools/context-mcp) and re-run this check.")
@@ -196,6 +215,7 @@ def preflight(config: Config, *, refresh_index: bool = False, verify_start: bool
         "After maintained-context edits, run this command with --refresh-index; this refreshes only derived data.",
     ))
     checks.append(pdf_image_runtime(config))
+    checks.append(legacy_converter_runtime(config))
     if verify_start:
         checks.append(fresh_start(config, command=server_command, client_timeout=client_timeout))
     return {

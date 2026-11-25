@@ -327,8 +327,9 @@ restated here.
 - **Office and RTF documents convert to derived Markdown; disguised text is read as text (Kata
   khky).** `cohort_ingest` decides by content, not suffix. Zip packages holding `word/`, `xl/`,
   `ppt/` or `visio/` parts become `docx`/`xlsx`/`pptx`/`vsdx`, `{\rtf` becomes `rtf`, and legacy
-  compound files (`.doc`/`.xls`/`.ppt`/`.vsd`) become `office-legacy` only when `soffice` is on
-  `PATH` (otherwise `needs-reader` with `needs-converter-runtime`). Other zips, encrypted packages,
+  compound files (`.doc`/`.xls`/`.ppt`/`.vsd`) become `office-legacy` only when a sandboxed
+  LibreOffice is available (otherwise `needs-reader` with `needs-converter-runtime`, or
+  `needs-converter-sandbox` when the host has no confinement). Other zips, encrypted packages,
   bad containers and non-matching suffixes stay `needs-reader` with `unsupported-container`,
   `encrypted-document`, `container-invalid` or `suffix-mismatch`. Strict UTF-8 text under any
   other suffix (or none) is admitted as `text` and kept as `<name>.txt` (locator unchanged);
@@ -339,9 +340,19 @@ restated here.
   (address space, no file writes) and the source sha256 re-checked. The worker refuses
   DTDs/entities, unsafe, duplicate or encrypted members, zip-bomb ratios and size, element and
   depth caps, and caps output lines, sheet rows, columns and cell text, recording truncation and
-  dropped images in `fidelity`. Legacy files go through `soffice --headless --convert-to` in a
-  private profile under the extraction home first. There is no network namespace; the stdlib
-  worker opens no sockets. The rendition is a derived line rendition of the registered original
+  dropped images in `fidelity`. Legacy files go through `soffice --headless --convert-to` first, in the sandbox of
+  `tools/extraction/office_runtime.py` (Kata qr1d): the runtime is found by `LIBRARIAN_SOFFICE`, the
+  user-space install `tools/extraction/provision_libreoffice.py` makes without root (pinned URL, size
+  and SHA-256 checked before unpacking), or `soffice` on `PATH`. Each conversion has a throwaway
+  directory with a read-only verified input copy, a private profile (macros and updates off), a
+  scrubbed environment, rlimits, a 300 s wall clock and a process-group kill, and runs under
+  `bwrap` (own namespaces, no network, only the runtime, system libraries and the work directory
+  visible), else `unshare` (no network, PID namespace, host filesystem visible), else not at all
+  (`needs-converter-sandbox`) unless the operator sets `LIBRARIAN_CONVERTER_SANDBOX=none`. The
+  rendition's `conversion.runtime` records the LibreOffice version, sandbox mode and install record.
+  A hang, crash or refusal is a per-file blocked stage (`conversion-timeout`,
+  `legacy-conversion-crashed`, `legacy-conversion-failed`) that the ledger keeps, so a rerun neither
+  halts the cohort nor launches LibreOffice again. The stdlib worker opens no sockets. The rendition is a derived line rendition of the registered original
   with `payload.format: "converted"` and `payload.conversion: {source_format, via, converter,
   version, code_sha256, lock_sha256, runtime, fidelity}`; its engine identity hashes both
   converter files (and the `soffice` version for legacy input), and cohort request names carry a
@@ -351,6 +362,13 @@ restated here.
   `::CohortConversionTests::test_converted_documents_are_derived_renditions_reviewed_selected_and_retrievable`,
   `::CohortConversionTests::test_conversion_failure_stays_visible_with_its_code`,
   `::CohortConversionTests::test_legacy_binary_converts_through_soffice_when_present`,
+  `::CohortConversionTests::test_a_hung_legacy_conversion_is_a_durable_disposition_and_not_repeated`
+  (and its `crashing` and `failing` siblings),
+  `::CohortConversionTests::test_without_a_sandbox_legacy_files_wait_with_their_own_code`,
+  `tests/test_office_runtime.py::BwrapTests`, `::UnshareTests` (read-only input, private profile, no
+  network, scrubbed environment, timeout with whole-tree kill, crash and size-limit codes),
+  `::LocateTests`, `::ProvisionTests` (checksum, size, escaping members, plain HTTP refused),
+  `::RealRuntimeTests` (the pinned LibreOffice when provisioned, `libreoffice.yml`),
   `::HostileInputTests`, `::IsolatedWorkerTests::test_wall_clock_timeout_and_output_cap_kill_the_child`,
   `::IsolatedWorkerTests::test_converter_identity_changes_with_converter_code`,
   `::CohortConversionTests::test_converter_change_extracts_again_even_under_trust_stat`.

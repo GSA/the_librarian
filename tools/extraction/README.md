@@ -363,20 +363,122 @@ lines, 10,000 rows, 64 columns and 1,000 characters per sheet cell.
 - RTF: text with `\par` lines, literal and `\'hh` bytes decoded by `\ansicpg`, `\u` characters (surrogate
   pairs combined), and table cells joined
   with `|`. Hidden destinations (font tables, `\*` groups, pictures, metadata) are skipped.
-- Legacy `.doc`/`.xls`/`.ppt`/`.vsd` (`office-legacy`): converted first with
-  `soffice --headless --convert-to` (private profile, extraction home, same timeout) to
-  DOCX/XLSX/PPTX/ODG, then as above. This only happens when LibreOffice's `soffice` is on `PATH`.
-  It is not installed or required; without it the file stays `needs-reader`
-  (`needs-converter-runtime`).
+- Legacy `.doc`/`.xls`/`.ppt`/`.vsd` (`office-legacy`): converted first by a sandboxed LibreOffice to
+  DOCX/XLSX/PPTX/ODG, then as above. This needs the optional runtime described in
+  [Legacy Office conversion](#legacy-office-conversion-libreoffice); without it the file stays
+  `needs-reader` (`needs-converter-runtime`), which is a recorded disposition and not an error.
 
 `payload.conversion` records `source_format`, `via`, `converter` (`librarian-convert`), `version`,
 `code_sha256` (both converter files), `lock_sha256` (`null`), `runtime` and `fidelity`
 (`truncated`, `dropped`, `notes`). The engine identity covers the converter code and policy (and
-the `soffice` version), and cohort extraction requests carry a `-c<12 hex>` suffix of the same
+the `soffice` version and sandbox mode), and cohort extraction requests carry a `-c<12 hex>` suffix of the same
   identity (like MHTML's `-mN`), so changing either extracts again, even under `--trust-stat`. The catalogued source remains the original
 bytes. Failures are blocked stages with a code: `container-invalid`, `container-limit`,
 `unsafe-member`, `encrypted-document`, `zip-bomb`, `xml-dtd`, `xml-invalid`, `xml-limit`,
 `ooxml-invalid`, `rtf-invalid`, `conversion-empty`, `conversion-limit`, `conversion-timeout`,
-`source-changed`, `converter-runtime-failed` or `legacy-conversion-failed`. The `converted`
+`source-changed`, `converter-runtime-failed`, `legacy-conversion-failed` or `legacy-conversion-crashed`. The `converted`
 kind is labelled low confidence (`converted-format`). Select these renditions with
 `format: "converted"`; they retrieve by `#line-N` like text.
+
+## Legacy Office conversion (LibreOffice)
+
+Legacy binary `.doc`, `.xls`, `.ppt` and `.vsd` files need LibreOffice to become DOCX/XLSX/PPTX/ODG
+first. LibreOffice is a large office suite that parses untrusted bytes, so it is **optional** (never a
+dependency of the toolkit), **provisionable without root (or with sudo through the host install script)**, and **always sandboxed**.
+
+### Provision it
+
+Two routes; both end in the same sandbox. A host install script that already runs with sudo (for
+service setup) should call the administrator route, so LibreOffice and `bwrap` arrive with the rest of the
+host; a teammate without sudo uses the user-space route.
+
+```sh
+# Administrator route (uses sudo unless already root): distribution packages plus bubblewrap
+.venv/bin/python -m tools.extraction.provision_libreoffice install-system   # --dry-run prints the command
+
+# User-space route, no sudo
+.venv/bin/python -m tools.extraction.provision_libreoffice install
+```
+
+### The user-space install in detail
+
+```sh
+.venv/bin/python -m tools.extraction.provision_libreoffice install   # about 220 MB download
+.venv/bin/python -m tools.extraction.provision_libreoffice status    # ready: true
+```
+
+`install` downloads the pinned upstream Linux x86-64 bundle over HTTPS from The Document
+Foundation, checks its **size and SHA-256 against the pins in the script** before unpacking
+anything, unpacks only the Writer, Calc, Impress and Draw packages with the Python standard
+library (no `dpkg`, no `sudo`, nothing outside the checkout) into
+`tools/extraction/.local/libreoffice/<version>/`, points `current` at it, writes a
+`provenance.json` (version, archive SHA-256) and finishes with `verify`, a synthetic conversion inside
+the sandbox. Offline hosts download the bundle elsewhere and pass it with `--archive FILE`; the
+same checks apply. `install --print-pins` shows the pinned URL, size and checksum, so a reviewer can
+compare them with the checksum The Document Foundation publishes next to the download. To change the
+version, edit `PINS` in `provision_libreoffice.py` (URL, size, SHA-256, version), reinstall and run
+`verify`; converter identity includes the runtime version, so cohort intake extracts legacy files again.
+
+Alternatives, in the order the toolkit looks for them:
+
+1. `LIBRARIAN_SOFFICE=/path/to/soffice` (an existing user-space install; an unusable path is not
+   replaced by a fallback);
+2. the install above (`tools/extraction/.local/libreoffice/current`);
+3. a system package (`install-system`, or `sudo apt install libreoffice-writer libreoffice-calc
+   libreoffice-impress libreoffice-draw bubblewrap`), found as `soffice` on `PATH`. The sandbox below
+   applies to it as well.
+
+`.vsd` (Visio 6 and earlier) needs LibreOffice's Visio import, which the pinned Draw package includes; other
+distributions may omit it, in which case that file ends `legacy-conversion-failed`.
+
+`python -m tools.extraction.office_runtime status` (also the MCP preflight check
+`legacy_converter_runtime`, informational) reports the executable, its version, the sandbox in force and
+the next action. Nothing here is required: with no runtime the files stay `needs-reader` with code
+`needs-converter-runtime`, and the next `ingest` or `qualify` after provisioning converts them.
+
+### Security model
+
+Every conversion runs in a throwaway directory under the extraction home that holds a read-only copy
+of the hash-verified input, an output directory, a private profile and a private temporary directory.
+The directory is removed on every exit path. The LibreOffice process is confined by the first of these
+that works on the host (`LIBRARIAN_CONVERTER_SANDBOX` = `auto`, `bwrap`, `unshare` or `none`):
+
+| Mode | Confinement |
+| --- | --- |
+| `bwrap` (bubblewrap, preferred) | New user, mount, PID, network, IPC and UTS namespaces; all capabilities dropped; a cleared environment; only the system libraries and the runtime directory (read-only), the input (read-only), the output and profile directories and a size-limited tmpfs are visible. The checkout, the stores, the rest of the home directory and every other file are absent. |
+| `unshare` (fallback) | New user, network and PID namespaces with the caller's own uid, `--kill-child`. No network and the process tree dies with the conversion, but the host filesystem is still visible to LibreOffice, so a flaw in LibreOffice could read what the account can read. |
+| `none` (explicit opt-out) | No confinement beyond the limits below. Only an operator can choose it, by setting `LIBRARIAN_CONVERTER_SANDBOX=none`; the rendition's runtime identity records `"sandbox": "none"`. |
+
+When neither `bwrap` nor `unshare` works (`auto`), legacy files stay `needs-reader` with code
+`needs-converter-sandbox` instead of running unconfined. On Ubuntu 24.04 and later, AppArmor may
+block unprivileged user namespaces for `bwrap`; an administrator can allow them (for example a
+profile for `/usr/bin/bwrap`, or `sysctl kernel.apparmor_restrict_unprivileged_userns=0`), or install the
+system package route and set `none` knowingly.
+
+Under every mode: macros, link, field and chart updates are switched off in a freshly written profile; the
+profile and `HOME` are private and discarded; the environment is scrubbed (no tokens, proxies or
+`LIBRARIAN_*` values); the child has its own session and process group; and limits apply to the whole
+process tree (`RLIMIT_AS` 6 GiB, `RLIMIT_FSIZE` 128 MiB per file, `RLIMIT_NOFILE` 1024, no core
+files, CPU time of the wall clock plus 30 s). The wall clock is 300 s; on expiry the whole process
+group is killed (`SIGTERM`, then `SIGKILL`). The converted output is read back only as a regular
+file, re-hashed, and handed to the same stdlib worker as every other format, so LibreOffice's output is
+untrusted too.
+
+### Failures are dispositions
+
+A legacy file never halts a cohort run and is never retried forever. Each failure is recorded for that file with
+a code and stays in the ledger, so a rerun reports it without launching LibreOffice again:
+`needs-converter-runtime` / `needs-converter-sandbox` (not provisioned; convert after provisioning),
+`conversion-timeout` (hang), `legacy-conversion-crashed` (killed by a signal), `legacy-conversion-failed`
+(non-zero exit, no output, or a file LibreOffice cannot read), `conversion-limit`, plus the worker's own
+refusals for the converted file. Each rendition's `conversion.runtime` records `soffice` (the version
+string), `sandbox` and `distribution` (the provisioning record, `null` for a system package).
+
+### Testing
+
+`tests/test_office_runtime.py` and `tests/test_convert.py` use a fake `soffice` script and synthetic
+files, so CI needs no LibreOffice: lookup order, read-only input, private profile, no network, scrubbed
+environment, timeout with a whole-tree kill, crash and failure codes, the file-size limit, provisioning
+checks (bad checksum, wrong size, escaping members, plain HTTP) and per-file dispositions through
+`cohort ingest`. The real-launcher tests run when `bwrap` or `unshare` work (CI installs bubblewrap),
+and `RealRuntimeTests` run the pinned LibreOffice when it is provisioned (`libreoffice.yml`).
