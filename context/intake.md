@@ -846,7 +846,9 @@ picture. Cost before a bulk run, read-only and body-free:
         [--inspected-form ranges] [--max-records N] [--max-pages N]
 
 It prints per rendition the status, parts, prompt characters and inline images, and totals of model
-calls (one per part) and approximate prompt tokens. `cohort rereview` selects reviews held as
+calls (one per part) and approximate prompt tokens. A rendition that was `too-large` or `over-budget`
+has no staged review, so re-run `cohort qualify` on its inbox to review it in parts (requests already
+staged cost nothing). `cohort rereview` selects reviews held as
 `standing-exception-budget-exceeded` (reason `budget-exceeded`) once the rendition needs parts, and
 its dry run counts each part as a call. To make a re-reviewed document a regression guard, add an
 authored case to the instance's ignored `config/evals.local.json`

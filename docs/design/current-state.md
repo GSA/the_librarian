@@ -995,7 +995,10 @@ restated here.
   budget) is selected by `cohort rereview` as reason `budget-exceeded` when the rendition now needs
   parts, and reviewed as a correction like any other head. `rereview` dry runs count each part as a
   model call (`estimate.model_calls`, with `documents` the renditions) and `--limit` bounds the
-  renditions started, never half of one. Evidence: `tests/test_review_parts.py`
+  renditions started, never half of one. A `too-large` or `over-budget` result never staged a
+  request, so the ledger has no head for it: a later `qualify` of the same inbox reviews it (parts
+  and all) and reuses every request already staged, so only these documents cost calls; only the
+  budget-held heads need `rereview`. Evidence: `tests/test_review_parts.py`
   (`SingleRecordTooLargeTests`, `test_too_many_parts_is_over_budget`),
   `tests/test_intake_cohort.py::RereviewTests` (`test_a_review_blocked_on_the_record_budget_is_re_reviewed_in_parts`,
   `test_dry_run_skips_a_record_no_prompt_can_hold_and_never_cuts_it`).
