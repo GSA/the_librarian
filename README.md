@@ -40,10 +40,13 @@ If the host has no `ensurepip`, use `python3 -m venv --without-pip .venv` and
 
 ### Optional: legacy Office files (`.doc`, `.xls`, `.ppt`, `.vsd`)
 
-Old binary Office formats convert only with a LibreOffice runtime, which is optional. A teammate
-provisions it without root or sudo, checksum-verified and confined by a sandbox with no network:
+Old binary Office formats convert only with a LibreOffice runtime, which is optional. Either an
+administrator installs the distribution packages and bubblewrap (put this in a host install script that
+already uses sudo), or a teammate provisions a checksum-verified copy without root. Both run
+confined by a sandbox with no network:
 
 ```sh
+.venv/bin/python -m tools.extraction.provision_libreoffice install-system   # sudo (or root), apt-get/dnf
 .venv/bin/python -m tools.extraction.provision_libreoffice install
 .venv/bin/python -m tools.extraction.office_runtime status
 ```
@@ -375,7 +378,7 @@ Run these from the clone root. Each supports `--help`.
 | `python -m tools.catalog.inventory` | List files under a configured root (`--root`, `--limit`, `directory`; metadata only) |
 | `python -m tools.extraction.extract` | Text, Gemini transcript, and ODT extraction (`prepare`, `verify`, `register`) |
 | `python -m tools.extraction.docling_extract` | Optional PDF and image extraction (`inspect`, `prepare`, `verify`, `register`) |
-| `python -m tools.extraction.provision_libreoffice` | Optional legacy Office runtime without root: `install` (pinned, checksum-verified), `verify`, `status`; see [tools/extraction/README.md](tools/extraction/README.md#legacy-office-conversion-libreoffice) |
+| `python -m tools.extraction.provision_libreoffice` | Optional legacy Office runtime: `install` (no root; pinned, checksum-verified), `install-system` (sudo; apt-get/dnf with bubblewrap), `verify`, `status`; see [tools/extraction/README.md](tools/extraction/README.md#legacy-office-conversion-libreoffice) |
 | `python -m tools.extraction.office_runtime` | `status`: whether legacy Office files convert now, and under which sandbox |
 | `python -m tools.retirement` | Read-only retirement manifest of a legacy tree joined to catalog receipts (`manifest`) and byte check of a restored copy (`verify`); see [context/retirement.md](context/retirement.md) |
 | `python -m tools.store_audit` | Scheduled full verification of the catalog, review events, claim corrections (when initialized), intake ledger and newest backups; JSON report, exit 1 if any store is flagged (cron/systemd timer; see the design doc) |

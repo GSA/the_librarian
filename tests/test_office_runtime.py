@@ -425,6 +425,32 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout)["sha256"], provision.PINS["sha256"])
 
 
+class SystemInstallTests(unittest.TestCase):
+    def test_the_system_install_uses_sudo_unless_root_and_names_the_needed_packages(self):
+        with unittest.mock.patch.object(provision.shutil, "which", return_value="/usr/bin/x"):
+            command = provision.system_command("apt-get", root=False)
+            self.assertEqual(command[:4], ["sudo", "apt-get", "install", "-y"])
+            for package in ("libreoffice-writer", "libreoffice-calc", "libreoffice-impress",
+                            "libreoffice-draw", "bubblewrap"):
+                self.assertIn(package, command)
+            self.assertEqual(provision.system_command("dnf", root=True)[:3], ["dnf", "install", "-y"])
+            self.assertEqual(provision.install_system(dry_run=True, manager="apt-get", root=True)[0], "apt-get")
+
+    def test_no_package_manager_or_no_sudo_is_a_clear_refusal(self):
+        with unittest.mock.patch.object(provision.shutil, "which", return_value=None):
+            for arguments in ({"manager": None, "root": True}, {"manager": "apt-get", "root": False}):
+                with self.subTest(arguments), self.assertRaises(provision.ProvisionError):
+                    provision.system_command(**arguments)
+
+    def test_a_failing_package_manager_is_reported_and_nothing_else_runs(self):
+        with unittest.mock.patch.object(provision.shutil, "which", return_value="/usr/bin/x"), \
+                unittest.mock.patch.object(provision.subprocess, "run",
+                                           return_value=subprocess.CompletedProcess([], 100)) as run:
+            with self.assertRaises(provision.ProvisionError):
+                provision.install_system(manager="apt-get", root=True)
+        self.assertEqual(run.call_count, 1)
+
+
 class PreflightTests(unittest.TestCase):
     def test_the_preflight_check_is_informational(self):
         from types import SimpleNamespace

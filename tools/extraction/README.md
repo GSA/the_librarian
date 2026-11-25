@@ -384,9 +384,23 @@ kind is labelled low confidence (`converted-format`). Select these renditions wi
 
 Legacy binary `.doc`, `.xls`, `.ppt` and `.vsd` files need LibreOffice to become DOCX/XLSX/PPTX/ODG
 first. LibreOffice is a large office suite that parses untrusted bytes, so it is **optional** (never a
-dependency of the toolkit), **provisioned without root**, and **always sandboxed**.
+dependency of the toolkit), **provisionable without root (or with sudo through the host install script)**, and **always sandboxed**.
 
-### Provision it without sudo
+### Provision it
+
+Two routes; both end in the same sandbox. A host install script that already runs with sudo (for
+service setup) should call the administrator route, so LibreOffice and `bwrap` arrive with the rest of the
+host; a teammate without sudo uses the user-space route.
+
+```sh
+# Administrator route (uses sudo unless already root): distribution packages plus bubblewrap
+.venv/bin/python -m tools.extraction.provision_libreoffice install-system   # --dry-run prints the command
+
+# User-space route, no sudo
+.venv/bin/python -m tools.extraction.provision_libreoffice install
+```
+
+### The user-space install in detail
 
 ```sh
 .venv/bin/python -m tools.extraction.provision_libreoffice install   # about 220 MB download
@@ -410,9 +424,9 @@ Alternatives, in the order the toolkit looks for them:
 1. `LIBRARIAN_SOFFICE=/path/to/soffice` (an existing user-space install; an unusable path is not
    replaced by a fallback);
 2. the install above (`tools/extraction/.local/libreoffice/current`);
-3. a system package (`sudo apt install libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw`,
-   or the distribution's equivalent), found as `soffice` on `PATH`, for hosts where an administrator
-   prefers it. The sandbox below applies to it as well.
+3. a system package (`install-system`, or `sudo apt install libreoffice-writer libreoffice-calc
+   libreoffice-impress libreoffice-draw bubblewrap`), found as `soffice` on `PATH`. The sandbox below
+   applies to it as well.
 
 `.vsd` (Visio 6 and earlier) needs LibreOffice's Visio import, which the pinned Draw package includes; other
 distributions may omit it, in which case that file ends `legacy-conversion-failed`.

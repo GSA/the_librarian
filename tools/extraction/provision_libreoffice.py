@@ -4,8 +4,11 @@
 ``install`` downloads the upstream Linux x86-64 ``deb`` bundle (or reads one given with ``--archive``),
 checks its size and SHA-256 against the pins below, unpacks only the Writer, Calc, Impress and Draw
 packages with the standard library (no ``dpkg``, no ``sudo``, nothing outside the toolkit) into
-``tools/extraction/.local/libreoffice/<version>/`` and points ``current`` at it. ``verify`` converts a
-synthetic document inside the sandbox; ``status`` reports readiness. Standard library only.
+``tools/extraction/.local/libreoffice/<version>/`` and points ``current`` at it. ``install-system`` is the
+administrator path for a host install script that already uses sudo: it installs the distribution's
+LibreOffice (Writer, Calc, Impress, Draw) and bubblewrap with ``apt-get`` or ``dnf``, running them
+through ``sudo`` unless already root. ``verify`` converts a synthetic document inside the sandbox;
+``status`` reports readiness. Standard library only.
 
 The pins come from The Document Foundation's published checksum for the release; re-pin by editing
 ``PINS`` (version, URL, size, SHA-256, package list) and re-running ``verify``.
@@ -17,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -188,6 +192,39 @@ def install_archive(archive, pins=PINS, local=None):
     return target
 
 
+SYSTEM_PACKAGES = {
+    "apt-get": ["libreoffice-writer", "libreoffice-calc", "libreoffice-impress", "libreoffice-draw", "bubblewrap"],
+    "dnf": ["libreoffice-writer", "libreoffice-calc", "libreoffice-impress", "libreoffice-draw", "bubblewrap"],
+}
+
+
+def system_command(manager=None, root=None):
+    """The package-manager argv for ``install-system`` (``sudo`` first unless already root), or raise."""
+    manager = manager or next((name for name in SYSTEM_PACKAGES if shutil.which(name)), None)
+    if manager not in SYSTEM_PACKAGES:
+        raise ProvisionError("No supported package manager (apt-get or dnf); install LibreOffice and bubblewrap by hand")
+    command = [manager, "install", "-y"] + (["--no-install-recommends"] if manager == "apt-get" else [])
+    command += SYSTEM_PACKAGES[manager]
+    if (os.geteuid() == 0) if root is None else root:
+        return command
+    if not shutil.which("sudo"):
+        raise ProvisionError("Not root and no sudo; run this as root or use the user-space install")
+    return ["sudo"] + command
+
+
+def install_system(dry_run=False, manager=None, root=None):
+    """Install the distribution packages; return the command run. Failures raise ``ProvisionError``."""
+    command = system_command(manager, root)
+    if not dry_run:
+        try:
+            done = subprocess.run(command, check=False)
+        except OSError as error:
+            raise ProvisionError("Could not run " + command[0] + ": " + str(error)) from error
+        if done.returncode != 0:
+            raise ProvisionError("%s exited with status %d" % (" ".join(command[:3]), done.returncode))
+    return command
+
+
 def verify():
     """Convert a synthetic document in the sandbox; return the readiness report. Raises on failure."""
     report = office_runtime.status()
@@ -211,12 +248,21 @@ def main(argv=None):
     install = commands.add_parser("install", help="Download (or read --archive), verify and unpack the pinned runtime")
     install.add_argument("--archive", type=Path, help="A bundle already downloaded; still checked against the pins")
     install.add_argument("--print-pins", action="store_true", help="Print the pinned URL, size and SHA-256 and exit")
+    system = commands.add_parser("install-system", help="Administrator path: install the distribution's LibreOffice "
+                                 "and bubblewrap with apt-get or dnf (uses sudo unless root)")
+    system.add_argument("--dry-run", action="store_true", help="Print the command and exit")
     commands.add_parser("verify", help="Run a synthetic conversion inside the sandbox")
     commands.add_parser("status", help="Report whether legacy conversion is ready (JSON)")
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
             print(json.dumps(office_runtime.status(), sort_keys=True))
+            return 0
+        if args.command == "install-system":
+            command = install_system(dry_run=args.dry_run)
+            print(json.dumps({"command": command, "ran": not args.dry_run}))
+            if not args.dry_run:
+                print(json.dumps(verify(), sort_keys=True))
             return 0
         if args.command == "verify":
             print(json.dumps(verify(), sort_keys=True))
