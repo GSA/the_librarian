@@ -27,6 +27,13 @@ CREATE TABLE acknowledgments (
  correlation_id TEXT NOT NULL, stage_id TEXT NOT NULL, payload TEXT NOT NULL,
  payload_sha256 TEXT NOT NULL, PRIMARY KEY(correlation_id,stage_id),
  FOREIGN KEY(correlation_id,stage_id) REFERENCES stages(correlation_id,stage_id));
+-- Kata 527a: the claim on an unfinished attempt while a process does its native work outside the writer
+-- lock (one row per stage, present only while the attempt is unfinished). Additive: a ledger without
+-- the table gets it from the next writer, and a stage with no row is unclaimed.
+CREATE TABLE IF NOT EXISTS claims (
+ correlation_id TEXT NOT NULL, stage_id TEXT NOT NULL, cycle INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+ owner TEXT NOT NULL, lease_until REAL NOT NULL, PRIMARY KEY(correlation_id, stage_id),
+ FOREIGN KEY(correlation_id,stage_id) REFERENCES stages(correlation_id,stage_id));
 -- Derived (Kata e22r): one row per cohort document, recomputable from the requests above.
 CREATE TABLE docs (
  system TEXT NOT NULL, path TEXT NOT NULL, format TEXT NOT NULL,

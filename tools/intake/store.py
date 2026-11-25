@@ -42,6 +42,13 @@ CREATE TABLE acknowledgments (
  correlation_id TEXT NOT NULL, stage_id TEXT NOT NULL, payload TEXT NOT NULL,
  payload_sha256 TEXT NOT NULL, PRIMARY KEY(correlation_id,stage_id),
  FOREIGN KEY(correlation_id,stage_id) REFERENCES stages(correlation_id,stage_id));
+-- Kata 527a: the claim on an unfinished attempt while a process does its native work outside the writer
+-- lock (one row per stage, present only while the attempt is unfinished). Additive: a ledger without
+-- the table gets it from the next writer, and a stage with no row is unclaimed.
+CREATE TABLE IF NOT EXISTS claims (
+ correlation_id TEXT NOT NULL, stage_id TEXT NOT NULL, cycle INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+ owner TEXT NOT NULL, lease_until REAL NOT NULL, PRIMARY KEY(correlation_id, stage_id),
+ FOREIGN KEY(correlation_id,stage_id) REFERENCES stages(correlation_id,stage_id));
 -- Derived (Kata e22r): one row per cohort document, recomputable from the requests above.
 CREATE TABLE docs (
  system TEXT NOT NULL, path TEXT NOT NULL, format TEXT NOT NULL,
@@ -61,6 +68,8 @@ CREATE INDEX docs_register ON docs(register_head);
 DOCS_DDL = DDL[DDL.index("-- Derived (Kata e22r)"):]
 # A ledger created before the index gets this one statement from the next writer to open it.
 CORRECTION_INDEX = DDL[DDL.index("CREATE INDEX IF NOT EXISTS requests_correction"):].split(";")[0]
+# A ledger created before claims gets exactly this table (Kata 527a) from the next writer to open it.
+CLAIMS_TABLE = DDL[DDL.index("CREATE TABLE IF NOT EXISTS claims"):].split(";")[0]
 
 
 def safe(path):
@@ -380,9 +389,12 @@ def locked(root, wait=None):
             c.execute("PRAGMA foreign_keys=ON")
             c.execute("PRAGMA synchronous=FULL")
             _check_structure(c, db, root)
-            if c.execute("SELECT 1 FROM sqlite_master WHERE name='requests_correction'").fetchone() is None:
+            present = {row[0] for row in c.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('requests_correction','claims')")}
+            if present != {"requests_correction", "claims"}:
                 with c:
                     c.execute(CORRECTION_INDEX)
+                    c.execute(CLAIMS_TABLE)
         except sqlite3.Error as error:
             raise (LedgerBusy() if _busy(error) else IntakeError("corrupt_store")) from error
         try:

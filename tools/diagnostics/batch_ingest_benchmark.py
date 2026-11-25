@@ -7,7 +7,8 @@ three ledger requests each, written directly so large seeds build quickly), copi
 entry (1 is the one-revision-per-registration path; a tree without ``batch_size`` runs as 1). Reports body-free
 JSON per run: wall and CPU ms per document, fsync and fdatasync calls per document (counted by a small
 LD_PRELOAD shim compiled with gcc when available), catalog revisions written and bytes written per
-document. Synthetic fixtures in temporary workspaces only; never point it at a real instance.
+document, and how long the intake ledger's writer lock was held (``ledger_lock_*``: count, total per document and as a
+share of wall time, longest single hold; Kata 527a). Synthetic fixtures in temporary workspaces only; never point it at a real instance.
 
     nice python3 tools/diagnostics/batch_ingest_benchmark.py --seed 2000 --files 100 --batch-sizes 1,25,50
 
@@ -16,6 +17,7 @@ and worker CPU per document). ``--tree`` measures another checkout (for example 
 ``--keep-seed DIR`` keeps the seeded instance for later runs of the same size.
 """
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import inspect
@@ -154,6 +156,25 @@ def build_seed(tree, destination, documents):
     return round(time.time() - start, 1)
 
 
+def lock_holds(store):
+    """Time every ``store.locked`` hold (from acquisition to release) in this process; returns the list of seconds.
+
+    Works on any tree: it wraps the module attribute, which the store's own writers and the runner both call.
+    """
+    holds, real = [], store.locked
+
+    @contextlib.contextmanager
+    def timed(root, wait=None):
+        with real(root, wait) as c:
+            start = time.perf_counter()
+            try:
+                yield c
+            finally:
+                holds.append(time.perf_counter() - start)
+    store.locked = timed
+    return holds
+
+
 def measure(args):
     """Child process: ingest ``--files`` documents into a copy of the seed and print one JSON line."""
     from _harness import use_tree
@@ -161,6 +182,7 @@ def measure(args):
     from tools.catalog import catalog_store as catalog
     from tools.diagnostics.ingest_benchmark import fixture
     from tools.intake import cohort, store
+    holds = lock_holds(store)
     shim = None
     if args.shim:
         shim = ctypes.CDLL(args.shim)
@@ -180,6 +202,7 @@ def measure(args):
         change_counter = lambda: int.from_bytes(ledger_db.read_bytes()[24:28], "big")  # +1 per committed write
         before_revisions, before_io = revisions(), Path("/proc/self/io").read_text()
         before_commits, before_size = change_counter(), ledger_db.stat().st_size
+        holds.clear()  # only the ingest below is measured: not the warm-up read above
         sync0 = (shim.shim_fsync(), shim.shim_fdatasync()) if shim else None
         start, cpu = time.perf_counter(), time.process_time()
         parameters = inspect.signature(cohort.ingest).parameters
@@ -206,6 +229,10 @@ def measure(args):
                   "ledger_commits_per_doc": round((change_counter() - before_commits) / files, 2),
                   "ledger_kib_per_doc": round((ledger_db.stat().st_size - before_size) / files / 1024, 2),
                   "kib_written_per_doc": round((int(io["write_bytes"]) - int(io0["write_bytes"])) / files / 1024, 1)}
+        held = sum(holds)
+        result.update(ledger_lock_holds=len(holds), ledger_lock_held_ms_per_doc=round(held / files * 1000, 1),
+                      ledger_lock_held_pct=round(100 * held / wall, 1),
+                      ledger_lock_longest_hold_ms=round(max(holds, default=0) * 1000, 1))
         catalog.status(root, audit=True)  # the result must replay in full
         print("RESULT " + json.dumps(result, sort_keys=True))
 

@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from tools import policy, validation_scope
 from tools.catalog import catalog_store as catalog
-from tools.extraction import convert, extract, mhtml
+from tools.extraction import convert, extract, mhtml, pdf_image
 from tools.durable import sha256_file
 from . import (agent_origin, archives, cohort_runtime, contracts, docs, exclusions as exclusion_rules, parse_pool,
                runner, store, upload)
@@ -783,18 +783,22 @@ def _stage_chunk(root, entries, name_of, stage_id, operation, arguments, heads):
     return summaries, failed
 
 
-# Formats whose prepare is a parse measured in milliseconds: their prepare stages settle as one chunk.
-# A converted document, PDF or image can take seconds, and a chunk settles under one ledger lock hold.
+# Formats whose prepare is a parse measured in milliseconds: the parse pool reads them ahead of the ledger.
 BATCH_PREPARE = {"text", "gemini-txt", "mhtml", "odt"}
+# Every format's prepare stage settles as one chunk: the ledger lock is not held while a stage prepares (Kata 527a),
+# so a PDF, image or converted office document no longer lengthens a hold that others wait on.
+BATCH_STAGES = BATCH_PREPARE | set(pdf_image.FORMATS) | set(convert.FORMATS)
 
 
 def _prepare_batch(root, entries, heads, outcomes):
     """Prepare a chunk's extractions; return those ready to register (``outcomes`` gets the rest).
 
-    The quick formats stage their requests with one commit and settle together; the rest are prepared in turn.
+    Every format stages its request with one commit and settles with its chunk. A PDF, image or converted
+    document is converted ahead of the ledger (``cohort_runtime.convert_ahead``); whatever of it is left runs
+    in ``run_batch`` with no ledger lock held, so it no longer needs a turn of its own.
     """
     registering = []
-    quick = [e for e in entries if e["format"] in BATCH_PREPARE]
+    quick = [e for e in entries if e["format"] in BATCH_STAGES]
     try:
         summaries, failed = _stage_chunk(root, quick, _prepare_name, "prepare", "extract-prepare", lambda base: base, heads)
         outcomes.update(failed)
@@ -824,22 +828,6 @@ def _prepare_batch(root, entries, heads, outcomes):
             outcomes[entry["relative"]] = _failure(stage["id"], stage)
         else:
             registering.append(entry)
-    for entry in entries:
-        if entry["format"] in BATCH_PREPARE:
-            continue
-        try:
-            stage = _prepare(root, entry, heads)
-            if stage["status"] != "succeeded":
-                outcomes[entry["relative"]] = _failure(stage["id"], stage)
-                continue
-            registering.append(entry)
-        except LedgerBusy:
-            _conflict(entry)
-            outcomes[entry["relative"]] = dict(BUSY_FAILURE)
-        except IntakeError as error:
-            if error.code not in CHAIN_REFUSALS:
-                raise
-            outcomes[entry["relative"]] = {"outcome": "failed", "stage": "prepare", "code": error.code}
     return registering
 
 
