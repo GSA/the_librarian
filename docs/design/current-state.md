@@ -1628,7 +1628,14 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
     attempt's cycle and ordinal) is additive: a ledger created before it gets exactly that table from the next
     writer to open it (as the correction index was), a stage with no row is unclaimed, and `audit` and the
     request/stage/attempt rules do not read it. A settled attempt has no claim. The owner is host, process ID
-    and a per-run nonce; the lease is `runner.LEASE_SECONDS` (15 minutes), measured on the run's clock (injectable).
+    and a per-run nonce; the lease is `runner.LEASE_SECONDS` (15 minutes), counted from the commit that takes the
+    claim (the run's injectable clock plus the time elapsed since the run began), not from the start of a slow
+    preparation. A run in native work renews its claims every `runner.HEARTBEAT_SECONDS` (a third of a lease) from a
+    thread that takes the lock only for that update, so a chunk whose work outlasts a lease is not taken over while
+    its process lives; a dead process stops renewing, and its claim is taken over at once by owner liveness.
+  - *Pinned intent and backoff.* A run that prepared with no ledger lock looks again under it: an intent another run
+    pinned meanwhile is the one the stage runs under (the rival preparation and its failure are dropped, the policy is
+    checked again), and a failure is recorded at the clock when it is recorded, so the retry backoff counts from the failure.
   - *One attempt per stage.* A stage whose claim is live (lease not expired, owner not known dead) is skipped:
     `run` returns the stage as it stands (`running`), `run_batch` leaves it out of its chunk, and neither
     charges anything. A claim whose lease expired, or whose owner is a process of this host that no longer
