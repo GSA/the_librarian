@@ -22,7 +22,7 @@ from tools.review_events import event_reader
 from tools.catalog import catalog_store as catalog
 from tools.durable import fsync_directory
 from tools.context_index import context_index as index, renditions
-from . import (agent_origin, cli, cohort_archives, deselect as deselection, exclusions as exclusion_rules, cohort_rereview, cohort_review, docsync, model_review, runner,
+from . import (agent_copies, agent_origin, cli, cohort_archives, deselect as deselection, exclusions as exclusion_rules, cohort_rereview, cohort_review, docsync, model_review, runner,
                selection_manifest, standing, store, throttle, upload, usage_log)
 from . import cohort_runtime, contracts, parse_pool
 from .cohort_ingest import BATCH_SIZE, classify, ingest
@@ -597,6 +597,17 @@ def _parser():
     command.add_argument("--manifest", required=True)
     command.add_argument("--index", default=DEFAULT_INDEX, dest="index_path")
     command = commands.add_parser(
+        "agent-copies", allow_abbrev=False, help=agent_copies.report.__doc__.split("\n")[0])
+    command.add_argument("--root", required=True, type=Path)
+    command.add_argument("--agent-system", action="append", default=[], metavar="SYSTEM", dest="agent_systems",
+                         help="the --system label of an agent-origin cohort (repeatable)")
+    command.add_argument("--min-similarity", type=float, default=agent_copies.MIN_SIMILARITY,
+                         help="share of lines in common that makes a copy 'similar' (default %s)"
+                              % agent_copies.MIN_SIMILARITY)
+    command.add_argument("--manifest", help="instance-relative selection manifest: mark copies it selects")
+    command.add_argument("--report", type=Path, help="private (0600) report with receipts and paths; "
+                         "usable as deselect --receipts-file")
+    command = commands.add_parser(
         "expand-archives", allow_abbrev=False,
         help="Report every zip/tar archive the inbox reaches; with --apply expand those not yet "
              "expanded into instance storage (one nesting level per run)")
@@ -812,6 +823,13 @@ def main(argv=None):
     try:
         if args.command in {"recover-identity", "recover-blocked-extractions", "recover-unresolved-evidence", "recover-deferred", "backfill-docs", "audit-docs", "docs-status"}:
             print(json.dumps(_maintenance(args), sort_keys=True))
+            return 0
+        if args.command == "agent-copies":
+            report = agent_copies.report(args.root, agent_systems=args.agent_systems,
+                                         min_similarity=args.min_similarity, manifest=args.manifest)
+            if args.report:
+                _write_private(args.report, report)
+            print(json.dumps({k: v for k, v in report.items() if k != "entries"}, sort_keys=True))
             return 0
         if args.command in {"expand-archives", "delete-archive-original"}:
             return _archive_command(args)

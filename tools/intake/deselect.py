@@ -43,12 +43,14 @@ from tools.context_index import context_index as index
 from tools.durable import fsync_directory
 from tools.review_events import event_history, event_reader
 from tools.review_events import event_store as events
-from . import docs, selection_manifest, standing_publication, store
+from . import agent_copies, docs, selection_manifest, standing_publication, store
 from .contracts import IntakeError, require
 
 LOG = "deselections.jsonl"
 SCHEMA = "librarian-deselect/1"
 REPORT_SCHEMA = "librarian-deselect-report/1"
+# Reports whose ``entries`` name ``receipt_id``s: a dry run, and ``cohort agent-copies`` (Kata rqr2).
+REPORT_SCHEMAS = (REPORT_SCHEMA, agent_copies.SCHEMA)
 BATCH = 200  # review events per append (the review-event contract allows 256)
 RETRIES = 5
 LOG_LIMIT = 256 * 1024 * 1024
@@ -94,7 +96,7 @@ def read_receipts(path):
         text = raw.decode("utf-8")
         if text.lstrip().startswith("{"):
             value = json.loads(text)
-            require(isinstance(value, dict) and value.get("schema") == REPORT_SCHEMA
+            require(isinstance(value, dict) and value.get("schema") in REPORT_SCHEMAS
                     and isinstance(value.get("entries"), list), "invalid_receipts")
             found = [e.get("receipt_id") for e in value["entries"] if isinstance(e, dict)]
         else:
