@@ -6,7 +6,6 @@ process off the stage; an expired claim, or one whose process is gone, is taken 
 attempt; a process that outlives its lease cannot record over its successor.
 """
 from contextlib import closing
-import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -501,7 +500,7 @@ class IngestKeepsTheLedgerFree(unittest.TestCase):
                 root, inbox = self.make(6)
                 held = []
 
-                def guard(real):
+                def guard(real, held=held):
                     def wrapped(*args, **kwargs):
                         held.append(not ledger_is_free(args[0]))
                         return real(*args, **kwargs)
