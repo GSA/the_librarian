@@ -725,8 +725,11 @@ note). Selectors: `--receipt D123` (repeatable), `--receipts-file` (one ID per l
 the ledger's `docs` rows, a rule matches; `--system` limits them to one cohort label) and `--dedupe`.
 Duplicates: selections of different receipts whose originals have the same SHA-256 (from the `docs` row, else from the catalog, so the optional table is not needed) form a group;
 every group is reported (`counts.duplicates`, `groups` in `--report`: `keep`, `receipts`, `removed`),
-and `--dedupe` keeps the lowest receipt that no other selector removes and deselects the rest, so a
-group is never emptied. Output is body-free counts (`deselect`, `remaining`, `by_reason`, `by_rule`,
+and `--dedupe` keeps one copy that no other selector removes and deselects the rest, so a
+group is never emptied. The kept copy is the one with the best path class of its inbox path (plain
+folder, then archive member or `_extracted` folder, then build/cache output, then VCS internals such
+as `.svn`), then the lowest receipt, because search results cite the kept copy's path. A group
+deduplicated by an earlier run is not revisited. Output is body-free counts (`deselect`, `remaining`, `by_reason`, `by_rule`,
 `unmapped`, `unmatched_receipts`, `duplicates`); `--report FILE` (0600) lists receipts and paths.
 
 Apply holds the ledger writer lock and records the removal in three steps, so a crash at any point is
