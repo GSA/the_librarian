@@ -103,7 +103,7 @@ named stage. The ledger is operational recovery state, never corpus authority.
   `--limit N` for staged rollout, qualifies remaining deferrals as low confidence by default,
   and resumes staged reviews without a new model call. Run `cohort publish` afterwards.
   Every indexed document carries a `confidence` label (`normal`, or `low` with reasons
-  `noted-issues`, `reviewer-deferred`, `embedded-instructions`, `sparse-record`, `converted-format`, `machine-ocr`, `agent-generated`, `incomplete-rendition`,
+  `noted-issues`, `reviewer-deferred`, `embedded-instructions`, `sparse-record`, `inline-data-reduced`, `converted-format`, `machine-ocr`, `agent-generated`, `incomplete-rendition`,
   `open-correction`); retrieval shows it, never hides the text. When a newer document,
   meeting transcript or answered question contradicts or settles a claim, record it with
   `python -m tools.review_events.corrections record|resolve` or `intake FILE` (a
@@ -827,6 +827,31 @@ timeout errors are retried up to 5 calls in total, waiting a numeric
 `Retry-After` or exponential backoff with jitter (2 s, 4 s, ...), each wait
 capped at 60 s and all waits within 600 s; other HTTP errors and invalid replies
 fail at once and the rendition stays `pending-review`.
+
+**Oversized renditions are reviewed in parts.** A rendition whose reviewer prompt would exceed
+400,000 characters, or whose records or pages exceed the policy budget, is cut into contiguous
+parts of whole records (every record and warning in exactly one part, warnings in part 1) and
+reviewed one call per part; the parts combine into one findings record (strictest decision, union
+of what was inspected, issues tagged by part) that `standing.evaluate` re-checks, so partial
+inspection is still never filled in. `max_records` and `max_pages` of the policy then apply to each
+part. `too-large` now means a single record that does not fit a prompt even alone (never cut, stays
+`pending-review`); `over-budget` means more than 64 parts or findings over `max_findings_bytes`.
+Large inline `data:` payloads (pictures) are replaced by `[inline data omitted: ...]` placeholders
+in the reviewer prompt and the search text, recorded in the findings, the review event and the
+published `inline_data` metadata, and the document gets the low-confidence reason
+`inline-data-reduced`; the extraction and original keep every byte, so open the original for the
+picture. Cost before a bulk run, read-only and body-free:
+
+    python -m tools.intake.model_review plan --root ROOT --rendition PATH ... [--criteria ...]
+        [--inspected-form ranges] [--max-records N] [--max-pages N]
+
+It prints per rendition the status, parts, prompt characters and inline images, and totals of model
+calls (one per part) and approximate prompt tokens. `cohort rereview` selects reviews held as
+`standing-exception-budget-exceeded` (reason `budget-exceeded`) once the rendition needs parts, and
+its dry run counts each part as a call. To make a re-reviewed document a regression guard, add an
+authored case to the instance's ignored `config/evals.local.json`
+(see [retrieval-evals](retrieval-evals.md)): query a phrase from the document's text, `expect_paths`
+its rendition, `expect_confidence` `low` when it had inline images.
 
 `python -m tools.intake.model_review evaluate --root ROOT --models-config FILE
 --model M ... --rendition PATH ... [--controls] [--criteria standing-review-v1|-v2]
