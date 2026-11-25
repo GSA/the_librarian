@@ -467,7 +467,7 @@ class QualifyStagesKeepTheLedgerLock(cohort_tests.QualifyCase):
     so they keep the ledger lock (the decision for the review path); the model call is made outside it already."""
 
     def ingest(self):
-        return cohort.ingest(self.root, self.inbox, system="inbox", actor="cohort-runner")
+        return cohort.ingest(self.root, self.inbox, system="example-docs-inbox", actor="cohort-runner")
 
     def test_the_review_event_commit_and_the_manifest_append_run_under_the_ledger_lock_and_are_brief(self):
         from tools.intake import standing_publication
@@ -488,7 +488,8 @@ class QualifyStagesKeepTheLedgerLock(cohort_tests.QualifyCase):
         with patch.object(events, "append", watch("review", events.append)), \
                 patch.object(standing_publication, "write_manifest",
                              watch("manifest", standing_publication.write_manifest)):
-            self._qualify(transport)
+            report = self._qualify(transport, system="example-docs-inbox")
+        self.assertEqual(report["counts"]["qualification"], {"qualified": 6})
         for label in ("review", "manifest"):
             self.assertTrue(seen[label])
             self.assertEqual(set(seen[label]), {False}, label)

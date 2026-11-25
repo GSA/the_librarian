@@ -183,6 +183,7 @@
   "tests/test_store_durability.py",
   "tests/test_catalog_batch.py",
   "tests/test_intake_batch.py",
+  "tests/test_intake_claims.py",
   "tools/diagnostics/batch_ingest_benchmark.py",
   "tests/test_authority_store_upgrade_paths.py",
   "tests/test_extraction_reuse.py",

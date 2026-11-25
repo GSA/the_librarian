@@ -1553,8 +1553,9 @@ the receipt stage and again for the extraction-registration stage (`extract.regi
   of text-family documents are staged with one commit and settle through `run_batch` (`extract-prepare` is a
   batch operation that runs each stage alone), and the registration requests are staged with one commit.
   `stage_many` reports a refused request on that request alone, and inserts the accepted ones in one
-  transaction. PDFs, images and converted office documents still prepare one at a time, because their
-  preparation can take seconds and a chunk settles under one ledger lock hold. `run` (the one-at-a-time path)
+  transaction. PDFs, images and converted office documents prepare in the chunk too (Kata 527a: the ledger
+  lock is no longer held while a stage prepares, so a slow conversion no longer lengthens a hold others wait
+  on; `cohort_runtime.convert_ahead` still converts them ahead of the ledger, up to `--concurrency` at once). `run` (the one-at-a-time path)
   also saves a new intent and records the running attempt in one commit; the intent is written first in the
   transaction, so it is durable whenever the attempt is, and a retry is never charged for an unfinished attempt.
 - **Crash model.** A kill before the catalog COMMIT leaves SQLite's rollback journal and the prior revision
@@ -1611,6 +1612,56 @@ with no duplicate or lost document, two processes ingesting one instance). Measu
   rows it touches; the ledger cannot reconstruct authority (the catalog and review events are
   authority), so a hand-edited ledger row misdirects work at worst, and `audit` is the check to run
   before an upgrade, a backup or after any unexplained failure.
+- **Claim, work, record (Kata 527a).** `runner.run` and `run_batch` no longer hold the ledger writer lock
+  across a stage's native work. A run takes the lock three times, each for ledger writes only: to *look*
+  (read the stage and decide whether to work it), to *begin* (commit the intent, a `running` attempt and a
+  claim in one transaction, so the intent is durable whenever the attempt is), and to *record* (write the
+  evidence, settle the attempt and stage, drop the claim). Preparing the intent and running the effect happen
+  between them with no ledger lock, so `progress`, a second `ingest` and `qualify` proceed during extraction,
+  catalog revisions and file syncs. Measured with `tools/diagnostics/batch_ingest_benchmark.py` (2,000-document
+  seed, 100 new documents, which now also reports `ledger_lock_*`: holds, held ms per document and share of
+  wall, longest hold): at `batch_size=50` the lock was held 74.9% of 12.7 s wall (95 ms per document, one
+  chunk hold of 2.8 s); it is held 12.3% of 8.1 s (10 ms per document, longest hold 138 ms). At `batch_size=1`:
+  83.1% of 52 s before, 37.1% of 40 s now (the one-at-a-time path takes the lock 15 (before) to 21 (now) times per
+  document for ledger reads, so many short holds remain; use batches).
+  - *Claim.* The `claims` table (one row per stage with an unfinished attempt: `owner`, `lease_until`, and the
+    attempt's cycle and ordinal) is additive: a ledger created before it gets exactly that table from the next
+    writer to open it (as the correction index was), a stage with no row is unclaimed, and `audit` and the
+    request/stage/attempt rules do not read it. A settled attempt has no claim. The owner is host, process ID
+    and a per-run nonce; the lease is `runner.LEASE_SECONDS` (15 minutes), measured on the run's clock (injectable).
+  - *One attempt per stage.* A stage whose claim is live (lease not expired, owner not known dead) is skipped:
+    `run` returns the stage as it stands (`running`), `run_batch` leaves it out of its chunk, and neither
+    charges anything. A claim whose lease expired, or whose owner is a process of this host that no longer
+    exists (a kill, or a run of this process that ended without recording), is taken over at once: the
+    unfinished attempt is reused and not charged, as before, and the new owner replaces the claim in the same
+    commit that looks again. Because a run looks again under the lock before it begins, two processes cannot
+    both begin the same attempt.
+  - *A process that outlives its lease.* Recording is conditional on the claim still being this run's (owner,
+    cycle, ordinal). A run whose stage was taken over finds another owner (or none, the successor having
+    settled) and records nothing, success or failure, so a late failure cannot overwrite a successor's evidence
+    and the stage ends with exactly one attempt. Its effect may have run a second time; the catalog marker and request ID
+    (Kata herq) make that a no-op, never a second record. A lease is long against the 150 s and 300 s
+    conversion wall timeouts, so a live conversion is not taken over.
+  - *Which stages release the lock.* Extraction, receipt and `catalog-submit` stages, and the whole `run_batch` path, do.
+    `standing-review`, `standing-select`, `standing-publish`, `index-build` and `review-append` keep the lock for the
+    run (`runner.LOCKED_OPERATIONS`): `standing-select` appends to the shared selection manifest, whose writers exclude
+    each other through the ledger lock, a publication must see the manifest it pinned, and a review commit is
+    made against a pinned review-event revision. Their stub-transport cost, measured over a six-document
+    `qualify` (the model call is made before the stage, outside the ledger): the `events.append` hold has mean 23
+    ms and maximum 51 ms, the manifest append mean 8 ms and maximum 10 ms, so releasing the lock there is deferred
+    to a follow-up (it needs a stale-revision retry in the stage).
+  - *Lock order.* The ledger lock is taken first and the catalog, review-event and index locks inside it or alone; no module of `tools/catalog`, `review_events`, `extraction` or `context_index` imports the intake, so no
+    path takes the catalog lock before the ledger lock. With the ledger lock released during the effect the
+    catalog lock is now taken with no ledger lock held, which cannot invert the order.
+  - *Crash model.* A kill after the begin commit leaves an unfinished attempt with a claim whose owner is dead;
+    the restart takes it over at once, uncharged. A kill mid-effect or before the record commit is the same
+    state; the effect is completed or found complete by its markers. A kill during the begin commit leaves
+    nothing (one transaction). Evidence: `tests/test_intake_claims.py` (the lock is free during prepare and
+    effect; live claim skipped; expired claim taken over once uncharged; a process that outlives its lease records
+    nothing, for success and for failure; a dead owner taken over at once; a ledger without the table gains it with its data; two
+    processes, one in native work; chunk skip, takeover and kill; no native step of an ingest runs under the lock; `qualify` keeps
+    it for its stages), `tests/test_intake_batch.py` `CrashInjection` (kills before and after the effect of a
+    one-document run, with the lock released).
 - The writer lock is polled non-blocking with jitter for at most
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` (default 30, max 3600; invalid values refuse)
   and the same value is the SQLite busy timeout. Exceeding it, or a transient SQLite

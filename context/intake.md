@@ -140,6 +140,14 @@ named stage. The ledger is operational recovery state, never corpus authority.
   seen by a running writer: run `audit` before an upgrade or backup and after any unexplained
   failure. `writer.lock` carries no hand-off; a read-only refusal such as `unknown_request` from a
   cohort existence probe costs the next writer nothing.
+- The ledger writer lock is not held during a stage's native work (claim, work, record; Kata 527a): a run
+  commits its intent, a `running` attempt and a claim (owner and a 15 minute lease), releases the lock, does the
+  extraction or catalog work, and retakes it to record the evidence. A second `ingest`, `progress` or `qualify`
+  proceeds meanwhile. A stage whose claim is live is skipped (it reads `running`); one whose lease expired or
+  whose owner process is gone is resumed at once, uncharged, so a crashed run needs no manual recovery. A
+  stage in `running` with no live process is therefore not stuck: run it again. `qualify`'s review, selection
+  and publication stages still hold the lock for the stage. Measure the hold with
+  `tools/diagnostics/batch_ingest_benchmark.py` (`ledger_lock_*` fields).
 - The ledger writer lock wait is bounded (default 30s, set
   `LIBRARIAN_INTAKE_LOCK_WAIT_SECONDS` or pass `wait`; the same value is the SQLite
   busy timeout). Exceeding it, or a transient SQLite BUSY/LOCKED during a stage,
