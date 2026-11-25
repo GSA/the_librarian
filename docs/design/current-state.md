@@ -950,8 +950,9 @@ is what matters; the chain of how it got here is in git history and the Katas
    versions; otherwise (journal or WAL present, or no `sqlite_dbpage`) the SHA-256
    of the exact database bytes. A receipt is trusted for as long as it covers exactly
    the file (Kata 91h5): there is no daily expiry. `validated_on` only records the UTC
-   date of the last full replay for the audit report. What replaces the daily check is
-   the scheduled audit ("Store validation cadence" below).
+   date of the last full replay for the audit report. The byte-hash path is tested on every
+   build by hiding the table (`without_dbpage`) and natively by the `test-no-dbpage` CI leg.
+   What replaces the daily check is the scheduled audit ("Store validation cadence" below).
 2. **Trusted head.** When the binding matches, the writer takes the state from the
    receipt (it must equal the state re-derived from the database head); otherwise
    it runs a full `inspect`. An unreadable receipt only costs a replay; it never
@@ -1205,6 +1206,9 @@ index. `qualify` did that about nine times per entry, so its serial toolkit cost
   the pass, so a commit that lands during validation is never remembered; a failed
   validation is never stored. Callers receive fresh state and event-list containers (the
   event dictionaries are shared and read-only by contract).
+  Without `sqlite_dbpage` (Ubuntu 24.04's SQLite) every read therefore replays in full and the
+  identity-bound residuals above do not exist; `WithoutDbpage` in `tests/test_review_event_memo.py` and
+  the `test-no-dbpage` CI leg (Kata 8rzp) hold that, and tests of the identity path skip there.
 - **Read locks and busy waits (Kata xeb8).** Review-event connections used SQLite's busy
   timeout 0, and a full replay (a cold `progress` render, or a publication's `read_snapshot(full=True)`) held its read transaction, and so its
   SHARED lock, for the whole O(history) validation (6.5 s at 13,000 events). A running
