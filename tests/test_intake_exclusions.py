@@ -45,6 +45,16 @@ class RuleTests(unittest.TestCase):
         self.assertEqual((found.match("a/b/z.md"), found.match("a/b/c/z.md"), found.match("z.md")),
                          ("one", "two", "two"))
 
+    def test_numbered_suffix_rules_match_rotated_and_dated_copies_only(self):
+        found = rules({"version": 1, "rules": [
+            {"id": "rotated", "reason": "rotated or numbered copies", "numbered_suffixes": True},
+            {"id": "logs", "extensions": [".log"], "globs": ["**/*.log.*"]}]})
+        cases = {"logs/app.015185": "rotated", "out/report.2023-04-11": "rotated",
+                 "x/server.log.2023-05-20": "rotated", "a/b.log": "logs", "a/b.log.gz.txt": "logs",
+                 "docs/v1.2": None, "docs/notes.md": None, "data/file.12": None, "README": None,
+                 "bundle.zip!/x/app.000123": "rotated", "release-2023-04-11/notes.md": None}
+        self.assertEqual({k: found.match(k) for k in cases}, cases)
+
     def test_malformed_rule_files_are_refused(self):
         bad = [
             [], {"version": 2, "rules": RULES["rules"]}, {"version": 1}, {"version": 1, "rules": []},
@@ -55,7 +65,9 @@ class RuleTests(unittest.TestCase):
             {"version": 1, "rules": [{"id": "x", "extensions": ["pom"]}]},
             {"version": 1, "rules": [{"id": "x", "extensions": [".a/b"]}]},
             {"version": 1, "rules": [{"id": "x", "globs": ["a"], "extra": 1}]},
-            {"version": 1, "rules": [{"id": "x", "globs": "a"}]}]
+            {"version": 1, "rules": [{"id": "x", "globs": "a"}]},
+            {"version": 1, "rules": [{"id": "x", "numbered_suffixes": 1}]},
+            {"version": 1, "rules": [{"id": "x", "numbered_suffixes": False}]}]
         for value in bad:
             with self.subTest(value=value), self.assertRaises(IntakeError) as caught:
                 exclusions.validate(value)

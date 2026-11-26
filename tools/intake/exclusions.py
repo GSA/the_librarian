@@ -10,7 +10,8 @@ reach model review: dependency trees, VCS internals, build-tool caches.
       {"id": "maven-cache", "extensions": [".pom", ".lastUpdated", ".sha1", ".repositories"]}]}
 
 A rule has a unique ``id`` (lower-case letters, digits and hyphens), an optional ``reason`` and at
-least one of ``globs`` and ``extensions``. A glob is matched against the whole inbox-relative path
+least one of ``globs``, ``extensions`` and ``numbered_suffixes`` (``true``: the name ends in a dot and
+three or more digits, or a dot and a ``YYYY-MM-DD`` date, as rotated logs and numbered copies do). A glob is matched against the whole inbox-relative path
 (``ARCHIVE!/MEMBER`` for an archive member): ``*`` and ``?`` stay within one path segment, ``**``
 crosses segments (``**/`` any leading directories, ``/**`` anything below). An extension (with its
 leading dot, compared case-insensitively) matches the end of the file name. The first matching rule
@@ -37,7 +38,11 @@ LIST_LIMIT = 200
 DEFAULT_FILE = "config/intake-exclusions.local.json"
 ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 FIELDS = {"version", "rules"}
-RULE_FIELDS = {"id", "reason", "globs", "extensions"}
+RULE_FIELDS = {"id", "reason", "globs", "extensions", "numbered_suffixes"}
+# ``numbered_suffixes: true`` matches a file name ending in a numeric or dated suffix, the shape of
+# rotated logs and numbered output copies (``app.015185``, ``report.2023-04-11``): at least three
+# digits, or a ``YYYY-MM-DD`` date, after the last dot.
+NUMBERED = re.compile(r".+\.(?:[0-9]{3,}|[0-9]{4}-[0-9]{2}-[0-9]{2})")
 
 
 def _invalid(condition):
@@ -95,8 +100,11 @@ def validate(value):
             and ".." not in g.split("/") and "" not in g.split("/")[:-1]))
         extensions = _texts(rule.get("extensions", []), lambda e: (
             2 <= len(e) <= 32 and e.startswith(".") and "/" not in e and "\0" not in e))
-        _invalid(globs or extensions)
+        numbered = rule.get("numbered_suffixes", False)
+        _invalid(type(numbered) is bool and ("numbered_suffixes" not in rule or numbered))
+        _invalid(globs or extensions or numbered)
         found.append({"id": rule["id"], "reason": reason, "globs": list(globs), "extensions": list(extensions),
+                      "numbered": numbered,
                       "patterns": [_glob(g) for g in globs],
                       "suffixes": tuple(e.lower() for e in extensions)})
     return found
@@ -117,6 +125,8 @@ class Rules:
         name = relative.rsplit("/", 1)[-1].lower()
         for rule in self.rules:
             if name.endswith(rule["suffixes"]) if rule["suffixes"] else False:
+                return rule["id"]
+            if rule["numbered"] and NUMBERED.fullmatch(name):
                 return rule["id"]
             if any(pattern.fullmatch(relative) for pattern in rule["patterns"]):
                 return rule["id"]
