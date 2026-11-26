@@ -33,7 +33,7 @@ REASONS = ("resume", "older-policy-pending", "older-policy-deferred", "older-pol
            "insufficient-inspected-scope", "current-policy-deferred", "budget-exceeded")
 # ``standing-<submission>-<rendition sha256[:12]>-<policy sha256[:8]>`` and its ``-c<n>`` corrections.
 NAME = re.compile(r"standing-(.+)-([0-9a-f]{12})-[0-9a-f]{8}(?:-c[0-9]+)?")
-CHARS_PER_TOKEN = 4
+CHARS_PER_TOKEN = model_review.CHARS_PER_TOKEN
 
 
 def _heads(c):
@@ -190,6 +190,10 @@ def _check(root, head, standing_policy, inspected_form):
     return (len(planned["tasks"]), planned["chars"]), None
 
 
+def _receipt(head):
+    return Path(head["args"]["rendition"]).parts[-3]
+
+
 def _per_document(cost_estimate, model):
     """Per-document tokens for ``model`` from a ``model_review.estimate`` file, or None."""
     if cost_estimate is None:
@@ -202,20 +206,27 @@ def _per_document(cost_estimate, model):
 
 
 def plan(root, selected, skipped, standing_policy, *, limit=None, inspected_form="list",
-         model=None, cost_estimate=None):
+         model=None, cost_estimate=None, receipts=None, max_parts=None):
     """The dry-run report for ``select``'s result, and the heads an applied run works through.
 
     Reads each rendition to be reviewed (never the ledger): one the current policy would not
     review (out of scope, over budget, too large for a prompt, stale) is skipped without a call.
     A rendition reviewed in parts costs one call per part (``model_calls``; ``documents`` counts the
     renditions). ``limit`` bounds the renditions reviewed, so a part-reviewed one is never started
-    and left half done; resumed heads cost none and are always included.
+    and left half done; resumed heads cost none and are always included. ``receipts`` (a set of receipt
+    IDs) keeps only those heads (``not-in-receipts`` for the rest); ``max_parts`` skips a rendition that
+    would need more calls than that as ``parts-deferred``, for a separately approved run.
     """
     skipped = Counter(skipped)
     work, chars, calls, held = [], 0, 0, Counter()
     for head in selected:
+        if receipts is not None and _receipt(head) not in receipts:
+            skipped["not-in-receipts"] += 1
+            continue
         if head["reason"] != "resume":
             size, reason = _check(root, head, standing_policy, inspected_form)
+            if reason is None and max_parts is not None and size[0] > max_parts:
+                reason = "parts-deferred"
             if reason is not None:
                 skipped[reason] += 1
                 continue

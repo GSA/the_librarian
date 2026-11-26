@@ -1020,10 +1020,34 @@ restated here.
   image is the retained original. Of 470 live too-large documents, 6 had inline images (92-97% of
   their prompt) and all fit one call once reduced. Evidence: `tests/test_inline_data.py`,
   `tests/test_review_parts.py` (`InlineDataTests`, `PublishedTests`).
+- **A review run can be narrowed and large documents deferred** (Kata m378). `cohort qualify` and
+  `cohort rereview` take `--receipt D123` (repeatable) and `--receipts-file` (IDs one per line, or a
+  `deselect` report). `qualify` then reviews only those documents: every other extracted entry
+  without a saved review is reported `pending-review` (`not-in-receipts`) with no model call and no
+  staged request, while entries already reviewed keep their outcome and selection, so the cohort's
+  manifest is unchanged for them; `rereview` skips other heads as `not-in-receipts`. `--max-parts N`
+  (1-64) leaves a rendition that would need more than N review calls `pending-review`
+  (`review_status` `parts-deferred`, with `review_parts`, counted in `counts.parts_deferred`; a
+  `rereview` head is skipped as `parts-deferred`), so the costliest documents need their own
+  approval. Evidence: `tests/test_intake_cohort.py::RereviewTests`
+  (`test_qualify_with_receipts_reviews_only_those_and_keeps_every_other_selection`,
+  `test_max_parts_defers_large_reviews_without_a_call_and_reports_them`,
+  `test_rereview_receipts_and_max_parts_narrow_the_selection`,
+  `test_cli_narrowing_options_reach_qualify_and_rereview`).
+- **Exclusion rules can match rotated and numbered copies.** An exclusion rule may set
+  `"numbered_suffixes": true`: a file name ending in a dot and three or more digits, or a dot and a
+  `YYYY-MM-DD` date (`app.015185`, `server.log.2023-05-20`), matches. Measured on a live cohort, such
+  copies and logs were 15% of the review calls of its oversized documents and mostly delimited or
+  log lines; `config/intake-exclusions.example.json` shows the rule with `logs` and `.svn-base`
+  internals. Extensions alone were a weak signal there (most large `.xml`, `.xlsx` and `.docx` files
+  were accepted by the reviewer), so the example excludes only these classes. Evidence:
+  `tests/test_intake_exclusions.py::RuleTests::test_numbered_suffix_rules_match_rotated_and_dated_copies_only`.
 - **Planning is read-only.** `python -m tools.intake.model_review plan --root ROOT --rendition PATH ...`
   prints, per rendition, its receipt, status (`whole`, `parts`, `too-large`, `over-budget`), parts,
-  prompt characters and inline images, and totals of model calls and approximate tokens (four
-  characters per token). It reads renditions only and writes nothing, so a bulk re-review's cost can
+  prompt characters and inline images, and totals of model calls and approximate tokens
+  (`model_review.CHARS_PER_TOKEN`, 2.66 characters per token: extraction JSON tokenizes denser than
+  prose, and a live cohort billed 13.77M prompt characters as 5.17M tokens; `cohort rereview`'s
+  estimate uses the same ratio). It reads renditions only and writes nothing, so a bulk re-review's cost can
   be stated before it is approved. Evidence: `tests/test_review_parts.py::PlanCommandTests`.
 
 ## 4. Backups

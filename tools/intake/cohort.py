@@ -10,6 +10,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import stat
@@ -330,6 +331,15 @@ def _publish(root, policy_path, policy_sha, manifest, index_path):
     raise IntakeError("publication_revisions_exhausted")
 
 
+def _check_narrowing(receipts, max_parts):
+    if receipts is not None and not (isinstance(receipts, (list, tuple, set, frozenset)) and receipts
+                                     and all(isinstance(r, str) and re.fullmatch(standing.RECEIPT, r)
+                                             for r in receipts)):
+        raise IntakeError("invalid_receipts")
+    if max_parts is not None and (type(max_parts) is not int or not 1 <= max_parts <= standing.MAX_PARTS):
+        raise IntakeError("invalid_max_parts")
+
+
 def _check_options(concurrency, initial_concurrency, inspected_form, deferred="hold"):
     if type(concurrency) is not int or concurrency < 1:
         raise IntakeError("invalid_concurrency")
@@ -390,14 +400,24 @@ def _qualification_counts(report, extracted, others, published):
         "entries": sum(e.get("review_code") == "selection-capacity" for e in extracted),
         "model_calls_skipped": sum(bool(e.get("capacity_call_skipped")) for e in extracted)}
     counts["published"] = int(published)
+    deferred = sum(e.get("review_status") == "parts-deferred" for e in extracted)
+    if deferred:
+        # Left for a separately approved run by ``max_parts``; no call was made for them.
+        counts["parts_deferred"] = deferred
 
 
 def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transport,
             context=None, index_path=DEFAULT_INDEX, concurrency=1, adaptive=True,
             initial_concurrency=None, inspected_form="list", trust_stat=False, deferred="hold",
             extract_concurrency=cohort_runtime.DEFAULT_CONCURRENCY,
-            origin=None, parse_workers=None, exclusions=None):
+            origin=None, parse_workers=None, exclusions=None, receipts=None, max_parts=None):
     """Ingest, model-review, select and publish the cohort; return body-free counts and usage.
+
+    ``receipts`` (receipt IDs) limits the model review to those documents: every other extracted
+    entry without a saved review is left ``pending-review`` (``not-in-receipts``) with no call, while
+    entries already reviewed keep their outcome and selection, so one document can be tried first.
+    ``max_parts`` leaves a rendition that would need more review calls than that ``pending-review``
+    (``review_status`` ``parts-deferred``, no call), so large documents get their own approval.
 
     ``concurrency`` is the most model calls ever in flight. With ``adaptive`` (the default) the
     run starts at ``initial_concurrency`` (default: ``concurrency``) and halves the number in flight
@@ -416,6 +436,7 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
     earlier selections of this cohort are dropped like those of any file no longer extracted.
     """
     _check_options(concurrency, initial_concurrency, inspected_form, deferred)
+    _check_narrowing(receipts, max_parts)
     if not context:
         # A maintained context document must be named; guessing one would not satisfy the policy.
         raise IntakeError("context_required")
@@ -454,7 +475,8 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
         cohort_review.review_all(root, extracted, {
             "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
             "manifest": manifest, "model": model, "transport": gated, "usage": usage,
-            "snapshot": snapshot, "inspected_form": inspected_form, "deferred": deferred}, concurrency)
+            "snapshot": snapshot, "inspected_form": inspected_form, "deferred": deferred,
+            "receipts": None if receipts is None else frozenset(receipts), "max_parts": max_parts}, concurrency)
     others = _reconcile_qualified(root, manifest, system, current, cohorts, extracted, keep)
     pub, inspected = _publish(root, policy_path, policy_sha, manifest, index_path)
     others["orphaned"] = pruned["orphaned"]
@@ -475,7 +497,8 @@ def qualify(root, inbox, *, system, actor, policy_path, manifest, model, transpo
 def rereview(root, *, policy_path, manifest, model, transport=None, apply=False, limit=None,
              include_current_deferred=False, include_older_rejected=False,
              deferred="qualify-low-confidence", concurrency=6,
-             adaptive=True, initial_concurrency=None, inspected_form="list", cost_estimate=None):
+             adaptive=True, initial_concurrency=None, inspected_form="list", cost_estimate=None,
+             receipts=None, max_parts=None):
     """Report, and with ``apply`` re-review under the current policy, held standing reviews.
 
     See ``cohort_rereview``. Selected: chain heads held under an older policy (pending review or
@@ -486,9 +509,11 @@ def rereview(root, *, policy_path, manifest, model, transport=None, apply=False,
     command) qualifies a reviewer deferral after a complete inspection as low confidence. The dry
     run makes no model call and writes nothing; it reports the selection per reason and the
     estimated model calls and tokens (``cost_estimate``: a ``model_review.estimate`` file keyed by
-    model). ``limit`` bounds the model calls of one run; rerunning continues where it stopped.
+    model). ``limit`` bounds the renditions of one run; rerunning continues where it stopped.
+    ``receipts`` and ``max_parts`` narrow the selection as for ``qualify``.
     """
     _check_options(concurrency, initial_concurrency, inspected_form, deferred)
+    _check_narrowing(receipts, max_parts)
     if limit is not None and (type(limit) is not int or limit < 0):
         raise IntakeError("invalid_limit")
     root = Path(root).resolve()
@@ -503,7 +528,9 @@ def rereview(root, *, policy_path, manifest, model, transport=None, apply=False,
                                                    include_older_rejected)
     report, work = cohort_rereview.plan(root, selected, skipped, standing_policy, limit=limit,
                                         inspected_form=inspected_form, model=model,
-                                        cost_estimate=cost_estimate)
+                                        cost_estimate=cost_estimate,
+                                        receipts=None if receipts is None else frozenset(receipts),
+                                        max_parts=max_parts)
     report["deferred"] = deferred
     if not apply:
         return report
@@ -514,7 +541,7 @@ def rereview(root, *, policy_path, manifest, model, transport=None, apply=False,
         "policy": standing_policy, "policy_path": policy_path, "policy_sha": policy_sha,
         "manifest": manifest, "model": model, "transport": transport,
         "usage": Counter({"prompt_tokens": 0, "completion_tokens": 0}),
-        "inspected_form": inspected_form, "deferred": deferred},
+        "inspected_form": inspected_form, "deferred": deferred, "max_parts": max_parts},
         concurrency, adaptive=adaptive, initial_concurrency=initial_concurrency))
     return report
 
@@ -717,6 +744,14 @@ def _model_options(command, *, models_required, deferred):
     command.add_argument("--inspected-form", choices=model_review.FORMS, default="list",
                          help="ask the reviewer for inspected records as every index "
                               "(list, default) or as ranges (ranges)")
+    command.add_argument("--receipt", action="append", dest="receipts", metavar="D123",
+                         help="review only this receipt (repeatable); others without a saved review are "
+                              "left pending-review (not-in-receipts) with no model call")
+    command.add_argument("--receipts-file", type=Path,
+                         help="receipt IDs, one per line (or a deselect-style report), as --receipt")
+    command.add_argument("--max-parts", type=int,
+                         help="leave renditions needing more review calls than this pending "
+                              "(parts-deferred), with no model call")
     command.add_argument("--deferred", choices=standing.DEFERRED_MODES, default=deferred,
                          help="hold reviewer deferrals unpublished (hold) or qualify completely "
                               "inspected ones as low confidence (qualify-low-confidence); "
@@ -737,7 +772,14 @@ def _rereview(args):
         limit=args.limit, include_current_deferred=args.include_current_deferred,
         include_older_rejected=args.include_older_rejected, deferred=args.deferred, concurrency=args.concurrency, adaptive=not args.no_adaptive,
         initial_concurrency=args.initial_concurrency, inspected_form=args.inspected_form,
-        cost_estimate=args.cost_estimate)
+        cost_estimate=args.cost_estimate, **_narrowing(args))
+
+
+def _narrowing(args):
+    """``receipts`` and ``max_parts`` from ``--receipt``, ``--receipts-file`` and ``--max-parts``."""
+    receipts = [*(args.receipts or []),
+                *(deselection.read_receipts(args.receipts_file) if args.receipts_file else [])]
+    return {"receipts": receipts or None, "max_parts": args.max_parts}
 
 
 def _deselect(args):
@@ -783,7 +825,7 @@ def _inbox_report(args):
             initial_concurrency=args.initial_concurrency,
             inspected_form=args.inspected_form, trust_stat=args.trust_stat,
             deferred=args.deferred, extract_concurrency=args.extract_concurrency, origin=origin,
-            parse_workers=args.parse_workers, exclusions=rules)
+            parse_workers=args.parse_workers, exclusions=rules, **_narrowing(args))
     if args.command == "ingest":
         return ingest(args.root, args.inbox, system=args.system, actor=args.actor,
                       limit=args.limit, batch_size=args.batch_size, trust_stat=args.trust_stat,

@@ -1,6 +1,7 @@
 """Reviewing a rendition too large for one prompt in parts, and reducing inline data for the reviewer."""
 import hashlib
 import json
+import math
 import unittest
 
 from contextlib import closing
@@ -142,11 +143,12 @@ class PlanCommandTests(PartsCase):
         self.assertEqual(code, 0)
         self.assertEqual(report["totals"], {"renditions": 1, "model_calls": len(planned["tasks"]),
                                             "prompt_chars": planned["chars"],
-                                            "prompt_tokens_approx": -(-planned["chars"] // 4),
+                                            "prompt_tokens_approx": math.ceil(planned["chars"] / 2.66),
                                             "by_status": {"parts": 1}})
         row = report["renditions"][0]
         self.assertEqual((row["receipt_id"], row["parts"], row["status"]), ("D1", len(planned["tasks"]), "parts"))
         self.assertNotIn("Row 0000", json.dumps(report))
+        self.assertEqual(model_review.CHARS_PER_TOKEN, 2.66)  # measured on a live cohort, not the 4 rule of thumb
 
     def test_the_plan_names_what_stays_too_large_or_over_budget(self):
         _, report = self.run_plan("--max-records", "1")

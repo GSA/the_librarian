@@ -17,6 +17,7 @@ from collections import Counter
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import random
@@ -32,6 +33,10 @@ from tools.context_index import inline_data, renditions
 from . import standing, store_busy, throttle, usage_log
 
 PROVIDER = "usai"
+# Prompt characters per token for estimates. Four is the usual rule of thumb; extraction JSON (record
+# indices, keys and escapes) tokenizes denser, and a live cohort measured about 2.66 (13.77M prompt
+# characters billed as 5.17M tokens), so estimates use the measured ratio.
+CHARS_PER_TOKEN = 2.66
 MAX_PROMPT_CHARS = 400_000
 DECISIONS = {"accept", "reject", "defer"}
 SYSTEM = """You are the standing reviewer for a private program document library.
@@ -378,13 +383,14 @@ def _combine(results, tasks, reductions):
 
 
 def review(root, rendition, standing_policy, model, transport,
-           max_prompt_chars=None, inspected_form="list"):
+           max_prompt_chars=None, inspected_form="list", max_parts=None):
     """Review one rendition with one model and record the reported findings privately.
 
     A rendition that does not fit one prompt (``max_prompt_chars``) or the policy's ``max_records``
     and ``max_pages`` is reviewed in contiguous parts, one model call each, and the parts combine
     into one findings record (``_combine``). A part that fails ends the review, with the usage of the
     calls already made. ``too-large`` is a single record that does not fit a prompt even alone;
+    ``parts-deferred`` is a rendition needing more than ``max_parts`` parts (the operator's cap; no call);
     ``over-budget`` is a rendition needing more than ``standing.MAX_PARTS`` parts, or findings over
     the policy's ``max_findings_bytes``; the first two are refused before any call, the last only after
     the parts were reviewed (their usage is reported, no findings are written).
@@ -398,6 +404,9 @@ def review(root, rendition, standing_policy, model, transport,
                    max_records=budget["max_records"], max_pages=budget["max_pages"])
     if planned["status"]:
         return {"status": planned["status"], "usage": _usage({})}
+    if max_parts is not None and len(planned["tasks"]) > max_parts:
+        # The operator's cap on calls per document: left for a later, separately approved run.
+        return {"status": "parts-deferred", "parts": len(planned["tasks"]), "usage": _usage({})}
     results, usage = [], Counter()
     for prepared in planned["tasks"]:
         result = assess(prepared, model, transport, max_prompt_chars)
@@ -709,7 +718,7 @@ def plan_report(root, renditions_, criteria, inspected_form="list", *, max_promp
 
     One entry per rendition (receipt, status ``whole``/``parts``/``too-large``/``over-budget``, parts,
     prompt characters, reduced inline data) and totals: model calls (one per part), prompt characters
-    and the usual four-characters-per-token estimate, which is what a bulk run's cost note starts from.
+    and approximate prompt tokens (``CHARS_PER_TOKEN``), which is what a bulk run's cost note starts from.
     """
     rows, totals, statuses = [], Counter(), Counter()
     for name in renditions_:
@@ -725,7 +734,7 @@ def plan_report(root, renditions_, criteria, inspected_form="list", *, max_promp
     return {"renditions": rows,
             "totals": {"renditions": len(rows), "model_calls": totals["model_calls"],
                        "prompt_chars": totals["prompt_chars"],
-                       "prompt_tokens_approx": -(-totals["prompt_chars"] // 4),
+                       "prompt_tokens_approx": math.ceil(totals["prompt_chars"] / CHARS_PER_TOKEN),
                        "by_status": dict(statuses)}}
 
 

@@ -846,7 +846,13 @@ picture. Cost before a bulk run, read-only and body-free:
         [--inspected-form ranges] [--max-records N] [--max-pages N]
 
 It prints per rendition the status, parts, prompt characters and inline images, and totals of model
-calls (one per part) and approximate prompt tokens. A rendition that was `too-large` or `over-budget`
+calls (one per part) and approximate prompt tokens (2.66 characters per token, measured).
+Stage a bulk run: `qualify` and `rereview` take `--receipt D123` / `--receipts-file FILE` to review
+only named documents (others without a saved review stay `pending-review`, `not-in-receipts`, at no
+cost) and `--max-parts N` to defer documents needing more than N calls (`parts-deferred`). Keep
+low-value classes out before review with exclusion rules: `"numbered_suffixes": true` matches rotated
+and dated copies (`app.015185`, `report.2023-04-11`), alongside `.log`, `**/*.log.*` and `.svn-base`
+(see `config/intake-exclusions.example.json`). A rendition that was `too-large` or `over-budget`
 has no staged review, so re-run `cohort qualify` on its inbox to review it in parts (requests already
 staged cost nothing). `cohort rereview` selects reviews held as
 `standing-exception-budget-exceeded` (reason `budget-exceeded`) once the rendition needs parts, and
