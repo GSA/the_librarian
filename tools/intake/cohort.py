@@ -779,7 +779,9 @@ def _narrowing(args):
     """``receipts`` and ``max_parts`` from ``--receipt``, ``--receipts-file`` and ``--max-parts``."""
     receipts = [*(args.receipts or []),
                 *(deselection.read_receipts(args.receipts_file) if args.receipts_file else [])]
-    return {"receipts": receipts or None, "max_parts": args.max_parts}
+    named = args.receipts is not None or args.receipts_file is not None
+    # A named filter that yields no IDs (an empty file) is refused, never widened to every document.
+    return {"receipts": receipts if named else None, "max_parts": args.max_parts}
 
 
 def _deselect(args):

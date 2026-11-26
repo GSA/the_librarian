@@ -2659,6 +2659,12 @@ class RereviewTests(QualifyCase):
             self.assertEqual(cohort.main(args), 0)
         report = json.loads(out.getvalue())
         self.assertEqual((report["selected"], report["skipped"]["not-in-receipts"]), ({}, 1))
+        # An empty receipts file is refused, never read as "no filter".
+        receipts.write_text("# nothing named\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cohort.main(args), 2)
+        self.assertEqual(json.loads(err.getvalue()), {"error": "invalid_receipts"})
 
     def test_new_criteria_carry_qualified_reviews_and_re_review_older_rejections_as_low_confidence(self):
         from tools.context_index import context_index as index
