@@ -41,6 +41,13 @@ REASONS = {
         "than a title and status); it may be incomplete.",
         "Confirm or complete it via the fuller record, a newer document, meeting transcript or "
         "answered question."),
+    "inline-data-reduced": (
+        "Large embedded data (such as pictures) was replaced by a short placeholder in the text that "
+        "was reviewed and searched. The text around it is complete; the picture content is not "
+        "searchable text. The original file keeps it, and the rendition's inline_data lists each "
+        "omitted item (record, type, size, hash).",
+        "Open the original file for the picture itself, or confirm what it shows via a newer "
+        "document, meeting transcript or answered question."),
     "converted-format": (
         "Text converted from a more complex format; layout, formatting or structure may be lost.",
         "Check the original file, or confirm via a newer document, meeting transcript or answered "
@@ -89,6 +96,8 @@ NOTED_PREFIX = "Reviewer-noted "
 DEFERRED_PREFIX = "Reviewer-deferred: "
 FLAGGED_PREFIX = "Reviewer-flagged "
 SPARSE_PREFIX = FLAGGED_PREFIX + "sparse record: "
+PARTS_PREFIX = "Reviewed in parts: "
+REDUCED_PREFIX = "Reviewer prompt reduced inline data: "
 INSTRUCTIONS_PREFIX = FLAGGED_PREFIX + "embedded instructions: "
 EXPLANATION_PREFIX = "Reviewer explanation: "
 SIDECAR_LIMIT = 1024 * 1024
@@ -179,6 +188,12 @@ def review_reasons(reviewed_scope):
     return found
 
 
+def review_statements(evidence, prefix):
+    """The review event's evidence statements that start with ``prefix``, in order."""
+    return [e["quote"] for e in evidence if isinstance(e, dict) and isinstance(e.get("quote"), str)
+            and e["quote"].startswith(prefix)]
+
+
 def review_flags(evidence):
     """The reviewer's flag statements (embedded instructions, sparse record) on a review event."""
     return [e["quote"] for e in evidence if isinstance(e, dict) and isinstance(e.get("quote"), str)
@@ -265,9 +280,14 @@ def declared_origin(root, records, original, read, engine):
     return origin
 
 
-def for_rendition(value, review, origin):
-    """The label of one selected rendition at build time."""
+def for_rendition(value, review, origin, inline=None):
+    """The label of one selected rendition at build time.
+
+    ``inline`` is ``inline_data.summary`` of its records (None: none were reduced)."""
     found = []
+    if inline:
+        found.append(reason("inline-data-reduced", [
+            f"{inline['count']} inline item(s), {inline['bytes']} bytes, replaced by placeholders"]))
     kind = rendition_kind(value)
     kinds = page_kinds(value["payload"]) if kind == "pdf-pages" else {kind: [kind]}
     for kind, details in kinds.items():

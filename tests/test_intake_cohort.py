@@ -2549,6 +2549,123 @@ class RereviewTests(QualifyCase):
             if request["correction_of"]:
                 self.assertEqual(request["correlation_id"], request["correction_of"] + "-c1")
 
+    def legacy_single_call(self):
+        """The review as it was before parts: one prompt for the whole rendition, whatever its size."""
+        real = model_review.plan
+
+        def whole(root, rendition, form="list", criteria=standing.CRITERIA[0], **limits):
+            return real(root, rendition, form, criteria)
+        return unittest.mock.patch.object(model_review, "plan", side_effect=whole)
+
+    def test_a_review_blocked_on_the_record_budget_is_re_reviewed_in_parts(self):
+        self.ingest()
+        self.write_policy(1)
+        policy = json.loads((self.root / self.POLICY).read_text())
+        policy["budget"]["max_records"] = 1
+        (self.root / self.POLICY).write_text(json.dumps(policy))
+        with self.legacy_single_call():
+            first = self._qualify(self.transport())["counts"]["qualification"]
+        held = first["exception"]
+        self.assertGreater(held, 0)  # the reviews of the longer documents ended budget-exceeded
+        spent = len(self.calls)
+        dry = self.rereview()
+        self.assertEqual(dry["selected"], {"budget-exceeded": held})
+        self.assertGreater(dry["estimate"]["model_calls"], held)  # each needs several parts
+        self.assertEqual(len(self.calls), spent)
+
+        applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual(applied["results"], {"qualified": held})
+        self.assertEqual(len(self.calls), spent + dry["estimate"]["model_calls"])
+        self.assertEqual(self.rereview()["selected"], {})
+        report = self._qualify(self.transport())
+        self.assertEqual(report["counts"]["qualification"].get("exception"), None)
+
+    def test_dry_run_skips_a_record_no_prompt_can_hold_and_never_cuts_it(self):
+        self._qualify(self.transport(incomplete=["Just text"]))
+        self.assertEqual(self.rereview()["selected"], {"insufficient-inspected-scope": 1})
+        spent = len(self.calls)
+        with unittest.mock.patch.object(model_review, "MAX_PROMPT_CHARS", 100):
+            dry = self.rereview()
+            applied = self.rereview(apply=True, transport=self.transport())
+        self.assertEqual((dry["estimate"]["model_calls"], dry["skipped"]["too-large"]), (0, 1))
+        self.assertEqual((applied["results"], len(self.calls)), ({}, spent))
+
+    def test_qualify_with_receipts_reviews_only_those_and_keeps_every_other_selection(self):
+        self.ingest()
+        self.write_policy(1)
+        first = self._qualify(self.transport(), receipts=[self.receipt("a/notes.md")])
+        self.assertEqual(len(self.calls), 1)
+        held = [e for e in first["entries"] if e.get("review_code") == "not-in-receipts"]
+        self.assertEqual(len(held), len(self.entries) - 1)
+        self.assertEqual(first["counts"]["qualification"], {"qualified": 1, "pending-review": len(held)})
+        # A full run later reviews the rest and keeps the first one without another call.
+        second = self._qualify(self.transport())
+        self.assertEqual(len(self.calls), len(self.entries))
+        self.assertNotIn("pending-review", second["counts"]["qualification"])
+        # Naming one receipt again neither re-reviews nor drops the others' selections.
+        third = self._qualify(self.transport(), receipts=[self.receipt("a/notes.md")])
+        self.assertEqual(len(self.calls), len(self.entries))
+        self.assertEqual(third["counts"]["qualification"], second["counts"]["qualification"])
+
+    def one_record_per_part(self):
+        policy = json.loads((self.root / self.POLICY).read_text())
+        policy["budget"]["max_records"] = 1
+        (self.root / self.POLICY).write_text(json.dumps(policy))
+        return {e["receipt_id"]: len(model_review.plan(self.root, e["rendition"], max_records=1,
+                                                       max_pages=100)["tasks"]) for e in self.entries}
+
+    def test_max_parts_defers_large_reviews_without_a_call_and_reports_them(self):
+        self.ingest()
+        self.write_policy(1)
+        planned = self.one_record_per_part()
+        self.assertTrue(any(n > 1 for n in planned.values()))
+        report = self._qualify(self.transport(), max_parts=1)
+        deferred = [e for e in report["entries"] if e.get("review_status") == "parts-deferred"]
+        self.assertEqual(len(deferred), sum(n > 1 for n in planned.values()))
+        self.assertEqual({e["review_parts"] for e in deferred}, {n for n in planned.values() if n > 1})
+        self.assertEqual(len(self.calls), sum(n == 1 for n in planned.values()))
+        self.assertEqual(report["counts"]["parts_deferred"], len(deferred))
+        with self.assertRaises(IntakeError):
+            self._qualify(self.transport(), max_parts=0)
+
+    def test_rereview_receipts_and_max_parts_narrow_the_selection(self):
+        self.ingest()
+        self.write_policy(1)
+        self._qualify(self.transport(incomplete=["Just text", "Decided"]))
+        self.assertEqual(self.rereview()["selected"], {"insufficient-inspected-scope": 2})
+        one = self.rereview(receipts=[self.receipt("m/plain.txt")])
+        self.assertEqual((one["selected"], one["skipped"]["not-in-receipts"]),
+                         ({"insufficient-inspected-scope": 1}, 1))
+        planned = self.one_record_per_part()
+        self.write_policy(1)  # rereview checks the current policy's budget: restore it, then narrow
+        capped = self.rereview(max_parts=1)
+        self.assertEqual(capped["selected"], {"insufficient-inspected-scope": 2})  # one call each
+        self.assertEqual(capped["skipped"].get("parts-deferred"), None)
+        self.one_record_per_part()
+        capped = self.rereview(max_parts=1)
+        gemini = planned[self.receipt("m/Sync - Notes by Gemini.txt")]
+        self.assertGreater(gemini, 1)
+        self.assertEqual(capped["skipped"]["parts-deferred"], 1)
+
+    def test_cli_narrowing_options_reach_qualify_and_rereview(self):
+        self._qualify(self.transport(incomplete=["Just text"]))
+        receipts = Path(self.temp.name) / "receipts.txt"
+        receipts.write_text("# one receipt\nD99999\n")
+        args = ["rereview", "--root", str(self.root), "--policy", self.POLICY,
+                "--manifest", "config/selection.local.json", "--model", "gpt-5.6-terra",
+                "--receipts-file", str(receipts), "--max-parts", "3"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cohort.main(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual((report["selected"], report["skipped"]["not-in-receipts"]), ({}, 1))
+        # An empty receipts file is refused, never read as "no filter".
+        receipts.write_text("# nothing named\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cohort.main(args), 2)
+        self.assertEqual(json.loads(err.getvalue()), {"error": "invalid_receipts"})
+
     def test_new_criteria_carry_qualified_reviews_and_re_review_older_rejections_as_low_confidence(self):
         from tools.context_index import context_index as index
         self.ingest()

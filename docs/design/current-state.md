@@ -432,7 +432,8 @@ restated here.
   my2k qualifications become low confidence at the next rebuild without re-review),
   `reviewer-deferred` (a `Reviewer-deferred:` statement, see below), `embedded-instructions`
   and `sparse-record` (`Reviewer-flagged ...` statements, below), `converted-format` and
-  `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
+  `inline-data-reduced` (a rendition whose large inline data was replaced by placeholders, below)
+  and `machine-ocr` (from `RENDITION_REASONS`, keyed by `rendition_kind`: `docling-<format>` or the
   extraction payload format; `docling-pdf`, `docling-image` and cohort `ocr` are `machine-ocr`, a cohort PDF text layer
   (`pdf-text`) and `converted` (office/RTF conversion, below) are `converted-format`, a cohort
   `pdf-pages` PDF is the union of its pages' kinds plus `incomplete-rendition` for pages not read
@@ -958,6 +959,96 @@ restated here.
   2,200 records) whose inspected-record list was abbreviated; `--inspected-form ranges` lets the
   reviewer state full coverage compactly while the completeness gate is unchanged. Evidence:
   `tests/test_intake_cohort.py::RereviewTests`.
+
+- **A rendition too large for one review call is reviewed in contiguous parts** (Kata m378).
+  `model_review.plan` builds the prompts. A rendition that fits `MAX_PROMPT_CHARS` (400,000
+  characters of system and user prompt) and the policy budget is one prompt, byte-identical to
+  before. Otherwise it is cut into parts of whole records, in order, so every record is in exactly
+  one part (a part closes before the next record would exceed the prompt, the policy's
+  `max_records`, or its `max_pages` of distinct pages); every warning is in part 1, whose system
+  prompt (and each other part's) says "part k of n, records a-b" and that text continuing across
+  parts is not missing evidence. Parts are reviewed one call each, serially within a document.
+  Any failed or unparsable part ends the review without findings (its usage is still counted). The
+  parts combine into **one** `standing-findings` record: the decision is the strictest part
+  decision (`reject`, then `defer`, then `accept`); `inspected` is the union of what each part
+  reported (records as `"first-last"` ranges), never filled in, so a record a part skipped leaves
+  the document `insufficient-inspected-scope` exactly as for one call; reported issues are the
+  union, each tagged `[part k/n]`; `sparse` holds only when every part is sparse. The findings add
+  `parts` (`first`, `last`, `warnings`, `decision` and inspected counts per part), and
+  `standing.evaluate` checks them without a model: contiguous, ordered, covering every record
+  once, warnings only in part 1, each part inside `max_records`/`max_pages`, each part's counts
+  equal to the findings, at most `standing.MAX_PARTS` (64) parts, and the decision equal to the
+  strictest part (else `findings-mismatch`/`budget-exceeded`). The review event says it was reviewed
+  in n parts, lists each part's range and decision, and states that consistency across parts was not
+  checked: a contradiction between two parts is not detectable by this design. The published
+  `qualification.reviewed_scope[].parts` carries that statement.
+  Evidence: `tests/test_review_parts.py` (`PlanTests`, `ReviewPartsTests`, `PublishedTests`),
+  `tests/test_standing.py::StandingExtractTests` (`test_parts_*`).
+- **`over-budget` and `too-large` have separate, narrow meanings.** `max_records` and `max_pages`
+  of a standing policy are budgets per review part, not per rendition (pins and policy hashes are
+  unchanged). `too-large` now means one record (or the first record with the warnings) does not fit
+  a prompt even alone, after inline data is reduced: a record is never cut, so that rendition stays
+  `pending-review` and visible, and `cohort rereview` lists it under `skipped.too-large`.
+  `over-budget` now means the rendition needs more than 64 parts, or the combined findings exceed
+  `max_findings_bytes`. `too-large` and the more-than-64-parts refusal are decided before any call;
+  findings over `max_findings_bytes` are only known after the parts were reviewed, so their calls are
+  spent (and counted in usage) while no findings are written. A review held earlier as
+  `standing-exception-budget-exceeded` (made in one call, refused on the per-review page or record
+  budget) is selected by `cohort rereview` as reason `budget-exceeded` when the rendition now needs
+  parts, and reviewed as a correction like any other head. `rereview` dry runs count each part as a
+  model call (`estimate.model_calls`, with `documents` the renditions) and `--limit` bounds the
+  renditions started, never half of one. A `too-large` or `over-budget` result never staged a
+  request, so the ledger has no head for it: a later `qualify` of the same inbox reviews it (parts
+  and all) and reuses every request already staged, so only these documents cost calls; only the
+  budget-held heads need `rereview`. Evidence: `tests/test_review_parts.py`
+  (`SingleRecordTooLargeTests`, `test_too_many_parts_is_over_budget`),
+  `tests/test_intake_cohort.py::RereviewTests` (`test_a_review_blocked_on_the_record_budget_is_re_reviewed_in_parts`,
+  `test_dry_run_skips_a_record_no_prompt_can_hold_and_never_cuts_it`).
+- **Large inline `data:` payloads are reduced for the reviewer and the index, and recorded.** A
+  `data:` URI with at least 1,000 payload characters (`inline_data.MIN_PAYLOAD`) is replaced in the
+  reviewer prompt and in the index's search text by `[inline data omitted: <type>, <n> bytes, sha256
+  <16 hex>]`; the system prompt tells the reviewer a placeholder is not missing content. The
+  extraction JSON, its hash and the cited line spans keep the original bytes (a `get` of the line
+  still returns them). The reduction is recorded in three places: the findings (`reductions`: count,
+  bytes, up to 20 images with record index, type, size and SHA-256 of the payload, and `more`), the
+  review event and `reviewed_scope[].reductions`, and the published rendition metadata
+  `inline_data` (the same summary, derived from the pinned rendition at build, so no re-extraction
+  and no rendition hash change). The document's label gains the low-confidence reason
+  `inline-data-reduced` (the image content is not searchable text; the original file keeps it, and
+  `inline_data` names each item). `inline_data.py` is bound into the index engine fingerprint, so an
+  index built before this change is rebuilt. OCR of embedded images is not done: the path to the
+  image is the retained original. Of 470 live too-large documents, 6 had inline images (92-97% of
+  their prompt) and all fit one call once reduced. Evidence: `tests/test_inline_data.py`,
+  `tests/test_review_parts.py` (`InlineDataTests`, `PublishedTests`).
+- **A review run can be narrowed and large documents deferred** (Kata m378). `cohort qualify` and
+  `cohort rereview` take `--receipt D123` (repeatable) and `--receipts-file` (IDs one per line, or a
+  `deselect` report). `qualify` then reviews only those documents: every other extracted entry
+  without a saved review is reported `pending-review` (`not-in-receipts`) with no model call and no
+  staged request, while entries already reviewed keep their outcome and selection, so the cohort's
+  manifest is unchanged for them; `rereview` skips other heads as `not-in-receipts`. `--max-parts N`
+  (1-64) leaves a rendition that would need more than N review calls `pending-review`
+  (`review_status` `parts-deferred`, with `review_parts`, counted in `counts.parts_deferred`; a
+  `rereview` head is skipped as `parts-deferred`), so the costliest documents need their own
+  approval. Evidence: `tests/test_intake_cohort.py::RereviewTests`
+  (`test_qualify_with_receipts_reviews_only_those_and_keeps_every_other_selection`,
+  `test_max_parts_defers_large_reviews_without_a_call_and_reports_them`,
+  `test_rereview_receipts_and_max_parts_narrow_the_selection`,
+  `test_cli_narrowing_options_reach_qualify_and_rereview`).
+- **Exclusion rules can match rotated and numbered copies.** An exclusion rule may set
+  `"numbered_suffixes": true`: a file name ending in a dot and three or more digits, or a dot and a
+  `YYYY-MM-DD` date (`app.015185`, `server.log.2023-05-20`), matches. Measured on a live cohort, such
+  copies and logs were 15% of the review calls of its oversized documents and mostly delimited or
+  log lines; `config/intake-exclusions.example.json` shows the rule with `logs` and `.svn-base`
+  internals. Extensions alone were a weak signal there (most large `.xml`, `.xlsx` and `.docx` files
+  were accepted by the reviewer), so the example excludes only these classes. Evidence:
+  `tests/test_intake_exclusions.py::RuleTests::test_numbered_suffix_rules_match_rotated_and_dated_copies_only`.
+- **Planning is read-only.** `python -m tools.intake.model_review plan --root ROOT --rendition PATH ...`
+  prints, per rendition, its receipt, status (`whole`, `parts`, `too-large`, `over-budget`), parts,
+  prompt characters and inline images, and totals of model calls and approximate tokens
+  (`model_review.CHARS_PER_TOKEN`, 2.66 characters per token: extraction JSON tokenizes denser than
+  prose, and a live cohort billed 13.77M prompt characters as 5.17M tokens; `cohort rereview`'s
+  estimate uses the same ratio). It reads renditions only and writes nothing, so a bulk re-review's cost can
+  be stated before it is approved. Evidence: `tests/test_review_parts.py::PlanCommandTests`.
 
 ## 4. Backups
 

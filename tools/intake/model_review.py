@@ -17,8 +17,9 @@ from collections import Counter
 import hashlib
 import http.client
 import json
+import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import random
 import re
 import sys
@@ -28,9 +29,14 @@ import urllib.error
 import urllib.request
 
 from tools.catalog import catalog_store as catalog
+from tools.context_index import inline_data, renditions
 from . import standing, store_busy, throttle, usage_log
 
 PROVIDER = "usai"
+# Prompt characters per token for estimates. Four is the usual rule of thumb; extraction JSON (record
+# indices, keys and escapes) tokenizes denser, and a live cohort measured about 2.66 (13.77M prompt
+# characters billed as 5.17M tokens), so estimates use the measured ratio.
+CHARS_PER_TOKEN = 2.66
 MAX_PROMPT_CHARS = 400_000
 DECISIONS = {"accept", "reject", "defer"}
 SYSTEM = """You are the standing reviewer for a private program document library.
@@ -104,6 +110,21 @@ In "inspected_records", write each run of consecutive record indices you inspect
 "first-last" string (inclusive) and a lone index as an integer, in ascending order, for example
 [0, "2-86", 90]. Inspecting all 87 records is ["0-86"]. List only what you actually inspected;
 a gap in the ranges is an uninspected record."""
+INLINE_NOTE = """
+Large embedded data: URIs (such as pictures) were replaced before this review by placeholders of the
+form "[inline data omitted: <type>, <n> bytes, sha256 <prefix>]". The toolkit did this and keeps the
+original bytes, so a placeholder is not missing, truncated or corrupt content: never list it as missing
+evidence, and never treat its absence as a reason to reject."""
+
+
+def part_note(number, count, first, last):
+    return f"""
+This rendition is too large for one review, so it is reviewed in {count} parts. This is part {number} of {count}:
+records {first} to {last}. Inspect every record and warning shown here, and report only those as inspected. Other parts are reviewed separately: text that continues from an earlier part or
+continues in a later part is not missing evidence, and the number of records shown is the number of
+this part, not of the whole rendition."""
+
+
 FORMS = ("list", "ranges")
 CONTROL = {"format": "text", "records": [
     {"i": 0, "text": "Lorem ipsum dolor sit amet ~~~ 0x00 0x00 ### %%% ??? \u00ff\u00fe"},
@@ -133,29 +154,42 @@ def _rendition(root, rendition):
     return raw, json.loads(raw)
 
 
+def _load(root, rendition):
+    """``(raw, value, records, prompt records, reductions)``: the rendition's records as the reviewer
+    sees them (inline data reduced; the extraction itself is never changed)."""
+    raw, value = _rendition(root, rendition)
+    payload = value["payload"]
+    records = payload[standing.EXTRACT_FORMATS[payload["format"]]]
+    shown, found = [], []
+    for i, item in enumerate(records):
+        shown.append(inline_data.reduce_value(_record(i, item), found))
+    return raw, value, records, shown, (inline_data.summary(records) if found else None)
+
+
+def _body(value, shown, warnings):
+    return {"format": value["payload"]["format"], "records": shown,
+            "warnings": [{"ref": f"#/payload/warnings/{i}", "text": w} for i, w in warnings]}
+
+
 def task(root, rendition, inspected_form="list", criteria=standing.CRITERIA[0]):
     """Build the exact review prompt and the complete inspection scope for one rendition.
 
     ``inspected_form`` selects how the prompt asks for the inspected record indices: ``list``
     (every index, the default) or ``ranges`` (``"first-last"`` strings). Replies in either form
     are accepted and recorded as the same explicit list. ``criteria`` (the policy's) selects the
-    reviewer prompt.
+    reviewer prompt. Large inline ``data:`` payloads appear as placeholders. The prompt covers the
+    whole rendition however large it is; ``plan`` cuts one that does not fit a call into parts.
     """
-    raw, value = _rendition(root, rendition)
-    payload = value["payload"]
-    records = payload[standing.EXTRACT_FORMATS[payload["format"]]]
-    body = {"format": payload["format"],
-            "records": [_record(i, r) for i, r in enumerate(records)],
-            "warnings": [{"ref": f"#/payload/warnings/{i}", "text": w}
-                         for i, w in enumerate(payload["warnings"])]}
-    return {**_task(body, value, inspected_form, criteria),
+    raw, value, _, shown, reductions = _load(root, rendition)
+    body = _body(value, shown, list(enumerate(value["payload"]["warnings"])))
+    return {**_task(body, value, inspected_form, criteria, INLINE_NOTE if reductions else ""),
             "rendition_sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def _task(body, value=None, inspected_form="list", criteria=standing.CRITERIA[0]):
+def _task(body, value=None, inspected_form="list", criteria=standing.CRITERIA[0], notes=""):
     if inspected_form not in FORMS:
         raise ValueError("inspected_form must be one of " + ", ".join(FORMS))
-    system = PROMPTS[criteria] + (RANGE_NOTE if inspected_form == "ranges" else "")
+    system = PROMPTS[criteria] + (RANGE_NOTE if inspected_form == "ranges" else "") + notes
     return {"value": value, "body": body,
             "expected": {"records": [r["i"] for r in body["records"]],
                          "warnings": [w["ref"] for w in body["warnings"]]},
@@ -163,29 +197,86 @@ def _task(body, value=None, inspected_form="list", criteria=standing.CRITERIA[0]
                          {"role": "user", "content": json.dumps(body, ensure_ascii=False)}]}
 
 
-def expand_records(items, limit):
-    """Expand a reply's ``inspected_records``: integers and inclusive ``"first-last"`` strings.
+def _chars(prepared):
+    return sum(len(m["content"]) for m in prepared["messages"])
 
-    Returns the indices in reply order, or None when an item is malformed, a range runs
-    backwards, or the expansion would exceed ``limit`` indices (the rendition's record count),
-    so a hostile range cannot allocate. Overlaps and repeats surface as duplicates, which the
-    caller rejects exactly as for a plain list.
+
+def plan(root, rendition, inspected_form="list", criteria=standing.CRITERIA[0], *,
+         max_prompt_chars=None, max_records=None, max_pages=None):
+    """How one rendition is reviewed: a body-free plan with the exact prompts.
+
+    ``{"status", "tasks", "chars", "parted", "reductions", "rendition_sha256"}``. A rendition that fits
+    one prompt (and the ``max_records`` and ``max_pages`` limits, when given) is one task, exactly as
+    ``task`` builds it. Otherwise it is cut into contiguous parts of whole records, in order, so every
+    record is in exactly one part: a part closes before the next record would push its prompt over
+    ``max_prompt_chars``, its record count over ``max_records`` or its distinct pages over
+    ``max_pages``. Every warning goes in the first part, which also holds at least one record. Each
+    part's system prompt says which part it is. ``status`` is ``too-large`` when the first record with
+    the warnings, or a later record on its own, does not fit a prompt (a record is never cut), and
+    ``over-budget`` when more than ``standing.MAX_PARTS`` parts would be needed; ``tasks`` is then empty.
     """
-    if not isinstance(items, list):
-        return None
-    out = []
-    for item in items:
-        if type(item) is int:
-            out.append(item)
-            continue
-        found = re.fullmatch(r"\s*([0-9]{1,9})\s*-\s*([0-9]{1,9})\s*", item) if isinstance(item, str) else None
-        if not found:
-            return None
-        first, last = int(found[1]), int(found[2])
-        if last < first or last - first + 1 > limit or len(out) + last - first + 1 > limit:
-            return None
-        out.extend(range(first, last + 1))
-    return out if len(out) <= limit else None
+    max_prompt_chars = MAX_PROMPT_CHARS if max_prompt_chars is None else max_prompt_chars
+    raw, value, records, shown, reductions = _load(root, rendition)
+    digest = hashlib.sha256(raw).hexdigest()
+    payload = value["payload"]
+    warnings = list(enumerate(payload["warnings"]))
+    notes = INLINE_NOTE if reductions else ""
+    result = {"status": None, "tasks": [], "chars": 0, "parted": False,
+              "reductions": reductions, "rendition_sha256": digest}
+    whole = _task(_body(value, shown, warnings), value, inspected_form, criteria, notes)
+    pages = (len(payload["pages"]) if payload["format"] in renditions.PAGE_LINE_FORMATS else 0)
+    if (_chars(whole) <= max_prompt_chars and (max_records is None or len(shown) <= max_records)
+            and (max_pages is None or pages <= max_pages)):
+        return {**result, "tasks": [{**whole, "rendition_sha256": digest}], "chars": _chars(whole)}
+    cuts = _cut(value, shown, warnings, inspected_form, criteria, notes, max_prompt_chars,
+                max_records, max_pages)
+    if isinstance(cuts, str):
+        return {**result, "status": cuts}
+    tasks = []
+    for number, (first, last) in enumerate(cuts, 1):
+        body = _body(value, shown[first:last + 1], warnings if number == 1 else [])
+        note = part_note(number, len(cuts), first, last)
+        tasks.append({**_task(body, value, inspected_form, criteria, notes + note),
+                      "rendition_sha256": digest, "part": (number, len(cuts), first, last)})
+    return {**result, "tasks": tasks, "chars": sum(_chars(t) for t in tasks), "parted": True}
+
+
+def _cut(value, shown, warnings, inspected_form, criteria, notes, max_prompt_chars, max_records, max_pages):
+    """``[(first, last), ...]`` record index spans of the parts, or the status that refuses them."""
+    payload = value["payload"]
+    records = payload[standing.EXTRACT_FORMATS[payload["format"]]]
+    paged = payload["format"] in renditions.PAGE_LINE_FORMATS
+    sizes = [len(json.dumps(r, ensure_ascii=False)) + 2 for r in shown]  # ", " between items
+    fixed = len(_task(_body(value, [], []), value, inspected_form, criteria, notes)["messages"][0]["content"])
+    empty = len(json.dumps(_body(value, [], []), ensure_ascii=False))
+    first_extra = len(json.dumps(_body(value, [], warnings), ensure_ascii=False)) - empty
+    # The part note's digits are not known while the parts are cut: reserve its widest form (the
+    # last part number of the most parts, the widest record numbers), so a part never outgrows its cap.
+    reserve = len(part_note(standing.MAX_PARTS, standing.MAX_PARTS, len(shown), len(shown)))
+    cuts, start = [], 0
+    while start < len(shown):
+        size = fixed + reserve + empty + (first_extra if not cuts else 0)
+        end, seen = start, set()
+        while end < len(shown):
+            page = records[end]["page"] if paged else None
+            fits = (size + sizes[end] - (2 if end == start else 0) <= max_prompt_chars
+                    and (max_records is None or end - start < max_records)
+                    and (max_pages is None or page in seen or len(seen) < max_pages))
+            if not fits:
+                break
+            size += sizes[end] - (2 if end == start else 0)
+            seen.add(page)
+            end += 1
+        if end == start:
+            return "too-large"
+        cuts.append((start, end - 1))
+        start = end
+        if len(cuts) > standing.MAX_PARTS:
+            return "over-budget"
+    return cuts or "too-large"
+
+
+expand_records = standing.expand_records
 
 
 def _parse(content, expected):
@@ -225,8 +316,9 @@ def _usage(reply):
     return {key: int(usage.get(key) or 0) for key in ("prompt_tokens", "completion_tokens")}
 
 
-def assess(prepared, model, transport, max_prompt_chars=MAX_PROMPT_CHARS):
+def assess(prepared, model, transport, max_prompt_chars=None):
     """One model call over a prepared task; returns a body-free status plus the parsed reply."""
+    max_prompt_chars = MAX_PROMPT_CHARS if max_prompt_chars is None else max_prompt_chars
     if sum(len(m["content"]) for m in prepared["messages"]) > max_prompt_chars:
         return {"status": "too-large", "usage": _usage({})}
     try:
@@ -256,28 +348,85 @@ def _write_private(root, name, raw):
         stream.write(raw)
 
 
+def _combine(results, tasks, reductions):
+    """One findings body from the parsed replies of every part (``tasks`` in order).
+
+    The document decision is the strictest part decision; what was inspected is the union of what
+    each part reported, never filled in; reported issues are the union, each tagged with its part;
+    ``sparse`` holds only when every part is sparse. A single-part review is exactly its reply.
+    """
+    parsed = [r["parsed"] for r in results]
+    if len(parsed) == 1 and "part" not in tasks[0]:
+        merged = {**parsed[0], "records": parsed[0]["records"]}
+        parts = None
+    else:
+        count = len(parsed)
+
+        def union(key):
+            items = [f"[part {n}/{count}] {text}"[:1000] for n, p in enumerate(parsed, 1) for text in p[key]]
+            if len(items) > 50:
+                items = items[:49] + [f"[{len(items) - 49} more noted across the parts; the first 49 are listed]"]
+            return items
+        explanation = " ".join(f"[part {n}/{count}] {p['explanation']}" for n, p in enumerate(parsed, 1))
+        merged = {"decision": max((p["decision"] for p in parsed), key=standing.DECISION_ORDER.index),
+                  "records": sorted(i for p in parsed for i in p["records"]),
+                  "warnings": sorted(w for p in parsed for w in p["warnings"]),
+                  "explanation": f"Reviewed in {count} part{'s' * (count != 1)}. {explanation}"[:2000],
+                  **{key: union(key) for key in ("contradictions", "missing_evidence",
+                                                 "unverifiable_references", "embedded_instructions")},
+                  "sparse": all(p["sparse"] for p in parsed)}
+        parts = [{"first": t["part"][2], "last": t["part"][3], "warnings": len(t["expected"]["warnings"]),
+                  "decision": p["decision"],
+                  "inspected": {"records": len(p["records"]), "warnings": len(p["warnings"])}}
+                 for t, p in zip(tasks, parsed)]
+    return merged, parts
+
+
 def review(root, rendition, standing_policy, model, transport,
-           max_prompt_chars=MAX_PROMPT_CHARS, inspected_form="list"):
-    """Review one rendition with one model and record the reported findings privately."""
+           max_prompt_chars=None, inspected_form="list", max_parts=None):
+    """Review one rendition with one model and record the reported findings privately.
+
+    A rendition that does not fit one prompt (``max_prompt_chars``) or the policy's ``max_records``
+    and ``max_pages`` is reviewed in contiguous parts, one model call each, and the parts combine
+    into one findings record (``_combine``). A part that fails ends the review, with the usage of the
+    calls already made. ``too-large`` is a single record that does not fit a prompt even alone;
+    ``parts-deferred`` is a rendition needing more than ``max_parts`` parts (the operator's cap; no call);
+    ``over-budget`` is a rendition needing more than ``standing.MAX_PARTS`` parts, or findings over
+    the policy's ``max_findings_bytes``; the first two are refused before any call, the last only after
+    the parts were reviewed (their usage is reported, no findings are written).
+    """
     reviewer = PROVIDER + ":" + model
     if standing_policy["reviewer"] != reviewer:
         raise ValueError("Standing policy reviewer must name the reviewing model")
     criteria = standing.criteria(standing_policy)
-    prepared = task(root, rendition, inspected_form, criteria)
-    if len(prepared["expected"]["records"]) > standing_policy["budget"]["max_records"]:
-        return {"status": "over-budget", "usage": _usage({})}
-    result = assess(prepared, model, transport, max_prompt_chars)
-    if result["status"] != "reviewed":
-        return result
-    parsed = result.pop("parsed")
+    budget = standing_policy["budget"]
+    planned = plan(root, rendition, inspected_form, criteria, max_prompt_chars=max_prompt_chars,
+                   max_records=budget["max_records"], max_pages=budget["max_pages"])
+    if planned["status"]:
+        return {"status": planned["status"], "usage": _usage({})}
+    if max_parts is not None and len(planned["tasks"]) > max_parts:
+        # The operator's cap on calls per document: left for a later, separately approved run.
+        return {"status": "parts-deferred", "parts": len(planned["tasks"]), "usage": _usage({})}
+    results, usage = [], Counter()
+    for prepared in planned["tasks"]:
+        result = assess(prepared, model, transport, max_prompt_chars)
+        usage.update(result["usage"])
+        if result["status"] != "reviewed":
+            return {**result, "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")}}
+        results.append(result)
+    parsed, parts = _combine(results, planned["tasks"], planned["reductions"])
+    result = {"status": "reviewed", "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens")},
+              "decision": parsed["decision"], "parts": len(planned["tasks"]),
+              "complete": all(r["complete"] for r in results)}
     raw, value = _rendition(root, rendition)
     schema = standing.CRITERIA_FINDINGS[criteria]
+    records = standing.compress_records(parsed["records"]) if parts else parsed["records"]
     findings = {"schema": schema,
                 "policy": {"policy_id": standing_policy["policy_id"],
                            "version": standing_policy["version"]},
                 "rendition": rendition, "rendition_sha256": hashlib.sha256(raw).hexdigest(),
                 "reviewer": reviewer, "decision": parsed["decision"],
-                "inspected": {"records": parsed["records"], "warnings": parsed["warnings"]},
+                "inspected": {"records": records, "warnings": parsed["warnings"]},
                 "explanation": parsed["explanation"],
                 "contradictions": parsed["contradictions"],
                 "missing_evidence": parsed["missing_evidence"],
@@ -285,8 +434,12 @@ def review(root, rendition, standing_policy, model, transport,
                 "correction_of": None, "new_mapping": False, "exception_resolution": None}
     if schema == standing.FINDINGS_SCHEMA_V3:
         findings.update(embedded_instructions=parsed["embedded_instructions"], sparse=parsed["sparse"])
+    if parts:
+        findings["parts"] = parts
+    if planned["reductions"]:
+        findings["reductions"] = planned["reductions"]
     encoded = json.dumps(findings, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    if len(encoded) > standing_policy["budget"]["max_findings_bytes"]:
+    if len(encoded) > budget["max_findings_bytes"]:
         return {**result, "status": "over-budget"}
     digest = hashlib.sha256(encoded).hexdigest()
     home = store_busy.instance_roots(root)["intake_home"]
@@ -325,7 +478,7 @@ def _score(model_results, models_seconds):
 
 
 def evaluate_models(root, renditions, models, transport, *, clock=time.monotonic,
-                    controls=False, max_prompt_chars=MAX_PROMPT_CHARS, criteria=None,
+                    controls=False, max_prompt_chars=None, criteria=None,
                     per_rendition=False, concurrency=1):
     """Score models on sample renditions (and optional controls); body-free, writes nothing.
 
@@ -559,9 +712,47 @@ def _policy_criteria(root, name):
         raise ValueError(getattr(error, "code", "standing-policy-unreadable")) from None
 
 
+def plan_report(root, renditions_, criteria, inspected_form="list", *, max_prompt_chars=None,
+                max_records=standing.DEFAULT_MAX_RECORDS, max_pages=standing.DEFAULT_MAX_PAGES):
+    """Body-free plan of how each rendition would be reviewed; reads renditions, writes nothing.
+
+    One entry per rendition (receipt, status ``whole``/``parts``/``too-large``/``over-budget``, parts,
+    prompt characters, reduced inline data) and totals: model calls (one per part), prompt characters
+    and approximate prompt tokens (``CHARS_PER_TOKEN``), which is what a bulk run's cost note starts from.
+    """
+    rows, totals, statuses = [], Counter(), Counter()
+    for name in renditions_:
+        planned = plan(root, name, inspected_form, criteria, max_prompt_chars=max_prompt_chars,
+                       max_records=max_records, max_pages=max_pages)
+        status = planned["status"] or ("parts" if planned["parted"] else "whole")
+        statuses[status] += 1
+        calls = len(planned["tasks"])
+        totals.update(model_calls=calls, prompt_chars=planned["chars"])
+        reductions = planned["reductions"] or {}
+        rows.append({"receipt_id": PurePosixPath(name).parts[-3], "status": status, "parts": calls,
+                     "prompt_chars": planned["chars"], "inline_images": reductions.get("count", 0)})
+    return {"renditions": rows,
+            "totals": {"renditions": len(rows), "model_calls": totals["model_calls"],
+                       "prompt_chars": totals["prompt_chars"],
+                       "prompt_tokens_approx": math.ceil(totals["prompt_chars"] / CHARS_PER_TOKEN),
+                       "by_status": dict(statuses)}}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
+    preview = commands.add_parser("plan", allow_abbrev=False,
+                                  help="how renditions would be reviewed (parts, calls, prompt size); "
+                                       "body-free, makes no model call and writes nothing")
+    preview.add_argument("--root", required=True, type=Path)
+    preview.add_argument("--rendition", action="append", required=True, dest="renditions")
+    preview.add_argument("--criteria", choices=sorted(PROMPTS), default=standing.CRITERIA[-1])
+    preview.add_argument("--inspected-form", choices=FORMS, default="list")
+    preview.add_argument("--max-prompt-chars", type=_positive_option, default=MAX_PROMPT_CHARS)
+    preview.add_argument("--max-records", type=_positive_option, default=standing.DEFAULT_MAX_RECORDS,
+                         help="the policy's per-review record budget (default %d)" % standing.DEFAULT_MAX_RECORDS)
+    preview.add_argument("--max-pages", type=_positive_option, default=standing.DEFAULT_MAX_PAGES,
+                         help="the policy's per-review page budget (default %d)" % standing.DEFAULT_MAX_PAGES)
     sample = commands.add_parser("evaluate", allow_abbrev=False,
                                  help="score models on sample renditions; body-free output")
     sample.add_argument("--root", required=True, type=Path)
@@ -582,6 +773,11 @@ def main(argv=None):
     sample.add_argument("--max-output-tokens", type=_positive_option,
                         help="send max_tokens with each request (default: not sent)")
     args = parser.parse_args(argv)
+    if args.command == "plan":
+        print(json.dumps(plan_report(args.root, args.renditions, args.criteria, args.inspected_form,
+                                     max_prompt_chars=args.max_prompt_chars, max_records=args.max_records,
+                                     max_pages=args.max_pages), sort_keys=True))
+        return 0
     criteria = args.criteria
     if criteria is None and args.policy:
         try:

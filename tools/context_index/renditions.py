@@ -9,7 +9,7 @@ import stat
 from bisect import bisect_right
 from pathlib import Path, PurePosixPath
 
-from tools.context_index import confidence, forked, qualification
+from tools.context_index import confidence, forked, inline_data, qualification
 
 
 # One instance publishes a reviewed cohort (tens of thousands of files), not a hand-picked handful.
@@ -338,11 +338,12 @@ def _check_selection(work, item):
     origin = confidence.declared_origin(
         root, records["records"], original,
         lambda path: catalog.private_file(work.no_symlinks(path)), engine)
-    label = confidence.for_rendition(value, review, origin)
+    inline = _inline(value, raw)
+    label = confidence.for_rendition(value, review, origin, inline)
     texts = [catalog.canonical(registration["receipt"]), catalog.canonical(original),
              catalog.canonical(child), catalog.canonical(relation),
              *sorted(catalog.canonical(record) for record in submission)]
-    return _piece(item, texts), (item, raw, value, _metadata(item, value, run, review), label)
+    return _piece(item, texts), (item, raw, value, _metadata(item, value, run, review, inline), label)
 
 
 # Checking selections is independent per selection and CPU-bound, so an identity-only check of many
@@ -444,7 +445,15 @@ def _read_original(root, source, no_symlinks, engine):
     return original_raw
 
 
-def _metadata(item, value, run, review):
+def _inline(value, raw):
+    """``inline_data.summary`` of the rendition's records, or None: what the index reduces and records."""
+    payload = value.get("payload")
+    if payload is None or b"data:" not in raw:
+        return None
+    return inline_data.summary(payload[_RECORD_KEYS[payload["format"]]])
+
+
+def _metadata(item, value, run, review, inline=None):
     payload = value.get("payload")
     docling = item["format"] == "docling"
     metadata = {
@@ -462,6 +471,8 @@ def _metadata(item, value, run, review):
             metadata[key] = payload[key]
     if review is not None:
         metadata["qualification"] = review
+    if inline:
+        metadata["inline_data"] = inline
     if docling:
         metadata["confidence"] = value["conversion"]["confidence"]
         metadata["omissions"] = value["conversion"]["omissions"]
@@ -689,6 +700,10 @@ def _docling_table_text(item, engine):
     return " ".join(cell["text"] for cell in cells)
 
 
+_RECORD_KEYS = {name: "lines" for name in ("gemini-txt", "text", "mhtml", *PAGE_LINE_FORMATS, "converted")}
+_RECORD_KEYS["odt"] = "nodes"
+
+
 def records(raw, value, engine):
     """Return exact on-disk JSON line spans alongside decoded search-only text."""
     if value.get("schema") == "docling-rendition-v1":
@@ -730,6 +745,9 @@ def records(raw, value, engine):
             continue
         anchor, title, search_text, parent, location = _describe_record(
             payload["format"], record, index, parents)
+        # Large inline data is not searchable text: the index sees a placeholder (the cited span
+        # keeps the original bytes).
+        search_text = inline_data.reduce_text(search_text)[0]
         yield {
             "anchor": anchor, "title": title, "start": start_line, "end": end_line,
             "text": "".join(lines[start_line - 1:end_line]), "search_text": search_text,

@@ -109,6 +109,15 @@ cases, exits 2 rather than comparing as OK.
    explicitly with `--tolerance` or `--max-regressions` rather than by editing the
    baseline.
 
+## Cases for documents that were once too large
+
+A document that needed review in parts, or whose pictures were reduced, gets one authored case
+when it is re-reviewed: query a distinctive phrase from its text, `expect_paths` its rendition,
+and `expect_confidence: "low"` when its label carries `inline-data-reduced`. Keep the cases in the
+instance's ignored `config/evals.local.json`, never in the repository, because their queries come from
+the instance's documents. Run `run` before the re-review (the cases are then reported as misses)
+and after publish, and `compare` them: the previously unreachable documents show as named gains.
+
 ## Limits
 
 - Generated known-item cases measure whether the index can still find what it

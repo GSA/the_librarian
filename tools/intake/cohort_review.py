@@ -135,7 +135,7 @@ def _review(root, entry, run):
                 "findings_path": f"{home}/findings/out-of-scope/{entry['rendition_sha256'][:24]}.json",
                 "findings_sha256": hashlib.sha256(b"").hexdigest()}
     return model_review.review(root, entry["rendition"], run["policy"], run["model"], run["transport"],
-                               inspected_form=run["inspected_form"])
+                               inspected_form=run["inspected_form"], max_parts=run.get("max_parts"))
 
 
 def _deferred_argument(deferred):
@@ -179,6 +179,8 @@ def _new_review(root, entry, run, corr, event_id, reviewed, spent=None):
     run["usage"].update(reviewed["usage"])
     if reviewed["status"] != "reviewed":
         entry.update(qualification="pending-review", review_status=reviewed["status"])
+        if "parts" in reviewed:
+            entry["review_parts"] = reviewed["parts"]
         return None
     try:
         return _stage_review(root, entry, run, corr, event_id, reviewed)
@@ -269,6 +271,12 @@ def _carried(root, entry, run):
     return None
 
 
+def _outside(entry, run):
+    """True when the run names ``receipts`` and ``entry`` is not one of them."""
+    receipts = run.get("receipts")
+    return receipts is not None and entry.get("receipt_id") not in receipts
+
+
 def _carried_tokens(policy):
     return [sha for _, _, sha in standing.carried(policy)]
 
@@ -299,6 +307,10 @@ def _review_and_select(root, entry, run, prefetched=None, spent=None):
             run["usage"].update(reviewed["usage"])
         entry["carried"] = True
         _conclude(entry, *kept)
+        return
+    if current is None and _outside(entry, run):
+        # Not named by ``receipts``: never reviewed in this run (a later run without the filter does it).
+        entry.update(qualification="pending-review", review_code="not-in-receipts")
         return
     if current is None:
         if failure is not None:
@@ -377,7 +389,8 @@ def review_all(root, extracted, run, concurrency):
         # still in the window; any other entry is checked exactly, in turn, in
         # _review_and_select, so no call is paid for an entry that cannot be selected.
         corrs = ["standing-" + _standing_token(entry, sha) for sha in [run["policy_sha"], *carried]]
-        return not existing.intersection(corrs) and _free_room(root, run["manifest"]) > waiting
+        return (not _outside(entry, run) and not existing.intersection(corrs)
+                and _free_room(root, run["manifest"]) > waiting)
     pipeline(extracted, concurrency, ahead, lambda entry: _review(root, entry, run),
              lambda entry, prefetched: _settle(root, entry, run, prefetched))
 

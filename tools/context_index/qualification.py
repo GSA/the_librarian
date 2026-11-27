@@ -62,11 +62,15 @@ def _bound(selection, source, snapshot, engine, complete_scope, label):
         reviewed_content.update(content)
         noted, deferral = confidence.review_notes(event["evidence"])
         flags = confidence.review_flags(event["evidence"])
+        parts = confidence.review_statements(event["evidence"], confidence.PARTS_PREFIX)
+        reduced = confidence.review_statements(event["evidence"], confidence.REDUCED_PREFIX)
         reviewed_scope.append({"event_id": event_id, "content": sorted(content),
                                "unit": "file", "extent": "defined_scope",
                                **({"noted_issues": noted} if noted else {}),
                                **({"deferral": deferral} if deferral is not None else {}),
-                               **({"flags": flags} if flags else {})})
+                               **({"flags": flags} if flags else {}),
+                               **({"parts": parts} if parts else {}),
+                               **({"reductions": reduced} if reduced else {})})
     return reviewed_content, reviewed_scope
 
 
